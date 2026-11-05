@@ -22,10 +22,18 @@ docker compose up --build   # server + Postgres 17 + Redis 7
 Open http://127.0.0.1:8080 and register. Save the **recovery kit** returned at
 registration offline: it is your X25519 private key.
 
+## Hosting
+
+Docker is the supported self-host path (`docker compose up --build`:
+server + Postgres + Redis). Cloudflare Workers cannot run this server
+as-is (it needs OS sockets, threads and a local DB driver; Workers is a
+wasm isolate runtime), so a Worker port would be a separate rewrite of
+the storage and HTTP layers around the portable `openwarp-crypto` crate.
+
 ## CLI
 
 ```bash
-export OPENWARP_HOST=http://127.0.0.1:8080 OPENWARP_TOKEN=<token-from-UI-or-login>
+openwarp login            # browser OAuth (PKCE), or: login --token <TOKEN>, or machine login with --client-id/--client-secret
 openwarp secrets --env <ENV_ID>          # redacted list
 openwarp secrets --env <ENV_ID> --show
 openwarp export  --env <ENV_ID>

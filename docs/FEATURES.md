@@ -92,3 +92,44 @@ Kept from OpenWarp where it already exceeds both: point-in-time recovery,
 secret-change proposals, and Postgres dynamic roles are not Phase features.
 Deferred by design: CLI parity (separate effort), Kubernetes operator,
 SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).
+
+## Trigger.dev sync
+
+Kind `trigger`, modelled directly on Trigger's env var REST API. Config:
+`token` (PAT `tr_pat_...` or env secret key), `project_ref`, `target_env`
+(`dev|staging|prod`) or `targets: [{project_ref, env, token}]` fan-out,
+`env_map`, `mode: upsert|mirror|import`, `prefix`, `include_keys`,
+`exclude_keys`, `base_url` (self-hosted), `dry_run`. Sync lists the remote
+env, diffs, bulk-imports creates/updates, and in mirror mode only prunes
+names this integration previously synced (tracked in
+`integration_sync_state`). `POST /api/integrations/:id/test` verifies the
+connection. Note: Trigger's REST create/import schema documents name/value
+only, so dashboard-style secret marking cannot be set via API; sync results
+say so explicitly when `mark_secret` is requested.
+
+## OAuth 2.1, MCP and CLI
+
+OpenWarp is its own OAuth 2.1 authorization server, shared by the CLI and
+MCP: RFC 9728 protected-resource metadata
+(`/.well-known/oauth-protected-resource`), RFC 8414 metadata
+(`/.well-known/oauth-authorization-server`), RFC 7591 dynamic client
+registration (`POST /oauth/register`), authorization code with mandatory
+PKCE S256 (`GET /oauth/authorize`, consent page), `POST /oauth/token`
+(refresh rotation: old refresh tokens die on use) and `/oauth/revoke`.
+API auth accepts OAuth access tokens alongside sessions and service tokens.
+
+MCP is served at `POST /mcp` (Streamable HTTP only; GET returns 405 on this
+stateless server). Unauthenticated calls get 401 with
+`WWW-Authenticate: Bearer resource_metadata=...`. Tools: `list_envs`,
+`list_secrets`, `get_secret`, `search_secrets` (scope `secrets:read`) and
+`set_secret`, `delete_secret`, `create_lease`, `sync_integration` (scope
+`secrets:write`, RBAC still applies). Every tool call is audit-logged.
+Resources: `openwarp://env/{env_id}`.
+
+CLI (`openwarp` binary in the same monorepo) logs in three ways: browser
+OAuth with PKCE and a loopback redirect (`login`), `login --token`, and
+machine Universal Auth (`login --client-id/--client-secret`). Credentials
+live in `~/.openwarp/config.json` (0600). Commands include `whoami`,
+`logout`, `init`, `orgs/apps/envs`, `secrets`, `get`, `set`, `delete`,
+`export --format dotenv|json|yaml|shell`, `import`, `run`,
+`e2e-create/put/get/grant`, and `completion bash|zsh|fish|powershell`.

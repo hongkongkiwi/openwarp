@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use hmac::{Hmac, Mac};
 type HmacSha256 = Hmac<Sha256>;
 
-pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook"];
+pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook"];
 
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
@@ -66,6 +66,61 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
         "aws_secrets_manager" | "aws_parameter_store" => aws_sync(config, secrets, kind).await,
         _ => Err(format!("unknown integration kind: {}", kind)),
     }
+}
+
+
+// ---------- Trigger.dev ----------
+pub struct TriggerTarget { pub project_ref: String, pub env: String, pub token: String }
+pub fn trigger_targets(config: &Value) -> Vec<TriggerTarget> {
+    let global_token = cfg(config, "token").to_string();
+    if let Some(arr) = config.get("targets").and_then(|v| v.as_array()) {
+        return arr.iter().map(|x| TriggerTarget{ project_ref: x.get("project_ref").and_then(|v| v.as_str()).unwrap_or("").to_string(), env: x.get("env").and_then(|v| v.as_str()).unwrap_or("prod").to_string(), token: x.get("token").and_then(|v| v.as_str()).unwrap_or(&global_token).to_string() }).collect();
+    }
+    let env = { let e = cfg(config, "target_env"); if e.is_empty() { cfg(config, "env") } else { e } };
+    vec![TriggerTarget{ project_ref: cfg(config, "project_ref").to_string(), env: if env.is_empty() { "prod".to_string() } else { env.to_string() }, token: global_token }]
+}
+fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
+    let prefix = cfg(config, "prefix"); let include: Vec<String> = config.get("include_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    let exclude: Vec<String> = config.get("exclude_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (format!("{}{}", prefix, k), v.clone())).collect()
+}
+pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let client = reqwest::Client::new(); let base_url = base(config, "https://api.trigger.dev");
+    let mode = { let m = cfg(config, "mode"); if m.is_empty() { "upsert" } else { m } };
+    let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let desired = trigger_desired(config, secrets);
+    let targets = trigger_targets(config);
+    if targets.iter().any(|x| x.project_ref.is_empty() || x.token.is_empty()) { return Err("trigger requires token and project_ref (per target or global)".into()); }
+    let mut managed: Vec<String> = Vec::new(); let mut reports: Vec<String> = Vec::new(); let mut failures = 0;
+    for tg in &targets {
+        let root = format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env);
+        let list_text = match req(client.get(&root).bearer_auth(&tg.token)).await { Ok(x) => x, Err(e) => { failures += 1; reports.push(format!("{}/{}: list failed: {}", tg.project_ref, tg.env, e)); continue; } };
+        let remote_list: Vec<Value> = serde_json::from_str(&list_text).unwrap_or_default();
+        let remote: std::collections::HashMap<String, String> = remote_list.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v.get("value")?.as_str()?.to_string()))).collect();
+        let (mut created, mut updated, mut unchanged, mut deleted) = (0, 0, 0, 0);
+        if !dry {
+            let mut bulk: Vec<Value> = Vec::new();
+            for (name, value) in &desired { match remote.get(name) { None => bulk.push(json!({"name":name,"value":value})), Some(old) if old != value => bulk.push(json!({"name":name,"value":value})), Some(_) => unchanged += 1 } }
+            created = bulk.iter().filter(|v| !remote.contains_key(v.get("name").and_then(|x| x.as_str()).unwrap_or(""))).count();
+            updated = bulk.len() - created;
+            if !bulk.is_empty() { if let Err(e) = req(client.post(format!("{}/import", root)).bearer_auth(&tg.token).json(&json!({"variables": bulk, "override": true}))).await { failures += 1; reports.push(format!("{}/{}: import failed: {}", tg.project_ref, tg.env, e)); continue; } }
+            if mode == "mirror" { for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) { let _ = req(client.delete(format!("{}/{}", root, name)).bearer_auth(&tg.token)).await; deleted += 1; } } }
+        } else { for (name, value) in &desired { match remote.get(name) { None => created += 1, Some(old) if old != value => updated += 1, Some(_) => unchanged += 1 } }
+            if mode == "mirror" { for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) { deleted += 1; } } } }
+        for (n, _) in &desired { if !managed.contains(n) { managed.push(n.clone()); } }
+        reports.push(format!("{}/{}: created={} updated={} unchanged={} deleted={}{}", tg.project_ref, tg.env, created, updated, unchanged, deleted, if dry { " (dry-run)" } else { "" }));
+    }
+    if failures > 0 && failures == targets.len() { return Err(reports.join("; ")); }
+    let mut note = String::new();
+    if config.get("mark_secret").and_then(|v| v.as_bool()).unwrap_or(false) { note = " NOTE: Trigger REST create/import schema documents name/value only, so secret marking could not be applied via API; mark these in the Trigger dashboard if needed.".to_string(); }
+    Ok((format!("Trigger.dev sync{}: {}{}", if dry { " (dry-run)" } else { "" }, reports.join("; "), note), managed))
+}
+pub async fn trigger_test(config: &Value) -> Result<String, String> {
+    let client = reqwest::Client::new(); let base_url = base(config, "https://api.trigger.dev"); let targets = trigger_targets(config);
+    let tg = targets.first().ok_or("no target")?; if tg.project_ref.is_empty() || tg.token.is_empty() { return Err("trigger requires token and project_ref".into()); }
+    let text = req(client.get(format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env)).bearer_auth(&tg.token)).await?;
+    let count = serde_json::from_str::<Vec<Value>>(&text).map(|v| v.len()).unwrap_or(0);
+    Ok(format!("Trigger connection OK: project {} env {} currently has {} variables", tg.project_ref, tg.env, count))
 }
 
 async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {

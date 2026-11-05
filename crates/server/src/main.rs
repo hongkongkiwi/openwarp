@@ -9,11 +9,15 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 pub struct AppState {
     db: Db,
     db_url: String,
+    pub_url: String,
     master: [u8; 32],
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
 }
 type S = Arc<AppState>;
 type Res = Result<Json<Value>, (StatusCode, Json<Value>)>;
+fn issuer(st: &S, h: &HeaderMap) -> String { if !st.pub_url.is_empty() { return st.pub_url.trim_end_matches('/').to_string(); } let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8080"); format!("http://{}", host) }
+fn cookie_val(h: &HeaderMap, name: &str) -> String { h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").split(';').filter_map(|p| p.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.to_string()).unwrap_or_default() }
+fn session_cookie(token: &str) -> String { format!("ow_session={}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800", token) }
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) { (code, Json(json!({"error": msg}))) }
 fn bad(msg: &str) -> (StatusCode, Json<Value>) { err(StatusCode::BAD_REQUEST, msg) }
 fn now() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 }
@@ -54,6 +58,8 @@ impl AppState {
         let hash = oc::hash_token(token);
         #[cfg(feature = "redis-cache")]
         if let Some(uid) = self.redis_get(&format!("sess:{}", hash)) { return Ok(uid); }
+        // OAuth 2.1 access tokens (CLI / MCP clients)
+        if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).map_err(|e| bad(&e))? { return Ok(db::s(&row, "user_id")); }
         // service / personal access tokens
         if let Some(row) = self.db.one("SELECT created_by,kind,created_at FROM tokens WHERE token_hash=?", &[json!(hash)]).map_err(|e| bad(&e))? {
             if db::s(&row, "kind") == "machine" && db::n(&row, "created_at") + 3600 < now() { return Err(err(StatusCode::UNAUTHORIZED, "machine token expired (1h TTL); login again via Universal Auth")); }
@@ -136,7 +142,7 @@ fn resolve_refs(v: &str, by_path: &HashMap<String, String>, by_key: &HashMap<Str
 }
 
 // ---------- auth ----------
-async fn register(State(st): State<S>, Json(r): Json<AuthReq>) -> Res {
+async fn register(State(st): State<S>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     if r.email.is_empty() || r.password.len() < 8 { return Err(bad("email and password (>=8 chars) required")); }
     let kp = oc::Keypair::generate();
     let wrapped = oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?;
@@ -145,17 +151,19 @@ async fn register(State(st): State<S>, Json(r): Json<AuthReq>) -> Res {
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).map_err(|e| bad(&e))?;
     let token = make_session(&st, &uid)?;
-    Ok(j(json!({"token": token, "user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64()})))
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    Ok((hdr, j(json!({"token": token, "user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64()}))))
 }
 fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).map_err(|e| bad(&e))?; Ok(t) }
-async fn login(State(st): State<S>, Json(r): Json<AuthReq>) -> Res {
+async fn login(State(st): State<S>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid credentials"))?;
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     let uid = db::s(&row, "id");
-    if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok(j(json!({"mfa_required": true, "mfa_token": challenge}))); }
+    if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
     let token = make_session(&st, &uid)?;
-    Ok(j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")})))
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")}))))
 }
 
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h)?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?; Ok(j(db::obj(&r))) }
@@ -285,6 +293,12 @@ async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<S
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; st.require_env(&eid,&uid)?;
     let rows = st.db.query("SELECT id,env_id,kind,name,created_at FROM integrations WHERE env_id=?", &[json!(eid)]).map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn sync_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h)?; let msg = sync_one(&st, &iid, &uid).await?; Ok(j(json!({"ok": true, "detail": msg}))) }
+async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h)?;
+    let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
+    let eid = db::s(&row, "env_id"); st.require_env(&eid, &uid)?; let key = st.env_key(&eid)?;
+    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    if db::s(&row, "kind") == "trigger" { let msg = integrations::trigger_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
+    Ok(j(json!({"ok": true, "detail": format!("kind {} is configured; use Sync to verify against the live service", db::s(&row, "kind"))}))) }
 async fn trigger_sync(st: &S, eid: &str, uid: &str) {
     if let Ok(rows) = st.db.query("SELECT id FROM integrations WHERE env_id=?", &[json!(eid)]) {
         for r in &rows { let _ = sync_one(st, &db::s(r, "id"), uid).await; }
@@ -296,6 +310,14 @@ async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, J
     let key = st.env_key(&eid)?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let items = st.list_secrets_decrypted(&eid, uid)?; let pairs: Vec<(String, String)> = items.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+    if db::s(&row, "kind") == "trigger" {
+        let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
+        let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
+        let (msg, managed) = integrations::trigger_sync(&config, &pairs, &prev).await.map_err(|e| bad(&e))?;
+        let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !dry { let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
+            for n in &managed { let hv = pairs.iter().find(|(k, _)| n.ends_with(k)).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); } }
+        st.audit(&org, &app, &eid, uid, "integration.sync", &msg); return Ok(msg); }
     let msg = integrations::sync(&db::s(&row, "kind"), &config, &pairs).await.map_err(|e| bad(&e))?;
     st.audit(&org, &app, &eid, uid, "integration.sync", &msg); Ok(msg)
 }
@@ -670,7 +692,7 @@ async fn totp_verify(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>)
     let code = body.get("code").and_then(|v| v.as_str()).unwrap_or(""); let counter = (now() / 30) as u64;
     if ![counter.wrapping_sub(1), counter, counter + 1].iter().any(|c| totp_code(&secret, *c) == code) { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
     meta_set(&st, &format!("totp_enabled:{}", uid), "1"); Ok(j(json!({"enabled": true}))) }
-async fn mfa_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
+async fn mfa_login(State(st): State<S>, Json(body): Json<Value>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let token = body.get("mfa_token").and_then(|v| v.as_str()).unwrap_or(""); let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
     let row = st.db.one("SELECT user_id,created_at FROM mfa_challenges WHERE token=?", &[json!(token)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid MFA challenge"))?;
     if db::n(&row,"created_at") + 300 < now() { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired")); }
@@ -683,7 +705,7 @@ async fn mfa_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
         if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(&st, &format!("totp_recovery:{}", uid), &list.join(",")); ok = true; } }
     if !ok { return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
     let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(token)]);
-    let session = make_session(&st, &uid)?; Ok(j(json!({"token": session, "user_id": uid}))) }
+    let session = make_session(&st, &uid)?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
 
 // ---------- log streams (T10) ----------
@@ -721,6 +743,167 @@ fn process_rotations(st: &S) {
             if upsert_secret(st, &eid, &key, "rotation-scheduler", &s).is_ok() { if let Ok((org, app)) = st.env_org_app(&eid) { st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&key_name); } } }
         let _ = st.db.exec("UPDATE rotation_schedules SET next_run=? WHERE id=?", &[json!(now()+db::n(r,"interval_secs")), json!(db::s(r,"id"))]); } }
 
+
+// ---------- OAuth 2.1 authorization server (shared by CLI login + MCP) ----------
+fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
+fn oauth_user(st: &S, h: &HeaderMap) -> Option<String> {
+    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
+    let cookie = cookie_val(h, "ow_session");
+    for tok in [bearer, cookie] { if tok.is_empty() { continue; }
+        if let Ok(Some(r)) = st.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(oc::hash_token(&tok))]) { if db::n(&r,"created_at") + 7*86400 >= now() { return Some(db::s(&r,"user_id")); } }
+        if let Ok(Some(r)) = st.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(oc::hash_token(&tok)), json!(now())]) { return Some(db::s(&r,"user_id")); } }
+    None }
+pub fn oauth_access(st: &S, h: &HeaderMap) -> Option<(String, String)> {
+    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let tok = auth.strip_prefix("Bearer ").unwrap_or("");
+    if tok.is_empty() { return None; }
+    st.db.one("SELECT user_id,scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(oc::hash_token(tok)), json!(now())]).ok().flatten().map(|r| (db::s(&r,"user_id"), db::s(&r,"scope"))) }
+async fn prm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
+    Json(json!({"resource": format!("{}/mcp", iss), "authorization_servers": [iss], "scopes_supported": ["secrets:read","secrets:write","mcp"], "bearer_methods_supported": ["header"]})) }
+async fn asm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
+    Json(json!({"issuer": iss, "authorization_endpoint": format!("{}/oauth/authorize", iss), "token_endpoint": format!("{}/oauth/token", iss), "registration_endpoint": format!("{}/oauth/register", iss), "revocation_endpoint": format!("{}/oauth/revoke", iss), "response_types_supported": ["code"], "grant_types_supported": ["authorization_code","refresh_token"], "code_challenge_methods_supported": ["S256"], "token_endpoint_auth_methods_supported": ["client_secret_post","none"], "scopes_supported": ["secrets:read","secrets:write","mcp"], "revocation_endpoint_auth_methods_supported": ["client_secret_post","none"]})) }
+async fn oauth_register(State(st): State<S>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    let redirects = body.get("redirect_uris").cloned().unwrap_or(json!([]));
+    if !redirects.as_array().map(|a| !a.is_empty()).unwrap_or(false) { return (StatusCode::BAD_REQUEST, Json(json!({"error":"redirect_uris required"}))); }
+    let auth_method = body.get("token_endpoint_auth_method").and_then(|v| v.as_str()).unwrap_or("client_secret_post");
+    let client_id = oc::random_token("client"); let secret = if auth_method == "none" { String::new() } else { oc::random_token("secret") };
+    let scope = body.get("scope").and_then(|v| v.as_str()).unwrap_or("secrets:read");
+    match st.db.exec("INSERT INTO oauth_clients(client_id,client_secret_hash,name,redirect_uris,scopes,created_at) VALUES(?,?,?,?,?,?)", &[json!(client_id), json!(if secret.is_empty(){String::new()}else{oc::hash_token(&secret)}), json!(body.get("client_name").and_then(|v| v.as_str()).unwrap_or("client")), json!(redirects.to_string()), json!(scope), json!(now())]) {
+        Ok(_) => { let mut out = json!({"client_id": client_id, "redirect_uris": redirects, "scope": scope, "token_endpoint_auth_method": auth_method}); if !secret.is_empty() { out["client_secret"] = json!(secret); } (StatusCode::CREATED, Json(out)) }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))) } }
+fn authorize_params_ok(st: &S, q: &HashMap<String, String>) -> Result<(String, String, String), String> {
+    let client_id = q.get("client_id").cloned().unwrap_or_default(); let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
+    let client = st.db.one("SELECT redirect_uris FROM oauth_clients WHERE client_id=?", &[json!(client_id)]).ok().flatten().ok_or("unknown client_id")?;
+    let uris: Vec<String> = serde_json::from_str(&db::s(&client, "redirect_uris")).unwrap_or_default();
+    if !uris.iter().any(|u| u == &redirect) { return Err("redirect_uri does not exactly match a registered URI".into()); }
+    if q.get("response_type").map(|s| s.as_str()) != Some("code") { return Err("response_type must be code".into()); }
+    if q.get("code_challenge_method").map(|s| s.as_str()) != Some("S256") || q.get("code_challenge").map(|s| s.is_empty()).unwrap_or(true) { return Err("PKCE with S256 is required".into()); }
+    Ok((client_id, redirect, q.get("scope").cloned().unwrap_or_else(|| "secrets:read".into()))) }
+async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> impl IntoResponse {
+    if let Err(e) = authorize_params_ok(&st, &q) { return (StatusCode::BAD_REQUEST, Html(format!("<h1>OAuth error</h1><p>{}</p>", e))).into_response(); }
+    if let Some(uid) = oauth_user(&st, &h) { let _ = uid;
+        let hidden: String = q.iter().map(|(k, v)| format!("<input type=hidden name=\"{}\" value=\"{}\">", k, v.replace('"',"&quot;"))).collect();
+        return Html(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{hidden}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", q.get("client_id").cloned().unwrap_or_default(), q.get("scope").cloned().unwrap_or_default())).into_response(); }
+    let hidden: String = q.iter().map(|(k, v)| format!("<input type=hidden name=\"{}\" value=\"{}\">", k, v.replace('"',"&quot;"))).collect();
+    Html(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{hidden}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>")).into_response() }
+async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> impl IntoResponse {
+    let (client_id, redirect, scope) = match authorize_params_ok(&st, &form) { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
+    let uid = if let Some(u) = oauth_user(&st, &h) { u } else {
+        let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
+        let row = match st.db.one("SELECT id,pass_hash FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response() };
+        if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
+        db::s(&row, "id") };
+    let state = form.get("state").cloned().unwrap_or_default();
+    if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::temporary(&format!("{}?error=access_denied&state={}", redirect, state)).into_response(); }
+    let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));
+    if st.db.exec("INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,code_challenge,scope,resource,expires_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(oc::hash_token(&code)), json!(client_id), json!(uid), json!(redirect), json!(form.get("code_challenge").cloned().unwrap_or_default()), json!(scope), json!(resource), json!(now()+300)]).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, "could not create code").into_response(); }
+    axum::response::Redirect::temporary(&format!("{}?code={}&state={}", redirect, code, state)).into_response() }
+fn issue_oauth_tokens(st: &S, client_id: &str, uid: &str, scope: &str, resource: &str, pair: &str) -> Value {
+    let access = oc::random_token("oat"); let refresh = oc::random_token("ort"); let pair = if pair.is_empty() { id() } else { pair.to_string() };
+    let _ = st.db.exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,kind,pair_id,expires_at,created_at) VALUES(?,?,?,?,?,'access',?,?,?)", &[json!(oc::hash_token(&access)), json!(client_id), json!(uid), json!(scope), json!(resource), json!(pair), json!(now()+3600), json!(now())]);
+    let _ = st.db.exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,kind,pair_id,expires_at,created_at) VALUES(?,?,?,?,?,'refresh',?,?,?)", &[json!(oc::hash_token(&refresh)), json!(client_id), json!(uid), json!(scope), json!(resource), json!(pair), json!(now()+30*86400), json!(now())]);
+    json!({"access_token": access, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh, "scope": scope}) }
+async fn oauth_token(State(st): State<S>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> (StatusCode, Json<Value>) {
+    let grant = form.get("grant_type").map(|s| s.as_str()).unwrap_or("");
+    let client_id = form.get("client_id").cloned().unwrap_or_default();
+    let client = match st.db.one("SELECT client_secret_hash FROM oauth_clients WHERE client_id=?", &[json!(client_id)]) { Ok(Some(r)) => r, _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error":"invalid_client"}))) };
+    let stored_secret = db::s(&client, "client_secret_hash");
+    if !stored_secret.is_empty() { let provided = form.get("client_secret").cloned().unwrap_or_default(); if oc::hash_token(&provided) != stored_secret { return (StatusCode::UNAUTHORIZED, Json(json!({"error":"invalid_client"}))); } }
+    if grant == "authorization_code" {
+        let code = form.get("code").cloned().unwrap_or_default();
+        let row = match st.db.one("SELECT * FROM oauth_codes WHERE code_hash=? AND expires_at>?", &[json!(oc::hash_token(&code)), json!(now())]) { Ok(Some(r)) => r, _ => return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))) };
+        if db::s(&row, "client_id") != client_id || db::s(&row, "redirect_uri") != form.get("redirect_uri").cloned().unwrap_or_default() { return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))); }
+        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+        use sha2::{Digest, Sha256}; let computed = b64url(&Sha256::digest(verifier.as_bytes()));
+        if computed != db::s(&row, "code_challenge") { return (StatusCode::BAD_REQUEST, Json(json!({"error":"PKCE verification failed"}))); }
+        let _ = st.db.exec("DELETE FROM oauth_codes WHERE code_hash=?", &[json!(oc::hash_token(&code))]);
+        (StatusCode::OK, Json(issue_oauth_tokens(&st, &client_id, &db::s(&row,"user_id"), &db::s(&row,"scope"), &db::s(&row,"resource"), "")))
+    } else if grant == "refresh_token" {
+        let rt = form.get("refresh_token").cloned().unwrap_or_default();
+        let row = match st.db.one("SELECT * FROM oauth_tokens WHERE token_hash=? AND kind='refresh' AND expires_at>?", &[json!(oc::hash_token(&rt)), json!(now())]) { Ok(Some(r)) => r, _ => return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))) };
+        if db::s(&row, "client_id") != client_id { return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))); }
+        let _ = st.db.exec("DELETE FROM oauth_tokens WHERE pair_id=?", &[json!(db::s(&row,"pair_id"))]);
+        (StatusCode::OK, Json(issue_oauth_tokens(&st, &client_id, &db::s(&row,"user_id"), &db::s(&row,"scope"), &db::s(&row,"resource"), &db::s(&row,"pair_id"))))
+    } else { (StatusCode::BAD_REQUEST, Json(json!({"error":"unsupported_grant_type"}))) } }
+async fn oauth_revoke(State(st): State<S>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> StatusCode {
+    let tok = form.get("token").cloned().unwrap_or_default(); let _ = st.db.exec("DELETE FROM oauth_tokens WHERE token_hash=?", &[json!(oc::hash_token(&tok))]); StatusCode::OK }
+
+
+// ---------- MCP server (Streamable HTTP, OAuth protected) ----------
+fn mcp_tools() -> Value { json!([
+ {"name":"list_envs","description":"List environments the caller can access","inputSchema":{"type":"object","properties":{"app_id":{"type":"string"}}}},
+ {"name":"list_secrets","description":"List secrets (names and values) in an environment","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"}},"required":["env_id"]}},
+ {"name":"get_secret","description":"Get one secret value by key","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"},"key":{"type":"string"}},"required":["env_id","key"]}},
+ {"name":"search_secrets","description":"Search secret keys across accessible apps","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}},
+ {"name":"set_secret","description":"Create or update a secret (requires secrets:write scope)","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"path":{"type":"string"}},"required":["env_id","key","value"]}},
+ {"name":"delete_secret","description":"Delete a secret by key (requires secrets:write scope)","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"},"key":{"type":"string"}},"required":["env_id","key"]}},
+ {"name":"create_lease","description":"Create a short-lived dynamic secret lease (requires secrets:write scope)","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"},"name":{"type":"string"}},"required":["env_id"]}},
+ {"name":"sync_integration","description":"Trigger a configured sync integration (requires secrets:write scope)","inputSchema":{"type":"object","properties":{"integration_id":{"type":"string"}},"required":["integration_id"]}}
+]) }
+fn rpc_result(id: &Value, result: Value) -> Value { json!({"jsonrpc":"2.0","id":id,"result":result}) }
+fn rpc_error(id: &Value, code: i64, msg: &str) -> Value { json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}}) }
+async fn mcp_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusCode, HeaderMap, Json<Value>)> {
+    let iss = issuer(st, h);
+    let mut hdr = HeaderMap::new(); hdr.insert("www-authenticate", format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"", iss).parse().unwrap());
+    if let Some(origin) = h.get("origin").and_then(|v| v.to_str().ok()) { let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !origin.contains(host) { return Err((StatusCode::FORBIDDEN, hdr, Json(json!({"error":"Origin does not match Host"})))); } }
+    if let Some((uid, scope)) = oauth_access(st, h) { return Ok((uid, scope)); }
+    if let Ok(uid) = st.token_user(h) { return Ok((uid, "secrets:read secrets:write".into())); }
+    Err((StatusCode::UNAUTHORIZED, hdr, Json(json!({"error":"unauthorized; OAuth access token required, see /.well-known/oauth-protected-resource"})))) }
+async fn mcp_post(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    let (uid, scope) = match mcp_auth(&st, &h).await { Ok(x) => x, Err(e) => return e.into_response() };
+    let id = body.get("id").cloned().unwrap_or(Value::Null); let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let params = body.get("params").cloned().unwrap_or(json!({}));
+    if id.is_null() { return StatusCode::ACCEPTED.into_response(); }
+    let write_tool = ["set_secret","delete_secret","create_lease","sync_integration"].contains(&method) || (method == "tools/call" && ["set_secret","delete_secret","create_lease","sync_integration"].contains(&params.get("name").and_then(|v| v.as_str()).unwrap_or("")));
+    if write_tool && !scope.split_whitespace().any(|s| s == "secrets:write" || s == "*") { return Json(rpc_error(&id, -32001, "insufficient scope: secrets:write required")).into_response(); }
+    let result: Result<Value, String> = match method {
+        "initialize" => Ok(json!({"protocolVersion": params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-06-18"), "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "openwarp", "version": env!("CARGO_PKG_VERSION")}})),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": mcp_tools()})),
+        "prompts/list" => Ok(json!({"prompts": []})),
+        "resources/list" => mcp_resources(&st, &uid),
+        "resources/read" => mcp_resource_read(&st, &uid, &params),
+        "tools/call" => mcp_call(&st, &uid, &params).await,
+        _ => Err(format!("method not found: {}", method)),
+    };
+    match result { Ok(r) => Json(rpc_result(&id, r)).into_response(), Err(e) => Json(rpc_error(&id, -32000, &e)).into_response() } }
+async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(json!({"error":"stateless MCP server: POST JSON-RPC to /mcp"}))) }
+fn mcp_resources(st: &S, uid: &str) -> Result<Value, String> {
+    let rows = st.db.query("SELECT e.id AS id, e.name AS name, a.name AS app FROM envs e JOIN apps a ON a.id=e.app_id JOIN org_members m ON m.org_id=a.org_id WHERE m.user_id=?", &[json!(uid)])?;
+    Ok(json!({"resources": rows.iter().map(|r| json!({"uri": format!("openwarp://env/{}", db::s(r,"id")), "name": format!("{} / {}", db::s(r,"app"), db::s(r,"name")), "mimeType": "application/json"})).collect::<Vec<_>>()})) }
+fn mcp_resource_read(st: &S, uid: &str, params: &Value) -> Result<Value, String> {
+    let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or(""); let eid = uri.strip_prefix("openwarp://env/").ok_or("bad resource uri")?;
+    st.require_env(eid, uid).map_err(|_| "forbidden".to_string())?;
+    let items = st.list_secrets_decrypted(eid, uid).map_err(|_| "read failed".to_string())?;
+    let text = serde_json::to_string(&items.iter().map(|x| x.2.clone()).collect::<Vec<_>>()).unwrap();
+    Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]})) }
+async fn mcp_call(st: &S, uid: &str, params: &Value) -> Result<Value, String> {
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or(""); let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let arg = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = |v: Value| json!({"content": [{"type":"text","text": v.to_string()}], "isError": false});
+    let env_audit = |st: &S, eid: &str, action: &str, detail: &str| { if let Ok((org, app)) = st.env_org_app(eid) { st.audit(&org, &app, eid, uid, action, detail); } };
+    match name {
+        "list_envs" => { let r = mcp_resources(st, uid)?; Ok(text(r)) }
+        "list_secrets" => { let eid = arg("env_id"); st.require_env(&eid, uid).map_err(|_| "forbidden".to_string())?; let items = st.list_secrets_decrypted(&eid, uid).map_err(|_| "read failed".to_string())?; env_audit(st, &eid, "mcp.list_secrets", &format!("{}", items.len())); Ok(text(json!(items.iter().map(|x| x.2.clone()).collect::<Vec<_>>()))) }
+        "get_secret" => { let eid = arg("env_id"); let key = arg("key"); st.require_env(&eid, uid).map_err(|_| "forbidden".to_string())?; let items = st.list_secrets_decrypted(&eid, uid).map_err(|_| "read failed".to_string())?;
+            let found = items.iter().find(|(k, _, _)| k == &key.to_uppercase()).map(|(_, v, _)| v.clone()).ok_or("secret not found")?; env_audit(st, &eid, "mcp.get_secret", &key); Ok(text(json!(found))) }
+        "search_secrets" => { let q = arg("query").to_uppercase(); let res = mcp_resources(st, uid)?; let mut hits = Vec::new();
+            for r in res["resources"].as_array().cloned().unwrap_or_default() { let eid = r["uri"].as_str().unwrap_or("").replace("openwarp://env/", ""); if let Ok(items) = st.list_secrets_decrypted(&eid, uid) { for (k, _, _) in items { if q.is_empty() || k.contains(&q) { hits.push(json!({"env_id": eid, "key": k})); } } } }
+            Ok(text(json!(hits))) }
+        "set_secret" => { let eid = arg("env_id"); let (org, _) = st.require_env(&eid, uid).map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "secrets:write").map_err(|_| "forbidden".to_string())?;
+            let key = st.env_key(&eid).map_err(|_| "env key failed".to_string())?; let s = SecretIn{ key: arg("key"), value: arg("value"), path: { let p = arg("path"); if p.is_empty() { "/".into() } else { p } }, comment: "via MCP".into(), tags: "".into(), secret_type: "secret".into() };
+            upsert_secret(st, &eid, &key, uid, &s).map_err(|_| "write failed".to_string())?; env_audit(st, &eid, "mcp.set_secret", &s.key); Ok(text(json!({"ok": true}))) }
+        "delete_secret" => { let eid = arg("env_id"); st.require_env(&eid, uid).map_err(|_| "forbidden".to_string())?;
+            let items = st.list_secrets_decrypted(&eid, uid).map_err(|_| "read failed".to_string())?; let sid = items.iter().find(|(k, _, _)| k == &arg("key").to_uppercase()).map(|(_, _, raw)| raw["id"].as_str().unwrap_or("").to_string()).ok_or("secret not found")?;
+            st.db.exec("UPDATE secrets SET deleted=1,updated_at=? WHERE id=?", &[json!(now()), json!(sid)])?; env_audit(st, &eid, "mcp.delete_secret", &arg("key")); Ok(text(json!({"ok": true}))) }
+        "create_lease" => { let eid = arg("env_id"); st.require_env(&eid, uid).map_err(|_| "forbidden".to_string())?; let key = st.env_key(&eid).map_err(|_| "env key failed".to_string())?;
+            let value = oc::random_token("dyn"); let lid = id(); st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(arg("name")), json!(oc::encrypt_symmetric(&key, value.as_bytes())), json!(now()+3600), json!(now())])?;
+            env_audit(st, &eid, "mcp.create_lease", &lid); Ok(text(json!({"id": lid, "value": value, "expires_at": now()+3600}))) }
+        "sync_integration" => { let msg = sync_one(st, &arg("integration_id"), uid).await.map_err(|_| "sync failed".to_string())?; Ok(text(json!(msg))) }
+        _ => Err(format!("unknown tool: {}", name)),
+    } }
+
 async fn health() -> impl IntoResponse { Json(json!({"ok": true, "service": "openwarp"})) }
 
 #[tokio::main]
@@ -730,11 +913,12 @@ async fn main() {
     let master = load_master(&db);
     #[cfg(feature = "redis-cache")]
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
-    let state = Arc::new(AppState { db, db_url: db_url.clone(), master, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
+    let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
+    let state = Arc::new(AppState { db, db_url: db_url.clone(), pub_url, master, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; process_rotations(&st2); } }); }
     let app = Router::new()
         .route("/", get(|| async { Html(ui::INDEX) })).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
-        .route("/health", get(health))
+        .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org))
         .route("/api/orgs/{oid}/members", post(invite_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
@@ -745,7 +929,7 @@ async fn main() {
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
         .route("/api/envs/{eid}/dynamic", get(list_leases).post(create_lease_v2)).route("/api/leases/{lid}", delete(revoke_lease)).route("/api/leases/{lid}/renew", post(renew_lease)).route("/api/envs/{eid}/rotations", get(list_rotations).post(create_rotation)).route("/api/rotations/{rid}", delete(delete_rotation)).route("/api/envs/{eid}/rotate", post(rotate_secret)).route("/api/envs/{eid}/restore-point", post(pitr))
-        .route("/api/integrations/{iid}/sync", post(sync_integration))
+        .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
         .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
