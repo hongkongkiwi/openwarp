@@ -19,6 +19,7 @@ hmac = "0.12"
 base64ct = { version = "1", features = ["alloc"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tracing = "0.1"
+jsonwebtoken = "9"
 
 [features]
 default = ["redis-cache"]

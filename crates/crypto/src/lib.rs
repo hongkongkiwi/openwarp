@@ -100,7 +100,7 @@ pub fn seal_github(recipient_pub_b64_std: &str, plaintext: &[u8]) -> Result<Stri
     use base64ct::Encoding as _; Ok(base64ct::Base64::encode_string(&out))
 }
 pub fn random_key() -> [u8;32] { let mut k=[0u8;32]; OsRng.fill_bytes(&mut k); k }
-pub fn random_token(prefix: &str) -> String { let mut b=[0u8;32]; OsRng.fill_bytes(&mut b); format!("{}_{}", prefix, b64(&b).replace('+',"").replace('/',"").replace('=',"")) }
+pub fn random_token(prefix: &str) -> String { let mut b=[0u8;32]; OsRng.fill_bytes(&mut b); format!("{}_{}", prefix, b64(&b).replace(['+', '/', '='], "")) }
 pub fn hash_token(token: &str) -> String { let mut h=Sha256::new(); h.update(token.as_bytes()); b64(&h.finalize()) }
 
 #[cfg(test)]

@@ -46,6 +46,11 @@ openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
   GitHub sync; browser-side E2E decryption is future work, so treat the server
   as trusted for plaintext in transit, exactly like an SSE-enabled Phase app.
 - `sealed` secrets are never returned by the API after deploy.
+- True E2E environments are available alongside SSE: in E2E envs the server
+  stores only ciphertext and wrapped env keys it cannot decrypt; the CLI and
+  the browser console (pure-JS X25519/XChaCha20-Poly1305) decrypt locally.
+- OIDC SSO (authorization-code flow, JWKS-verified) and SCIM provisioning
+  (users + groups) are wired per organisation.
 - Get an external crypto review before production use.
 
 ## Features (all unlocked)
@@ -56,5 +61,5 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full matrix and API reference.
 
 ```bash
 cargo test --workspace     # crypto + DB tests
-cargo clippy --workspace
+cargo clippy --workspace -- -D warnings
 ```

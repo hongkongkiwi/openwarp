@@ -17,10 +17,10 @@ impl Db {
         if url.starts_with("postgres") {
             // `postgres` sync client drives its own runtime; it cannot run inside tokio.
             let url = url.to_string();
-            return std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let client = postgres::Client::connect(&url, postgres::NoTls).map_err(|e| e.to_string())?;
                 let db = Db::Postgres(std::sync::Arc::new(Mutex::new(client))); db.migrate()?; Ok(db)
-            }).join().map_err(|_| "postgres connect thread panicked".to_string())?;
+            }).join().map_err(|_| "postgres connect thread panicked".to_string())?
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
             let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
@@ -68,6 +68,7 @@ impl Db {
     pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
     fn migrate(&self) -> Result<(), String> {
         for stmt in SCHEMA { self.exec(stmt, &[])?; }
+        for alter in ["ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'", "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0", "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1"] { let _ = self.exec(alter, &[]); }
         Ok(())
     }
 }
@@ -130,6 +131,8 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lockbox(id TEXT PRIMARY KEY,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,max_views BIGINT DEFAULT 1,views BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,name TEXT NOT NULL,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS env_keys(env_id TEXT NOT NULL,user_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS oidc_states(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
 ];
 
 #[cfg(test)]

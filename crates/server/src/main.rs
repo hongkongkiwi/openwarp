@@ -118,6 +118,7 @@ async fn register(State(st): State<S>, Json(r): Json<AuthReq>) -> Res {
 fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, Json(r): Json<AuthReq>) -> Res {
     let row = st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid credentials"))?;
+    if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     let uid = db::s(&row, "id"); let token = make_session(&st, &uid)?;
     Ok(j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")})))
@@ -180,7 +181,7 @@ fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> R
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
     } Ok(()) }
 fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pending_comment = String::new();
-    for line in text.lines() { let l = line.trim(); if l.is_empty() { continue; } if l.starts_with('#') { pending_comment = l.trim_start_matches('#').trim().to_string(); continue; }
+    for line in text.lines() { let l = line.trim(); if l.is_empty() { continue; } else if l.starts_with('#') { pending_comment = l.trim_start_matches('#').trim().to_string(); continue; }
         if let Some((k, v)) = l.trim_start_matches("export ").split_once('=') { out.push(SecretIn{ key: k.trim().to_string(), value: v.trim().trim_matches('"').trim_matches('\'').to_string(), path: "/".into(), comment: pending_comment.clone(), tags: "".into(), secret_type: "".into() }); pending_comment.clear(); } } out }
 async fn delete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
@@ -279,7 +280,10 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     if st.require_org(&oid,&uid)? == "developer" { return Err(err(StatusCode::FORBIDDEN,"admin required")); }
     if let Some(v)=body.get("ip_allowlist").and_then(|x|x.as_str()) { st.db.exec("UPDATE orgs SET ip_allowlist=? WHERE id=?", &[json!(v), json!(oid)]).map_err(|e| bad(&e))?; }
     if let Some(v)=body.get("audit_webhook").and_then(|x|x.as_str()) { st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(format!("audit_webhook:{}",oid)), json!(v)]).map_err(|e| bad(&e)).or_else(|_| st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(format!("audit_webhook:{}",oid))]).map_err(|e| bad(&e)))?; }
-    if let Some(v)=body.get("oidc_issuer").and_then(|x|x.as_str()) { let _ = st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(format!("oidc_issuer:{}",oid)), json!(v)]); }
+    for (field, enc) in [("oidc_issuer", false), ("oidc_client_id", false), ("oidc_redirect_uri", false), ("oidc_client_secret", true)] {
+        if let Some(v)=body.get(field).and_then(|x|x.as_str()) { let stored = if enc { oc::encrypt_symmetric(&st.master, v.as_bytes()) } else { v.to_string() };
+            let k = format!("{}:{}", field, oid);
+            if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k.clone()), json!(stored.clone())]).is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(stored), json!(k)]); } } }
     Ok(j(json!({"ok":true}))) }
 async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; let (org,app)=st.require_env(&eid,&uid)?;
     let key_name = body.get("key").and_then(|v|v.as_str()).unwrap_or(""); let new_val = body.get("value").and_then(|v|v.as_str()).map(|s|s.to_string()).unwrap_or_else(|| oc::random_token("rot"));
@@ -296,6 +300,137 @@ async fn scim_list_users(State(st): State<S>, h: HeaderMap) -> Res { let uid = s
     let rows = st.db.query("SELECT id,email FROM users ORDER BY created_at", &[]).map_err(|e| bad(&e))?;
     Ok(j(json!({"Resources": rows.iter().map(|r| json!({"id":db::s(r,"id"),"userName":db::s(r,"email"),"active":true})).collect::<Vec<_>>(), "totalResults": rows.len()}))) }
 
+
+async fn create_e2e_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?;
+    let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; st.require_org(&db::s(&app,"org_id"), &uid)?;
+    if r.name.is_empty() || r.name.len() > 32 || !r.name.chars().all(|c| c.is_ascii_alphanumeric() || c=='-' || c=='_') { return Err(bad("bad env name")); }
+    let user = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
+    let eid = id(); let env_key = oc::random_key();
+    let wrapped = oc::encrypt_to(&db::s(&user,"pubkey"), &env_key).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,created_at) VALUES(?,?,?,'','e2e',?)", &[json!(eid), json!(aid), json!(r.name), json!(now())]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(eid), json!(uid), json!(wrapped)]).map_err(|e| bad(&e))?;
+    Ok(j(json!({"id": eid, "mode": "e2e"}))) }
+async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; let (org, app) = st.require_env(&eid, &uid)?;
+    let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r,"mode")).unwrap_or_default();
+    if mode != "e2e" { return Err(bad("env is not in e2e mode")); }
+    if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::FORBIDDEN, "no wrapped env key for caller")); }
+    let mut count = 0;
+    for s in body.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""); let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
+        let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or(""); let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+        if key_enc.is_empty() || key_hash.is_empty() { continue; }
+        if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).map_err(|e| bad(&e))? {
+            let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
+            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+        } else { let sid = id();
+            st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,1,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+        } count += 1;
+    }
+    st.audit(&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)); Ok(j(json!({"deployed": count}))) }
+async fn e2e_get(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; st.require_env(&eid, &uid)?;
+    let wrapped = st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::FORBIDDEN, "no wrapped env key for caller; ask a member to grant access"))?;
+    let rows = st.db.query("SELECT id,path,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).map_err(|e| bad(&e))?;
+    Ok(j(json!({"wrapped_key": db::s(&wrapped,"wrapped_key"), "secrets": rows.iter().map(db::obj).collect::<Vec<_>>()}))) }
+async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; st.require_env(&eid, &uid)?;
+    if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::FORBIDDEN, "caller has no env key to grant")); }
+    let email = body.get("email").and_then(|v| v.as_str()).unwrap_or(""); let wrapped = body.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
+    if email.is_empty() || wrapped.is_empty() { return Err(bad("email and wrapped_key (wrapped client-side for grantee) required")); }
+    let target = st.db.one("SELECT id FROM users WHERE email=?", &[json!(email.to_lowercase())]).map_err(|e| bad(&e))?.ok_or_else(|| bad("user not found"))?;
+    st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(eid), json!(db::s(&target,"id")), json!(wrapped)]).map_err(|e| bad(&e))
+        .or_else(|_| st.db.exec("UPDATE env_keys SET wrapped_key=? WHERE env_id=? AND user_id=?", &[json!(wrapped), json!(eid), json!(db::s(&target,"id"))]).map_err(|e| bad(&e)))?;
+    Ok(j(json!({"ok": true}))) }
+async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h)?; let _ = uid;
+    let email = q.get("email").cloned().unwrap_or_default();
+    let row = st.db.one("SELECT id,email,pubkey FROM users WHERE email=?", &[json!(email.to_lowercase())]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"user not found"))?;
+    Ok(j(db::obj(&row))) }
+
+
+fn meta_get(st: &S, k: &str) -> String { st.db.one("SELECT v FROM meta WHERE k=?", &[json!(k)]).ok().flatten().map(|r| db::s(&r,"v")).unwrap_or_default() }
+async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)> {
+    let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+    reqwest::get(&url).await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
+async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
+    if issuer.is_empty() || client_id.is_empty() || redirect_uri.is_empty() { return Err(bad("OIDC not configured for this org (set oidc_issuer, oidc_client_id, oidc_client_secret, oidc_redirect_uri via org settings)")); }
+    let disc = oidc_discovery(&issuer).await?; let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
+    let state = oc::random_token("st"); let nonce = oc::random_token("n");
+    st.db.exec("INSERT INTO oidc_states(state,org_id,created_at) VALUES(?,?,?)", &[json!(state), json!(oid), json!(now())]).map_err(|e| bad(&e))?;
+    let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
+    Ok(axum::response::Redirect::temporary(&url)) }
+fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
+#[derive(serde::Deserialize)] struct Claims { email: Option<String>, sub: String }
+async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
+    let srow = st.db.one("SELECT org_id FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
+    let oid = db::s(&srow, "org_id"); let _ = st.db.exec("DELETE FROM oidc_states WHERE state=?", &[json!(state)]);
+    let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
+    let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)); let client_secret = oc::decrypt_symmetric(&st.master, &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let disc = oidc_discovery(&issuer).await?;
+    let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or(""); let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
+    let client = reqwest::Client::new();
+    let tok: Value = client.post(token_ep).form(&[("grant_type","authorization_code"),("code",&code),("redirect_uri",&redirect_uri),("client_id",&client_id),("client_secret",&client_secret)]).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string()))?;
+    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or_else(|| bad("token response has no id_token"))?;
+    let header = jsonwebtoken::decode_header(id_token).map_err(|e| bad(&e.to_string()))?; let kid = header.kid.ok_or_else(|| bad("id_token has no kid"))?;
+    let jwks: Value = client.get(jwks_uri).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string()))?;
+    let jwk = jwks.get("keys").and_then(|v| v.as_array()).and_then(|ks| ks.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid))).ok_or_else(|| bad("kid not found in JWKS"))?;
+    let dkey = jsonwebtoken::DecodingKey::from_rsa_components(jwk.get("n").and_then(|v| v.as_str()).unwrap_or(""), jwk.get("e").and_then(|v| v.as_str()).unwrap_or("")).map_err(|e| bad(&e.to_string()))?;
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&[&client_id]); validation.set_issuer(&[&issuer]);
+    let data = jsonwebtoken::decode::<Claims>(id_token, &dkey, &validation).map_err(|e| bad(&format!("id_token verification failed: {}", e)))?;
+    let email = data.claims.email.ok_or_else(|| bad("id_token has no email"))?.to_lowercase();
+    let uid = if let Some(u) = st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))? { db::s(&u,"id") } else {
+        let kp = oc::Keypair::generate(); let pw = oc::random_token("oidc"); let nid = id();
+        st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(nid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?; nid };
+    if st.org_role(&oid, &uid).is_none() { let _ = st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(oid), json!(uid)]); }
+    st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
+    let token = make_session(&st, &uid)?;
+    Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
+
+// ---------- SCIM groups + user lifecycle ----------
+fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
+    let members = st.db.query("SELECT user_id FROM team_members WHERE team_id=?", &[json!(tid)]).unwrap_or_default();
+    json!({"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"], "id": tid, "displayName": db::s(row,"name"), "members": members.iter().map(|m| json!({"value": db::s(m,"user_id"), "$ref": format!("/scim/v2/Users/{}", db::s(m,"user_id"))})).collect::<Vec<_>>()}) }
+fn scim_replace_members(st: &S, tid: &str, body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).map_err(|e| bad(&e))?;
+    for m in body.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default() { if let Some(uid) = m.get("value").and_then(|v| v.as_str()) { let _ = st.db.exec("INSERT INTO team_members(team_id,user_id) VALUES(?,?)", &[json!(tid), json!(uid)]); } } Ok(()) }
+async fn scim_create_group(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { st.token_user(&h)?;
+    let name = body.get("displayName").and_then(|v| v.as_str()).unwrap_or(""); if name.is_empty() { return Err(bad("displayName required")); }
+    let oid = body.get("org_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let org = if !oid.is_empty() { oid } else { st.db.query("SELECT org_id FROM org_members LIMIT 1", &[]).map_err(|e| bad(&e))?.first().map(|r| db::s(r,"org_id")).unwrap_or_default() };
+    let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(org), json!(name)]).map_err(|e| bad(&e))?;
+    scim_replace_members(&st, &tid, &body)?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?.unwrap(); Ok(j(scim_group_json(&st,&row))) }
+async fn scim_list_groups(State(st): State<S>, h: HeaderMap) -> Res { st.token_user(&h)?;
+    let rows = st.db.query("SELECT * FROM teams ORDER BY name", &[]).map_err(|e| bad(&e))?;
+    Ok(j(json!({"schemas":["urn:ietf:params:scim:api:messages:2.0:ListResponse"], "Resources": rows.iter().map(|r| scim_group_json(&st,r)).collect::<Vec<_>>(), "totalResults": rows.len()}))) }
+async fn scim_get_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { st.token_user(&h)?;
+    let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row))) }
+async fn scim_put_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Json(body): Json<Value>) -> Res { st.token_user(&h)?;
+    if let Some(name) = body.get("displayName").and_then(|v| v.as_str()) { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(name), json!(tid)]).map_err(|e| bad(&e))?; }
+    scim_replace_members(&st, &tid, &body)?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row))) }
+async fn scim_patch_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Json(body): Json<Value>) -> Res { st.token_user(&h)?;
+    for op in body.get("Operations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let path = op.get("path").and_then(|v| v.as_str()).unwrap_or(""); let val = op.get("value").cloned().unwrap_or(json!({}));
+        if path == "displayName" { if let Some(n) = val.as_str() { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(n), json!(tid)]).map_err(|e| bad(&e))?; } }
+        else if path.starts_with("members") { scim_replace_members(&st, &tid, &json!({"members": val}))?; } }
+    let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row))) }
+async fn scim_delete_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { st.token_user(&h)?;
+    st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).map_err(|e| bad(&e))?; st.db.exec("DELETE FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?; Ok(j(json!({"deleted": tid}))) }
+async fn scim_put_user(State(st): State<S>, h: HeaderMap, Path(uid): Path<String>, Json(body): Json<Value>) -> Res { st.token_user(&h)?;
+    if let Some(email) = body.get("userName").and_then(|v| v.as_str()) { st.db.exec("UPDATE users SET email=? WHERE id=?", &[json!(email.to_lowercase()), json!(uid)]).map_err(|e| bad(&e))?; }
+    if let Some(active) = body.get("active").and_then(|v| v.as_bool()) { apply_active(&st, &uid, active)?; }
+    Ok(j(json!({"id": uid, "active": true}))) }
+async fn scim_patch_user(State(st): State<S>, h: HeaderMap, Path(uid): Path<String>, Json(body): Json<Value>) -> Res { st.token_user(&h)?;
+    for op in body.get("Operations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        if op.get("path").and_then(|v| v.as_str()) == Some("active") { if let Some(a) = op.get("value").and_then(|v| v.as_bool()) { apply_active(&st, &uid, a)?; } } }
+    Ok(j(json!({"id": uid}))) }
+async fn scim_delete_user(State(st): State<S>, h: HeaderMap, Path(uid): Path<String>) -> Res { st.token_user(&h)?; apply_active(&st, &uid, false)?; Ok(j(json!({"id": uid, "active": false}))) }
+fn apply_active(st: &S, uid: &str, active: bool) -> Result<(), (StatusCode, Json<Value>)> {
+    st.db.exec("UPDATE users SET active=? WHERE id=?", &[json!(if active {1} else {0}), json!(uid)]).map_err(|e| bad(&e))?;
+    if !active { st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?; st.db.exec("DELETE FROM org_members WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?; st.db.exec("DELETE FROM team_members WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?; }
+    Ok(()) }
+
 async fn health() -> impl IntoResponse { Json(json!({"ok": true, "service": "openwarp"})) }
 
 #[tokio::main]
@@ -307,22 +442,24 @@ async fn main() {
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
     let state = Arc::new(AppState { db, master, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
     let app = Router::new()
-        .route("/", get(|| async { Html(ui::INDEX) }))
+        .route("/", get(|| async { Html(ui::INDEX) })).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/health", get(health))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org))
         .route("/api/orgs/{oid}/members", post(invite_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/settings", put(org_settings)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team))
-        .route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/tokens", post(create_token))
+        .route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", post(create_token))
         .route("/api/envs/{eid}", delete(delete_env))
-        .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets))
+        .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
         .route("/api/envs/{eid}/dynamic", get(list_leases).post(create_lease)).route("/api/envs/{eid}/rotate", post(rotate_secret)).route("/api/envs/{eid}/restore-point", post(pitr))
         .route("/api/integrations/{iid}/sync", post(sync_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
+        .route("/api/search", get(search)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
+        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
         .with_state(state);
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     println!("openwarp listening on {} db={}", addr, db_url);

@@ -13,3 +13,4 @@ clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+openwarp-crypto = { path = "../crypto" }

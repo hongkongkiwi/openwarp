@@ -10,6 +10,8 @@ pub const INDEX: &str = r#"<!doctype html><html><head><meta charset="utf-8"><tit
 <input id="k" placeholder="KEY"><input id="v" placeholder="value"><input id="path" placeholder="/path" value="/"><select id="stype"><option>secret</option><option>sealed</option><option>config</option></select><button onclick="addSecret()">Deploy secret</button><br>
 <textarea id="import" rows="4" cols="80" placeholder="Paste .env to import"></textarea><button onclick="importEnv()">Import .env</button><button onclick="exportEnv()">Export</button><pre id="exp"></pre>
 <input id="q" placeholder="Global search"><button onclick="search()">Search</button><pre id="searchres"></pre></div>
+<div class="card"><h3>End-to-end encrypted env (browser decryption, key never leaves this page)</h3>
+<input id="kit" placeholder="Recovery kit (X25519 private key, base64)" size="50"><input id="e2eenv" placeholder="E2E env ID"><button onclick="loadE2E()">Decrypt E2E secrets in browser</button><pre id="e2eres"></pre></div>
 <div class="card"><h3>Integrations / Audit / Tokens</h3><button onclick="mkToken()">Create service token</button><span id="tok"></span><button onclick="loadAudit()">Audit log</button><pre id="audit"></pre></div>
 </div>
 <script>
@@ -33,5 +35,6 @@ async function exportEnv(){let d=await api('GET',`/api/envs/${envs.value}/export
 async function search(){let d=await api('GET','/api/search?q='+encodeURIComponent(q.value));searchres.textContent=JSON.stringify(d,null,2)}
 async function mkToken(){let d=await api('POST',`/api/apps/${apps.value}/tokens`,{name:'cli'});tok.textContent=d.token}
 async function loadAudit(){let d=await api('GET',`/api/orgs/${orgs.value}/audit`);audit.textContent=JSON.stringify(d.slice(0,50),null,2)}
+async function loadE2E(){try{let d=await api('GET',`/api/envs/${e2eenv.value}/e2e/secrets`);let envKey=await OW.decryptAsymmetric(kit.value,d.wrapped_key);let rows=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(envKey,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(envKey,s.value_enc)));e2eres.textContent=rows.join('\n')||'(no secrets)'}catch(e){e2eres.textContent='E2E error: '+(e.message||e)}}
 if(T)show();
-</script></body></html>"#;
+</script><script src="/e2e.js"></script></body></html>"#;
