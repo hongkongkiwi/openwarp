@@ -1,69 +1,294 @@
-pub const INDEX: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>OpenWarp Console</title>
-<style>body{font-family:system-ui;background:#0b1020;color:#e6e9f5;margin:0;padding:24px}input,button,select,textarea{background:#151b31;color:#fff;border:1px solid #2a3358;border-radius:8px;padding:8px;margin:4px}button{cursor:pointer;background:#3b5bff}.card{background:#121830;border:1px solid #24305c;border-radius:12px;padding:16px;margin:12px 0}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #24305c;padding:6px;text-align:left}code{color:#8ab4ff}</style></head>
-<body><h1>OpenWarp</h1><p>Unrestricted secrets management. No tiers, no licence gates.</p>
-<div id="auth" class="card"><h3>Login / Register</h3><input id="email" placeholder="email"><input id="pw" type="password" placeholder="password (8+)"><button onclick="login()">Login</button><button onclick="register()">Register</button><span id="authmsg"></span></div>
-<div id="main" style="display:none">
-<div class="card"><button onclick="loadOrgs()">Refresh</button> <input id="orgname" placeholder="New organisation"><button onclick="createOrg()">Create org</button> <select id="orgs" onchange="loadApps()"></select>
-<input id="appname" placeholder="New app"><button onclick="createApp()">Create app</button> <select id="apps" onchange="loadEnvs()"></select>
-<input id="envname" placeholder="Custom env (unlimited)"><button onclick="createEnv()">Add env</button> <select id="envs" onchange="loadSecrets()"></select></div>
-<div class="card"><h3>Secrets</h3><div id="secrets"></div>
-<input id="k" placeholder="KEY"><input id="v" placeholder="value"><input id="path" placeholder="/path" value="/"><select id="stype"><option>secret</option><option>sealed</option><option>config</option></select><button onclick="addSecret()">Deploy secret</button><br>
-<textarea id="import" rows="4" cols="80" placeholder="Paste .env to import"></textarea><button onclick="importEnv()">Import .env</button><button onclick="exportEnv()">Export</button><pre id="exp"></pre>
-<input id="q" placeholder="Global search"><button onclick="search()">Search</button><pre id="searchres"></pre></div>
-<div class="card"><h3>End-to-end encrypted env (browser decryption, key never leaves this page)</h3>
-<input id="kit" placeholder="Recovery kit (X25519 private key, base64)" size="50"><input id="e2eenv" placeholder="E2E env ID"><button onclick="loadE2E()">Decrypt E2E secrets in browser</button><pre id="e2eres"></pre></div>
-<div class="card"><h3>Proposals / Access / Teams / Identities</h3>
-<button onclick="loadProposals()">Proposals (selected env)</button><pre id="props"></pre>
-<input id="pemail" placeholder="member email for access context">
-<button onclick="loadTeams()">Teams</button><button onclick="mkTeam()">Create team</button><pre id="teams"></pre>
-<input id="idname" placeholder="machine identity name"><button onclick="mkIdentity()">Create identity (Universal Auth)</button><pre id="ident"></pre></div>
-<div class="card"><h3>Integrations</h3><select id="ikind"><option>trigger</option><option>github</option><option>gitlab</option><option>vercel</option><option>netlify</option><option>cloudflare</option><option>cloudflare_pages</option><option>supabase</option><option>nomad</option><option>coolify</option><option>heroku</option><option>render</option><option>flyio</option><option>railway</option><option>digitalocean</option><option>gcp_secret_manager</option><option>azure_key_vault</option><option>kubernetes</option><option>hashicorp_vault</option><option>aws_secrets_manager</option><option>aws_parameter_store</option><option>webhook</option></select>
-<textarea id="icfg" rows="3" cols="70" placeholder='config JSON, e.g. {"token":"...","project_id":"42","base_url":"https://gitlab.com/api/v4"}'></textarea>
-<button onclick="mkIntegration()">Add integration to env</button><button onclick="loadIntegrations()">List / sync</button><pre id="ints"></pre></div>
-<div class="card"><h3>Dynamic secrets / Rotation / Lockbox / PKI / Log streams</h3>
-<button onclick="mkLease()">New dynamic lease (env)</button><button onclick="loadLeases()">Leases</button><pre id="leases"></pre>
-<input id="rotkey" placeholder="KEY to rotate"><input id="rotint" placeholder="interval secs" value="86400"><button onclick="mkRotation()">Schedule rotation</button>
-<button onclick="mkLockbox()">Lockbox from last secret value field</button><pre id="lockres"></pre>
-<input id="caname" placeholder="CA name"><button onclick="mkCA()">Create PKI CA</button><pre id="cares"></pre>
-<input id="streamurl" placeholder="log stream webhook URL"><button onclick="mkStream()">Add log stream</button><button onclick="loadDeliveries()">Delivery history</button><pre id="delivs"></pre></div>
-<div class="card"><h3>Integrations / Audit / Tokens</h3><button onclick="mkToken()">Create service token</button><span id="tok"></span><button onclick="loadAudit()">Audit log</button><pre id="audit"></pre></div>
+pub const INDEX: &str = r##"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenWarp Console</title><link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>◆</text></svg>">
+<style>
+:root{--bg:#08080c;--bg2:#0e0e14;--panel:#12121b;--panel2:#171724;--line:#23233a;--line2:#2e2e4a;--text:#eceaf8;--muted:#9a97b3;--faint:#6b6884;--acc:#7c6cff;--acc2:#9d8fff;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--mono:ui-monospace,'SF Mono',SFMono-Regular,Menlo,monospace;--sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',Roboto,sans-serif;--r:10px}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 var(--sans);-webkit-font-smoothing:antialiased}
+button{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line2);border-radius:8px;padding:7px 14px;cursor:pointer;transition:.15s}button:hover{border-color:var(--acc);background:#1d1d2f}button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}button.primary:hover{background:var(--acc2)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--text);background:var(--panel2)}button.danger:hover{border-color:var(--bad);color:var(--bad)}button:disabled{opacity:.45;cursor:default}
+input,select,textarea{font:inherit;color:var(--text);background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:8px 11px;outline:none}input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(124,108,255,.18)}textarea{font-family:var(--mono);font-size:12.5px;width:100%}
+a{color:var(--acc2)}code,.mono{font-family:var(--mono);font-size:12.5px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;letter-spacing:-.02em}
+.mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--acc),#4f46e5);display:grid;place-items:center;color:#fff;font-size:15px;flex:none}
+#auth{min-height:100vh;display:grid;place-items:center;background:radial-gradient(900px 500px at 50% -10%,rgba(124,108,255,.16),transparent)}
+.authcard{width:400px;max-width:92vw;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:32px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.authcard h1{font-size:22px;margin:14px 0 4px}.authcard p.sub{color:var(--muted);margin:0 0 20px}
+.field{margin-bottom:12px}.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}.field input{width:100%}
+.seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:3px;margin-bottom:20px}.seg button{flex:1;background:transparent;border:0;color:var(--muted)}.seg button.on{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+#shell{display:none;height:100vh;grid-template-columns:248px 1fr;grid-template-rows:100vh}
+aside{background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 12px;gap:4px;overflow:auto}
+aside .orgsel{width:100%;margin:14px 0 10px}
+.navbtn{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:0;border-radius:8px;padding:8px 10px;color:var(--muted);font-weight:500}.navbtn:hover{background:var(--panel2);color:var(--text)}.navbtn.on{background:rgba(124,108,255,.14);color:var(--text)}.navbtn .ic{width:18px;text-align:center;flex:none}
+.sidefoot{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;color:var(--muted);font-size:12.5px}
+main{overflow:auto;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 28px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(8,8,12,.85);backdrop-filter:blur(8px);z-index:5}
+.topbar h2{font-size:17px;margin:0;letter-spacing:-.01em}.crumb{color:var(--faint)}.grow{flex:1}
+.searchbox{display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:6px 11px;color:var(--faint);cursor:pointer;min-width:210px}.searchbox:hover{border-color:var(--acc)}kbd{font:11px var(--mono);background:var(--panel2);border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:1px 5px;color:var(--muted)}
+.content{padding:24px 28px 110px;max-width:1220px;width:100%;margin:0 auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.appcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;cursor:pointer;transition:.15s}.appcard:hover{border-color:var(--acc);transform:translateY(-1px)}.appcard h3{margin:0 0 6px;font-size:15px}.appcard .meta{color:var(--muted);font-size:12.5px}
+.chip{display:inline-block;font:11px var(--mono);background:var(--panel2);border:1px solid var(--line2);border-radius:99px;padding:2px 8px;margin:2px 3px 0 0;color:var(--muted)}
+.envtabs{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 16px}.envtab{border-radius:99px;padding:6px 14px;font-weight:600;font-size:13px}.envtab.on{background:var(--acc);border-color:var(--acc);color:#fff}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);text-align:left;padding:10px 14px;background:var(--bg2);border-bottom:1px solid var(--line)}
+td{padding:9px 14px;border-bottom:1px solid var(--line);vertical-align:middle}tr:last-child td{border-bottom:0}tbody tr:hover{background:rgba(124,108,255,.04)}
+.badge{font:10.5px var(--mono);border-radius:5px;padding:2px 6px;border:1px solid}.b-secret{color:var(--acc2);border-color:rgba(124,108,255,.4)}.b-sealed{color:var(--warn);border-color:rgba(251,191,36,.4)}.b-config{color:var(--ok);border-color:rgba(52,211,153,.4)}
+.iconbtn{background:transparent;border:0;padding:7px 9px;min-width:30px;min-height:30px;border-radius:6px;color:var(--muted);font-size:14px}.iconbtn:hover{color:var(--text);background:var(--panel2)}
+td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(--mono);font-size:12.5px}td input:focus{box-shadow:none;border-bottom:1px dashed var(--acc);border-radius:0}
+.stagedot{display:inline-block;width:7px;height:7px;border-radius:99px;background:var(--warn);margin-right:6px}
+#deploybar{position:fixed;left:50%;transform:translateX(-50%) translateY(90px);bottom:26px;background:#1b1b2c;border:1px solid var(--line2);border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:center;box-shadow:0 18px 50px rgba(0,0,0,.55);transition:.25s;z-index:40}#deploybar.show{transform:translateX(-50%) translateY(0)}
+.modalwrap{position:fixed;inset:0;background:rgba(4,4,8,.7);display:none;place-items:center;z-index:60;backdrop-filter:blur(3px)}.modalwrap.show{display:grid}
+.modal{width:560px;max-width:94vw;max-height:88vh;overflow:auto;background:var(--panel);border:1px solid var(--line2);border-radius:16px;padding:24px}.modal h3{margin:0 0 14px;font-size:16px}
+#palette{position:fixed;inset:0;background:rgba(4,4,8,.65);display:none;z-index:70;padding:12vh 16px 16px}.palettecard{max-width:620px;margin:0 auto;background:var(--panel);border:1px solid var(--line2);border-radius:14px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6)}.palettecard input{width:100%;border:0;background:transparent;font-size:16px;padding:16px}.pitem{padding:10px 16px;cursor:pointer;display:flex;gap:10px;align-items:center}.pitem:hover,.pitem.sel{background:rgba(124,108,255,.12)}
+#toasts{position:fixed;right:18px;bottom:18px;z-index:90;display:flex;flex-direction:column;gap:8px}.toast{background:#1d2b22;border:1px solid #245c3f;color:#a7f3d0;border-radius:10px;padding:11px 15px;box-shadow:0 10px 30px rgba(0,0,0,.5);max-width:380px}.toast.err{background:#331d24;border-color:#5c2436;color:#fecdd3}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:18px;flex-wrap:wrap}.tabbtn{background:transparent;border:0;border-radius:8px 8px 0 0;color:var(--muted);padding:9px 13px;font-weight:600;font-size:13px}.tabbtn.on{color:var(--text);box-shadow:inset 0 -2px var(--acc)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:14px}.card h3{margin:0 0 6px;font-size:15px}.card p{color:var(--muted);margin:0 0 12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.empty{padding:48px 20px;text-align:center;color:var(--faint);border:1px dashed var(--line2);border-radius:14px}.empty .big{font-size:22px;margin-bottom:6px}
+.mut{color:var(--muted)}.small{font-size:12.5px}.val{font-family:var(--mono);font-size:12.5px;word-break:break-all}
+@media(max-width:820px){#shell{grid-template-columns:1fr}aside{display:none}.content{padding:16px 14px 100px}}
+</style></head>
+<body>
+<div id="auth">
+  <div class="authcard">
+    <div class="logo"><span class="mark">◆</span>OpenWarp</div>
+    <h1 id="authtitle">Welcome back</h1><p class="sub">Secrets management with no tiers and no licence gates.</p>
+    <div class="seg"><button id="seglogin" class="on" onclick="authMode('login')">Sign in</button><button id="segreg" onclick="authMode('register')">Create account</button></div>
+    <div id="authform">
+      <div class="field"><label>Email</label><input id="email" type="email" autocomplete="email" placeholder="you@company.com"></div>
+      <div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••••" onkeydown="if(event.key==='Enter')doAuth()"></div>
+      <div class="field" id="mfafield" style="display:none"><label>Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
+      <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
+      <p class="small mut" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
+    </div>
+  </div>
 </div>
+
+<div id="shell">
+  <aside>
+    <div class="logo"><span class="mark">◆</span>OpenWarp</div>
+    <select id="orgs" class="orgsel" onchange="switchOrg()"></select>
+    <button class="navbtn" data-nav="apps" onclick="nav('apps')"><span class="ic">▦</span>Apps</button>
+    <button class="navbtn" data-nav="access" onclick="nav('access')"><span class="ic">♟</span>Members &amp; access</button>
+    <button class="navbtn" data-nav="integrations" onclick="nav('integrations')"><span class="ic">⇄</span>Integrations</button>
+    <button class="navbtn" data-nav="audit" onclick="nav('audit')"><span class="ic">≡</span>Audit log</button>
+    <button class="navbtn" data-nav="settings" onclick="nav('settings')"><span class="ic">⚙</span>Settings</button>
+    <div class="sidefoot"><div id="whoami" class="mono"></div><button class="ghost" style="padding:4px 0" onclick="logout()">Sign out</button></div>
+  </aside>
+  <main>
+    <div class="topbar"><h2 id="pagetitle">Apps</h2><span class="crumb" id="crumb"></span><div class="grow"></div>
+      <div class="searchbox" onclick="openPalette()"><span>⌕</span><span style="flex:1">Search secrets…</span><kbd>⌘K</kbd></div>
+      <button class="primary" id="topaction" onclick="newApp()">+ New app</button>
+    </div>
+    <div class="content" id="view"></div>
+  </main>
+</div>
+
+<div id="deploybar"><span id="deploytext"></span><button class="ghost" onclick="discardStage()">Discard</button><button class="primary" onclick="deployStage()">Deploy changes</button></div>
+
+<div class="modalwrap" id="modalwrap"><div class="modal" id="modal"></div></div>
+<div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
+<div id="toasts"></div>
 <script>
-let T=localStorage.getItem('owt')||''; const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
-async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b?JSON.stringify(b):undefined});let t=await r.json();if(!r.ok)throw t.error||r.status;return t}
-async function register(){try{let d=await api('POST','/api/auth/register',{email:email.value,password:pw.value});T=d.token;localStorage.setItem('owt',T);authmsg.textContent='Registered. Recovery kit (save offline): '+d.recovery_kit;show()}catch(e){authmsg.textContent=e}}
-async function login(){try{let d=await api('POST','/api/auth/login',{email:email.value,password:pw.value});T=d.token;localStorage.setItem('owt',T);show()}catch(e){authmsg.textContent=e}}
-function show(){main.style.display='block';loadOrgs()}
-async function loadOrgs(){let d=await api('GET','/api/orgs');orgs.innerHTML=d.map(o=>`<option value="${o.id}">${o.name} (${o.role})</option>`).join('');loadApps()}
-async function createOrg(){await api('POST','/api/orgs',{name:orgname.value});loadOrgs()}
-async function loadApps(){if(!orgs.value)return;let d=await api('GET',`/api/orgs/${orgs.value}/apps`);apps.innerHTML=d.map(a=>`<option value="${a.id}">${a.name}</option>`).join('');loadEnvs()}
-async function createApp(){await api('POST',`/api/orgs/${orgs.value}/apps`,{name:appname.value});loadApps()}
-async function loadEnvs(){if(!apps.value)return;let d=await api('GET',`/api/apps/${apps.value}/envs`);envs.innerHTML=d.map(e=>`<option value="${e.id}">${e.name}</option>`).join('');loadSecrets()}
-async function createEnv(){await api('POST',`/api/apps/${apps.value}/envs`,{name:envname.value});loadEnvs()}
-async function loadSecrets(){if(!envs.value)return;let d=await api('GET',`/api/envs/${envs.value}/secrets`);secrets.innerHTML='<table><tr><th>Key</th><th>Value</th><th>Path</th><th>Type</th><th>v</th><th></th></tr>'+d.secrets.map(s=>`<tr><td>${s.key}</td><td>${s.value===null?'🔒 sealed':s.value}</td><td>${s.path}</td><td>${s.type}</td><td>${s.version}</td><td><button onclick="hist('${s.id}')">History</button><button onclick="delSecret('${s.id}')">Delete</button></td></tr>`).join('')+'</table><pre id="hist"></pre>'}
-async function addSecret(){await api('PUT',`/api/envs/${envs.value}/secrets`,{secrets:[{key:k.value,value:v.value,path:path.value,type:stype.value}]});loadSecrets()}
-async function delSecret(id){await api('DELETE',`/api/secrets/${id}`);loadSecrets()}
-async function hist(id){let d=await api('GET',`/api/secrets/${id}/history`);document.getElementById('hist').textContent=JSON.stringify(d,null,2)}
-async function importEnv(){await api('POST',`/api/envs/${envs.value}/import`,{text:import.value});loadSecrets()}
-async function exportEnv(){let d=await api('GET',`/api/envs/${envs.value}/export`);exp.textContent=d.text}
-async function search(){let d=await api('GET','/api/search?q='+encodeURIComponent(q.value));searchres.textContent=JSON.stringify(d,null,2)}
-async function mkToken(){let d=await api('POST',`/api/apps/${apps.value}/tokens`,{name:'cli'});tok.textContent=d.token}
-async function loadAudit(){let d=await api('GET',`/api/orgs/${orgs.value}/audit`);audit.textContent=JSON.stringify(d.slice(0,50),null,2)}
-async function loadProposals(){let d=await api('GET',`/api/envs/${envs.value}/proposals`);props.innerHTML=d.map(p=>`${p.id} ${p.status} by ${p.author} <button onclick="approveProp('${p.id}')">Approve</button>`).join('<br>')||'none'}
-async function approveProp(id){await api('POST',`/api/proposals/${id}/approve`,{});loadProposals()}
-async function loadTeams(){let d=await api('GET',`/api/orgs/${orgs.value}/teams`);teams.textContent=JSON.stringify(d)}
-async function mkTeam(){await api('POST',`/api/orgs/${orgs.value}/teams`,{name:'team-'+Date.now()});loadTeams()}
-async function mkIdentity(){let d=await api('POST',`/api/orgs/${orgs.value}/identities`,{name:idname.value||'machine'});ident.textContent='client_id='+d.client_id+' client_secret='+d.client_secret}
-async function mkIntegration(){await api('POST',`/api/envs/${envs.value}/integrations`,{kind:ikind.value,config:JSON.parse(icfg.value||'{}')});loadIntegrations()}
-async function loadIntegrations(){let d=await api('GET',`/api/envs/${envs.value}/integrations`);ints.innerHTML=d.map(i=>`${i.kind} <button onclick="syncInt('${i.id}')">Sync now</button>`).join('<br>')||'none'}
-async function syncInt(id){let d=await api('POST',`/api/integrations/${id}/sync`,{});alert(JSON.stringify(d))}
-async function mkLease(){let d=await api('POST',`/api/envs/${envs.value}/dynamic`,{name:'lease'});leases.textContent=JSON.stringify(d)}
-async function loadLeases(){let d=await api('GET',`/api/envs/${envs.value}/dynamic`);leases.textContent=JSON.stringify(d,null,2)}
-async function mkRotation(){let d=await api('POST',`/api/envs/${envs.value}/rotations`,{key:rotkey.value,interval_secs:parseInt(rotint.value)});alert(JSON.stringify(d))}
-async function mkLockbox(){let d=await api('POST','/api/lockbox',{text:v.value});lockres.textContent=location.origin+d.url}
-async function mkCA(){let d=await api('POST',`/api/orgs/${orgs.value}/pki/cas`,{name:caname.value||'internal-ca'});cares.textContent=d.certificate}
-async function mkStream(){await api('POST',`/api/orgs/${orgs.value}/log-streams`,{name:'s1',url:streamurl.value});loadDeliveries()}
-async function loadDeliveries(){let d=await api('GET',`/api/orgs/${orgs.value}/log-streams/deliveries`);delivs.textContent=JSON.stringify(d.slice(0,20),null,2)}
-async function loadE2E(){try{let d=await api('GET',`/api/envs/${e2eenv.value}/e2e/secrets`);let envKey=await OW.decryptAsymmetric(kit.value,d.wrapped_key);let rows=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(envKey,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(envKey,s.value_enc)));e2eres.textContent=rows.join('\n')||'(no secrets)'}catch(e){e2eres.textContent='E2E error: '+(e.message||e)}}
-if(T)show();
-</script><script src="/e2e.js"></script></body></html>"#;
+let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], STAGED={}, VIEW='apps', MFA=null;
+const $=id=>document.getElementById(id);
+const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
+async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+  if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
+function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function modal(html){$('modal').innerHTML=html;$('modalwrap').classList.add('show')}
+function closeModal(){$('modalwrap').classList.remove('show')}
+$('modalwrap').addEventListener('click',e=>{if(e.target.id==='modalwrap')closeModal()});
+document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()} if(e.key==='Escape'){closeModal();$('palette').style.display='none'}});
+
+// ---------- auth ----------
+let MODE='login';
+function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');$('authtitle').textContent=m==='login'?'Welcome back':'Create your account';$('authbtn').textContent=m==='login'?'Sign in':'Create account'}
+async function doAuth(){try{
+  if(MODE==='register'){let d=await api('POST','/api/auth/register',{email:$('email').value,password:$('pw').value});T=d.token;localStorage.setItem('owt',T);
+    modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`);return}
+  let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
+  if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';$('authbtn').textContent='Verify code';$('authbtn').onclick=doMfa;toast('Enter your authenticator or recovery code');return}
+  T=d.token;localStorage.setItem('owt',T);enterApp();
+}catch(e){toast(e.message,true)}}
+async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T=d.token;localStorage.setItem('owt',T);enterApp()}catch(e){toast(e.message,true)}}
+async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';localStorage.removeItem('owt');location.reload()}
+async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
+  let me=await api('GET','/api/me');$('whoami').textContent=me.email;
+  let orgs=await api('GET','/api/orgs');ORG=orgs[0]?.id||'';$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
+  nav('apps')}
+async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;nav('apps')}
+
+// ---------- navigation ----------
+function nav(v){VIEW=v;document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
+  $('topaction').style.display=(v==='apps')?'':'none';
+  ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)()}
+
+// ---------- apps ----------
+async function renderApps(){$('topaction').style.display='';$('pagetitle').textContent='Apps';$('crumb').textContent='';
+  $('view').innerHTML='<div class="empty"><div class="big">Loading…</div></div>';
+  APPS=ORG?await api('GET',`/api/orgs/${ORG}/apps`):[];
+  if(!APPS.length){$('view').innerHTML=`<div class="empty"><div class="big">▦</div>No apps yet<p>Create an app to start managing secrets for a project.</p><button class="primary" onclick="newApp()">Create your first app</button></div>`;return}
+  let envCounts={};for(let a of APPS){try{let es=await api('GET',`/api/apps/${a.id}/envs`);envCounts[a.id]=es}catch(e){envCounts[a.id]=[]}}
+  $('view').innerHTML=`<div class="row" style="margin-bottom:14px"><input id="appfilter" placeholder="Filter apps…" style="min-width:240px" oninput="filterApps(this.value)"><span class="mut small">${APPS.length} app${APPS.length!==1?'s':''}, unlimited environments</span></div>
+  <div class="grid" id="appgrid">${APPS.map(a=>appCard(a,envCounts[a.id])).join('')}</div>`}
+function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
+function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.style.display=APPS[i].name.toLowerCase().includes(q.toLowerCase())?'':'none'})}
+async function newApp(){modal(`<h3>New app</h3><div class="field"><label>App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label>Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+  <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
+async function createApp(){try{await api('POST',`/api/orgs/${ORG}/apps`,{name:$('na-name').value,readme:$('na-readme').value});closeModal();toast('App created');renderApps()}catch(e){toast(e.message,true)}}
+async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET',`/api/apps/${id}/envs`);ENV=ENVS[0]||null;STAGED={};renderEnv()}
+
+// ---------- environments and secrets ----------
+async function renderEnv(){$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
+  if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
+  if(!ENV)ENV=ENVS[0];
+  let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
+  $('view').innerHTML=`
+  <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
+  <div class="row" style="margin-bottom:12px">
+    <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawSecrets()">
+    <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button>
+    <span class="grow"></span><button class="primary" onclick="addRow()">+ New secret</button>
+  </div>
+  <div id="stable"></div>
+  ${APP?.readme?`<div class="card" style="margin-top:14px"><h3>Readme</h3><pre class="val" style="white-space:pre-wrap">${esc(APP.readme)}</pre></div>`:''}`;
+  drawSecrets();updateDeployBar()}
+async function switchEnv(id){if(Object.keys(STAGED).length&&!confirm('Discard staged changes?'))return;ENV=ENVS.find(e=>e.id===id);STAGED={};renderEnv()}
+function envMode(e){return 'sse'}
+async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label>Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
+async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label>Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+async function createE2eEnv(){try{let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name:$('ne2-name').value});closeModal();toast('E2E environment created: '+d.id);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);renderEnv()}catch(e){toast(e.message,true)}}
+async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{await api('DELETE',`/api/envs/${ENV.id}`);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');renderEnv()}catch(e){toast(e.message,true)}}
+function drawSecrets(){let q=($('sfilter')?.value||'').toLowerCase();
+  let rows=SECRETS.filter(s=>!q||s.key.toLowerCase().includes(q)||(s.path||'').toLowerCase().includes(q));
+  let stagedRows=Object.values(STAGED);
+  let all=[...rows.map(s=>({s})),...stagedRows.filter(x=>x.isNew).map(x=>({s:x,isNew:true}))];
+  if(!all.length){$('stable').innerHTML='<div class="empty"><div class="big">No secrets here yet</div>Click “+ New secret”, or import a .env file.</div>';return}
+  $('stable').innerHTML=`<table><thead><tr><th style="width:26%">Key</th><th>Value</th><th style="width:13%">Path</th><th style="width:9%">Version</th><th style="width:15%"></th></tr></thead><tbody>
+  ${all.map(({s,isNew})=>{let st=STAGED[s.id]||(isNew?s:null);let shown=st?st.value:s.value;let dirty=!!st;
+    return `<tr><td>${dirty?'<span class="stagedot"></span>':''}<span class="mono">${esc(st?st.key:s.key)}</span> <span class="badge b-${esc(s.type||'secret')}">${esc(s.type||'secret')}</span></td>
+    <td>${s.type==='sealed'?'<span class="mut mono">🔒 sealed, never shown</span>':`<span class="val" data-val="${esc(shown??'')}" data-show="0">••••••••••</span>`}</td>
+    <td class="mono mut">${esc(s.path||'/')}</td><td class="mut">${isNew?'new':'v'+(s.version||1)}</td>
+    <td style="white-space:nowrap;text-align:right">
+      ${s.type!=='sealed'?`<button class="iconbtn" title="Reveal" onclick="revealVal(this)">◉</button><button class="iconbtn" title="Copy value" onclick="copyVal(this)">⧉</button>`:''}
+      <button class="iconbtn" title="Edit" onclick="editRow('${s.id}')">✎</button>
+      <button class="iconbtn" title="History" onclick="showHistory('${s.id}')">↺</button>
+      <button class="iconbtn" title="Personal override" onclick="overrideRow('${s.id}','${esc(s.key)}')">♟</button>
+      <button class="iconbtn" title="Delete" onclick="delSecret('${s.id}','${esc(s.key)}')">🗑</button></td></tr>`}).join('')}
+  </tbody></table>`}
+function findValEl(btn){return btn.closest('tr').querySelector('.val')}
+function revealVal(btn){let el=findValEl(btn);let show=el.dataset.show==='1';el.dataset.show=show?'0':'1';el.textContent=show?'••••••••••':el.dataset.val}
+function copyVal(btn){navigator.clipboard.writeText(findValEl(btn).dataset.val);toast('Value copied')}
+function stage(id,key,value,path,type,isNew){STAGED[id]={id,key,value,path:path||'/',type:type||'secret',isNew:!!isNew};updateDeployBar();drawSecrets()}
+function addRow(){let id='new-'+Date.now();STAGED[id]={id,key:'',value:'',path:'/',type:'secret',isNew:true};
+  modal(`<h3>New secret</h3><div class="field"><label>Key</label><input id="ns-key" placeholder="DATABASE_URL"></div><div class="field"><label>Value</label><textarea id="ns-val" rows="3"></textarea></div><div class="row"><div class="field" style="flex:1"><label>Path</label><input id="ns-path" value="/"></div><div class="field"><label>Type</label><select id="ns-type"><option>secret</option><option>sealed</option><option>config</option></select></div></div><div class="row"><button class="primary" onclick="stageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div><p class="small mut">Staged changes deploy together, like a commit. Sealed values can never be read back.</p>`)}
+function stageNew(id){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return}STAGED[id].key=k.toUpperCase();STAGED[id].value=$('ns-val').value;STAGED[id].path=$('ns-path').value||'/';STAGED[id].type=$('ns-type').value;closeModal();updateDeployBar();drawSecrets()}
+function editRow(id){let s=SECRETS.find(x=>x.id===id);if(!s)return;
+  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label>Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div><div class="field"><label>Comment</label><input id="ed-comment" value="${esc(s.comment||'')}"></div><div class="row"><button class="primary" onclick="stageEdit('${id}')">Stage change</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+function stageEdit(id){let s=SECRETS.find(x=>x.id===id);STAGED[id]={id,key:s.key,value:$('ed-val').value,path:s.path,type:s.type,comment:$('ed-comment').value};closeModal();updateDeployBar();drawSecrets();toast('Change staged, deploy when ready')}
+async function overrideRow(id,key){modal(`<h3>Personal override: ${esc(key)}</h3><p class="mut">Only you see this value. Teammates keep the shared one.</p><div class="field"><label>Your value</label><textarea id="ov-val" rows="3"></textarea></div><div class="row"><button class="primary" onclick="saveOverride('${id}')">Save override</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+async function saveOverride(id){try{await api('POST',`/api/secrets/${id}/override`,{secrets:[{key:'x',value:$('ov-val').value}]});closeModal();toast('Override saved');renderEnv()}catch(e){toast(e.message,true)}}
+async function delSecret(id,key){let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
+  if(!confirm('Delete '+key+'? You can restore it from history.'))return;try{await api('DELETE',`/api/secrets/${id}`);toast('Secret deleted');renderEnv()}catch(e){toast(e.message,true)}}
+function updateDeployBar(){let n=Object.keys(STAGED).length;$('deploybar').classList.toggle('show',n>0&&VIEW==='apps'&&!!ENV);$('deploytext').innerHTML=n?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
+function discardStage(){STAGED={};updateDeployBar();drawSecrets()}
+async function deployStage(){try{let items=Object.values(STAGED).map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));let d=await api('PUT',`/api/envs/${ENV.id}/secrets`,{secrets:items});STAGED={};toast(`Deployed ${d.deployed} secret${d.deployed!==1?'s':''}`);renderEnv()}catch(e){toast(e.message,true)}}
+async function showHistory(id){try{let h=await api('GET',`/api/secrets/${id}/history`);
+  modal(`<h3>History</h3>${h.length?h.map(v=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>v${v.version}</b> <span class="mut small">${new Date(v.created_at*1000).toLocaleString()}</span><br><span class="val">${esc(v.value)}</span></span><button onclick="restoreVer('${id}',${v.version})">Restore</button></div>`).join(''):'<p class="mut">No history.</p>'}<div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message,true)}}
+async function restoreVer(id,ver){try{await api('POST',`/api/secrets/${id}/restore/${ver}`,{});closeModal();toast('Restored version '+ver);renderEnv()}catch(e){toast(e.message,true)}}
+function importModal(){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…"></textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+async function doImport(){try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text:$('imp-text').value});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
+async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export`);modal(`<h3>Export ${esc(ENV.name)}</h3><textarea rows="12" readonly>${esc(d.text)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Export copied')">Copy .env</button><button class="ghost" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message,true)}}
+
+// ---------- access, integrations, audit, settings ----------
+function needAppEnv(){if(!APP){toast('Open an app first',true);nav('apps');return false} return true}
+async function renderAccess(){if(!needAppEnv()&&!ORG)return;$('pagetitle').textContent='Members & access';$('crumb').textContent='';
+  let teams=await api('GET',`/api/orgs/${ORG}/teams`).catch(()=>[]);let roles=await api('GET',`/api/orgs/${ORG}/roles`).catch(()=>[]);
+  let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
+  let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
+  $('view').innerHTML=`
+  <div class="card"><h3>Invite member</h3><p>Members must register first, then you can invite them by email.</p><div class="row"><input id="inv-email" type="email" placeholder="teammate@company.com" style="min-width:240px"><select id="inv-role">${roles.map(r=>`<option>${esc(r.name)}</option>`).join('')}</select><button class="primary" onclick="invite()">Invite</button></div></div>
+  <div class="card"><h3>Custom roles</h3><p>Comma-separated permissions, for example <span class="mono">secrets:read</span> or <span class="mono">*</span>.</p><div class="row"><input id="role-name" placeholder="deployer"><input id="role-perms" placeholder="secrets:read,secrets:write" style="min-width:260px"><button onclick="mkRole()">Create role</button></div><div>${roles.map(r=>`<span class="chip">${esc(r.name)}: ${esc((r.permissions||[]).join(', '))}${r.managed?' (managed)':''}</span>`).join('')}</div></div>
+  <div class="card"><h3>Teams</h3><div class="row"><input id="team-name" placeholder="platform-team"><button onclick="mkTeam()">Create team</button></div><div>${teams.map(t=>`<span class="chip">${esc(t.name)}</span>`).join('')||'<span class="mut">No teams yet</span>'}</div></div>
+  <div class="card"><h3>Secret change proposals ${ENV?('· '+esc(ENV.name)):''}</h3><p>Proposals stage secret changes for admin approval instead of deploying directly.</p>
+  ${props.length?props.map(p=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0"><span class="mono small">${esc(p.id.slice(0,8))} · ${esc(p.status)} · by ${esc(String(p.author).slice(0,8))}</span>${p.status==='pending'?`<span><button onclick="decideProp('${p.id}','approve')">Approve</button> <button class="danger" onclick="decideProp('${p.id}','reject')">Reject</button></span>`:''}</div>`).join(''):'<span class="mut">No proposals</span>'}
+  <div class="row" style="margin-top:12px"><button onclick="proposeModal()">New proposal</button></div></div>
+  <div class="card"><h3>Access requests ${ENV?('· '+esc(ENV.name)):''}</h3>
+  ${reqs.length?reqs.map(r=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0"><span class="small">${esc(r.reason||'access')} · ${esc(r.status)}</span>${r.status==='pending'?`<span><button onclick="decideAccess('${r.id}','approve')">Approve</button> <button class="danger" onclick="decideAccess('${r.id}','reject')">Reject</button></span>`:''}</div>`).join(''):'<span class="mut">No requests</span>'}
+  <div class="row" style="margin-top:12px"><button onclick="requestAccess()">Request access to current env</button></div></div>
+  <div class="card"><h3>Machine identities</h3><p>For CI and workloads. Universal Auth exchanges client credentials for a 1-hour token.</p><div class="row"><input id="id-name" placeholder="github-actions"><button onclick="mkIdentity()">Create identity</button></div><pre class="val" id="ident-out"></pre></div>
+  <div class="card"><h3>Service tokens ${APP?('· '+esc(APP.name)):''}</h3><div class="row"><button onclick="mkToken()">Create token</button><button onclick="loadTokens()">List / revoke</button></div><pre class="val" id="tok-out"></pre><div id="tok-list"></div></div>`}
+async function invite(){try{await api('POST',`/api/orgs/${ORG}/members`,{email:$('inv-email').value,role:$('inv-role').value});toast('Member invited')}catch(e){toast(e.message,true)}}
+async function mkRole(){try{await api('POST',`/api/orgs/${ORG}/roles`,{name:$('role-name').value,permissions:$('role-perms').value.split(',').map(s=>s.trim()).filter(Boolean)});toast('Role created');renderAccess()}catch(e){toast(e.message,true)}}
+async function mkTeam(){try{await api('POST',`/api/orgs/${ORG}/teams`,{name:$('team-name').value});toast('Team created');renderAccess()}catch(e){toast(e.message,true)}}
+async function decideProp(id,a){try{let d=await api('POST',`/api/proposals/${id}/${a}`,{});toast('Proposal '+d.status);renderAccess()}catch(e){toast(e.message,true)}}
+function proposeModal(){modal(`<h3>New proposal for ${esc(ENV.name)}</h3><textarea id="pr-text" rows="8" placeholder="KEY=value per line"></textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="submitProposal()">Submit for approval</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+async function submitProposal(){try{let secrets=$('pr-text').value.split('\n').filter(l=>l.includes('=')).map(l=>{let i=l.indexOf('=');return{key:l.slice(0,i).trim(),value:l.slice(i+1)}});await api('POST',`/api/envs/${ENV.id}/proposals`,{secrets});closeModal();toast('Proposal submitted');renderAccess()}catch(e){toast(e.message,true)}}
+async function decideAccess(id,a){try{await api('POST',`/api/access-requests/${id}/${a}`,{});toast('Request '+a+'d');renderAccess()}catch(e){toast(e.message,true)}}
+async function requestAccess(){try{await api('POST',`/api/envs/${ENV.id}/access-requests`,{reason:'requested from console'});toast('Access requested');renderAccess()}catch(e){toast(e.message,true)}}
+async function mkIdentity(){try{let d=await api('POST',`/api/orgs/${ORG}/identities`,{name:$('id-name').value||'machine'});$('ident-out').textContent=`client_id: ${d.client_id}\nclient_secret: ${d.client_secret}\nShown once. Exchange at POST /api/v1/machine/auth/universal/login`}catch(e){toast(e.message,true)}}
+async function mkToken(){try{let d=await api('POST',`/api/apps/${APP.id}/tokens`,{name:'console',env_id:ENV?ENV.id:''});$('tok-out').textContent=d.token+'\nScoped to env: '+(ENV?ENV.name:'all')}catch(e){toast(e.message,true)}}
+async function loadTokens(){try{let toks=await api('GET',`/api/apps/${APP.id}/tokens`);$('tok-list').innerHTML=toks.map(t=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0"><span class="mono small">${esc(t.name)} · ${esc(t.kind||'token')} · ${new Date((t.created_at||0)*1000).toLocaleDateString()}</span><button class="danger" onclick="revokeToken('${t.id}')">Revoke</button></div>`).join('')||'<span class="mut">No tokens</span>'}catch(e){toast(e.message,true)}}
+async function revokeToken(id){try{await api('DELETE',`/api/tokens/${id}`);toast('Token revoked');loadTokens()}catch(e){toast(e.message,true)}}
+
+const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','webhook'];
+async function renderIntegrations(){if(!needAppEnv())return;setTimeout(kindHint,0);$('pagetitle').textContent='Integrations';$('crumb').textContent=ENV?('/ '+ENV.name):'';
+  let ints=ENV?await api('GET',`/api/envs/${ENV.id}/integrations`).catch(()=>[]):[];
+  $('view').innerHTML=`<div class="card"><h3>Sync secrets to a platform</h3><p>Integrations run automatically on every deploy, or on demand. Config is stored encrypted. Trigger.dev example config: <span class="mono">{"token":"tr_pat_…","project_ref":"proj_…","target_env":"prod"}</span></p>
+  <div class="row"><select id="ikind" onchange="kindHint()">${KINDS.map(k=>`<option>${k}</option>`).join('')}</select></div>
+  <p class="small" id="ikind-hint"></p><textarea id="icfg" rows="4" placeholder='{"token":"…"}'></textarea>
+  <div class="row" style="margin-top:10px"><button class="primary" onclick="mkIntegration()">Add integration</button></div></div>
+  <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
+  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><pre class="val" id="leases"></pre>
+  <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>
+  <div class="card"><h3>Lockbox: one-time secret sharing</h3><div class="row"><input id="lb-val" placeholder="value to share once" style="min-width:280px"><button onclick="mkLockbox()">Create link</button></div><pre class="val" id="lb-out"></pre></div>`}
+const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer"}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}'};
+function kindHint(){if(!$('ikind'))return;let k=$('ikind').value;$('ikind-hint').textContent=KIND_HINTS[k]||('Config for '+k+' as JSON. Common keys: token, base_url for self-hosted instances. Stored encrypted at rest.')}
+async function mkIntegration(){try{await api('POST',`/api/envs/${ENV.id}/integrations`,{kind:$('ikind').value,config:JSON.parse($('icfg').value||'{}')});toast('Integration added');renderIntegrations()}catch(e){toast(e.message,true)}}
+async function testInt(id){try{let d=await api('POST',`/api/integrations/${id}/test`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
+async function syncInt(id){try{let d=await api('POST',`/api/integrations/${id}/sync`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
+async function mkLease(){try{let d=await api('POST',`/api/envs/${ENV.id}/dynamic`,{name:$('lease-name').value||'lease'});$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
+async function loadLeases(){try{let d=await api('GET',`/api/envs/${ENV.id}/dynamic`);$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
+async function mkRotation(){try{await api('POST',`/api/envs/${ENV.id}/rotations`,{key:$('rot-key').value,interval_secs:parseInt($('rot-int').value)});toast('Rotation scheduled')}catch(e){toast(e.message,true)}}
+async function mkLockbox(){try{let d=await api('POST','/api/lockbox',{text:$('lb-val').value});$('lb-out').textContent=location.origin+d.url+'\nOpens once, expires in 24h. The key is in the #fragment and never sent to the server on page load.'}catch(e){toast(e.message,true)}}
+
+async function renderAudit(){$('pagetitle').textContent='Audit log';$('crumb').textContent='';
+  let rows=await api('GET',`/api/orgs/${ORG}/audit`).catch(()=>[]);
+  $('view').innerHTML=`<div class="card"><h3>Log streams</h3><p>Audit events are also forwarded to streams with HMAC-signed retries.</p><div class="row"><input id="stream-url" placeholder="https://hooks.example.com/openwarp" style="min-width:300px"><button onclick="mkStream()">Add stream</button><button onclick="loadDeliveries()">Delivery history</button></div><pre class="val" id="delivs"></pre></div>
+  <table><thead><tr><th>When</th><th>Action</th><th>Actor</th><th>Detail</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="mut small">${new Date((r.created_at||0)*1000).toLocaleString()}</td><td class="mono">${esc(r.action)}</td><td class="mono small">${esc(String(r.actor||'').slice(0,10))}</td><td class="mut">${esc(r.detail||'')}</td></tr>`).join('')||'<tr><td colspan="4" class="mut">No events yet</td></tr>'}</tbody></table>`}
+async function mkStream(){try{await api('POST',`/api/orgs/${ORG}/log-streams`,{name:'console',url:$('stream-url').value});toast('Log stream added')}catch(e){toast(e.message,true)}}
+async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-streams/deliveries`);$('delivs').textContent=JSON.stringify(d.slice(0,25),null,2)}catch(e){toast(e.message,true)}}
+
+async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
+  $('view').innerHTML=`
+  <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
+  <div class="field"><label>IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" placeholder="203.0.113.0/24"></div>
+  <div class="field"><label>OIDC issuer</label><input id="set-oidc-iss" placeholder="https://accounts.google.com"></div>
+  <div class="row"><input id="set-oidc-cid" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="OIDC client secret"><input id="set-oidc-redir" placeholder="redirect URI" style="min-width:260px"></div>
+  <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
+  <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
+  <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
+  <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
+  <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
+  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
+async function saveSettings(){try{await api('PUT',`/api/orgs/${ORG}/settings`,{ip_allowlist:$('set-ip').value,oidc_issuer:$('set-oidc-iss').value,oidc_client_id:$('set-oidc-cid').value,oidc_client_secret:$('set-oidc-sec').value,oidc_redirect_uri:$('set-oidc-redir').value});toast('Settings saved')}catch(e){toast(e.message,true)}}
+async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
+async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
+async function loadE2E(){try{let d=await api('GET',`/api/envs/${$('e2e-env').value}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
+  $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
+async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
+async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
+
+// ---------- command palette ----------
+function openPalette(){$('palette').style.display='block';$('paletteinput').value='';$('paletteresults').innerHTML='';setTimeout(()=>$('paletteinput').focus(),30)}
+async function paletteSearch(){let q=$('paletteinput').value;if(q.length<2){$('paletteresults').innerHTML='';return}
+  try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${esc(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
+function paletteGo(key){$('palette').style.display='none';if(APP&&ENV){nav('apps');renderEnv().then(()=>{let f=$('sfilter');if(f){f.value=key;drawSecrets()}})}}
+$('palette').addEventListener('click',e=>{if(e.target.id==='palette')$('palette').style.display='none'});
+
+if(T){$('auth').style.display='none';enterApp().catch(()=>{$('auth').style.display='grid';$('shell').style.display='none'})}
+</script>
+<script src="/e2e.js"></script>
+</body></html>
+"##;
