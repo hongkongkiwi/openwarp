@@ -60,3 +60,35 @@ it cannot decrypt. Grant access with `POST /api/envs/:id/e2e/grant` where the
 `DATABASE_URL=sqlite://file.db` (default, testing) or
 `postgres://...` (production). One portable SQL dialect layer translates
 `?` placeholders to `$n` for Postgres. `REDIS_URL` optionally caches session lookups (1h TTL, verified against a Redis-protocol server: SETEX on first auth, GET hits after); absent Redis, sessions live only in the DB.
+
+## Takeaways from Phase + Infisical source review (implemented)
+
+Reviewed `phasehq/console`, `phasehq/cli`, and `Infisical/infisical` against
+OpenWarp. Deduplicated implement-now list, all shipped server-side:
+
+- IP allowlists are now **enforced** by middleware (CIDR, fail-closed when
+  set; `OPENWARP_TRUST_PROXY=1` to trust `X-Forwarded-For`), not just stored.
+- Sealed secrets: type locked after save, values redacted in history as well
+  as in list responses.
+- SCIM and user lookup scoped to orgs the caller actually admins.
+- Logout, 7-day session expiry, token list/revoke, env-scoped service
+  tokens (a token scoped to one env gets 403 in any other).
+- Custom RBAC matrix: `POST/GET /api/orgs/:id/roles` with permission lists
+  (`secrets:write`, `secrets:delete`, `*`); custom-role members are checked
+  on write/delete paths.
+- TOTP MFA with one-time recovery codes: setup/verify, login challenge
+  (`mfa_required` + 5-minute `mfa_token`), `POST /api/auth/mfa`.
+- Lease renew, plus a rotation scheduler (30s tick) with per-key schedules
+  (`/api/envs/:id/rotations`); E2E envs are skipped by the scheduler.
+- Log streams with persisted delivery history and 3-attempt HMAC-signed
+  retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
+- Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
+- Machine identities with Universal Auth, secret-change proposals with
+  admin approval, access requests, dynamic Postgres leases (real roles,
+  dropped on revoke), and a basic PKI (CA, issue, revoke) came from the
+  Infisical feature set.
+
+Kept from OpenWarp where it already exceeds both: point-in-time recovery,
+secret-change proposals, and Postgres dynamic roles are not Phase features.
+Deferred by design: CLI parity (separate effort), Kubernetes operator,
+SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).

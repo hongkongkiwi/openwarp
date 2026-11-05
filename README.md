@@ -51,6 +51,11 @@ openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
   the browser console (pure-JS X25519/XChaCha20-Poly1305) decrypt locally.
 - OIDC SSO (authorization-code flow, JWKS-verified) and SCIM provisioning
   (users + groups) are wired per organisation.
+- TOTP MFA with recovery codes, enforced IP allowlists, custom RBAC roles,
+  env-scoped service tokens, machine identities (Universal Auth), approval
+  workflows, log streams, a rotation scheduler, dynamic Postgres leases and
+  a basic PKI round out the Phase + Infisical takeaways. CLI parity is a
+  separate later effort; the current CLI covers run/inject and E2E.
 - Get an external crypto review before production use.
 
 ## Features (all unlocked)
