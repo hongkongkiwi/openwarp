@@ -1,0 +1,17 @@
+services:
+  server:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      DATABASE_URL: "postgres://openwarp:openwarp@db:5432/openwarp"
+      REDIS_URL: "redis://cache:6379"
+      # OPENWARP_MASTER_KEY: "<base64 32 bytes>"  # set in production; else persisted in DB meta table
+    depends_on: [db, cache]
+    volumes: [data:/data]
+  db:
+    image: postgres:17-alpine
+    environment: { POSTGRES_USER: openwarp, POSTGRES_PASSWORD: openwarp, POSTGRES_DB: openwarp }
+    volumes: [pgdata:/var/lib/postgresql/data]
+  cache:
+    image: redis:7-alpine
+volumes: { data: {}, pgdata: {} }

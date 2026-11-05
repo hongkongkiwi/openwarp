@@ -1,0 +1,146 @@
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+pub type Row = HashMap<String, Value>;
+pub enum Db {
+    Sqlite(Mutex<rusqlite::Connection>),
+    Postgres(std::sync::Arc<Mutex<postgres::Client>>),
+}
+fn pg_sql(sql: &str) -> String {
+    let mut out = String::new(); let mut n = 0;
+    for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
+    out
+}
+impl Db {
+    pub fn open(url: &str) -> Result<Self, String> {
+        if url.starts_with("postgres") {
+            // `postgres` sync client drives its own runtime; it cannot run inside tokio.
+            let url = url.to_string();
+            return std::thread::spawn(move || {
+                let client = postgres::Client::connect(&url, postgres::NoTls).map_err(|e| e.to_string())?;
+                let db = Db::Postgres(std::sync::Arc::new(Mutex::new(client))); db.migrate()?; Ok(db)
+            }).join().map_err(|_| "postgres connect thread panicked".to_string())?;
+        } else {
+            let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
+            let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+            let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+        }
+    }
+    #[allow(dead_code)]
+    pub fn open_memory() -> Result<Self, String> {
+        let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+    }
+    pub fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+        match self {
+            Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
+            Db::Postgres(c) => {
+                let c = c.clone(); let sql = sql.to_string(); let params = params.to_vec();
+                std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql); let pg = PgParams::new(&params); let refs = pg.refs(); client.execute(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())?
+            }
+        }
+    }
+    pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        match self {
+            Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
+            Db::Postgres(c) => {
+                let c = c.clone(); let sql_owned = sql.to_string(); let params_owned = params.to_vec();
+                let rows = std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql_owned); let pg = PgParams::new(&params_owned); let refs = pg.refs(); client.query(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())??;
+                let mut out = Vec::new();
+                for r in &rows {
+                    let mut m = Row::new();
+                    for (i, col) in r.columns().iter().enumerate() {
+                        let v: Value = if let Ok(v) = r.try_get::<_, Option<String>>(i) { v.map(Value::String).unwrap_or(Value::Null) }
+                            else if let Ok(v) = r.try_get::<_, Option<i64>>(i) { v.map(|n| Value::Number(n.into())).unwrap_or(Value::Null) }
+                            else if let Ok(v) = r.try_get::<_, Option<bool>>(i) { v.map(Value::Bool).unwrap_or(Value::Null) }
+                            else if let Ok(v) = r.try_get::<_, Option<Value>>(i) { v.unwrap_or(Value::Null) }
+                            else { Value::Null };
+                        m.insert(col.name().to_string(), v);
+                    }
+                    out.push(m);
+                }
+                Ok(out)
+            }
+        }
+    }
+    pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
+    fn migrate(&self) -> Result<(), String> {
+        for stmt in SCHEMA { self.exec(stmt, &[])?; }
+        Ok(())
+    }
+}
+enum PgOwned { S(String), I(i64), B(bool), N(Option<String>) }
+struct PgParams { owned: Vec<PgOwned> }
+impl PgParams {
+    fn new(params: &[Value]) -> Self { Self { owned: params.iter().map(|v| match v { Value::String(s) => PgOwned::S(s.clone()), Value::Number(n) => PgOwned::I(n.as_i64().unwrap_or(0)), Value::Bool(b) => PgOwned::B(*b), _ => PgOwned::N(None) }).collect() } }
+    fn refs(&self) -> Vec<&(dyn postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
+}
+fn sqlite_val(v: &rusqlite::types::Value) -> Value {
+    use rusqlite::types::Value as V;
+    match v { V::Null => Value::Null, V::Integer(n) => Value::Number((*n).into()), V::Real(f) => serde_json::json!(*f), V::Text(s) => Value::String(s.clone()), V::Blob(b) => Value::String(openwarp_crypto::b64(b)) }
+}
+fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<u64, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let n = stmt.execute(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
+    Ok(n as u64)
+}
+fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        let mut m = Row::new();
+        for (i, c) in cols.iter().enumerate() { let v: rusqlite::types::Value = r.get(i).map_err(|e| e.to_string())?; m.insert(c.clone(), sqlite_val(&v)); }
+        out.push(m);
+    }
+    Ok(out)
+}
+fn sqlite_param(v: &Value) -> SqliteParam { SqliteParam(v.clone()) }
+struct SqliteParam(Value);
+impl rusqlite::ToSql for SqliteParam {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, Value as V};
+        Ok(match &self.0 { Value::Null => ToSqlOutput::Owned(V::Null), Value::String(s) => ToSqlOutput::Owned(V::Text(s.clone())), Value::Number(n) => ToSqlOutput::Owned(V::Integer(n.as_i64().unwrap_or(0))), Value::Bool(b) => ToSqlOutput::Owned(V::Integer(if *b {1} else {0})), other => ToSqlOutput::Owned(V::Text(other.to_string())) })
+    }
+}
+pub fn s(row: &Row, k: &str) -> String { row.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string() }
+pub fn n(row: &Row, k: &str) -> i64 { row.get(k).and_then(|v| v.as_i64()).unwrap_or(0) }
+pub fn obj(row: &Row) -> Value { let mut m = Map::new(); for (k, v) in row { m.insert(k.clone(), v.clone()); } Value::Object(m) }
+
+const SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL,pubkey TEXT NOT NULL,wrapped_privkey TEXT NOT NULL,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS orgs(id TEXT PRIMARY KEY,name TEXT NOT NULL,ip_allowlist TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS org_members(org_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,PRIMARY KEY(org_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS teams(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS team_members(team_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(team_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS apps(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,readme TEXT DEFAULT '',sse BIGINT DEFAULT 1,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS app_members(app_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,PRIMARY KEY(app_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS envs(id TEXT PRIMARY KEY,app_id TEXT NOT NULL,name TEXT NOT NULL,env_key_wrapped TEXT NOT NULL,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS env_members(env_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
+    "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS integrations(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,config_enc TEXT NOT NULL,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS lockbox(id TEXT PRIMARY KEY,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,max_views BIGINT DEFAULT 1,views BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,name TEXT NOT NULL,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL)",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*; use serde_json::json;
+    #[test] fn sqlite_migrate_and_crud() {
+        let db = Db::open_memory().unwrap();
+        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).unwrap();
+        let rows = db.query("SELECT name FROM orgs WHERE id=?", &[json!("o1")]).unwrap();
+        assert_eq!(s(&rows[0], "name"), "Acme");
+        // placeholder translation used by Postgres backend
+        assert_eq!(pg_sql("SELECT * FROM t WHERE a=? AND b=?"), "SELECT * FROM t WHERE a=$1 AND b=$2");
+    }
+}
