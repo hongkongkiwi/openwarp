@@ -347,6 +347,7 @@ async fn env_scoped_token_cannot_escape_through_mcp_or_mint_tokens() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "OWN_SECRET", "own-value").await;
     set_secret(&s, token, &envs[1], "OTHER_ENV_SECRET", "hidden-value").await;
 
     let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(token), Some(json!({"name": "ci", "env_id": envs[0]}))).await;
@@ -380,6 +381,15 @@ async fn env_scoped_token_cannot_escape_through_mcp_or_mint_tokens() {
         )
         .await;
     assert!(!r.text.contains("hidden-value"), "env-scoped token read another environment over MCP: {}", r.text);
+    let r = s
+        .call(
+            Method::POST,
+            "/mcp",
+            Some(&pat),
+            Some(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_secrets", "arguments": {"env_id": envs[0]}}})),
+        )
+        .await;
+    assert!(r.text.contains("own-value"), "the same token must still work on its own environment over MCP: {}", r.text);
 
     let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&pat), Some(json!({"name": "wider"}))).await;
     assert_eq!(r.status, 403, "a scoped token must not mint an unscoped token, got {} {}", r.status, r.text);
@@ -470,6 +480,15 @@ async fn mcp_write_tools_respect_custom_role_permissions() {
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
 
     let (oat, _) = oauth_token(&s, mt, "secrets:read secrets:write", &format!("{}/mcp", s.base)).await;
+    let r = s
+        .call(
+            Method::POST,
+            "/mcp",
+            Some(&oat),
+            Some(json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": "list_secrets", "arguments": {"env_id": envs[0]}}})),
+        )
+        .await;
+    assert!(r.text.contains("KEEP_ME"), "the token must work on a read before the delete is denied: {}", r.text);
     let r = s
         .call(
             Method::POST,
