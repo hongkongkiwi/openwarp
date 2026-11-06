@@ -442,10 +442,48 @@ without returning the encrypted config. The OpenAI/OpenRouter/Resend adapters
 are covered by mock-provider tests; the schedule endpoint has an HTTP
 integration test.
 
-### PKI, AWS leases and HA
+### PKI, device certificates, AWS leases and HA
 
 `GET /api/pki/cas/:id/crl` returns a signed PEM CRL containing every revoked
-certificate, with the issuer reconstructed from the stored serial.
+certificate, with the issuer reconstructed from the stored serial. The CRL is
+public: a broker fetches it without a workspace token, and the CA signature is
+what proves integrity. `POST /api/pki/cas/:id/ocsp` answers OCSP requests the
+same way and is also public.
+
+Certificates are issued from a workspace-owned CA. Two issuance paths share it:
+
+- `POST /api/pki/cas/:id/issue` generates the keypair on the server and returns
+  `private_key` once. It requires workspace admin and serves services and devices
+  that cannot generate a CSR. With `device_id` the certificate is bound to a
+  device record and becomes its active certificate.
+- `POST /api/pki/enroll` takes a PKCS#10 CSR and returns only the certificate, so
+  the private key never leaves the device. It needs no workspace token and is
+  authorised by a single-use enrollment code.
+
+Device records live under a CA: `POST/GET /api/pki/cas/:id/devices`,
+`GET/PATCH/DELETE /api/pki/devices/:id`, `POST /api/pki/devices/:id/revoke` and
+`POST /api/pki/devices/:id/enrollment`. A record carries the CN, optional DNS and
+IP SANs, the model, hardware serial, tags and an app/environment binding. Device
+certificates are client-auth only, default to 90 days (`cert_days`, clamped to 1
+to 365), and their SANs come from the record, never from the CSR.
+
+Enrollment codes are 256-bit random values stored only as a SHA-256 hash, valid
+from five minutes to seven days, and consumed atomically on the first successful
+request. Revoking or deleting a device invalidates its outstanding codes, and an
+enrollment that races a revocation fails rather than attaching a certificate.
+`pki:write` grants device administration without full admin; owner and admin hold
+it through `*` and the managed developer role does not. OAuth access tokens and
+service tokens can request the `pki:read` and `pki:write` scopes. An
+environment-scoped token can create, list, enroll and revoke only devices whose
+`env_id` matches its own environment; the CA-wide issuance and certificate-list
+endpoints stay closed to it.
+
+A broker that trusts the CA validates the certificate directly. Register the CA
+certificate returned by `GET /api/orgs/:id/pki/cas` as its trust anchor (EMQX,
+HiveMQ and Mosquitto read a CA file; AWS IoT Core and Azure Device Provisioning
+accept a registered CA). Revocation reaches the broker through the public CRL or,
+more practically for fleets, through the short certificate lifetime.
+
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores
 the admin secret. Postgres lease host allowlisting remains in force.

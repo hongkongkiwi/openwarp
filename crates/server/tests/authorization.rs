@@ -1744,3 +1744,234 @@ async fn pitr_restores_creates_deletes_and_tags() {
     let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
     assert!(list.body["secrets"].as_array().expect("secrets").iter().any(|x| x["key"] == "BRAVO"), "a manually restored secret must survive a point-in-time restore: {}", list.text);
 }
+
+// Device certificates: the key stays on the device, enrollment is a one-time
+// code plus a CSR, and the CRL is public because a broker fetches it.
+async fn pki_ca(s: &Server, token: &str, org: &str, name: &str) -> (String, String) {
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": name}))).await;
+    assert_eq!(r.status, 200, "create CA failed: {}", r.text);
+    (r.body["id"].as_str().unwrap().to_string(), r.body["certificate"].as_str().unwrap().to_string())
+}
+
+async fn pki_device(s: &Server, token: &str, ca: &str, name: &str) -> String {
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(token), Some(json!({"name": name, "sans": ["sensor.local", "192.0.2.10"], "cert_days": 30}))).await;
+    assert_eq!(r.status, 200, "create device failed: {}", r.text);
+    r.body["id"].as_str().unwrap().to_string()
+}
+
+fn device_csr(key: &rcgen::KeyPair, cn: &str) -> String {
+    let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).expect("csr params");
+    params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+    params.serialize_request(key).expect("csr").pem().expect("csr pem")
+}
+
+#[tokio::test]
+async fn device_csr_enrollment_issues_cert_once() {
+    let s = Server::start().await;
+    let u = register(&s, "device-enroll@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, ca_pem) = pki_ca(&s, token, org, "iot-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().expect("enrollment code").to_string();
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "claimed-other-device");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 200, "enrollment failed: {}", r.text);
+    assert_eq!(r.body["name"], json!("sensor-1"), "the device record owns the CN, not the CSR: {}", r.text);
+    assert!(r.body["certificate"].as_str().unwrap_or("").starts_with("-----BEGIN CERTIFICATE-----"), "{}", r.text);
+    assert_eq!(r.body["ca_certificate"].as_str().unwrap_or(""), ca_pem);
+    assert!(r.body.get("private_key").is_none(), "enrollment must never return the device private key");
+    let again = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(again.status, 401, "an enrollment code is single use: {}", again.text);
+}
+
+#[tokio::test]
+async fn device_enrollment_rejects_unknown_code() {
+    let s = Server::start().await;
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "unknown");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": "owdev_does-not-exist", "csr": csr}))).await;
+    assert_eq!(r.status, 401, "{}", r.text);
+    assert!(r.text.contains("invalid or expired enrollment code"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn device_management_requires_pki_write() {
+    let s = Server::start().await;
+    let (owner, org, viewer, _viewer_id, _app, _envs) = org_with_viewer(&s, "pkiperm").await;
+    let (ca, _) = pki_ca(&s, &owner, &org, "perm-ca").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&viewer), Some(json!({"name": "sensor-1"}))).await;
+    assert_eq!(r.status, 403, "a viewer must not create devices: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(&viewer), None).await;
+    assert_eq!(r.status, 200, "a workspace member may read the inventory: {}", r.text);
+
+    let operator = register(&s, "pki-operator@test.invalid").await;
+    let op_token = operator["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&owner), Some(json!({"name": "pki-ops", "permissions": ["pki:write"]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    invite(&s, &owner, &org, "pki-operator@test.invalid", "pki-ops").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&op_token), Some(json!({"name": "sensor-2"}))).await;
+    assert_eq!(r.status, 200, "pki:write may create devices: {}", r.text);
+    let device = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(&op_token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "pki:write may mint enrollment codes: {}", r.text);
+}
+
+#[tokio::test]
+async fn device_revocation_invalidates_outstanding_enrollment_codes() {
+    let s = Server::start().await;
+    let u = register(&s, "device-revoke-codes@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "revoke-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let second = r.body["code"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/revoke", device), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": second, "csr": csr}))).await;
+    assert_eq!(r.status, 401, "revoking a device must invalidate its outstanding codes: {}", r.text);
+}
+
+#[tokio::test]
+async fn device_management_honours_token_scopes() {
+    let s = Server::start().await;
+    let (owner, org, _viewer, _viewer_id, app, envs) = org_with_viewer(&s, "pkitoken").await;
+    let (ca, _) = pki_ca(&s, &owner, &org, "token-ca").await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&owner), Some(json!({"name": "pki-pat", "scopes": "pki:read pki:write"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let pki_token = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&pki_token), Some(json!({"name": "sensor-a"}))).await;
+    assert_eq!(r.status, 200, "a pki:write token may create devices: {}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&owner), Some(json!({"name": "secret-pat", "scopes": "secrets:write"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let secret_token = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&secret_token), Some(json!({"name": "sensor-b"}))).await;
+    assert_eq!(r.status, 403, "a secrets-only token must not administer devices: {}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&owner), Some(json!({"name": "env-pat", "scopes": "pki:read pki:write", "env_id": envs[0]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let env_token = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&env_token), Some(json!({"name": "sensor-env"}))).await;
+    assert_eq!(r.status, 200, "an environment-scoped token may create a device in its environment: {}", r.text);
+    assert_eq!(r.body["env_id"], json!(envs[0]));
+    let env_device = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&env_token), Some(json!({"name": "sensor-elsewhere", "env_id": envs[1]}))).await;
+    assert_eq!(r.status, 403, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(&env_token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let names: Vec<&str> = r.body.as_array().expect("devices").iter().filter_map(|d| d["name"].as_str()).collect();
+    assert!(names.contains(&"sensor-env"), "{}", r.text);
+    assert!(!names.contains(&"sensor-a"), "the env-scoped token must not list another environment: {}", r.text);
+    let r = s.call(Method::PATCH, &format!("/api/pki/devices/{}", env_device), Some(&env_token), Some(json!({"env_id": envs[1]}))).await;
+    assert_eq!(r.status, 403, "an environment-scoped token must not move a device out of its environment: {}", r.text);
+    let r = s.call(Method::PATCH, &format!("/api/pki/devices/{}", env_device), Some(&env_token), Some(json!({"name": "sensor-env-2"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["env_id"], json!(envs[0]));
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/pki/cas", org), Some(&pki_token), None).await;
+    assert_eq!(r.status, 200, "a pki:read token may list CAs: {}", r.text);
+    let mcp = s.call(Method::POST, "/mcp", Some(&pki_token), Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_secrets", "arguments": {"env_id": envs[0]}}}))).await;
+    assert_eq!(mcp.status, 200, "{}", mcp.text);
+    assert!(mcp.body["error"]["message"].as_str().unwrap_or("").contains("insufficient scope"), "a pki-only token must not read secrets over MCP: {}", mcp.text);
+}
+
+#[tokio::test]
+async fn device_can_enroll_again_after_revocation() {
+    let s = Server::start().await;
+    let u = register(&s, "device-renew@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "renew-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let first = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&first, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let first_cert = r.body["serial"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/revoke", device), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // A deliberate new code after revocation is a fresh device generation.
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let second = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&second, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 200, "renewal after revocation must work: {}", r.text);
+    let renewed = r.body["serial"].as_str().unwrap().to_string();
+    assert_ne!(renewed, first_cert);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["active_cert"]["serial"], json!(renewed));
+    assert_eq!(r.body["active_cert"]["revoked"], json!(false));
+}
+
+#[tokio::test]
+async fn crl_is_public_and_lists_device_revocation() {
+    let s = Server::start().await;
+    let u = register(&s, "device-crl@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "crl-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"device_id": device, "days": 10}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/revoke", device), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/crl", ca), None, None).await;
+    assert_eq!(r.status, 200, "a broker fetches the CRL without a token: {}", r.text);
+    assert!(r.header("content-type").contains("pkix-crl"), "{}", r.header("content-type"));
+    assert!(r.text.contains("BEGIN X509 CRL"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn device_records_are_workspace_scoped() {
+    let s = Server::start().await;
+    let a = register(&s, "device-scope-a@test.invalid").await;
+    let b = register(&s, "device-scope-b@test.invalid").await;
+    let at = a["token"].as_str().unwrap();
+    let aorg = a["org_id"].as_str().unwrap();
+    let bt = b["token"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, at, aorg, "scope-ca").await;
+    let device = pki_device(&s, at, &ca, "sensor-1").await;
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(bt), None).await;
+    assert_ne!(r.status, 200, "another workspace must not list the inventory: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(bt), Some(json!({}))).await;
+    assert_ne!(r.status, 200, "another workspace must not mint an enrollment code: {}", r.text);
+}
+
+#[tokio::test]
+async fn server_issued_device_cert_is_bound_to_device() {
+    let s = Server::start().await;
+    let u = register(&s, "device-bind@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "bind-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"device_id": device, "days": 10}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let cert = r.body["id"].as_str().unwrap().to_string();
+    assert!(!r.body["private_key"].as_str().unwrap_or("").is_empty(), "the server-key path returns the key once: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["active_cert_id"], json!(cert));
+    assert_eq!(r.body["active_cert"]["id"], json!(cert));
+    assert_eq!(r.body["name"], json!("sensor-1"));
+    let r = s.call(Method::POST, &format!("/api/pki/certs/{}/revoke", cert), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert!(r.body["active_cert"].is_null(), "revoking the cert must clear the active pointer: {}", r.text);
+    assert_eq!(r.body["active_cert_id"], json!(""));
+}

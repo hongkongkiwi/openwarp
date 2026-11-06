@@ -270,6 +270,18 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'",
         "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''",
     ]),
+    (14, &[
+        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
+        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
+        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -303,9 +315,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 13, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 14, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 13, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 14, "each migration must be recorded exactly once");
     }
 }

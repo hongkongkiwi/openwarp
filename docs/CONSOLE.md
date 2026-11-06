@@ -91,4 +91,6 @@ Workspace settings include IP allowlists and OIDC configuration. Test policy cha
 
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 
+The PKI card creates and selects a workspace CA, lists the device inventory and mints one-time enrollment codes. Select the CA, add a device name and optional environment, then use **Enroll code** to copy the single-use code to the device. The CA certificate shown below the table is the trust anchor for the MQTT broker. **Revoke** retires the device's active certificate. The console never displays a device private key, because enrollment only accepts a CSR.
+
 [Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)

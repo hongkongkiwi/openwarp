@@ -79,6 +79,18 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## Device certificates
+
+Device certificates are client certificates for an external broker. OpenWarp does not terminate mTLS with them and does not treat a device certificate as a workspace credential; the broker is the relying party.
+
+Device enrollment consumes a one-time code and a PKCS#10 CSR. The server verifies the CSR self-signature, ignores its subject, SAN and extension requests, and issues a certificate for the device record's name and SANs with the CSR's public key. The device private key never reaches the server on this path. The older `POST /api/pki/cas/:id/issue` path still generates a key on the server and returns it once; it requires workspace admin and exists for devices that cannot produce a CSR.
+
+Enrollment codes are 256-bit random values. Only a SHA-256 hash is stored, the code is consumed atomically on first use, and it expires between five minutes and seven days. Treat a code as a credential: anyone holding it can obtain one certificate for that device until it is used or expires. Mint codes per device, not per fleet, and delete the device record when the code is no longer needed.
+
+CN and SANs are taken from the device record, never from the CSR, so one enrolled device cannot claim another device's identity. Device certificates are client-auth only and default to 90 days. Issuing a new certificate moves the device's active pointer but does not revoke the previous one, so revoke it explicitly when the old key may be compromised. Prefer a dedicated CA per fleet or environment: the CA private key is encrypted with the instance master key, so an attacker with the database and master key can forge any certificate under that CA. Replacing the CA is the rotation boundary; existing broker trust must be updated deliberately.
+
+The CRL and OCSP endpoints are public. A CRL is a signed public artifact and brokers fetch it without credentials; it reveals the serial numbers and revocation state of that CA's certificates. CA identifiers are random and not enumerable. Revocation times come from the stored `revoked_at` value, and the CRL's `nextUpdate` is seven days, so short-lived certificates are the more reliable revocation mechanism for a fleet.
+
 ## Network and operational controls
 
 Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They are not a replacement for a firewall: authentication/bootstrap routes have different handling. Keep the server and database on trusted networks and expose only the intended HTTPS entry point.

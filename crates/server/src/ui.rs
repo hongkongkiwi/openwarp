@@ -504,8 +504,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
-  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
+  <div class="card"><h3>PKI</h3><p>Issue service certificates and enroll devices against your own CA. Device keys are generated on the device and never reach this server.</p><div id="pki-body" class="small mut">Loading…</div></div>
+  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`;renderPki()}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
@@ -524,7 +524,23 @@ async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
-async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
+let PKI_CAS=[],PKI_CA='';
+async function renderPki(){let el=$('pki-body');if(!el)return;
+  try{PKI_CAS=await api('GET',`/api/orgs/${ORG}/pki/cas`);
+    if(!PKI_CAS.some(c=>c.id===PKI_CA))PKI_CA=PKI_CAS.length?PKI_CAS[0].id:'';
+    let caSel=PKI_CAS.length?`<select id="pki-ca" onchange="PKI_CA=this.value;renderPki()" style="min-width:220px">${PKI_CAS.map(c=>`<option value="${esc(c.id)}"${c.id===PKI_CA?' selected':''}>${esc(c.name)}</option>`).join('')}</select>`:'';
+    let devices=PKI_CA?await api('GET',`/api/pki/cas/${PKI_CA}/devices`):[];
+    let rows=devices.map(d=>`<tr><td class="mono">${esc(d.name)}</td><td class="small mut">${esc(d.env_id||'-')}</td><td class="small">${d.active_cert?esc(d.active_cert.revoked?'revoked':'active')+' '+esc((d.active_cert.serial||'').slice(0,12)):'none'}</td><td class="small mut">${d.active_cert?new Date(d.active_cert.expires_at*1000).toLocaleDateString():'-'}</td><td class="row"><button onclick="mintEnrollment('${esc(d.id)}')">Enroll code</button><button class="danger" onclick="revokeDevice('${esc(d.id)}')">Revoke</button></td></tr>`).join('')||'<tr><td colspan="5" class="mut small">No devices yet.</td></tr>';
+    el.innerHTML=`<div class="row">${caSel}<input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div>
+      ${PKI_CA?`<div class="row" style="margin-top:10px"><input id="dev-name" placeholder="device name (CN)"><input id="dev-env" placeholder="environment id (optional)" style="min-width:220px"><button class="primary" onclick="mkDevice()">Add device</button></div>
+      <table class="table"><thead><tr><th>Device</th><th>Environment</th><th>Certificate</th><th>Expires</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      <pre class="val" id="ca-out"></pre>`:''}`;
+    let out=$('ca-out');if(out&&PKI_CA){let ca=PKI_CAS.find(c=>c.id===PKI_CA);out.textContent='CA certificate (trust this in the broker):\n'+(ca?ca.certificate:'');}
+  }catch(e){el.textContent='PKI unavailable: '+(e.message||e);}}
+async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});PKI_CA=d.id;toast('CA created');renderPki()}catch(e){toast(e.message,true)}}
+async function mkDevice(){try{let b={name:$('dev-name').value};if($('dev-env').value)b.env_id=$('dev-env').value;await api('POST',`/api/pki/cas/${PKI_CA}/devices`,b);toast('Device added');renderPki()}catch(e){toast(e.message,true)}}
+async function mintEnrollment(id){try{let d=await api('POST',`/api/pki/devices/${id}/enrollment`,{ttl_seconds:3600});$('ca-out').textContent='One-time enrollment code (valid until '+new Date(d.expires_at*1000).toLocaleString()+'):\n'+d.code+'\n\nPOST '+location.origin+'/api/pki/enroll from the device with JSON {"code":"<code>","csr":"<PEM CSR>"}.\nThe code is single use; only its hash is stored.'}catch(e){toast(e.message,true)}}
+async function revokeDevice(id){if(!confirm('Revoke the active certificate for this device?'))return;try{let d=await api('POST',`/api/pki/devices/${id}/revoke`,{});toast('Revoked '+d.revoked+' certificate(s)');renderPki()}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
 
 // ---------- command palette ----------
