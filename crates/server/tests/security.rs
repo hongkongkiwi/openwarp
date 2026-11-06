@@ -896,6 +896,35 @@ async fn production_rejects_a_master_key_left_in_the_database() {
 }
 
 #[tokio::test]
+async fn deploy_reports_integration_delivery_failures() {
+    let s = Server::start().await;
+    let u = register(&s, "deploy@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s
+        .call(
+            Method::POST,
+            &format!("/api/envs/{}/integrations", envs[0]),
+            Some(token),
+            Some(json!({"kind": "instabox", "config": {"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1", "hosts": ["api.example.com"]}})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "integration create failed: {}", r.text);
+    let r = s
+        .call(
+            Method::PUT,
+            &format!("/api/envs/{}/secrets", envs[0]),
+            Some(token),
+            Some(json!({"secrets": [{"key": "DEPLOY_KEY", "value": "v"}]})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "deploy failed: {}", r.text);
+    let errors = r.body["sync_errors"].as_array().cloned().unwrap_or_default();
+    assert!(!errors.is_empty(), "a failed integration delivery must be reported: {}", r.text);
+}
+
+#[tokio::test]
 async fn secure_cookie_flag_follows_the_public_url() {
     let plain = Server::start().await;
     let r = plain.call(Method::POST, "/api/auth/register", None, Some(json!({"email": "cookie@test.invalid", "password": "correct-horse-battery"}))).await;

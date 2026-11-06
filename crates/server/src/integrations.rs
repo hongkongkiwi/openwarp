@@ -229,7 +229,7 @@ pub async fn instabox_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Boat (boat.dev) sandbox environments ----------
-fn enc(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
+fn enc(s: &str) -> String { s.bytes().map(|b| match b { b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(), b => format!("%{:02X}", b) }).collect() }
 fn boat_env_ref(config: &Value) -> String { let e = cfg(config, "environment"); if e.is_empty() { cfg(config, "environment_id").to_string() } else { e.to_string() } }
 fn dotenv_map(text: &str) -> std::collections::HashMap<String, String> {
     text.lines().filter_map(|line| { let l = line.trim(); if l.is_empty() || l.starts_with('#') { return None; } let (k, v) = l.split_once('=')?; Some((k.trim().to_string(), v.trim().trim_matches('"').trim_matches('\'').to_string())) }).collect() }
@@ -572,6 +572,12 @@ mod tests {
         let secrets = vec![("API_KEY".to_string(), "v".to_string())];
         let error = instabox_sync(&config, &secrets, &[]).await.expect_err("missing hosts");
         assert!(error.contains("allow_all_hosts"), "{}", error);
+    }
+
+    #[test]
+    fn boat_query_encoder_uses_utf8_bytes() {
+        assert_eq!(enc("équipe"), "%C3%A9quipe");
+        assert_eq!(enc("a b/c"), "a%20b%2Fc");
     }
 
     #[tokio::test]

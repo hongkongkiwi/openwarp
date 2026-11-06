@@ -281,7 +281,7 @@ async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     let key = st.env_key(&eid)?; let mut count = 0;
     for s in &inputs { if s.key.trim().is_empty() { continue; } upsert_secret(&st, &eid, &key, &uid, s)?; count += 1; }
     st.audit(&org, &app, &eid, &uid, "secret.deploy", &format!("{} secrets", count));
-    trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"deployed": count}))) }
+    let sync_errors = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"deployed": count, "sync_errors": sync_errors}))) }
 fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> Result<(), (StatusCode, Json<Value>)> {
     let kname = s.key.trim().to_uppercase(); let khash = oc::hash_token(&format!("{}:{}", s.path, kname));
     let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).map_err(|e| bad(&e))?;
@@ -374,10 +374,16 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     if db::s(&row, "kind") == "boat" { let msg = integrations::boat_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     if db::s(&row, "kind") == "daytona" { let msg = integrations::daytona_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Ok(j(json!({"ok": true, "detail": format!("kind {} is configured; use Sync to verify against the live service", db::s(&row, "kind"))}))) }
-async fn trigger_sync(st: &S, eid: &str, uid: &str) {
+async fn trigger_sync(st: &S, eid: &str, uid: &str) -> Vec<String> {
+    let mut errors = Vec::new();
     if let Ok(rows) = st.db.query("SELECT id FROM integrations WHERE env_id=?", &[json!(eid)]) {
-        for r in &rows { let _ = sync_one(st, &db::s(r, "id"), uid).await; }
+        for r in &rows { let iid = db::s(r, "id");
+            if let Err((_, Json(v))) = sync_one(st, &iid, uid).await {
+                let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("integration sync failed").to_string();
+                if let Ok((org, app)) = st.env_org_app(eid) { st.audit(&org, &app, eid, uid, "integration.sync_failed", &format!("{}: {}", iid, msg)); }
+                errors.push(format!("{}: {}", iid, msg)); } }
     }
+    errors
 }
 async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
@@ -671,8 +677,8 @@ async fn decide_proposal(State(st): State<S>, h: HeaderMap, Path((pid, action)):
         for it in &items { let s = SecretIn{ key: it["key"].as_str().unwrap_or("").into(), value: it["value"].as_str().unwrap_or("").into(), path: it["path"].as_str().unwrap_or("/").into(), comment: it["comment"].as_str().unwrap_or("").into(), tags: it["tags"].as_str().unwrap_or("").into(), secret_type: it["type"].as_str().unwrap_or("secret").into() };
             if !s.key.is_empty() { upsert_secret(&st, &eid, &key, &uid, &s)?; count += 1; } }
         st.db.exec("UPDATE proposals SET status='approved',decided_by=? WHERE id=?", &[json!(uid), json!(pid)]).map_err(|e| bad(&e))?;
-        st.audit(&org,&app,&eid,&uid,"proposal.approve",&format!("{} applied {} secrets",pid,count)); trigger_sync(&st,&eid,&uid).await;
-        Ok(j(json!({"status":"approved","applied":count})))
+        st.audit(&org,&app,&eid,&uid,"proposal.approve",&format!("{} applied {} secrets",pid,count)); let sync_errors = trigger_sync(&st,&eid,&uid).await;
+        Ok(j(json!({"status":"approved","applied":count,"sync_errors":sync_errors})))
     } else if action == "reject" {
         st.db.exec("UPDATE proposals SET status='rejected',decided_by=? WHERE id=?", &[json!(uid), json!(pid)]).map_err(|e| bad(&e))?;
         st.audit(&org,&app,&eid,&uid,"proposal.reject",&pid); Ok(j(json!({"status":"rejected"})))

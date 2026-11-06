@@ -94,7 +94,13 @@ fn main() {
     let saved_host = cfg["host"].as_str().map(|s| s.to_string());
     if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
         match refresh_lock() {
-            Some(lock) => { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } let _ = std::fs::remove_file(lock); }
+            Some(lock) => {
+                let fresh = load_config();
+                if token_expired(&fresh) {
+                    if let Some((at, rt)) = refresh_tokens(&client, &host, &fresh) { let mut c = fresh.clone(); c["access_token"] = json!(at); c["refresh_token"] = json!(rt); c["obtained_at"] = json!(now_secs()); save_config(&c); cfg = c; }
+                } else { cfg = fresh; }
+                let _ = std::fs::remove_file(lock);
+            }
             None => { std::thread::sleep(std::time::Duration::from_millis(300)); if let Ok(s) = std::fs::read_to_string(config_path()) { if let Ok(v) = serde_json::from_str::<Value>(&s) { cfg = v; } } }
         }
     }
