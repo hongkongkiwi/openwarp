@@ -43,10 +43,12 @@ Each kind takes `token` plus target ids in `config`, e.g.
 ## End-to-end encryption mode
 
 SSE mode is the default (server decrypts for sync/CLI, ciphertext at rest).
-True E2E envs (`POST /api/apps/:id/envs/e2e`) are also implemented: the env
-key is generated client-side of the trust boundary, wrapped to each member's
-X25519 public key (`env_keys` table), and the server only stores ciphertext
-it cannot decrypt. Grant access with `POST /api/envs/:id/e2e/grant` where the
+True E2E envs (`POST /api/apps/:id/envs/e2e`) are also implemented: the CLI
+generates the env key locally and sends only the wrapped form (`wrapped_key`,
+wrapped to the creator's X25519 public key), so the server never sees the
+key. It stores only ciphertext it cannot decrypt. Clients that omit
+`wrapped_key` get a server-generated key instead and the response carries
+`server_generated: true`, which is a compatibility path, not E2E. Grant access with `POST /api/envs/:id/e2e/grant` where the
 *wrapped key is produced by the grantor's client*, never by the server.
 
 - CLI: `openwarp e2e-create|e2e-put|e2e-get|e2e-grant` (keys from `OPENWARP_PRIVKEY`, your recovery kit).
@@ -133,3 +135,54 @@ live in `~/.openwarp/config.json` (0600). Commands include `whoami`,
 `logout`, `init`, `orgs/apps/envs`, `secrets`, `get`, `set`, `delete`,
 `export --format dotenv|json|yaml|shell`, `import`, `run`,
 `e2e-create/put/get/grant`, and `completion bash|zsh|fish|powershell`.
+
+## Instabox org Secrets
+
+Kind `instabox` syncs environment secrets into an Instabox organisation's
+Secrets over its REST API (`/v1/orgs/{org}/secrets`). Config: `api_key` (an
+`ibk_` key, or `token`), `org`, `delivery` (`proxy` default, or `env`),
+`hosts` (exact hostnames the Instabox proxy may substitute the value into;
+proxy delivery only), `mode` (`upsert` default, or `mirror`), `prefix`,
+`include_keys`, `exclude_keys`, `base_url` for self-hosted, and `dry_run`.
+
+Sync lists remote metadata first, imports every desired name in one atomic
+`/import` call, and in mirror mode deletes only names this integration
+previously managed, tracked in `integration_sync_state`. Dry-run performs no
+writes and reports would-create and would-replace counts. Instabox never
+returns values, so sync cannot diff by value; it reports what it sent. Names
+are validated against Instabox's `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, and
+values are checked for size and, in proxy mode, for CR or LF. Deploying an
+environment triggers the same path as other integrations.
+`POST /api/integrations/:id/test` verifies the key and org.
+
+## Hardening pass (2026-11-06)
+
+- SCIM requires `?org_id=<org>` and owner or admin rights in that org. User
+  listing returns only that org's members, user updates reject non-members,
+  group operations verify the group belongs to the org, and deactivation
+  removes that membership only.
+- OIDC binds accounts by issuer plus subject in `oidc_subjects`. A first SSO
+  login whose email already exists is refused instead of linked, closing the
+  attacker-configured-issuer takeover.
+- OAuth consent enforces TOTP when the account has it enabled, rejects
+  deactivated accounts, rate-limits password attempts, escapes every
+  parameter and serves a restrictive Content-Security-Policy.
+- OAuth access tokens are scope-checked on REST (`secrets:read` for reads,
+  `secrets:write` for mutations) and `/mcp` checks the token audience.
+- Environment-scoped service tokens are rejected over MCP for other
+  environments and cannot mint new tokens.
+- The IP allowlist covers `/api`, `/mcp` and `/scim`, not just `/api`.
+- Login and consent attempts are limited to five failures per 15 minutes per
+  IP and email. Session cookies gain `Secure` when the public URL is HTTPS.
+- Machine identities cannot hold the owner role, only owners can create
+  admin identities, and custom-role members cannot create identities.
+- MCP write tools honour `secrets:write`, `secrets:delete` and
+  `secrets:write` on rotation and leases, matching the REST checks.
+- Trigger sync fails when any target fails, and validates
+  `dev|staging|prod`.
+- New endpoints: `GET /api/orgs/:id/members`,
+  `DELETE /api/orgs/:id/members/:uid`, `PATCH|DELETE /api/apps/:id`,
+  `PATCH /api/envs/:id`.
+- `OPENWARP_ENV=production` refuses to start without `OPENWARP_MASTER_KEY`.
+- Committed HTTP integration suite in `crates/server/tests/security.rs` and
+  CI in `.github/workflows/ci.yml`.

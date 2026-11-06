@@ -25,7 +25,10 @@ registration offline: it is your X25519 private key.
 ## Hosting
 
 Docker is the supported self-host path (`docker compose up --build`:
-server + Postgres + Redis). Cloudflare Workers cannot run this server
+server + Postgres + Redis). Set `OPENWARP_MASTER_KEY` (32 random bytes,
+base64) and `OPENWARP_ENV=production` for anything real: production refuses
+to start without an external master key, while development generates one and
+stores it in the database with a warning. Cloudflare Workers cannot run this server
 as-is (it needs OS sockets, threads and a local DB driver; Workers is a
 wasm isolate runtime), so a Worker port would be a separate rewrite of
 the storage and HTTP layers around the portable `openwarp-crypto` crate.
@@ -33,12 +36,17 @@ the storage and HTTP layers around the portable `openwarp-crypto` crate.
 ## CLI
 
 ```bash
-openwarp login            # browser OAuth (PKCE), or: login --token <TOKEN>, or machine login with --client-id/--client-secret
+openwarp login            # browser OAuth (PKCE, ephemeral loopback port), or: login --token <TOKEN>, or machine login with --client-id/--client-secret
+openwarp init --app <APP_ID> --env <ENV_ID>   # writes .openwarp.json; later commands read it
 openwarp secrets --env <ENV_ID>          # redacted list
 openwarp secrets --env <ENV_ID> --show
 openwarp export  --env <ENV_ID>
 openwarp import  --env <ENV_ID> .env
 openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
+```
+
+Access tokens are refreshed automatically from the saved refresh token when
+one exists; `init` defaults remove the need to pass `--env` on every call.
 ```
 
 ## Security model
@@ -57,13 +65,26 @@ openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
 - True E2E environments are available alongside SSE: in E2E envs the server
   stores only ciphertext and wrapped env keys it cannot decrypt; the CLI and
   the browser console (pure-JS X25519/XChaCha20-Poly1305) decrypt locally.
-- OIDC SSO (authorization-code flow, JWKS-verified) and SCIM provisioning
-  (users + groups) are wired per organisation.
-- TOTP MFA with recovery codes, enforced IP allowlists, custom RBAC roles,
-  env-scoped service tokens, machine identities (Universal Auth), approval
-  workflows, log streams, a rotation scheduler, dynamic Postgres leases and
-  a basic PKI round out the Phase + Infisical takeaways. CLI parity is a
-  separate later effort; the current CLI covers run/inject and E2E.
+- OIDC SSO (authorization-code flow, JWKS-verified) identifies users by
+  issuer plus subject, never by email: a first-time SSO login that matches an
+  existing account is refused instead of linked, so an organisation cannot
+  take over an account by configuring its own issuer. SCIM users and groups
+  require `org_id` and admin rights in that organisation, and deactivation
+  removes that organisation's membership only.
+- TOTP MFA with recovery codes (also enforced on the OAuth consent flow),
+  enforced IP allowlists covering `/api`, `/mcp` and `/scim`, login rate
+  limiting, custom RBAC roles, env-scoped service tokens that cannot escape
+  their environment (including over MCP) or mint wider tokens, machine
+  identities (Universal Auth), approval workflows, log streams, a rotation
+  scheduler, dynamic Postgres leases and a basic PKI round out the Phase +
+  Infisical takeaways.
+- OAuth access tokens are scope-checked on every REST call (`secrets:read`
+  for reads, `secrets:write` for mutations) and `/mcp` validates the token
+  audience. The authorize page escapes all parameters and sets a
+  restrictive Content-Security-Policy.
+- `OPENWARP_ENV=production` refuses to start without `OPENWARP_MASTER_KEY`;
+  development still generates one and stores it in the database, with a
+  warning.
 - Get an external crypto review before production use.
 
 ## Features (all unlocked)
@@ -73,6 +94,11 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full matrix and API reference.
 ## Development
 
 ```bash
-cargo test --workspace     # crypto + DB tests
-cargo clippy --workspace -- -D warnings
+cargo test --workspace     # crypto, DB and HTTP integration tests
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+`crates/server/tests/security.rs` spawns the real server on a private SQLite
+file and covers tenant isolation, SCIM scoping, OAuth scope and audience,
+MFA on consent, token scoping, IP allowlists, HTML escaping, member
+management and rate limiting. CI runs it on every push and pull request.

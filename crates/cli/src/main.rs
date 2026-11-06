@@ -15,18 +15,18 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Init { #[arg(long)] app: String, #[arg(long)] env: String },
     Orgs,
     Apps { #[arg(long)] org: String },
-    Envs { #[arg(long)] app: String },
-    Secrets { #[arg(long)] env: String, #[arg(long)] show: bool },
-    Get { #[arg(long)] env: String, key: String },
-    Set { #[arg(long)] env: String, key: String, value: String },
-    Delete { #[arg(long)] env: String, key: String },
-    Export { #[arg(long)] env: String, #[arg(long, default_value = "dotenv")] format: String },
-    Import { #[arg(long)] env: String, file: String },
-    Run { #[arg(long)] env: String, #[arg(last = true)] command: Vec<String> },
-    E2eCreate { #[arg(long)] app: String, #[arg(long)] name: String },
-    E2ePut { #[arg(long)] env: String, #[arg(long)] key: String, #[arg(long)] value: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
-    E2eGet { #[arg(long)] env: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
-    E2eGrant { #[arg(long)] env: String, #[arg(long)] email: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
+    Envs { #[arg(long, default_value = "")] app: String },
+    Secrets { #[arg(long, default_value = "")] env: String, #[arg(long)] show: bool },
+    Get { #[arg(long, default_value = "")] env: String, key: String },
+    Set { #[arg(long, default_value = "")] env: String, key: String, value: String },
+    Delete { #[arg(long, default_value = "")] env: String, key: String },
+    Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String },
+    Import { #[arg(long, default_value = "")] env: String, file: String },
+    Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
+    E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
+    E2ePut { #[arg(long, default_value = "")] env: String, #[arg(long)] key: String, #[arg(long)] value: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
+    E2eGet { #[arg(long, default_value = "")] env: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
+    E2eGrant { #[arg(long, default_value = "")] env: String, #[arg(long)] email: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     /// Print shell completions: openwarp completion bash|zsh|fish
     Completion { shell: String },
 }
@@ -37,6 +37,20 @@ fn save_config(v: &Value) { let p = config_path(); if let Some(parent) = p.paren
     std::fs::write(&p, serde_json::to_string_pretty(v).unwrap()).expect("write config");
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)); } }
 fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
+fn load_local_config() -> Value { std::fs::read_to_string(".openwarp.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
+fn pick(explicit: &str, local: &Value, key: &str, flag: &str) -> String {
+    if !explicit.is_empty() { return explicit.to_string(); }
+    if let Some(v) = local[key].as_str() { if !v.is_empty() { return v.to_string(); } }
+    eprintln!("no value for {}: pass the flag or run openwarp init --app <APP_ID> --env <ENV_ID>", flag);
+    std::process::exit(2) }
+fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+fn token_expired(cfg: &Value) -> bool {
+    let at = cfg["obtained_at"].as_i64().unwrap_or(0);
+    at > 0 && now_secs() - at > 3000 && cfg["refresh_token"].as_str().map(|s| !s.is_empty()).unwrap_or(false) }
+fn refresh_tokens(client: &reqwest::blocking::Client, host: &str, cfg: &Value) -> Option<(String, String)> {
+    let rt = cfg["refresh_token"].as_str()?; let cid = cfg["client_id"].as_str()?;
+    let d: Value = client.post(format!("{}/oauth/token", host)).form(&[("grant_type", "refresh_token"), ("refresh_token", rt), ("client_id", cid)]).send().ok()?.json().ok()?;
+    Some((d["access_token"].as_str()?.to_string(), d["refresh_token"].as_str().unwrap_or(rt).to_string())) }
 
 fn e2e_env_key(client: &reqwest::blocking::Client, host: &str, token: &str, env: &str, privkey: &str) -> ([u8;32], openwarp_crypto::Keypair) {
     let kp = openwarp_crypto::Keypair::from_secret_b64(privkey).expect("bad privkey (recovery kit)");
@@ -48,27 +62,32 @@ fn e2e_env_key(client: &reqwest::blocking::Client, host: &str, token: &str, env:
 
 fn main() {
     let cli = Cli::parse();
-    let cfg = load_config();
-    let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
-    let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
+    let local = load_local_config();
+    let mut cfg = load_config();
+    let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
+    if token_expired(&cfg) { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } }
+    let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
     match &cli.cmd {
         Cmd::Login { token: t, client_id, client_secret } => {
-            if let Some(tok) = t { let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(tok); save_config(&c); println!("Token saved to {}", config_path().display()); return; }
+            if let Some(tok) = t { let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(tok); c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Token saved to {}", config_path().display()); return; }
             if let (Some(cid), Some(sec)) = (client_id, client_secret) {
                 let d: Value = client.post(format!("{}/api/v1/machine/auth/universal/login", host)).json(&json!({"client_id": cid, "client_secret": sec})).send().expect("req").json().expect("json");
                 let at = d["accessToken"].as_str().unwrap_or_else(|| panic!("machine login failed: {}", d));
-                let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); save_config(&c); println!("Machine login OK (token expires in {}s)", d["expiresIn"]); return; }
-            // Browser OAuth 2.1 with PKCE, loopback redirect
-            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":["http://127.0.0.1:8917/callback"],"token_endpoint_auth_method":"none","scope":"secrets:read secrets:write mcp"})).send().expect("req").json().expect("json");
+                let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Machine login OK (token expires in {}s)", d["expiresIn"]); return; }
+            // Browser OAuth 2.1 with PKCE, loopback redirect on an ephemeral port
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port for the OAuth redirect");
+            let port = listener.local_addr().expect("loopback address").port();
+            let redirect = format!("http://127.0.0.1:{}/callback", port);
+            let encoded = redirect.replace(':', "%3A").replace('/', "%2F");
+            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":"secrets:read secrets:write mcp"})).send().expect("req").json().expect("json");
             let cid = reg["client_id"].as_str().expect("client_id").to_string();
             let verifier = openwarp_crypto::random_token("verifier");
             let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
             let state = openwarp_crypto::random_token("state");
-            let url = format!("{}/oauth/authorize?response_type=code&client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8917%2Fcallback&scope=secrets%3Aread%20secrets%3Awrite%20mcp&state={}&code_challenge={}&code_challenge_method=S256&resource={}%2Fmcp", host, cid, state, challenge, host);
-            let listener = std::net::TcpListener::bind("127.0.0.1:8917").expect("bind loopback (close any other openwarp login waiting on this port)");
+            let url = format!("{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope=secrets%3Aread%20secrets%3Awrite%20mcp&state={}&code_challenge={}&code_challenge_method=S256&resource={}%2Fmcp", host, cid, encoded, state, challenge, host);
             println!("Open this URL to sign in and approve:\n{}", url);
             let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(&url).status();
             let (mut stream, _) = listener.accept().expect("callback");
@@ -82,10 +101,10 @@ fn main() {
             let params: std::collections::HashMap<String, String> = query.split('?').nth(1).unwrap_or("").split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
             if params.get("state").map(|s| s.as_str()) != Some(&state) { panic!("OAuth state mismatch"); }
             let code = params.get("code").expect("no code in callback").clone();
-            let form = [("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", "http://127.0.0.1:8917/callback"), ("client_id", &cid), ("code_verifier", &verifier)];
+            let form = [("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", redirect.as_str()), ("client_id", &cid), ("code_verifier", &verifier)];
             let tok: Value = client.post(format!("{}/oauth/token", host)).form(&form).send().expect("req").json().expect("json");
             let at = tok["access_token"].as_str().unwrap_or_else(|| panic!("token exchange failed: {}", tok));
-            let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["refresh_token"] = tok["refresh_token"].clone(); c["client_id"] = json!(cid); save_config(&c);
+            let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["refresh_token"] = tok["refresh_token"].clone(); c["client_id"] = json!(cid); c["obtained_at"] = json!(now_secs()); save_config(&c);
             println!("Logged in. Credentials saved to {}", config_path().display());
         }
         Cmd::Logout => { let _ = client.post(format!("{}/api/auth/logout", host)).bearer_auth(&token).send(); let mut c = cfg.clone(); c["access_token"] = Value::Null; c["refresh_token"] = Value::Null; save_config(&c); println!("Logged out"); }
@@ -93,38 +112,42 @@ fn main() {
         Cmd::Init { app, env } => { std::fs::write(".openwarp.json", serde_json::to_string_pretty(&json!({"host": host, "app_id": app, "env_id": env})).unwrap()).expect("write .openwarp.json"); println!("Wrote .openwarp.json"); }
         Cmd::Orgs => { println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/orgs", host))).unwrap()); }
         Cmd::Apps { org } => { println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/orgs/{}/apps", host, org))).unwrap()); }
-        Cmd::Envs { app } => { println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/apps/{}/envs", host, app))).unwrap()); }
-        Cmd::Secrets { env, show } => { let d = get(&format!("{}/api/envs/{}/secrets", host, env));
+        Cmd::Envs { app } => { let app = pick(app, &local, "app_id", "--app"); println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/apps/{}/envs", host, app))).unwrap()); }
+        Cmd::Secrets { env, show } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
             for s in d["secrets"].as_array().cloned().unwrap_or_default() { println!("{}={}", s["key"].as_str().unwrap_or(""), if *show { s["value"].as_str().unwrap_or("") } else { "[REDACTED]" }); } }
-        Cmd::Get { env, key } => { let d = get(&format!("{}/api/envs/{}/secrets", host, env));
+        Cmd::Get { env, key } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
             match d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))) { Some(s) => println!("{}", s["value"].as_str().unwrap_or("")), None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
-        Cmd::Set { env, key, value } => { let d: Value = client.put(format!("{}/api/envs/{}/secrets", host, env)).bearer_auth(&token).json(&json!({"secrets": [{"key": key, "value": value}]})).send().expect("req").json().expect("json"); let _ = &post;
+        Cmd::Set { env, key, value } => { let env = pick(env, &local, "env_id", "--env"); let d: Value = client.put(format!("{}/api/envs/{}/secrets", host, env)).bearer_auth(&token).json(&json!({"secrets": [{"key": key, "value": value}]})).send().expect("req").json().expect("json"); let _ = &post;
             println!("{}", if d.get("deployed").is_some() { format!("Set {} (deployed {})", key.to_uppercase(), d["deployed"]) } else { d.to_string() }); }
-        Cmd::Delete { env, key } => { let d = get(&format!("{}/api/envs/{}/secrets", host, env));
+        Cmd::Delete { env, key } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
             let sid = d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))).and_then(|s| s["id"].as_str().map(|x| x.to_string()));
             match sid { Some(id) => { let r: Value = client.delete(format!("{}/api/secrets/{}", host, id)).bearer_auth(&token).send().expect("req").json().expect("json"); println!("{}", r); } None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
-        Cmd::Export { env, format } => { let d = get(&format!("{}/api/envs/{}/export", host, env));
+        Cmd::Export { env, format } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/export", host, env));
             match format.as_str() {
                 "json" => println!("{}", serde_json::to_string_pretty(&d["secrets"]).unwrap()),
                 "yaml" => { for s in d["secrets"].as_array().cloned().unwrap_or_default() { println!("{}: {:?}", s["key"].as_str().unwrap_or(""), s["value"].as_str().unwrap_or("")); } }
                 "shell" => { for line in d["text"].as_str().unwrap_or("").lines() { if let Some((k, v)) = line.split_once('=') { println!("export {}='{}'", k, v.replace('\'', "'\\''")); } } }
                 _ => println!("{}", d["text"].as_str().unwrap_or("")), } }
-        Cmd::Import { env, file } => { let text = std::fs::read_to_string(file).expect("read file");
+        Cmd::Import { env, file } => { let env = pick(env, &local, "env_id", "--env"); let text = std::fs::read_to_string(file).expect("read file");
             let d: Value = client.post(format!("{}/api/envs/{}/import", host, env)).bearer_auth(&token).json(&json!({"text": text})).send().expect("request").json().expect("json"); println!("{}", d); }
-        Cmd::Run { env, command } => { if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
+        Cmd::Run { env, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
             let d = get(&format!("{}/api/envs/{}/export", host, env));
             let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]);
             for line in d["text"].as_str().unwrap_or("").lines() { if let Some((k, v)) = line.split_once('=') { cmd.env(k, v); } }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
-        Cmd::E2eCreate { app, name } => { let d: Value = client.post(format!("{}/api/apps/{}/envs/e2e", host, app)).bearer_auth(&token).json(&json!({"name": name})).send().expect("req").json().expect("json"); println!("{}", d); }
-        Cmd::E2ePut { env, key, value, privkey } => { let (ek, _) = e2e_env_key(&client, &host, &token, env, privkey);
+        Cmd::E2eCreate { app, name } => { let app = pick(app, &local, "app_id", "--app");
+            let me = get(&format!("{}/api/me", host));
+            let env_key = openwarp_crypto::random_key();
+            let wrapped = openwarp_crypto::encrypt_to(me["pubkey"].as_str().expect("public key"), &env_key).expect("wrap env key");
+            let d: Value = client.post(format!("{}/api/apps/{}/envs/e2e", host, app)).bearer_auth(&token).json(&json!({"name": name, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
+        Cmd::E2ePut { env, key, value, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let kname = key.to_uppercase(); let khash = openwarp_crypto::hash_token(&format!("/:{}", kname));
             let payload = json!({"secrets": [{"key_enc": openwarp_crypto::encrypt_symmetric(&ek, kname.as_bytes()), "value_enc": openwarp_crypto::encrypt_symmetric(&ek, value.as_bytes()), "key_hash": khash, "path": "/"}]});
             let d: Value = client.put(format!("{}/api/envs/{}/e2e/secrets", host, env)).bearer_auth(&token).json(&payload).send().expect("req").json().expect("json"); println!("{}", d); }
-        Cmd::E2eGet { env, privkey } => { let (ek, _) = e2e_env_key(&client, &host, &token, env, privkey);
+        Cmd::E2eGet { env, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let d = get(&format!("{}/api/envs/{}/e2e/secrets", host, env));
             for s in d["secrets"].as_array().cloned().unwrap_or_default() { let k = openwarp_crypto::decrypt_symmetric(&ek, s["key_enc"].as_str().unwrap_or("")).unwrap(); let v = openwarp_crypto::decrypt_symmetric(&ek, s["value_enc"].as_str().unwrap_or("")).unwrap(); println!("{}={}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v)); } }
-        Cmd::E2eGrant { env, email, privkey } => { let (ek, _) = e2e_env_key(&client, &host, &token, env, privkey);
+        Cmd::E2eGrant { env, email, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let u = get(&format!("{}/api/users/lookup?email={}", host, email));
             let wrapped = openwarp_crypto::encrypt_to(u["pubkey"].as_str().expect("grantee pubkey"), &ek).expect("wrap");
             let d: Value = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }

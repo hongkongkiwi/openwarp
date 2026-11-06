@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use hmac::{Hmac, Mac};
 type HmacSha256 = Hmac<Sha256>;
 
-pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook"];
+pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox"];
 
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
@@ -63,6 +63,7 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
             let mut spec: Value = client.get(format!("{}/v2/apps/{}", base(config,"https://api.digitalocean.com"), app_id)).bearer_auth(cfg(config,"token")).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
             if let Some(svcs) = spec.get_mut("spec").and_then(|s| s.get_mut("services")).and_then(|v| v.as_array_mut()) { for svc in svcs.iter_mut() { let mut envs: Vec<Value> = secrets.iter().map(|(k,v)| json!({"key":k,"value":v,"scope":"RUN_AND_BUILD_TIME","type":"SECRET"})).collect(); if let Some(existing) = svc.get_mut("envs").and_then(|e| e.as_array_mut()) { existing.append(&mut envs); } else { svc["envs"] = json!(envs); } } }
             req(client.put(format!("{}/v2/apps/{}", base(config,"https://api.digitalocean.com"), app_id)).bearer_auth(cfg(config,"token")).json(&json!({"spec": spec["spec"]}))).await?; Ok("pushed to DigitalOcean App Platform".into()) }
+        "instabox" => instabox_sync(config, secrets, &[]).await.map(|(report, _)| report),
         "aws_secrets_manager" | "aws_parameter_store" => aws_sync(config, secrets, kind).await,
         _ => Err(format!("unknown integration kind: {}", kind)),
     }
@@ -91,6 +92,7 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
     let desired = trigger_desired(config, secrets);
     let targets = trigger_targets(config);
     if targets.iter().any(|x| x.project_ref.is_empty() || x.token.is_empty()) { return Err("trigger requires token and project_ref (per target or global)".into()); }
+    if let Some(bad) = targets.iter().find(|t| !matches!(t.env.as_str(), "dev" | "staging" | "prod")) { return Err(format!("trigger env must be dev, staging or prod (got {:?})", bad.env)); }
     let mut managed: Vec<String> = Vec::new(); let mut reports: Vec<String> = Vec::new(); let mut failures = 0;
     for tg in &targets {
         let root = format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env);
@@ -110,7 +112,7 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
         for (n, _) in &desired { if !managed.contains(n) { managed.push(n.clone()); } }
         reports.push(format!("{}/{}: created={} updated={} unchanged={} deleted={}{}", tg.project_ref, tg.env, created, updated, unchanged, deleted, if dry { " (dry-run)" } else { "" }));
     }
-    if failures > 0 && failures == targets.len() { return Err(reports.join("; ")); }
+    if failures > 0 { return Err(reports.join("; ")); }
     let mut note = String::new();
     if config.get("mark_secret").and_then(|v| v.as_bool()).unwrap_or(false) { note = " NOTE: Trigger REST create/import schema documents name/value only, so secret marking could not be applied via API; mark these in the Trigger dashboard if needed.".to_string(); }
     Ok((format!("Trigger.dev sync{}: {}{}", if dry { " (dry-run)" } else { "" }, reports.join("; "), note), managed))
@@ -121,6 +123,91 @@ pub async fn trigger_test(config: &Value) -> Result<String, String> {
     let text = req(client.get(format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env)).bearer_auth(&tg.token)).await?;
     let count = serde_json::from_str::<Vec<Value>>(&text).map(|v| v.len()).unwrap_or(0);
     Ok(format!("Trigger connection OK: project {} env {} currently has {} variables", tg.project_ref, tg.env, count))
+}
+
+fn instabox_config(config: &Value) -> Result<(String, String, reqwest::Url), String> {
+    let key = if cfg(config, "api_key").trim().is_empty() { cfg(config, "token") } else { cfg(config, "api_key") }.trim();
+    let key = key.strip_prefix("Bearer ").or_else(|| key.strip_prefix("bearer ")).unwrap_or(key).trim();
+    let org = cfg(config, "org").trim();
+    if key.is_empty() || org.is_empty() { return Err("Instabox requires api_key (or token) and org".into()); }
+    let mut url = reqwest::Url::parse(&base(config, "https://api.instabox.sh")).map_err(|e| format!("Instabox invalid base_url: {}", e))?;
+    url.path_segments_mut().map_err(|_| "Instabox base_url cannot be a base URL".to_string())?
+        .pop_if_empty().extend(["v1", "orgs", org, "secrets"]);
+    Ok((key.to_string(), org.to_string(), url))
+}
+
+async fn instabox_list(client: &reqwest::Client, root: &reqwest::Url, key: &str) -> Result<Vec<String>, String> {
+    let text = req(client.get(root.clone()).header("X-API-Key", key)).await.map_err(|e| format!("Instabox list failed: {}", e))?;
+    let response: Value = serde_json::from_str(&text).map_err(|e| format!("Instabox invalid list response: {}", e))?;
+    let items = response.get("items").and_then(Value::as_array).ok_or("Instabox invalid list response: missing items array")?;
+    items.iter().map(|item| item.get("name").and_then(Value::as_str).map(str::to_string)
+        .ok_or_else(|| "Instabox invalid list response: missing secret name".to_string())).collect()
+}
+
+pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (key, org, root) = instabox_config(config)?;
+    let delivery = match cfg(config, "delivery") { "" => "proxy", value => value };
+    if delivery != "proxy" && delivery != "env" { return Err("Instabox delivery must be proxy or env".into()); }
+    let hosts: Vec<String> = match config.get("hosts") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items.iter().map(|v| v.as_str().map(str::to_string).ok_or("Instabox hosts must be an array of strings".to_string())).collect::<Result<_, _>>()?,
+        Some(_) => return Err("Instabox hosts must be an array of strings".into()),
+    };
+    if delivery == "env" && !hosts.is_empty() { return Err("Instabox env delivery requires empty hosts".into()); }
+    let mode = match cfg(config, "mode") { "" => "upsert", value => value };
+    if mode != "upsert" && mode != "mirror" { return Err("Instabox mode must be upsert or mirror".into()); }
+    let dry = config.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+    let desired = trigger_desired(config, secrets);
+    let invalid: Vec<&str> = desired.iter().filter_map(|(name, _)| {
+        let bytes = name.as_bytes();
+        if bytes.len() > 128 || bytes.first().is_none_or(|b| !b.is_ascii_alphabetic() && *b != b'_') ||
+            bytes.iter().skip(1).any(|b| !b.is_ascii_alphanumeric() && *b != b'_') { Some(name.as_str()) } else { None }
+    }).collect();
+    if !invalid.is_empty() { return Err(format!("Instabox invalid secret names: {}", invalid.join(", "))); }
+    let invalid_values: Vec<&str> = desired.iter().filter_map(|(name, value)| {
+        if value.len() > 65536 || value.contains('\0') || (delivery == "proxy" && (value.contains('\r') || value.contains('\n'))) { Some(name.as_str()) } else { None }
+    }).collect();
+    if !invalid_values.is_empty() { return Err(format!("Instabox invalid secret values: {}", invalid_values.join(", "))); }
+    let values = map_json(&desired);
+    let managed: Vec<String> = values.as_object().unwrap().keys().cloned().collect();
+    let client = reqwest::Client::new();
+    let remote = instabox_list(&client, &root, &key).await?;
+    let created = managed.iter().filter(|name| !remote.contains(name)).count();
+    let replaced = managed.len() - created;
+    let mut deleted = 0;
+    if !dry {
+        let mut import = root.clone();
+        import.path_segments_mut().map_err(|_| "Instabox invalid secrets URL".to_string())?.push("import");
+        req(client.post(import).header("X-API-Key", &key).json(&json!({"values": values, "delivery": delivery, "hosts": hosts}))).await
+            .map_err(|e| format!("Instabox import failed: {}", e))?;
+        if mode == "mirror" {
+            let mut failures = Vec::new();
+            let mut attempted = std::collections::HashSet::new();
+            for name in previous_managed {
+                if !managed.contains(name) && remote.contains(name) && attempted.insert(name) {
+                    let mut url = root.clone();
+                    url.path_segments_mut().map_err(|_| "Instabox invalid secrets URL".to_string())?.push(name);
+                    match req(client.delete(url).header("X-API-Key", &key)).await {
+                        Ok(_) => deleted += 1,
+                        Err(e) => failures.push(format!("{}: {}", name, e)),
+                    }
+                }
+            }
+            if !failures.is_empty() { return Err(format!("Instabox delete failed after importing {} and deleting {}: {}", managed.len(), deleted, failures.join("; "))); }
+        }
+    }
+    let report = if dry {
+        format!("Instabox sync (dry-run): org {} delivery={} mode={} count={} would-create={} would-replace={}", org, delivery, mode, managed.len(), created, replaced)
+    } else {
+        format!("Instabox sync: org {} delivery={} mode={} imported={} deleted={}", org, delivery, mode, managed.len(), deleted)
+    };
+    Ok((report, managed))
+}
+
+pub async fn instabox_test(config: &Value) -> Result<String, String> {
+    let (key, org, root) = instabox_config(config)?;
+    let remote = instabox_list(&reqwest::Client::new(), &root, &key).await?;
+    Ok(format!("Instabox connection OK: org {} currently has {} Secrets", org, remote.len()))
 }
 
 async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
@@ -183,3 +270,87 @@ fn chrono_now() -> String {
     format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, mo, d, h, mi, s)
 }
 fn civil(z: i64) -> (i64, u32, u32) { let z = z + 719468; let era = z.div_euclid(146097); let doe = z.rem_euclid(146097); let yoe = (doe - doe/1460 + doe/36524 - doe/146096)/365; let y = yoe + era*400; let doy = doe - (365*yoe + yoe/4 - yoe/100); let mp = (5*doy + 2)/153; let d = (doy - (153*mp+2)/5 + 1) as u32; let m = if mp < 10 { mp+3 } else { mp-9 } as u32; (if m <= 2 { y+1 } else { y }, m, d) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    fn header_end(buf: &[u8]) -> Option<usize> { buf.windows(4).position(|w| w == b"\r\n\r\n") }
+    fn content_length(head: &str) -> usize { head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse().ok() } else { None } }).unwrap_or(0) }
+
+    fn start_mock() -> (String, Calls) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
+        let addr = listener.local_addr().expect("mock addr");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+                let mut buf = Vec::new(); let mut chunk = [0u8; 4096];
+                loop {
+                    let read = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                    buf.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = header_end(&buf) {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        if buf.len() >= end + 4 + content_length(&head) { break; }
+                    }
+                }
+                let end = header_end(&buf).unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                let request = head.lines().next().unwrap_or("").to_string();
+                let mut parts = request.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let len = content_length(&head);
+                let body = String::from_utf8_lossy(&buf[end + 4..(end + 4 + len).min(buf.len())]).to_string();
+                sink.lock().unwrap().push((method.clone(), path.clone(), body));
+                let (status, payload) = if method == "GET" { ("200 OK", json!({"items": [{"name": "OLD"}]}).to_string()) }
+                    else if method == "DELETE" { ("204 No Content", String::new()) }
+                    else { ("200 OK", json!({"items": []}).to_string()) };
+                let _ = stream.write_all(format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, payload.len(), payload).as_bytes());
+            }
+        });
+        (format!("http://{}", addr), calls)
+    }
+
+    #[tokio::test]
+    async fn instabox_mirror_imports_changes_and_prunes_only_managed_names() {
+        let (base, calls) = start_mock();
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base, "hosts": ["api.example.com"], "mode": "mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string()), ("NEW_KEY".to_string(), "v2".to_string())];
+        let (report, managed) = instabox_sync(&config, &secrets, &["OLD".to_string()]).await.expect("sync");
+        assert!(report.contains("imported=2"), "{}", report);
+        assert!(managed.contains(&"API_KEY".to_string()));
+        let calls = calls.lock().unwrap();
+        let import = calls.iter().find(|(m, p, _)| m == "POST" && p.ends_with("/import")).expect("import call");
+        let body: Value = serde_json::from_str(&import.2).expect("json body");
+        assert_eq!(body["delivery"], "proxy");
+        assert_eq!(body["values"]["API_KEY"], "v1");
+        assert!(calls.iter().any(|(m, p, _)| m == "DELETE" && p.ends_with("/OLD")), "mirror should delete the previously managed name");
+        assert!(!calls.iter().any(|(m, p, _)| m == "DELETE" && p.ends_with("/NEW_KEY")), "mirror must not delete names it does not own");
+    }
+
+    #[tokio::test]
+    async fn instabox_dry_run_never_mutates() {
+        let (base, calls) = start_mock();
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base, "dry_run": true});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = instabox_sync(&config, &secrets, &[]).await.expect("dry run");
+        assert!(report.contains("dry-run"), "{}", report);
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().all(|(m, _, _)| m == "GET"), "dry run must only read: {:?}", *calls);
+    }
+
+    #[tokio::test]
+    async fn instabox_rejects_names_the_api_cannot_store() {
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1"});
+        let secrets = vec![("not-a-valid-name".to_string(), "v".to_string())];
+        let error = instabox_sync(&config, &secrets, &[]).await.expect_err("invalid name");
+        assert!(error.contains("invalid secret names"), "{}", error);
+    }
+}

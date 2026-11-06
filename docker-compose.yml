@@ -3,15 +3,36 @@ services:
     build: .
     ports: ["8080:8080"]
     environment:
-      DATABASE_URL: "postgres://openwarp:openwarp@db:5432/openwarp"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-openwarp}:${POSTGRES_PASSWORD:-openwarp}@db:5432/${POSTGRES_DB:-openwarp}"
       REDIS_URL: "redis://cache:6379"
-      # OPENWARP_MASTER_KEY: "<base64 32 bytes>"  # set in production; else persisted in DB meta table
-    depends_on: [db, cache]
-    volumes: [data:/data]
+      OPENWARP_MASTER_KEY: ${OPENWARP_MASTER_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    volumes: ["./data:/data"]
+    restart: unless-stopped
   db:
     image: postgres:17-alpine
-    environment: { POSTGRES_USER: openwarp, POSTGRES_PASSWORD: openwarp, POSTGRES_DB: openwarp }
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openwarp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openwarp}
+      POSTGRES_DB: ${POSTGRES_DB:-openwarp}
     volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
   cache:
     image: redis:7-alpine
-volumes: { data: {}, pgdata: {} }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  pgdata: {}
