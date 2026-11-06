@@ -39,6 +39,14 @@ The [`openwarp-crypto` crate](../crates/crypto/src/lib.rs) implements X25519 key
 
 Secret metadata is not uniformly encrypted. Identifiers, membership, paths, tags, timestamps, audit records, and operational state can reveal information. Treat the entire database as sensitive, including when secret values are ciphertext.
 
+## Password reuse detection
+
+When a standard `secret` value is written, the server stores a fingerprint in `secrets.value_fp`, keyed and salted with the workspace id. The fingerprint is HMAC-SHA256 under a key derived from the instance master key, not a plain hash of the value. Equal values in two workspaces do not produce equal fingerprints. A database-only compromise therefore cannot test a candidate password list against the stored fingerprints. The fingerprint is not reversible: the master key lets an attacker test guesses, not recover a value directly.
+
+The console checks a value before staging a new secret, an edit, or an import. It reports occurrences in the same workspace and only in environments the caller can already open. An environment-scoped token cannot use the check to see other environments. Sealed values are never indexed, so a match cannot confirm a sealed value the caller cannot read. `config` and `ssh_key` values are not indexed, and E2E environments are skipped because the server never sees their plaintext.
+
+Both `orgs.reuse_check` and `apps.reuse_check` default to on, and the warning requires both. Turning a switch off suppresses the warning but does not delete existing fingerprints. Existing rows are indexed by a one-time backfill at startup; new writes are indexed inline. The check is advisory, so an authorised caller can save the value anyway. Do not treat a missing warning as proof that a value is unique.
+
 ## Identity and authentication
 
 - Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag.
