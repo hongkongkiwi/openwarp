@@ -131,9 +131,10 @@ Naming is off by default and applies to every adapter. It renames a key on the w
 | --- | --- |
 | `prefix` | Prepended to every selected key; accepts `{{environment}}` |
 | `suffix` | Appended to every selected key; accepts `{{environment}}` |
+| `case` | `upper` or `lower`; rewrites the source key before prefix, suffix or template substitution. Defaults to preserving case |
 | `name_template` | Replaces prefix and suffix when set. Must contain `{{secretKey}}` exactly once, and may use `{{environment}}` |
 
-For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
+For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. For Terraform-style names, `"prefix": "TF_VAR_", "case": "upper"` writes `db_host` as `TF_VAR_DB_HOST`; `case` applies to the key only, so the prefix keeps its spelling. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
 
 The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) also share these options:
 

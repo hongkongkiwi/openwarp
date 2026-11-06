@@ -256,12 +256,17 @@ pub fn trigger_targets(config: &Value) -> Vec<TriggerTarget> {
 }
 // Prefix and suffix wrap the key; name_template replaces both with a
 // {{secretKey}}/{{environment}} pattern (Infisical calls this a key schema).
+// `case` rewrites the source key first, so affixes keep their spelling.
 fn env_subst(value: &str, environment: &str) -> String { value.replace("{{environment}}", environment) }
+fn cased_key(config: &Value, key: &str) -> String {
+    match cfg(config, "case") { "upper" => key.to_uppercase(), "lower" => key.to_lowercase(), _ => key.to_string() }
+}
 pub(crate) fn desired_name(config: &Value, key: &str) -> String {
     let environment = cfg(config, "_environment");
+    let key = cased_key(config, key);
     let template = cfg(config, "name_template");
     if !template.is_empty() {
-        template.replace("{{secretKey}}", key).replace("{{environment}}", environment)
+        template.replace("{{secretKey}}", &key).replace("{{environment}}", environment)
     } else {
         format!("{}{}{}", env_subst(cfg(config, "prefix"), environment), key, env_subst(cfg(config, "suffix"), environment))
     }
@@ -287,6 +292,8 @@ pub fn local_name(config: &Value, remote: &str) -> String {
 /// A template without exactly one `{{secretKey}}` would collapse every key into
 /// one remote name, so reject it before any adapter runs.
 pub fn validate_naming(config: &Value) -> Result<(), String> {
+    let case = cfg(config, "case");
+    if !case.is_empty() && case != "upper" && case != "lower" { return Err(format!("case must be upper or lower (got {:?})", case)); }
     let template = cfg(config, "name_template");
     if template.is_empty() { return Ok(()); }
     let count = template.matches("{{secretKey}}").count();
@@ -3891,11 +3898,23 @@ mod tests {
     }
 
     #[test]
+    fn case_rewrites_the_key_before_wrapping() {
+        let terraform = json!({"prefix": "TF_VAR_", "case": "upper"});
+        assert_eq!(desired_name(&terraform, "db_host"), "TF_VAR_DB_HOST");
+        assert_eq!(desired_name(&json!({"prefix": "app_", "suffix": "_v1", "case": "lower"}), "API_KEY"), "app_api_key_v1");
+        assert_eq!(desired_name(&json!({"name_template": "{{environment}}_{{secretKey}}", "_environment": "Prod", "case": "lower"}), "API_KEY"), "Prod_api_key");
+        assert_eq!(desired_name(&json!({"case": "upper"}), "mixedCase"), "MIXEDCASE");
+        assert_eq!(local_name(&terraform, "TF_VAR_DB_HOST"), "DB_HOST");
+    }
+
+    #[test]
     fn name_template_needs_exactly_one_secret_key_placeholder() {
         assert!(validate_naming(&json!({"name_template": "{{secretKey}}"})).is_ok());
         assert!(validate_naming(&json!({})).is_ok());
         assert!(validate_naming(&json!({"name_template": "static"})).is_err());
         assert!(validate_naming(&json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
+        assert!(validate_naming(&json!({"case": "upper"})).is_ok());
+        assert!(validate_naming(&json!({"case": "title"})).is_err());
     }
 
     #[tokio::test]
