@@ -69,6 +69,12 @@ minutes is treated as abandoned and can be taken over. Long migrations are
 unaffected: the timestamp is checked only when another runner cannot acquire the
 lock.
 
+Several replicas can boot at once against one database. Ledger creation is
+idempotent and tolerates the PostgreSQL catalogue race; the loser of the lock
+exits with `another instance is applying migrations` rather than waiting. Let the
+winning instance finish and restart the other one. The migration tests include
+two simultaneous PostgreSQL runners and assert a clean final ledger.
+
 ## What boot refuses
 
 The runner verifies the whole ledger before applying anything. Boot fails, with
@@ -107,6 +113,10 @@ openwarp-migrate repair --version 18 --accept-checksum
 The URL comes from `DATABASE_URL` or `--database-url`. A missing scheme is a
 SQLite path. Exit code 0 means clean, 1 means a problem was found, and 2 means
 the arguments or the connection failed.
+
+`status`, `plan`, and `verify` open SQLite with `query_only` and refuse a missing
+file, so an inspection cannot create a database or change a ledger. `apply` may
+create a SQLite file. `repair` requires an existing ledger.
 
 Use `--set-applied` after checking that an interrupted migration really did
 finish its work. Use `--remove` when the schema is unchanged and the migration
@@ -147,18 +157,27 @@ human has to reconcile.
 `crates/server/tests/migrations.rs` covers the fresh path, checksum drift,
 newer-database refusal, history gaps, interrupted migrations and repair, lock
 contention and stale takeover, a legacy ledger catching up, and a full apply on
-live PostgreSQL and MariaDB. The SQLite cases always run. The other two run when
+live PostgreSQL and MariaDB. It also builds the real version 9 schema from
+`tests/fixtures/schema_v9.sql`, seeds rows, and upgrades it through versions 10
+to 18 without losing data. The SQLite cases always run. The other two run when
 their environment variables are set, as shown above; each test creates and drops
 its own database.
 
-The D1 implementation is compiled by the Workers check:
+The D1 driver runs against a local workerd D1 database:
 
 ```bash
-cargo check -p openwarp-server --lib --target wasm32-unknown-unknown --no-default-features
+npm install --no-save wrangler@4.151.1
+WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 ```
 
-It is not exercised at runtime by the test suite, because that needs a deployed
-D1 binding. A D1 deployment that owns migrations calls the same runner:
+The script builds the Worker with the test-only `d1-smoke` feature, which adds
+an internal route that calls the same runner with the D1 binding. It applies the
+manifest, checks version 18 and the 16 squashed rows, and verifies that a second
+apply is a no-op. The production Worker build in `wrangler.toml` does not enable
+the feature, so that route is absent from deployed bundles. CI runs this after
+the Workerd smoke test.
+
+A D1 deployment that owns migrations calls the same runner:
 
 ```rust
 let d1 = env.d1("DB")?;

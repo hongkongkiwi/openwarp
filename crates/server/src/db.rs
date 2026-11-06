@@ -32,6 +32,12 @@ unsafe impl Sync for Db {}
 #[derive(Clone, Copy, PartialEq)]
 pub enum Backend { Sqlite, Postgres, Mysql }
 
+/// How an operator command opens SQLite. PostgreSQL and MySQL ignore it because
+/// opening a connection does not create a database.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq)]
+enum OpenMode { Create, Existing, ReadOnly }
+
 #[cfg(not(target_arch = "wasm32"))]
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
@@ -55,10 +61,21 @@ impl Db {
         db.migrate().await?;
         Ok(db)
     }
-    /// Open without migrating. The operator CLI uses this to inspect or repair a
-    /// database before deciding to apply anything.
+    /// Open without migrating. The operator CLI uses this to apply or repair.
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn connect(url: &str) -> Result<Self, String> {
+    pub async fn connect(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::Create).await }
+    /// Open an existing database without creating it. A mistyped SQLite path
+    /// fails instead of leaving an empty file behind.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn connect_existing(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::Existing).await }
+    /// Open for inspection. SQLite rejects writes on this connection, so status
+    /// and verify cannot change a ledger or create a database by accident.
+    /// PostgreSQL and MySQL are not enforced read-only; those commands only
+    /// issue SELECTs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn connect_read_only(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::ReadOnly).await }
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn open_mode(url: &str, mode: OpenMode) -> Result<Self, String> {
         // A scheme is case-insensitive in a URL; the drivers are not, so the
         // normalized form is what gets parsed.
         let (scheme, rest) = match url.split_once("://") { Some((s, r)) => (s.to_ascii_lowercase(), r), None => (String::new(), "") };
@@ -81,11 +98,20 @@ impl Db {
             Ok(Db::Mysql(mysql_async::Pool::new(opts)))
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
-            let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+            let flags = if mode == OpenMode::Create {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            } else {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            };
+            let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
             // A second instance booting at the same time waits for the writer
             // instead of failing the migration with SQLITE_BUSY.
             conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+            if mode == OpenMode::ReadOnly {
+                conn.execute_batch("PRAGMA query_only=ON;").map_err(|e| e.to_string())?;
+            } else {
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+            }
             Ok(Db::Sqlite(std::sync::Mutex::new(conn)))
         }
     }

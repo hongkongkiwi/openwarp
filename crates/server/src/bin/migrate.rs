@@ -80,7 +80,13 @@ fn parse() -> Result<Option<Args>, String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
-    let db = Db::connect(&args.url).await?;
+    // Inspection never creates a database or writes a ledger. Apply may create
+    // one; repair requires one to exist already.
+    let db = match args.command.as_str() {
+        "status" | "plan" | "verify" => Db::connect_read_only(&args.url).await?,
+        "repair" => Db::connect_existing(&args.url).await?,
+        _ => Db::connect(&args.url).await?,
+    };
     match args.command.as_str() {
         "status" => {
             let status = migrate::status(&db, MIGRATIONS).await?;

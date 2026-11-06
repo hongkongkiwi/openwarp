@@ -314,7 +314,12 @@ async fn exec_tolerant<T: Target>(target: &T, statements: &[String]) -> Result<(
 
 fn is_duplicate(error: &str) -> bool {
     let message = error.to_ascii_lowercase();
-    message.contains("duplicate column") || message.contains("already exists") || message.contains("duplicate key name")
+    message.contains("duplicate column")
+        || message.contains("already exists")
+        || message.contains("duplicate key name")
+        // PostgreSQL's CREATE TABLE IF NOT EXISTS race on its catalogue index.
+        || message.contains("duplicate key value violates unique constraint")
+        || message.contains("tuple concurrently updated")
 }
 
 fn is_missing_relation(error: &str) -> bool {
@@ -389,6 +394,10 @@ pub async fn status<T: Target>(target: &T, migrations: &[Migration]) -> Result<S
 
 pub async fn repair<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
     validate(migrations)?;
+    // A repair must never manufacture a ledger in a database that has none.
+    if target.query("SELECT version FROM schema_migrations LIMIT 1").await.is_err() {
+        return Err("no schema_migrations ledger in this database; run status or apply first".to_string());
+    }
     ensure_ledger(target).await?;
     let version = match action { Repair::SetApplied(v) | Repair::Remove(v) | Repair::AcceptChecksum(v) => v };
     let migration = migrations.iter().find(|m| m.version == version)
@@ -630,13 +639,20 @@ impl<'a, T: Target> Lock<'a, T> {
     async fn acquire(target: &'a T) -> Result<Self, String> {
         let owner = openwarp_crypto::random_token("mig");
         let now = crate::clock::now();
-        let claimed = target.exec(&format!(
-            "INSERT INTO schema_migration_lock(id,owner,acquired_at) VALUES(1,'{}',{})", owner, now,
-        )).await;
-        if claimed.is_err() {
+        // Two attempts cover the case where the previous holder released
+        // between our insert and our read.
+        for attempt in 0..2 {
+            if target.exec(&format!(
+                "INSERT INTO schema_migration_lock(id,owner,acquired_at) VALUES(1,'{}',{})", owner, now,
+            )).await.is_ok() {
+                return Ok(Self { target, owner });
+            }
             let holder = target.query("SELECT owner, acquired_at FROM schema_migration_lock WHERE id=1").await?
-                .into_iter().next()
-                .ok_or_else(|| "could not acquire the migration lock".to_string())?;
+                .into_iter().next();
+            let Some(holder) = holder else {
+                if attempt == 0 { continue; }
+                return Err("could not acquire the migration lock; retry".to_string());
+            };
             let current = s(&holder, "owner");
             let acquired_at = n(&holder, "acquired_at");
             if now - acquired_at > LOCK_STALE_SECS {
@@ -648,14 +664,13 @@ impl<'a, T: Target> Lock<'a, T> {
             }
             let held = target.query("SELECT owner FROM schema_migration_lock WHERE id=1").await?
                 .into_iter().next().map(|row| s(&row, "owner")).unwrap_or_default();
-            if held != owner {
-                return Err(format!(
-                    "another instance is applying migrations (lock held since {}); retry after it finishes or {} seconds after a crash",
-                    acquired_at, LOCK_STALE_SECS,
-                ));
-            }
+            if held == owner { return Ok(Self { target, owner }); }
+            return Err(format!(
+                "another instance is applying migrations (lock held since {}); retry after it finishes or {} seconds after a crash",
+                acquired_at, LOCK_STALE_SECS,
+            ));
         }
-        Ok(Self { target, owner })
+        Err("could not acquire the migration lock; retry".to_string())
     }
 
     async fn release(&self) {
@@ -666,7 +681,7 @@ impl<'a, T: Target> Lock<'a, T> {
 }
 
 async fn ensure_ledger<T: Target>(target: &T) -> Result<(), String> {
-    target.exec("CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL,name TEXT DEFAULT '',checksum TEXT DEFAULT '',success BIGINT DEFAULT 1,execution_ms BIGINT DEFAULT 0)").await?;
+    exec_idempotent(target, "CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL,name TEXT DEFAULT '',checksum TEXT DEFAULT '',success BIGINT DEFAULT 1,execution_ms BIGINT DEFAULT 0)").await?;
     // A ledger created by an older binary lacks the metadata columns. Adding
     // them is the one place duplicates are expected, so a duplicate is ignored
     // and every other error still aborts boot.
@@ -676,12 +691,31 @@ async fn ensure_ledger<T: Target>(target: &T) -> Result<(), String> {
         "ALTER TABLE schema_migrations ADD COLUMN success BIGINT DEFAULT 1",
         "ALTER TABLE schema_migrations ADD COLUMN execution_ms BIGINT DEFAULT 0",
     ] {
-        if let Err(error) = target.exec(column).await {
-            if !is_duplicate(&error) { return Err(error); }
-        }
+        exec_idempotent(target, column).await?;
     }
-    target.exec("CREATE TABLE IF NOT EXISTS schema_migration_lock(id BIGINT PRIMARY KEY,owner TEXT NOT NULL,acquired_at BIGINT NOT NULL)").await?;
+    exec_idempotent(target, "CREATE TABLE IF NOT EXISTS schema_migration_lock(id BIGINT PRIMARY KEY,owner TEXT NOT NULL,acquired_at BIGINT NOT NULL)").await?;
     Ok(())
+}
+
+/// Create or alter an object that another booting instance may be creating at
+/// the same time. An existing object is success; a PostgreSQL catalogue race is
+/// retried once so the other transaction's change can settle.
+async fn exec_idempotent<T: Target>(target: &T, sql: &str) -> Result<(), String> {
+    match target.exec(sql).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_transient(&error) => match target.exec(sql).await {
+            Ok(()) => Ok(()),
+            Err(again) if is_duplicate(&again) => Ok(()),
+            Err(again) => Err(again),
+        },
+        Err(error) if is_duplicate(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_transient(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("duplicate key value violates unique constraint") || message.contains("tuple concurrently updated")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

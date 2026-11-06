@@ -75,6 +75,9 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
+# Test-only Worker route that runs the migration manifest against a D1 binding.
+# The production Worker build does not enable it.
+d1-smoke = []
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

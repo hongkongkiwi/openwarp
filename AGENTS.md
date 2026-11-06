@@ -62,7 +62,8 @@ Run the stack with `DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo 
 
 ## Tests and evidence
 
-- `security.rs` locks tenant isolation, scopes, sessions and protocol boundaries; `authorization.rs` covers roles, grants, environment policy and approvals; `accounts.rs` covers signup, invitations, providers and recovery; `ui.test.cjs` checks console source.
+- `security.rs` locks tenant isolation, scopes, sessions and protocol boundaries; `authorization.rs` covers roles, grants, environment policy and approvals; `accounts.rs` covers signup, invitations, providers and recovery; `migrations.rs` covers ledger checks, a real v9 upgrade, and live PostgreSQL and MariaDB; `ui.test.cjs` checks console source.
+- `scripts/d1-migrate-smoke.sh` runs the migration driver against a local workerd D1 database. It builds a test-only Worker feature, so never enable `d1-smoke` in a deployed bundle.
 - The HTTP suites start real server processes against private databases. Never point them at data you care about, and never commit `*.db` files, recovery kits, tokens or exported secrets.
 - Reproduce a bug with a failing test first. Tenant, token and environment boundaries need failure cases as well as success cases.
 - Never weaken an assertion, skip a check or hardcode a value to manufacture green.

@@ -69,7 +69,7 @@ HTTP suites start real server processes against private databases. The Node suit
 
 Schema changes are append-only. Add a numbered file under `crates/server/migrations/` and the matching entry in `crates/server/src/migrate.rs`; never edit a migration that a released binary has applied, because the runner stores a checksum and refuses to boot when it no longer matches. The [schema migrations](MIGRATIONS.md) guide covers the ledger, the consolidated baseline, the MySQL DDL rules, and the repair commands.
 
-`openwarp-migrate status`, `plan`, `verify`, and `repair` inspect a database without starting the server. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines.
+`openwarp-migrate status`, `plan`, `verify`, and `repair` inspect a database without starting the server. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines. Run `WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh` to exercise the D1 driver against local workerd.
 
 ## Container validation
 
