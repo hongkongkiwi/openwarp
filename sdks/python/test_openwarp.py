@@ -5,11 +5,13 @@ Run: OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest sdks/python/t
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -39,7 +41,10 @@ class Server:
                "OPENWARP_PUBLIC_URL": self.base, "TOKIO_WORKER_THREADS": "2"}
         env.pop("OPENWARP_MASTER_KEY", None)
         env.pop("REDIS_URL", None)
-        self.process = subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.stderr_lines: list[str] = []
+        self.process = subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, text=True, bufsize=1)
+        threading.Thread(target=self._read_stderr, daemon=True).start()
         deadline = time.time() + 20
         while time.time() < deadline:
             try:
@@ -51,6 +56,21 @@ class Server:
             time.sleep(0.1)
         self.stop()
         raise RuntimeError(f"server did not start at {self.base}")
+
+    def _read_stderr(self) -> None:
+        assert self.process.stderr is not None
+        for line in self.process.stderr:
+            self.stderr_lines.append(line)
+
+    def wait_for_verify_link(self) -> str:
+        pattern = re.compile(re.escape(self.base) + r"/api/auth/verify\?token=[A-Za-z0-9_%-]+")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            match = pattern.search("".join(self.stderr_lines))
+            if match:
+                return match.group(0)
+            time.sleep(0.05)
+        raise RuntimeError("the verification link was not written to the server log")
 
     def stop(self) -> None:
         self.process.kill()
@@ -70,8 +90,14 @@ class SdkTest(unittest.TestCase):
     def test_round_trip(self) -> None:
         client = Client(self.server.base)
         registered = client.register("sdk-py@test.invalid", "sdk-password-1")
-        self.assertTrue(registered["token"])
-        client.token = registered["token"]
+        if registered.get("token"):
+            client.token = registered["token"]
+        else:
+            with urllib.request.urlopen(self.server.wait_for_verify_link(), timeout=5) as response:
+                self.assertEqual(response.status, 200)
+            session = client.login("sdk-py@test.invalid", "sdk-password-1")
+            self.assertTrue(session.get("token"))
+            client.token = session["token"]
 
         self.assertEqual(client.me()["email"], "sdk-py@test.invalid")
         self.assertTrue(client.providers()["password"])

@@ -164,6 +164,14 @@ func (c *Client) Register(ctx context.Context, email, password string) (string, 
 	return out.Token, err
 }
 
+func (c *Client) Login(ctx context.Context, email, password string) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	err := c.do(ctx, http.MethodPost, "/api/auth/login", map[string]string{"email": email, "password": password}, &out)
+	return out.Token, err
+}
+
 func (c *Client) ListOrgs(ctx context.Context) ([]Org, error) {
 	var out []Org
 	return out, c.do(ctx, http.MethodGet, "/api/orgs", nil, &out)

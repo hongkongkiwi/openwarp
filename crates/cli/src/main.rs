@@ -20,7 +20,8 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Get { #[arg(long, default_value = "")] env: String, key: String },
     Set { #[arg(long, default_value = "")] env: String, key: String, value: String },
     Delete { #[arg(long, default_value = "")] env: String, key: String },
-    Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String },
+    /// base skips your personal overrides, which is what a deployment wants
+    Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
     Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
     E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
@@ -231,7 +232,7 @@ fn main() {
         Cmd::Delete { env, key } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
             let sid = d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))).and_then(|s| s["id"].as_str().map(|x| x.to_string()));
             match sid { Some(id) => { let r: Value = client.delete(format!("{}/api/secrets/{}", host, id)).bearer_auth(&token).send().expect("req").json().expect("json"); println!("{}", r); } None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
-        Cmd::Export { env, format } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/export", host, env));
+        Cmd::Export { env, format, base } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/export{}", host, env, if *base { "?base=1" } else { "" }));
             let items = d["secrets"].as_array().cloned().unwrap_or_default();
             match format.as_str() {
                 "json" => println!("{}", serde_json::to_string_pretty(&d["secrets"]).unwrap()),

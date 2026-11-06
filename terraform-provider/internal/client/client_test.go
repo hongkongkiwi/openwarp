@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func freePort(t *testing.T) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
-func startServer(t *testing.T) string {
+func startServer(t *testing.T) (string, string) {
 	t.Helper()
 	bin := os.Getenv("OPENWARP_BIN")
 	if bin == "" {
@@ -38,7 +39,14 @@ func startServer(t *testing.T) string {
 	dir := t.TempDir()
 	port := freePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	logPath := filepath.Join(dir, "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create server log: %v", err)
+	}
 	command := exec.Command(bin)
+	command.Stdout = logFile
+	command.Stderr = logFile
 	env := make([]string, 0, len(os.Environ())+4)
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, "OPENWARP_MASTER_KEY=") || strings.HasPrefix(kv, "REDIS_URL=") || strings.HasPrefix(kv, "OPENWARP_ENV=") {
@@ -58,6 +66,7 @@ func startServer(t *testing.T) string {
 	t.Cleanup(func() {
 		_ = command.Process.Kill()
 		_, _ = command.Process.Wait()
+		_ = logFile.Close()
 	})
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
@@ -65,22 +74,57 @@ func startServer(t *testing.T) string {
 		if err == nil {
 			response.Body.Close()
 			if response.StatusCode == http.StatusOK {
-				return base
+				return base, logPath
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("server did not become healthy")
+	return "", ""
+}
+
+func waitForVerifyLink(t *testing.T, base, logPath string) string {
+	t.Helper()
+	pattern := regexp.MustCompile(regexp.QuoteMeta(base) + `/api/auth/verify\?token=[A-Za-z0-9_%-]+`)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(logPath)
+		if err == nil {
+			if link := pattern.FindString(string(data)); link != "" {
+				return link
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the verification link was not written to the server log")
 	return ""
 }
 
 func TestClientRoundTrip(t *testing.T) {
-	base := startServer(t)
+	base, logPath := startServer(t)
 	ctx := context.Background()
 	api := client.New(base, "")
 	token, err := api.Register(ctx, "provider@test.invalid", "provider-password-1")
 	if err != nil {
 		t.Fatalf("register: %v", err)
+	}
+	if token == "" {
+		link := waitForVerifyLink(t, base, logPath)
+		response, err := http.Get(link)
+		if err != nil {
+			t.Fatalf("open verification link: %v", err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("verification link returned %d", response.StatusCode)
+		}
+		token, err = api.Login(ctx, "provider@test.invalid", "provider-password-1")
+		if err != nil {
+			t.Fatalf("login after verification: %v", err)
+		}
+	}
+	if token == "" {
+		t.Fatal("registration produced no session token")
 	}
 	api.Token = token
 

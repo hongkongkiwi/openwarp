@@ -1,0 +1,93 @@
+image:
+  repository: openwarp
+  tag: ""
+  pullPolicy: IfNotPresent
+replicaCount: 2
+nameOverride: ""
+fullnameOverride: ""
+env:
+  OPENWARP_ENV: production
+  OPENWARP_PUBLIC_URL: ""
+existingSecret: openwarp-master
+# Secret keys: master-key, database-url, redis-url, metrics-token.
+databaseUrl: ""
+existingDatabaseSecret: openwarp-database
+redisUrl: ""
+existingRedisSecret: ""
+metrics:
+  existingSecret: ""
+service:
+  type: ClusterIP
+  port: 8080
+ingress:
+  enabled: false
+  className: ""
+  # Long-lived sockets on /api/live. nginx-ingress honours these; other
+  # controllers need the equivalent read and send timeout.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  hosts:
+    - host: openwarp.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Kubernetes EnvVar entries, including valueFrom.secretKeyRef when needed.
+extraEnv: []
+# External Secrets Operator bridge. Serves one OpenWarp environment as the JSON
+# map an ESO webhook SecretStore expects. The bridge holds no credentials: each
+# request carries an OpenWarp service token. Read docs/KUBERNETES.md first.
+eso:
+  enabled: false
+  image:
+    # Empty reuses image.repository and the resulting tag above.
+    repository: ""
+    tag: ""
+  replicas: 1
+  port: 8090
+  # Empty targets this release's own Service.
+  openwarpUrl: ""
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+

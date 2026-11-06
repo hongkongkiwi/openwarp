@@ -6,15 +6,20 @@ version.workspace = true
 
 [dependencies]
 openwarp-crypto = { path = "../crypto" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
-postgres = { version = "0.19", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+risaml = { version = "0.7", default-features = false, features = ["crypto-rustcrypto"] }
+keystore-ocsp = "1.0"
+keystore-pki = "1.0"
+rsa = { version = "0.9", features = ["pem"] }
 redis = { version = "0.27", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 hmac = "0.12"
 base64ct = { version = "1", features = ["alloc"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -23,7 +28,19 @@ jsonwebtoken = "9"
 rcgen = "0.13"
 sha1 = "0.10"
 ipnet = "2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
+time = "0.3"
+ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
+native-tls = { version = "0.2", optional = true }
 
 [features]
-default = ["redis-cache"]
+default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
+# LDAP opens a raw TCP/TLS socket to a directory. Native builds enable it; a
+# Workers/WASM port must build with --no-default-features and cannot offer it.
+ldap = ["dep:ldap3", "dep:native-tls"]
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Resolves to the vendored parse-depth-capped fork through [patch.crates-io].
+lber = "0.4"

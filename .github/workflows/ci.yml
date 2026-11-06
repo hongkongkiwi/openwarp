@@ -8,6 +8,22 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openwarp
+          POSTGRES_PASSWORD: openwarp
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OPENWARP_TEST_POSTGRES_URL: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,3 +78,41 @@ jobs:
           curl -fsS http://127.0.0.1:8080/health
           docker exec openwarp-ci openwarp --help >/dev/null
           docker stop openwarp-ci
+
+  sdks-and-provider:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: terraform-provider-openwarp/go.sum
+      - uses: hashicorp/setup-terraform@v3
+      # The live SDK and provider tests start the real binary, so build it once
+      # and point every suite at the absolute path.
+      - run: cargo build --bin openwarp-server
+      - name: TypeScript SDK
+        run: |
+          npm ci --prefix sdk/typescript
+          OPENWARP_BIN="$PWD/target/debug/openwarp-server" npm test --prefix sdk/typescript
+      - name: Rust SDK
+        run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" cargo test --manifest-path sdk/rust/Cargo.toml
+      - name: Terraform provider unit and live client tests
+        working-directory: terraform-provider-openwarp
+        run: |
+          go build ./...
+          go vet ./...
+          OPENWARP_BIN="$PWD/../target/debug/openwarp-server" go test ./...
+      - name: Terraform provider acceptance tests
+        working-directory: terraform-provider-openwarp
+        env:
+          TF_ACC: "1"
+          OPENWARP_BIN: ${{ github.workspace }}/target/debug/openwarp-server
+        run: go test ./internal/provider -v -timeout 20m

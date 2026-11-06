@@ -59,7 +59,8 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field" id="mfafield" style="display:none"><label for="mfacode">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
       <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()">Forgot password?</button>
-      <div id="social" class="row" style="margin-top:12px"></div>
+      <button class="ghost" style="width:100%;margin-top:6px" onclick="samlPrompt()">Sign in with SAML</button>
+      <div id="social" class="row" style="margin-top:12px;flex-wrap:wrap"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
     </div>
   </div>
@@ -127,8 +128,10 @@ document.addEventListener('keydown',e=>{
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
   let btns=[];
-  if(p.google)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/google/start'">Continue with Google</button>`);
-  if(p.github)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/github/start'">Continue with GitHub</button>`);
+  for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X']]){
+    if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">Continue with ${name}</button>`)}
+  if(p.oidc)btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start'">Continue with ${esc(p.oidc_name||'SSO')}</button>`);
+  if(p.ldap)btns.push(`<button style="flex:1 1 45%" onclick="ldapPrompt()">Sign in with directory (LDAP)</button>`);
   $('social').innerHTML=btns.join('');
   if(p.signups!=='open'){
     $('segreg').style.display='none';
@@ -150,6 +153,19 @@ async function acceptInvite(){try{
 function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()">Send link</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Reset password')}
+function samlPrompt(){let org=prompt('Workspace ID for SAML sign-in');if(org)location.href='/api/auth/saml/'+encodeURIComponent(org)+'/start'}
+function ldapPrompt(){modal(`<h3>Sign in with your directory</h3><p class="mut">Your password goes to this server over the API and is checked by your directory over TLS.</p>
+  <div class="field"><label for="ld-org">Workspace ID</label><input id="ld-org" placeholder="workspace id"></div>
+  <div class="field"><label for="ld-user">Directory username</label><input id="ld-user" autocomplete="username"></div>
+  <div class="field"><label for="ld-pw">Password</label><input id="ld-pw" type="password" autocomplete="current-password"></div>
+  <div class="row"><button class="primary" onclick="ldapSignIn()">Sign in</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Directory sign-in')}
+async function ldapSignIn(){try{
+  let d=await api('POST','/api/auth/ldap',{org_id:$('ld-org').value.trim(),username:$('ld-user').value,password:$('ld-pw').value});
+  if(d.mfa_required){MFA=d.mfa_token;
+    $('modal').innerHTML=`<h3>Two-factor code</h3><div class="field"><label for="ld-mfa">Authenticator / recovery code</label><input id="ld-mfa" placeholder="123456"></div><div class="row"><button class="primary" onclick="ldapMfa()">Verify</button></div>`;return}
+  T='';closeModal();enterApp();
+}catch(e){toast(e.message,true)}}
+async function ldapMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('ld-mfa').value});T='';closeModal();enterApp()}catch(e){toast(e.message,true)}}
 async function sendForgot(){try{await api('POST','/api/auth/forgot',{email:$('fp-email').value});closeModal();toast('If that address has an account, a reset link is on its way')}catch(e){toast(e.message,true)}}
 function showReset(token){
   $('auth').style.display='grid';$('shell').style.display='none';$('authtitle').textContent='Choose a new password';
@@ -202,7 +218,7 @@ async function renderApps(){$('topaction').style.display='';$('pagetitle').textC
   let envCounts={};for(let a of APPS){try{let es=await api('GET',`/api/apps/${a.id}/envs`);envCounts[a.id]=es}catch(e){envCounts[a.id]=[]}}
   $('view').innerHTML=`<div class="row" style="margin-bottom:14px"><input id="appfilter" placeholder="Filter apps…" style="min-width:240px" oninput="filterApps(this.value)"><span class="mut small">${APPS.length} app${APPS.length!==1?'s':''}, unlimited environments</span></div>
   <div class="grid" id="appgrid">${APPS.map(a=>appCard(a,envCounts[a.id])).join('')}</div>`}
-function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
+function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}${a.reuse_check===false?' · reuse checks off':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
 function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.style.display=APPS[i].name.toLowerCase().includes(q.toLowerCase())?'':'none'})}
 async function newApp(){modal(`<h3>New app</h3><div class="field"><label for="na-name">App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label for="na-readme">Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
   <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
@@ -220,7 +236,7 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pag
   <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
   <div class="row" style="margin-bottom:12px">
     <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawSecrets()">
-    <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button>
+    <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button><button onclick="appSettings()">App settings</button>
     <span class="grow"></span><button class="primary" onclick="addRow()">+ New secret</button>
   </div>
   <div id="stable"></div>
@@ -242,6 +258,14 @@ async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
 function envMode(e){return e&&e.mode==='e2e'?'e2e':'sse'}
 async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
+function appSettings(){if(!APP){toast('Open an app first',true);return}let on=APP.reuse_check!==false;
+  modal(`<h3>App settings</h3><p class="mut">${esc(APP.name||'')}</p>
+    <label class="row" style="gap:8px;margin:12px 0"><input type="checkbox" id="app-reuse" ${on?'checked':''}> Warn when a secret value is reused elsewhere in this workspace</label>
+    <p class="small mut">The workspace setting must also be on. The warning is advisory; you can still save the value.</p>
+    <div class="row"><button class="primary" onclick="saveAppSettings()">Save</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'App settings')}
+async function saveAppSettings(){try{let on=$('app-reuse').checked;
+  await api('PUT',`/api/apps/${APP.id}/settings`,{reuse_check:on});
+  APP.reuse_check=on;closeModal();toast('App settings saved')}catch(e){toast(e.message,true)}}
 async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createE2eEnv(){try{let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name:$('ne2-name').value});closeModal();toast('E2E environment created: '+d.id);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);renderEnv()}catch(e){toast(e.message,true)}}
 async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
@@ -271,26 +295,74 @@ function drawSecrets(){
 function findValEl(btn){return btn.closest('tr').querySelector('.val')}
 function revealVal(btn){let el=findValEl(btn);let show=el.dataset.show==='1';el.dataset.show=show?'0':'1';el.textContent=show?'••••••••••':el.dataset.val}
 function copyVal(btn){navigator.clipboard.writeText(findValEl(btn).dataset.val);toast('Value copied')}
-function addRow(){if(!ENV){toast('Open an environment first',true);return}let id='new-'+Date.now();
+let REUSE_PROCEED=null,REUSE_BACK=null;
+async function reusePreflight(items,exclude){if(!ENV)return[];
+  try{let d=await api('POST',`/api/envs/${ENV.id}/secrets/reuse-check`,{secrets:items.map(s=>({key:s.key,value:s.value,path:s.path||'/',type:s.type||'secret'})),exclude:exclude||[]});
+    return d.enabled===false?[]:(d.matches||[])}catch(e){return []}}
+function reuseWarn(matches,proceed,back){
+  REUSE_PROCEED=proceed;REUSE_BACK=back||null;
+  let groups=matches.map(m=>`<div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0">
+    <div class="row" style="justify-content:space-between"><span class="mono">${esc(m.key)}</span><span class="mut small">${esc(m.path||'/')}</span></div>
+    ${m.items.map(it=>`<div class="row" style="justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--line)">
+      <span class="small"><b>${esc(it.app_name||'app')}</b> / ${esc(it.env_name||'env')} <span class="mut">·</span> <span class="mono">${esc(it.key)}</span> <span class="mut">${esc(it.path||'/')}</span></span>
+      <button onclick="reuseGo('${jsq(it.app_id)}','${jsq(it.env_id)}','${jsq(it.key)}')">Go to</button></div>`).join('')}
+  </div>`).join('');
+  modal(`<h3>This value is already in use</h3>
+    <p class="mut">The same value is stored elsewhere in this workspace. Reusing it means one leak exposes every place it is used.</p>
+    ${groups}
+    <div class="row" style="margin-top:14px"><button class="primary" onclick="reuseProceed()">Use anyway</button>${REUSE_BACK?'<button class="ghost" onclick="reuseBack()">Back</button>':''}</div>`,'Reused secret value')}
+function reuseProceed(){let cb=REUSE_PROCEED;REUSE_PROCEED=null;REUSE_BACK=null;closeModal();if(cb)cb()}
+function reuseBack(){let cb=REUSE_BACK;REUSE_PROCEED=null;REUSE_BACK=null;closeModal();if(cb)cb()}
+async function reuseGo(aid,eid,key){
+  if(!aid||!eid){toast('That item is no longer available',true);return}
+  let cur=ENV&&ENV.id;
+  if(cur&&Object.keys(drafts()).length&&!confirm('Discard staged changes?'))return;
+  if(cur)delete DRAFTS[cur];
+  closeModal();REUSE_PROCEED=null;REUSE_BACK=null;
+  try{
+    if(!APPS.some(a=>a.id===aid))APPS=await api('GET',`/api/orgs/${ORG}/apps`);
+    APP=APPS.find(a=>a.id===aid)||{id:aid};
+    ENVS=await api('GET',`/api/apps/${aid}/envs`);
+    ENV=ENVS.find(e=>e.id===eid)||ENVS[0]||null;
+    await renderEnv();
+    let f=$('sfilter');if(f){f.value=key;drawSecrets()}
+    toast('Showing '+key+' in '+(ENV?ENV.name:''));
+  }catch(e){toast(e.message,true)}}
+function addRow(prefill){if(!ENV){toast('Open an environment first',true);return}let id='new-'+Date.now();let v=prefill||{};
+  let types=['secret','sealed','ssh_key','config'];
   modal(`<h3>New secret</h3>
-    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL"></div>
-    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3"></textarea></div>
-    <div class="row"><div class="field" style="flex:1"><label for="ns-path">Path</label><input id="ns-path" value="/"></div>
-    <div class="field"><label for="ns-type">Type</label><select id="ns-type"><option>secret</option><option>sealed</option><option>config</option></select></div></div>
+    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL" value="${esc(v.key||'')}"></div>
+    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3">${esc(v.value||'')}</textarea></div>
+    <div class="row"><div class="field" style="flex:1"><label for="ns-path">Path</label><input id="ns-path" value="${esc(v.path||'/')}"></div>
+    <div class="field"><label for="ns-type">Type</label><select id="ns-type">${types.map(t=>`<option${t===(v.type||'secret')?' selected':''}>${t}</option>`).join('')}</select></div></div>
     <div class="row"><button class="primary" onclick="stageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
     <p class="small mut">Staged changes deploy together, like a commit. Sealed values can never be read back.</p>`,'New secret')}
-function stageNew(id){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return}
-  if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};
-  DRAFTS[ENV.id][id]={id,key:k.toUpperCase(),value:$('ns-val').value,path:$('ns-path').value||'/',type:$('ns-type').value,comment:'',isNew:true};
-  closeModal();drawSecrets();updateDeployBar()}
-function editRow(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;let isNew=!!d;
-  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div>
-    <div class="field"><label for="ed-comment">Comment</label><input id="ed-comment" value="${esc(s.comment||'')}"></div>
+function reuseCandidate(){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return null}
+  return {key:k.toUpperCase(),value:$('ns-val').value,path:$('ns-path').value||'/',type:$('ns-type').value,comment:'',isNew:true}}
+function commitNew(id,s){s.id=id;if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]=s;closeModal();drawSecrets();updateDeployBar()}
+async function stageNew(id){let s=reuseCandidate();if(!s)return;
+  if(s.type==='secret'&&s.value){
+    let matches=await reusePreflight([s],SECRETS.filter(x=>x.type==='secret'&&x.key===s.key&&(x.path||'/')===s.path&&(x.value??'')===s.value).map(x=>x.id));
+    if(matches.length){reuseWarn(matches,()=>commitNew(id,s),()=>addRow(s));return}
+  }
+  commitNew(id,s)}
+function editRow(id,prefill){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;let isNew=!!d;
+  let value=prefill?prefill.value:(s.value??'');let comment=prefill?prefill.comment:(s.comment||'');
+  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(value)}</textarea></div>
+    <div class="field"><label for="ed-comment">Comment</label><input id="ed-comment" value="${esc(comment)}"></div>
     <div class="row"><button class="primary" onclick="stageEdit('${jsq(id)}')">${isNew?'Stage secret':'Stage change'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Edit secret')}
-function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;
-  if(d){d.value=$('ed-val').value;d.comment=$('ed-comment').value}
-  else{if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]={id,key:s.key,value:$('ed-val').value,path:s.path,type:s.type,comment:$('ed-comment').value}}
+function commitEdit(id,s,value,comment){let d=drafts()[id];
+  if(d){d.value=value;d.comment=comment}
+  else{if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]={id,key:s.key,value,path:s.path,type:s.type,comment}}
   closeModal();drawSecrets();updateDeployBar();toast('Change staged, deploy when ready')}
+async function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;
+  let value=$('ed-val').value,comment=$('ed-comment').value;
+  let changed=!d||d.value!==value;
+  if(changed&&(s.type||'secret')==='secret'&&value){
+    let matches=await reusePreflight([{key:s.key,value,path:s.path||'/',type:'secret'}],[s.id]);
+    if(matches.length){reuseWarn(matches,()=>commitEdit(id,s,value,comment),()=>editRow(id,{value,comment}));return}
+  }
+  commitEdit(id,s,value,comment)}
 async function overrideRow(id,key){modal(`<h3>Personal override: ${esc(key)}</h3><p class="mut">Only you see this value. Teammates keep the shared one.</p><div class="field"><label for="ov-val">Your value</label><textarea id="ov-val" rows="3"></textarea></div><div class="row"><button class="primary" onclick="saveOverride('${jsq(id)}')">Save override</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Personal override')}
 async function saveOverride(id){try{await api('POST',`/api/secrets/${id}/override`,{secrets:[{key:'x',value:$('ov-val').value}]});closeModal();toast('Override saved');renderEnv()}catch(e){toast(e.message,true)}}
 async function delSecret(id,key){let d=drafts()[id];
@@ -310,8 +382,18 @@ async function deployStage(){try{let items=draftList().map(s=>({key:s.key,value:
 async function showHistory(id){try{let h=await api('GET',`/api/secrets/${id}/history`);
   modal(`<h3>History</h3>${h.length?h.map(v=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>v${v.version}</b> <span class="mut small">${new Date(v.created_at*1000).toLocaleString()}</span><br><span class="val">${esc(v.value)}</span></span><button onclick="restoreVer('${jsq(id)}',${v.version})">Restore</button></div>`).join(''):'<p class="mut">No history.</p>'}<div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">Close</button></div>`,'Secret history')}catch(e){toast(e.message,true)}}
 async function restoreVer(id,ver){try{await api('POST',`/api/secrets/${id}/restore/${ver}`,{});closeModal();toast('Restored version '+ver);renderEnv()}catch(e){toast(e.message,true)}}
-function importModal(){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" aria-label=".env contents" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…"></textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
-async function doImport(){try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text:$('imp-text').value});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
+function importModal(text){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" aria-label=".env contents" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…">${esc(text||'')}</textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+function parseEnvLoose(text){let out=[];for(let line of String(text||'').split('\n')){let l=line.trim();if(!l||l.startsWith('#'))continue;
+  if(l.startsWith('export '))l=l.slice(7).trim();let i=l.indexOf('=');if(i<1)continue;
+  let value=l.slice(i+1).trim();if((value.startsWith('"')&&value.endsWith('"'))||(value.startsWith("'")&&value.endsWith("'")))value=value.slice(1,-1);
+  out.push({key:l.slice(0,i).trim().toUpperCase(),value,path:'/',type:'secret'})}return out}
+async function doImport(force,text){
+  if(text===undefined)text=$('imp-text').value;
+  if(!force){let cands=parseEnvLoose(text);
+    if(cands.length){let exclude=SECRETS.filter(x=>x.type==='secret'&&cands.some(c=>c.key===x.key&&(x.path||'/')===c.path&&(x.value??'')===c.value)).map(x=>x.id);
+      let matches=await reusePreflight(cands,exclude);
+      if(matches.length){reuseWarn(matches,()=>doImport(true,text),()=>importModal(text));return}}}
+  try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
 async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export`);modal(`<h3>Export ${esc(ENV.name)}</h3><textarea id="exp-text" aria-label="Exported secrets" rows="12" readonly>${esc(d.text)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Export copied')">Copy .env</button><button class="ghost" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message,true)}}
 
 // ---------- access, integrations, audit, settings ----------
@@ -349,7 +431,7 @@ async function mkToken(){try{let d=await api('POST',`/api/apps/${APP.id}/tokens`
 async function loadTokens(){try{let toks=await api('GET',`/api/apps/${APP.id}/tokens`);$('tok-list').innerHTML=toks.map(t=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0"><span class="mono small">${esc(t.name)} · ${esc(t.kind||'token')} · ${new Date((t.created_at||0)*1000).toLocaleDateString()}</span><button class="danger" onclick="revokeToken('${t.id}')">Revoke</button></div>`).join('')||'<span class="mut">No tokens</span>'}catch(e){toast(e.message,true)}}
 async function revokeToken(id){try{await api('DELETE',`/api/tokens/${id}`);toast('Token revoked');loadTokens()}catch(e){toast(e.message,true)}}
 
-const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','webhook','instabox','boat','daytona'];
+const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','1password','dokploy','caprover','portainer','docker_swarm','bitbucket','circleci','teamcity','travisci','terraform_cloud','qovery','laravel_forge','openwarp','devin','cloudflare_secrets_store','octopus_deploy','azure_devops','cursor','northflank','spacelift','rundeck','cloud66','humanitec','ovh_kms','scaleway_secret_manager','azure_app_configuration','vultr','hetzner','linode','digitalocean_ssh','ssh','keeper','oci_vault','huggingface','webhook','instabox','boat','daytona'];
 async function renderIntegrations(){if(!needAppEnv())return;setTimeout(kindHint,0);$('pagetitle').textContent='Integrations';$('crumb').textContent=ENV?('/ '+ENV.name):'';
   let ints=ENV?await api('GET',`/api/envs/${ENV.id}/integrations`).catch(()=>[]):[];
   $('view').innerHTML=`<div class="card"><h3>Sync secrets to a platform</h3><p>Integrations run automatically on every deploy, or on demand. Config is stored encrypted. Trigger.dev example config: <span class="mono">{"token":"tr_pat_…","project_ref":"proj_…","target_env":"prod"}</span></p>
@@ -357,16 +439,16 @@ async function renderIntegrations(){if(!needAppEnv())return;setTimeout(kindHint,
   <p class="small" id="ikind-hint"></p><textarea id="icfg" rows="4" placeholder='{"token":"…"}'></textarea>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="mkIntegration()">Add integration</button></div></div>
   <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button> <button class="danger" onclick="delInt('${i.id}')">Delete</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
-  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><pre class="val" id="leases"></pre>
+  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><select id="lease-type"><option value="generic">generic</option><option value="openrouter">openrouter</option><option value="resend">resend</option><option value="openai">openai</option><option value="huggingface">huggingface</option><option value="fireworks">fireworks</option><option value="mistral">mistral</option><option value="perplexity">perplexity</option><option value="xai">xai</option><option value="gemini">gemini</option><option value="cloudflare">cloudflare</option><option value="deepgram">deepgram</option><option value="elevenlabs">elevenlabs</option><option value="deepinfra">deepinfra</option><option value="baseten">baseten</option><option value="fal">fal</option><option value="speechmatics">speechmatics</option><option value="chutes">chutes</option><option value="aws_iam">aws_iam</option><option value="postgres">postgres</option></select><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><textarea id="lease-cfg" rows="2" placeholder='provider config, e.g. {"management_key":"…","limit":5}'></textarea><pre class="val" id="leases"></pre>
   <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>
   <div class="card"><h3>Lockbox: one-time secret sharing</h3><div class="row"><input id="lb-val" placeholder="value to share once" style="min-width:280px"><button onclick="mkLockbox()">Create link</button></div><pre class="val" id="lb-out"></pre></div>`}
-const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer"}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}',instabox:'Instabox: {"api_key":"ibk_…","org":"team","hosts":["api.example.com"],"delivery":"proxy"}',boat:'Boat: {"api_key":"boat_…","environment":"base","upgrade":true}',daytona:'Daytona: {"api_key":"…","organization_id":"…","hosts":["api.example.com"]}'};
+const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer","signing_secret":"optional HMAC key"}',azure_app_configuration:'Azure App Configuration: {"endpoint":"https://store.azconfig.io","id":"access key id","secret":"base64 access key","label":"optional"}',scaleway_secret_manager:'Scaleway Secret Manager: {"region":"fr-par","secret_key":"…","project_id":"…","path":"/app"}',vultr:'Vultr SSH keys: {"api_key":"…"} (each secret value must be an OpenSSH public key)',hetzner:'Hetzner SSH keys: {"token":"…"} (syncs secrets of type ssh_key; a changed key is recreated)',linode:'Linode SSH keys: {"token":"…"} (syncs secrets of type ssh_key; a changed key is recreated)',digitalocean_ssh:'DigitalOcean account SSH keys: {"token":"…"} (syncs secrets of type ssh_key; distinct from digitalocean, which updates an App Platform spec)',ssh:'SSH file: {"host":"app.example.com","user":"deploy","identity_file":"/keys/deploy","known_hosts":"ssh-ed25519 AAAA…","files":[{"path":"/srv/app/.env","format":"dotenv","folders":["/app"]}]}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}',aws_secrets_manager:'AWS Secrets Manager: {"region":"us-east-1","access_key_id":"…","secret_access_key":"…","mapping":"one_to_one"} or add "secret_id":"app/prod" for one JSON secret',aws_parameter_store:'AWS Parameter Store: {"region":"us-east-1","access_key_id":"…","secret_access_key":"…","path_prefix":"/app/prod"}','1password':'1Password Connect: {"connect_url":"https://connect.example.com","token":"…","vault_id":"…","value_label":"value"}',dokploy:'Dokploy: {"base_url":"https://dokploy.example.com","api_key":"…","application_id":"…"} or "compose_id"',caprover:'CapRover: {"base_url":"https://captain.example.com","password":"…","app_name":"app"}',portainer:'Portainer: {"base_url":"https://portainer.example.com:9443","api_key":"…","endpoint_id":1,"stack_id":1}',docker_swarm:'Docker Swarm: {"api_url":"https://docker.example.com:2376","ca_cert":"PEM","client_cert":"PEM","client_key":"PEM"}',bitbucket:'Bitbucket: {"workspace":"…","repo_slug":"…","token":"…"}',circleci:'CircleCI: {"project_slug":"gh/org/repo","token":"…"}',teamcity:'TeamCity: {"base_url":"https://teamcity.example.com","token":"…","project_locator":"_Root"}',travisci:'Travis CI: {"repo":"owner/repo","token":"…"}',terraform_cloud:'Terraform Cloud: {"token":"…","workspace_id":"ws-…","category":"env"}',qovery:'Qovery: {"token":"…","organization_id":"…","project_id":"…","environment_id":"…"}',laravel_forge:'Laravel Forge: {"token":"…","organization":"org","server_id":1,"site_id":1}',openwarp:'OpenWarp: {"base_url":"https://other-openwarp.example.com","token":"…","env_id":"…"}',devin:'Devin: {"token":"cog_…","org_id":"org-…"}',cloudflare_secrets_store:'Cloudflare Secrets Store: {"token":"…","account_id":"…","store_id":"…","scopes":["workers"]}',octopus_deploy:'Octopus Deploy: {"base_url":"https://octopus.example.com","api_key":"API-…","space_id":"Spaces-1","project_id":"Projects-123"}',azure_devops:'Azure DevOps: {"organization":"org","project":"project","group_id":"1","token":"PAT"}',cursor:'Cursor: {"token":"…","environment_id":"…"} (omit environment_id for team secrets)',northflank:'Northflank: {"token":"…","project_id":"…","secret_group_id":"…"}',spacelift:'Spacelift: {"token":"…","stack_id":"…"} (or "account":"…")',rundeck:'Rundeck: {"instance_url":"https://rundeck.example.com","api_token":"…","project":"proj"}',cloud66:'Cloud 66: {"access_token":"…","stack_id":"…"}',humanitec:'Humanitec: {"api_token":"…","org":"org","app":"app","scope":"application"}',ovh_kms:'OVHcloud KMS: {"okms_domain":"https://kms.example.com","okms_id":"…","token":"…","path":"app"}',keeper:'Keeper: {"instance_url":"https://keeper.example.com","api_key":"…","folder_uid":"…"}',huggingface:'Hugging Face Space: {"token":"hf_…","namespace":"org","repo":"space","target":"secrets"} (or "variables")',oci_vault:'OCI Vault: {"tenancy_ocid":"…","user_ocid":"…","fingerprint":"…","private_key":"PEM","region":"us-ashburn-1","compartment_id":"…","vault_id":"…","key_id":"…"}',instabox:'Instabox: {"api_key":"ibk_…","org":"team","hosts":["api.example.com"],"delivery":"proxy"}',boat:'Boat: {"api_key":"boat_…","environment":"base","upgrade":true}',daytona:'Daytona: {"api_key":"…","organization_id":"…","hosts":["api.example.com"]}'};
 function kindHint(){if(!$('ikind'))return;let k=$('ikind').value;$('ikind-hint').textContent=KIND_HINTS[k]||('Config for '+k+' as JSON. Common keys: token, base_url for self-hosted instances. Stored encrypted at rest.')}
 async function mkIntegration(){try{await api('POST',`/api/envs/${ENV.id}/integrations`,{kind:$('ikind').value,config:JSON.parse($('icfg').value||'{}')});toast('Integration added');renderIntegrations()}catch(e){toast(e.message,true)}}
 async function testInt(id){try{let d=await api('POST',`/api/integrations/${id}/test`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
 async function syncInt(id){try{let d=await api('POST',`/api/integrations/${id}/sync`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
 async function delInt(id){if(!confirm('Delete this integration? Sync state for it is removed too.'))return;try{await api('DELETE',`/api/integrations/${id}`);toast('Integration deleted');renderIntegrations()}catch(e){toast(e.message,true)}}
-async function mkLease(){try{let d=await api('POST',`/api/envs/${ENV.id}/dynamic`,{name:$('lease-name').value||'lease'});$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
+async function mkLease(){try{let body={name:$('lease-name').value||'lease',type:$('lease-type').value};if($('lease-cfg').value.trim())body.config=JSON.parse($('lease-cfg').value);let d=await api('POST',`/api/envs/${ENV.id}/dynamic`,body);$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
 async function loadLeases(){try{let d=await api('GET',`/api/envs/${ENV.id}/dynamic`);$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
 async function mkRotation(){try{await api('POST',`/api/envs/${ENV.id}/rotations`,{key:$('rot-key').value,interval_secs:parseInt($('rot-int').value)});toast('Rotation scheduled')}catch(e){toast(e.message,true)}}
 async function mkLockbox(){try{let d=await api('POST','/api/lockbox',{text:$('lb-val').value});$('lb-out').textContent=location.origin+d.url+'\nOpens once, expires in 24h. The key is in the #fragment and never sent to the server on page load.'}catch(e){toast(e.message,true)}}
@@ -381,6 +463,28 @@ async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
+  let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
+  let samlCard=`<div class="card"><h3>SAML SSO</h3><p>Service provider metadata: <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
+    <div class="field"><label for="set-saml-entity">IdP entity ID</label><input id="set-saml-entity" value="${esc(saml?.idp_entity_id||'')}" placeholder="https://idp.example/metadata"></div>
+    <div class="field"><label for="set-saml-url">IdP metadata URL</label><input id="set-saml-url" placeholder="https://idp.example/metadata.xml" style="width:100%"></div>
+    <div class="field"><label for="set-saml-xml">or paste metadata XML</label><textarea id="set-saml-xml" rows="4">${esc(saml?.metadata_xml||'')}</textarea></div>
+    <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-saml-unsigned" ${saml?.allow_unsigned_metadata?'checked':''}> Allow unsigned metadata (not recommended)</label>
+    <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-saml-auto" ${saml?.auto_provision?'checked':''}> Auto-provision first-time users</label>
+    <div class="field"><label for="set-saml-domains">Allowed email domains</label><input id="set-saml-domains" value="${esc(saml?.allowed_domains||'')}" placeholder="example.com" style="width:100%"></div>
+    <div class="row"><button class="primary" onclick="saveSaml()">Save SAML</button></div><pre class="val" id="saml-out"></pre></div>`;
+  let prov=await api('GET','/api/auth/providers').catch(()=>null);
+  let ldap=prov?.ldap?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
+  let ldapCard=prov?.ldap?`<div class="card"><h3>LDAP directory</h3><p>Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
+  <div class="field"><label for="ld-url">Directory URL (ldaps:// only)</label><input id="ld-url" value="${esc(ldap?.url||'')}" placeholder="ldaps://dc01.example.com:636" style="width:100%"></div>
+  <div class="row"><input id="ld-bind-dn" value="${esc(ldap?.bind_dn||'')}" placeholder="service bind DN" style="min-width:280px"><input id="ld-bind-pw" type="password" placeholder="${ldap?.bind_password_set?'stored; leave blank to keep':'service account password'}"></div>
+  <div class="field"><label for="ld-base-dn">Base DN</label><input id="ld-base-dn" value="${esc(ldap?.base_dn||'')}" placeholder="OU=People,DC=example,DC=com" style="width:100%"></div>
+  <div class="field"><label for="ld-filter">User filter ({username} is escaped per RFC 4515)</label><input id="ld-filter" value="${esc(ldap?.user_filter||'(uid={username})')}" style="width:100%"></div>
+  <div class="row"><input id="ld-email-attr" value="${esc(ldap?.email_attr||'mail')}" placeholder="mail"><input id="ld-name-attr" value="${esc(ldap?.name_attr||'displayName')}" placeholder="displayName"><input id="ld-group-attr" value="${esc(ldap?.group_attr||'memberOf')}" placeholder="memberOf"></div>
+  <div class="field"><label for="ld-roles">Group to role map (Group=role;Group=role)</label><input id="ld-roles" value="${esc(ldap?.group_roles||'')}" placeholder="Admins=admin;Developers=developer" style="width:100%"></div>
+  <div class="row"><input id="ld-default-role" value="${esc(ldap?.default_role||'developer')}" placeholder="default role"><input id="ld-domains" value="${esc(ldap?.allowed_domains||'')}" placeholder="allowed email domains" style="min-width:260px"></div>
+  <div class="field"><label for="ld-ca">Internal CA certificate (PEM, optional)</label><textarea id="ld-ca" rows="3">${esc(ldap?.ca_cert_pem||'')}</textarea></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="ld-auto" ${ldap?.auto_provision?'checked':''}> Auto-provision first-time users in allowed domains</label>
+  <div class="row"><button class="primary" onclick="saveLdap()">Save LDAP</button><button class="danger" onclick="removeLdap()">Remove</button></div></div>`:'';
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
@@ -388,23 +492,34 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
+  <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> Warn when a secret value is reused elsewhere in this workspace</label>
+  <p class="small mut" style="margin:0 0 10px">Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.</p>
   <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
   <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" style="min-width:260px"></div>
   <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
+  ${samlCard}
+  ${ldapCard}
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
-async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
   if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
   if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
+async function saveSaml(){try{let b={idp_entity_id:$('set-saml-entity').value,metadata_url:$('set-saml-url').value,metadata_xml:$('set-saml-xml').value,allow_unsigned_metadata:$('set-saml-unsigned').checked,auto_provision:$('set-saml-auto').checked,allowed_domains:$('set-saml-domains').value};let d=await api('PUT',`/api/orgs/${ORG}/saml`,b);$('saml-out').textContent='SP metadata: '+d.sp_metadata_url;toast('SAML saved')}catch(e){toast(e.message,true)}}
+async function saveLdap(){try{
+  let b={url:$('ld-url').value,bind_dn:$('ld-bind-dn').value,base_dn:$('ld-base-dn').value,user_filter:$('ld-filter').value,email_attr:$('ld-email-attr').value,name_attr:$('ld-name-attr').value,group_attr:$('ld-group-attr').value,group_roles:$('ld-roles').value,default_role:$('ld-default-role').value,allowed_domains:$('ld-domains').value,ca_cert_pem:$('ld-ca').value,auto_provision:$('ld-auto').checked};
+  if($('ld-bind-pw').value)b.bind_password=$('ld-bind-pw').value;
+  await api('PUT',`/api/orgs/${ORG}/ldap`,b);toast('LDAP saved');renderSettings()}catch(e){toast(e.message,true)}}
+async function removeLdap(){if(!confirm('Remove LDAP sign-in for this workspace?'))return;
+  try{await api('DELETE',`/api/orgs/${ORG}/ldap`);toast('LDAP removed');renderSettings()}catch(e){toast(e.message,true)}}
 async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);

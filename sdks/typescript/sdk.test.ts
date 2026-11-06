@@ -25,19 +25,21 @@ function freePort(): Promise<number> {
   });
 }
 
-async function startServer(): Promise<{ base: string; child: ChildProcess; dir: string }> {
+async function startServer(): Promise<{ base: string; child: ChildProcess; dir: string; stderr: () => string }> {
   const dir = mkdtempSync(join(tmpdir(), "openwarp-sdk-ts-"));
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const env = { ...process.env, DATABASE_URL: `sqlite://${dir}/sdk.db`, ADDR: `127.0.0.1:${port}`, OPENWARP_PUBLIC_URL: base, TOKIO_WORKER_THREADS: "2" };
   delete env.OPENWARP_MASTER_KEY;
   delete env.REDIS_URL;
-  const child = spawn(BIN, [], { env, stdio: "ignore" });
+  const child = spawn(BIN, [], { env, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     try {
       const r = await fetch(`${base}/health`);
-      if (r.ok) return { base, child, dir };
+      if (r.ok) return { base, child, dir, stderr: () => stderr };
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -45,13 +47,31 @@ async function startServer(): Promise<{ base: string; child: ChildProcess; dir: 
   throw new Error(`server did not start at ${base}`);
 }
 
+async function waitForVerifyLink(stderr: () => string, base: string): Promise<string> {
+  const deadline = Date.now() + 10_000;
+  const pattern = new RegExp(`${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/api/auth/verify\\?token=[A-Za-z0-9_%-]+`);
+  while (Date.now() < deadline) {
+    const match = stderr().match(pattern);
+    if (match) return match[0];
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("the verification link was not written to the server log");
+}
+
 test("TypeScript SDK round trip against a live server", async () => {
-  const { base, child, dir } = await startServer();
+  const { base, child, dir, stderr } = await startServer();
   try {
     const client = new OpenWarp({ host: base });
     const reg = await client.register("sdk-ts@test.invalid", "sdk-password-1");
-    assert.ok(reg.token, "register returns a session");
-    client.token = reg.token;
+    if (reg.token) {
+      client.token = reg.token;
+    } else {
+      const link = await waitForVerifyLink(stderr, base);
+      assert.equal((await fetch(link)).status, 200, "the verification link opens");
+      const session = await client.login("sdk-ts@test.invalid", "sdk-password-1");
+      assert.ok(session.token, "login after verification returns a session");
+      client.token = session.token;
+    }
 
     assert.equal((await client.me()).email, "sdk-ts@test.invalid");
     const providers = await client.providers();

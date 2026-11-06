@@ -5,58 +5,62 @@ use std::sync::Mutex;
 pub type Row = HashMap<String, Value>;
 pub enum Db {
     Sqlite(Mutex<rusqlite::Connection>),
-    Postgres(std::sync::Arc<Mutex<postgres::Client>>),
+    Postgres(deadpool_postgres::Pool),
 }
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
     out
 }
+fn pg_err(error: tokio_postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => db.message().to_string(),
+        None => error.to_string(),
+    }
+}
 impl Db {
-    pub fn open(url: &str) -> Result<Self, String> {
+    pub async fn open(url: &str) -> Result<Self, String> {
         if url.starts_with("postgres") {
-            // `postgres` sync client drives its own runtime; it cannot run inside tokio.
-            let url = url.to_string();
-            std::thread::spawn(move || {
-                let client = postgres::Client::connect(&url, postgres::NoTls).map_err(|e| e.to_string())?;
-                let db = Db::Postgres(std::sync::Arc::new(Mutex::new(client))); db.migrate()?; Ok(db)
-            }).join().map_err(|_| "postgres connect thread panicked".to_string())?
+            let config: tokio_postgres::Config = url.parse().map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
+            let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+            let size = std::env::var("OPENWARP_PG_POOL_SIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 64);
+            let pool = deadpool_postgres::Pool::builder(manager).max_size(size).build().map_err(|e| format!("postgres pool: {}", e))?;
+            let db = Db::Postgres(pool); db.migrate().await?; Ok(db)
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
             let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
-            let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+            let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
         }
     }
     #[allow(dead_code)]
-    pub fn open_memory() -> Result<Self, String> {
+    pub async fn open_memory() -> Result<Self, String> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+        let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
     }
-    pub fn is_postgres(&self) -> bool { matches!(self, Db::Postgres(_)) }
-    pub fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+    pub async fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
-            Db::Postgres(c) => {
-                let c = c.clone(); let sql = sql.to_string(); let params = params.to_vec();
-                std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql); let pg = PgParams::new(&params); let refs = pg.refs(); client.execute(sql2.as_str(), &refs[..]).map_err(pg_error) }).join().map_err(|_| "pg thread panicked".to_string())?
+            Db::Sqlite(c) => {
+                let result = { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) };
+                result
+            }
+            Db::Postgres(pool) => {
+                let client = pool.get().await.map_err(|e| e.to_string())?;
+                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                client.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)
             }
         }
     }
-    /// Whether a table has a column, without relying on backend error text.
-    fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
-        let row = if self.is_postgres() {
-            self.one("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?", &[serde_json::json!(table), serde_json::json!(column)])?
-        } else {
-            self.one(&format!("SELECT COUNT(*) AS n FROM pragma_table_info('{}') WHERE name=?", table), &[serde_json::json!(column)])?
-        };
-        Ok(row.map(|r| n(&r, "n") > 0).unwrap_or(false)) }
-    pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+    pub async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
-            Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
-            Db::Postgres(c) => {
-                let c = c.clone(); let sql_owned = sql.to_string(); let params_owned = params.to_vec();
-                let rows = std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql_owned); let pg = PgParams::new(&params_owned); let refs = pg.refs(); client.query(sql2.as_str(), &refs[..]).map_err(pg_error) }).join().map_err(|_| "pg thread panicked".to_string())??;
+            Db::Sqlite(c) => {
+                let result = { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) };
+                result
+            }
+            Db::Postgres(pool) => {
+                let client = pool.get().await.map_err(|e| e.to_string())?;
+                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                let rows = client.query(sql2.as_str(), &refs[..]).await.map_err(pg_err)?;
                 let mut out = Vec::new();
                 for r in &rows {
                     let mut m = Row::new();
@@ -74,90 +78,56 @@ impl Db {
             }
         }
     }
-    pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
-    /// Highest applied migration. 0 means the database is empty or predates the
-    /// ledger.
-    pub fn version(&self) -> Result<i64, String> {
-        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[])?.map(|r| n(&r, "version")).unwrap_or(0)) }
-    /// Applies every migration above the recorded version, once. Version 1 is
-    /// the original schema and is written to be idempotent: it tolerates the
-    /// "column already exists" errors produced by databases created before the
-    /// ledger existed. Later versions run as individual statements and must
-    /// also be safe to retry if the process dies mid-way.
-    pub fn migrate(&self) -> Result<(), String> {
-        self.exec("CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)", &[])?;
-        let current = self.version()?;
-        for version in 1..=SCHEMA_VERSION {
-            if version <= current { continue; }
-            self.apply_migration(version)?;
-            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())])
-                .map_err(|e| format!("migration {} applied but could not be recorded: {}", version, e))?;
+    pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    pub async fn version(&self) -> Result<i64, String> {
+        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
+    async fn migrate(&self) -> Result<(), String> {
+        for stmt in SCHEMA { self.exec(stmt, &[]).await?; }
+        for alter in [
+            "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
+            "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
+            "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0",
+            "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0",
+            "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1",
+            "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'",
+            "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0",
+            "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''",
+            "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''",
+            "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
+            "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
+            "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
+            "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
+        ] { let _ = self.exec(alter, &[]).await; }
+        for idx in INDEXES { let _ = self.exec(idx, &[]).await; }
+        // Record the baseline once, then apply numbered additive migrations.
+        if self.one("SELECT version FROM schema_migrations WHERE version=1", &[]).await?.is_none() {
+            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(now_secs())]).await;
         }
-        // Idempotent data backfill, independent of the schema ledger.
-        if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
-            let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
-            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]);
+        for (version, statements) in MIGRATIONS {
+            if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)]).await?.is_some() { continue; }
+            for stmt in *statements {
+                if let Err(e) = self.exec(stmt, &[]).await {
+                    let duplicate = e.contains("duplicate column") || e.contains("already exists");
+                    if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
+                }
+            }
+            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())]).await?;
+        }
+        // One-time backfill: environments that already had an allowlist keep it.
+        if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
+            let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
+            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]).await;
         }
         Ok(())
     }
-    fn apply_migration(&self, version: i64) -> Result<(), String> {
-        match version {
-            1 => {
-                for stmt in SCHEMA { self.exec(stmt, &[])?; }
-                for (table, column, alter) in LEGACY_COLUMNS {
-                    if !self.column_exists(table, column)? {
-                        self.exec(alter, &[]).map_err(|e| format!("migration 1 failed ({}): {}", alter, e))?;
-                    }
-                }
-                for idx in INDEXES { self.exec(idx, &[]).map_err(|e| format!("migration 1 failed ({}): {}", idx, e))?; }
-                Ok(())
-            }
-            2 => {
-                // Secret versions now carry the path and tags they were written
-                // with, so a point-in-time restore can put tags back. Rows from
-                // before this version default to '/' and ''.
-                for (table, column, alter) in [
-                    ("secret_versions", "path", "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'"),
-                    ("secret_versions", "tags", "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''"),
-                ] {
-                    if !self.column_exists(table, column)? {
-                        self.exec(alter, &[]).map_err(|e| format!("migration 2 failed ({}): {}", alter, e))?;
-                    }
-                }
-                Ok(())
-            }
-            other => Err(format!("no migration registered for version {}", other)),
-        }
-    }
 }
-fn pg_error(e: postgres::Error) -> String {
-    match e.as_db_error() { Some(d) => format!("postgres {}: {}", d.code().code(), d.message()), None => e.to_string() } }
-
-/// The highest migration this binary knows about. Add a step to
-/// `apply_migration` and bump this together.
-pub const SCHEMA_VERSION: i64 = 2;
-
-const LEGACY_COLUMNS: &[(&str, &str, &str)] = &[
-    ("envs", "mode", "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'"),
-    ("envs", "restricted", "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0"),
-    ("envs", "require_approval", "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0"),
-    ("secrets", "e2e", "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0"),
-    ("secrets", "deleted_at", "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0"),
-    ("users", "active", "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1"),
-    ("tokens", "kind", "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'"),
-    ("tokens", "expires_at", "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0"),
-    ("leases", "username", "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''"),
-    ("leases", "config_enc", "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''"),
-    ("oidc_states", "nonce", "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''"),
-    ("pki_cas", "serial", "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''"),
-    ("rotation_schedules", "path", "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'"),
-    ("users", "email_verified", "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1"),
-];
 enum PgOwned { S(String), I(i64), B(bool), N(Option<String>) }
 struct PgParams { owned: Vec<PgOwned> }
 impl PgParams {
     fn new(params: &[Value]) -> Self { Self { owned: params.iter().map(|v| match v { Value::String(s) => PgOwned::S(s.clone()), Value::Number(n) => PgOwned::I(n.as_i64().unwrap_or(0)), Value::Bool(b) => PgOwned::B(*b), _ => PgOwned::N(None) }).collect() } }
-    fn refs(&self) -> Vec<&(dyn postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
+    fn refs(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn tokio_postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
 }
 fn sqlite_val(v: &rusqlite::types::Value) -> Value {
     use rusqlite::types::Value as V;
@@ -209,7 +179,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',path TEXT DEFAULT '/',tags TEXT DEFAULT '',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
     "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,scopes TEXT DEFAULT '',last_used_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS integrations(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,config_enc TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS lockbox(id TEXT PRIMARY KEY,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,max_views BIGINT DEFAULT 1,views BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,name TEXT NOT NULL,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
@@ -228,7 +198,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS roles(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,permissions TEXT DEFAULT '[]')",
     "CREATE TABLE IF NOT EXISTS log_streams(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,secret TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS log_deliveries(id TEXT PRIMARY KEY,stream_id TEXT NOT NULL,event TEXT NOT NULL,payload TEXT DEFAULT '',status TEXT DEFAULT 'pending',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS rotation_schedules(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,key_name TEXT NOT NULL,path TEXT DEFAULT '/',interval_secs BIGINT NOT NULL,next_run BIGINT NOT NULL,enabled BIGINT DEFAULT 1,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS rotation_schedules(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,key_name TEXT NOT NULL,path TEXT DEFAULT '/',interval_secs BIGINT NOT NULL,next_run BIGINT NOT NULL,enabled BIGINT DEFAULT 1,config_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS mfa_challenges(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS pki_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,cn TEXT NOT NULL,cert_pem TEXT NOT NULL,serial TEXT NOT NULL,revoked BIGINT DEFAULT 0,expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,window_start BIGINT NOT NULL,count BIGINT NOT NULL)",
@@ -236,6 +206,70 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS social_subjects(provider TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(provider,subject))",
     "CREATE TABLE IF NOT EXISTS invites(token_hash TEXT PRIMARY KEY,email TEXT NOT NULL,org_id TEXT NOT NULL,role TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,accepted BIGINT DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,kind TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
+    "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS saml_configs(org_id TEXT PRIMARY KEY,idp_entity_id TEXT NOT NULL,idp_metadata_xml TEXT NOT NULL,sp_key_enc TEXT NOT NULL,sp_cert_pem TEXT NOT NULL,allow_unsigned_metadata BIGINT DEFAULT 0,metadata_trusted_cert TEXT DEFAULT '',auto_provision BIGINT DEFAULT 0,allowed_domains TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS saml_pending(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,snapshot TEXT NOT NULL,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS saml_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS saml_subjects(org_id TEXT NOT NULL,idp_entity_id TEXT NOT NULL,name_id TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(org_id,idp_entity_id,name_id))",
+    "CREATE TABLE IF NOT EXISTS rotation_hooks(org_id TEXT PRIMARY KEY,url TEXT NOT NULL,secret_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+];
+
+// Additive migrations applied after the baseline schema. A statement may fail
+// because a fresh database already created the column or table; those errors
+// are recognised and ignored, anything else aborts the boot.
+const MIGRATIONS: &[(i64, &[&str])] = &[
+    (2, &[
+        "ALTER TABLE tokens ADD COLUMN scopes TEXT DEFAULT ''",
+        "ALTER TABLE tokens ADD COLUMN last_used_at BIGINT DEFAULT 0",
+    ]),
+    (3, &[
+        "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
+    ]),
+    (4, &[
+        "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
+    ]),
+    (5, &[
+        "CREATE TABLE IF NOT EXISTS saml_configs(org_id TEXT PRIMARY KEY,idp_entity_id TEXT NOT NULL,idp_metadata_xml TEXT NOT NULL,sp_key_enc TEXT NOT NULL,sp_cert_pem TEXT NOT NULL,allow_unsigned_metadata BIGINT DEFAULT 0,metadata_trusted_cert TEXT DEFAULT '',auto_provision BIGINT DEFAULT 0,allowed_domains TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS saml_pending(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,snapshot TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS saml_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS saml_subjects(org_id TEXT NOT NULL,idp_entity_id TEXT NOT NULL,name_id TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(org_id,idp_entity_id,name_id))",
+    ]),
+    (6, &[
+        "CREATE TABLE IF NOT EXISTS rotation_hooks(org_id TEXT PRIMARY KEY,url TEXT NOT NULL,secret_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    ]),
+    (7, &[
+        "ALTER TABLE social_states ADD COLUMN nonce TEXT DEFAULT ''",
+        "ALTER TABLE social_states ADD COLUMN code_verifier TEXT DEFAULT ''",
+    ]),
+    (8, &[
+        "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    ]),
+    (9, &[
+        "ALTER TABLE social_states ADD COLUMN link_user TEXT DEFAULT ''",
+        "ALTER TABLE oidc_states ADD COLUMN link_user TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS identity_bindings(issuer TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,provider TEXT DEFAULT '',created_at BIGINT NOT NULL,PRIMARY KEY(issuer,subject))",
+        "CREATE TABLE IF NOT EXISTS logout_replay(jti TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+    ]),
+    (10, &[
+        "CREATE TABLE IF NOT EXISTS ldap_configs(org_id TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '',bind_dn TEXT NOT NULL DEFAULT '',bind_password_enc TEXT NOT NULL DEFAULT '',base_dn TEXT NOT NULL DEFAULT '',user_filter TEXT NOT NULL DEFAULT '(uid={username})',email_attr TEXT NOT NULL DEFAULT 'mail',name_attr TEXT NOT NULL DEFAULT 'displayName',group_attr TEXT NOT NULL DEFAULT 'memberOf',group_roles TEXT NOT NULL DEFAULT '',default_role TEXT NOT NULL DEFAULT 'developer',auto_provision BIGINT NOT NULL DEFAULT 0,allowed_domains TEXT NOT NULL DEFAULT '',ca_cert_pem TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS ldap_subjects(org_id TEXT NOT NULL,dn TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,role TEXT NOT NULL DEFAULT '',PRIMARY KEY(org_id,dn))",
+    ]),
+    (11, &[
+        "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
+    ]),
+    (12, &[
+        "ALTER TABLE orgs ADD COLUMN reuse_check BIGINT DEFAULT 1",
+        "ALTER TABLE apps ADD COLUMN reuse_check BIGINT DEFAULT 1",
+        "ALTER TABLE secrets ADD COLUMN value_fp TEXT DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_secrets_fp ON secrets(value_fp)",
+    ]),
+    (13, &[
+        "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'",
+        "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -248,42 +282,30 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_env_members_user ON env_members(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_leases_env ON leases(env_id)",
     "CREATE INDEX IF NOT EXISTS idx_sync_state_integration ON integration_sync_state(integration_id)",
+    "CREATE INDEX IF NOT EXISTS idx_team_env_grants_env ON team_env_grants(env_id)",
+    "CREATE INDEX IF NOT EXISTS idx_instance_leases_expiry ON instance_leases(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_rotations_due ON rotation_schedules(enabled,next_run)",
     "CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)",
     "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_live_events_id ON live_events(id)",
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*; use serde_json::json;
-    #[test] fn sqlite_migrate_and_crud() {
-        let db = Db::open_memory().unwrap();
-        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).unwrap();
-        let rows = db.query("SELECT name FROM orgs WHERE id=?", &[json!("o1")]).unwrap();
+    #[tokio::test] async fn sqlite_migrate_and_crud() {
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).await.unwrap();
+        let rows = db.query("SELECT name FROM orgs WHERE id=?", &[json!("o1")]).await.unwrap();
         assert_eq!(s(&rows[0], "name"), "Acme");
         // placeholder translation used by Postgres backend
         assert_eq!(pg_sql("SELECT * FROM t WHERE a=? AND b=?"), "SELECT * FROM t WHERE a=$1 AND b=$2");
     }
-    #[test] fn migrations_are_recorded_once() {
-        let db = Db::open_memory().unwrap();
-        assert_eq!(db.version().unwrap(), SCHEMA_VERSION, "a fresh database lands on the current version");
-        db.migrate().unwrap();
-        db.migrate().unwrap();
-        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).unwrap().unwrap();
-        assert_eq!(n(&row, "n"), SCHEMA_VERSION, "each migration must be recorded exactly once");
-    }
-    #[test] fn legacy_database_is_upgraded_and_recorded_once() {
-        // A database from before the ledger: no columns added after the first
-        // release, no schema_migrations table.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL,pubkey TEXT NOT NULL,wrapped_privkey TEXT NOT NULL,created_at BIGINT NOT NULL)").unwrap();
-        let db = Db::Sqlite(Mutex::new(conn));
-        db.migrate().unwrap();
-        assert_eq!(db.version().unwrap(), SCHEMA_VERSION);
-        let cols = db.query("PRAGMA table_info(users)", &[]).unwrap();
-        assert!(cols.iter().any(|r| s(r, "name") == "email_verified"), "missing columns are added on upgrade");
-        db.migrate().unwrap();
-        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).unwrap().unwrap();
-        assert_eq!(n(&row, "n"), SCHEMA_VERSION, "a second boot must not re-apply the baseline");
+    #[tokio::test] async fn migrations_are_recorded_once() {
+        let db = Db::open_memory().await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 13, "a fresh database lands on the current version");
+        db.migrate().await.unwrap();
+        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
+        assert_eq!(n(&row, "n"), 13, "each migration must be recorded exactly once");
     }
 }

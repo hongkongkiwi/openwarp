@@ -1,3 +1,28 @@
+# Rust build output
 /target
+/sdk/rust/target
+
+# TypeScript SDK build output and installed dependencies
+/sdk/typescript/dist/
+/sdk/typescript/node_modules/
+
+# Git worktrees live inside the repo and are never committed
+/.worktrees/
+
+# Local databases and runtime state
 *.db
 *.db-*
+*.sqlite
+*.sqlite3
+/data/
+
+# Local environment (docker compose reads .env; real values never get committed)
+.env
+.env.*
+!.env.example
+
+# Agent, editor and OS state
+/.agents/state/
+/.serena/
+.DS_Store
+*.log

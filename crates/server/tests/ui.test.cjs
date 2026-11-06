@@ -173,7 +173,7 @@ function hidden(element) {
 const saved = { id: 'saved-secret', key: 'DATABASE_URL', value: 'fixture-original', path: '/service', type: 'secret', version: 2 };
 const draft = { key: 'NEW_CONFIG', value: 'fixture-draft', path: '/draft', type: 'config', comment: '' };
 
-async function consoleUI(secrets = [saved]) {
+async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const document = new Element('document', null);
   document.ownerDocument = document;
   document.getElementById = id => document.querySelector('#' + id);
@@ -189,6 +189,7 @@ async function consoleUI(secrets = [saved]) {
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
+    '/api/orgs/org-a/saml': { configured: false },
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -214,9 +215,17 @@ async function consoleUI(secrets = [saved]) {
       calls.push(call);
       let body;
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
+      else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
+        if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
+        body = { enabled: true, matches: (call.body.exclude || []).includes('saved-secret') ? [] : reuse };
+      }
+      else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
+      else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
+      else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
+      else if (options.method === 'POST' && url === '/api/auth/mfa') body = { token: 'session-token' };
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -256,7 +265,7 @@ async function consoleUI(secrets = [saved]) {
       await this.click(this.button(this.el('modal'), /^Stage secret$/));
     },
     async deploy() { await this.click(this.button(this.el('deploybar'), /^Deploy changes$/)); },
-    writes() { return calls.filter(c => c.method !== 'GET'); },
+    writes() { return calls.filter(c => c.method !== 'GET' && !/^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(c.url)); },
     key(key, shiftKey = false) {
       const event = { type: 'keydown', key, shiftKey, metaKey: false, ctrlKey: false };
       document.activeElement.dispatchEvent(event);
@@ -293,6 +302,14 @@ for (const dismissal of ['Cancel', 'Escape', 'backdrop']) {
     assert.deepEqual(ui.writes(), []);
   });
 }
+
+test('the integration picker lists the cloud secret stores and the signed webhook hint', () => {
+  const kinds = source.match(/const KINDS=\[([^\]]*)\]/)?.[1] ?? '';
+  for (const kind of ['digitalocean', 'scaleway_secret_manager', 'azure_app_configuration', 'vultr', 'hetzner', 'linode', 'digitalocean_ssh', 'ssh', 'webhook']) {
+    assert.ok(kinds.includes(`'${kind}'`), `${kind} must be selectable`);
+  }
+  assert.match(source, /signing_secret/, 'the webhook hint must mention the signing secret');
+});
 
 test('a valid new secret stages locally and deploys only on explicit Deploy', async () => {
   const ui = await consoleUI();
@@ -517,4 +534,115 @@ test('the reset view asks for the kit and an explicit key replacement', async ()
     assert.ok(label && label.textContent.trim(), `#${id} needs a programmatic label`);
   }
   assert.match(ui.el('authform').textContent, /lose end-to-end access/i, 'replacing the key must state its cost');
+});
+
+test('directory sign-in carries the workspace and completes the second factor', async () => {
+  const ui = await consoleUI();
+  await ui.invoke('ldapPrompt()');
+  for (const id of ['ld-org', 'ld-user', 'ld-pw']) assert.ok(ui.document.getElementById(id), `missing ${id}`);
+  ui.el('ld-org').value = 'org-a';
+  ui.el('ld-user').value = 'bob';
+  ui.el('ld-pw').value = 'user-secret';
+  await ui.invoke('ldapSignIn()');
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['POST', '/api/auth/ldap']]);
+  assert.deepEqual(ui.calls[0].body, { org_id: 'org-a', username: 'bob', password: 'user-secret' },
+    'the directory request must carry the workspace id, username and password only');
+  assert.ok(ui.document.getElementById('ld-mfa'), 'an MFA challenge must render the code field');
+  ui.el('ld-mfa').value = '123456';
+  ui.calls.length = 0;
+  await ui.invoke('ldapMfa()');
+  assert.deepEqual(ui.calls[0].body, { mfa_token: 'mfa-1', code: '123456' });
+});
+
+test('the LDAP settings card is absent when the server does not advertise the provider', async () => {
+  const ui = await consoleUI();
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.document.getElementById('ld-url'), null,
+    'a build without the ldap feature must not render directory settings');
+  assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };
+
+test('a reused value warns before staging, can be saved anyway, and is not a write', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  assert.match(ui.el('modal').textContent, /already in use/i);
+  assert.match(ui.el('modal').textContent, /DATABASE_URL/);
+  assert.match(ui.el('modal').textContent, /Development/);
+  assert.equal(ui.rows().length, 1, 'nothing may be staged until the warning is acknowledged');
+  assert.ok(hidden(ui.el('deploybar')), 'the warning must not enable deployment');
+  assert.deepEqual(ui.writes(), [], 'the preflight is not a write');
+  await ui.click(ui.button(ui.el('modal'), /^Use anyway$/));
+  assert.ok(ui.row('NEW_CONFIG'), 'Use anyway must stage the draft');
+  assert.ok(!hidden(ui.el('deploybar')), 'the acknowledged draft becomes deployable');
+  assert.deepEqual(ui.writes(), [], 'staging stays local');
+});
+
+test('Back from a reuse warning restores the new-secret form', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  await ui.click(ui.button(ui.el('modal'), /^Back$/));
+  assert.equal(ui.el('ns-key').value, draft.key);
+  assert.equal(ui.el('ns-val').value, draft.value);
+  assert.equal(ui.el('ns-path').value, draft.path);
+  assert.equal(ui.el('ns-type').value, 'secret');
+  assert.ok(hidden(ui.el('deploybar')), 'backing out must not stage anything');
+});
+
+test('Go to leaves the warning and filters the matching environment', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  await ui.click(ui.button(ui.el('modal'), /^Go to$/));
+  assert.ok(!ui.el('modalwrap').classList.contains('show'), 'navigation must close the warning');
+  assert.equal(ui.el('sfilter').value, 'DATABASE_URL');
+  assert.ok(ui.row('DATABASE_URL'), 'the matching row must be visible');
+  assert.ok(hidden(ui.el('deploybar')), 'navigation must not stage the pending secret');
+});
+
+test('workspace and app settings expose the reuse switch', async () => {
+  const ui = await consoleUI();
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('set-reuse').hasAttribute('checked'), 'the workspace switch defaults on');
+  ui.el('set-reuse').checked = false;
+  await ui.invoke('saveSettings()');
+  const orgPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/orgs/org-a/settings');
+  assert.ok(orgPut, 'saving settings must reach the workspace endpoint');
+  assert.equal(orgPut.body.reuse_check, false, 'the workspace switch must be saved');
+  ui.run("APP={id:'app-a',name:'First app'};ENVS=[{id:'env-a',name:'Development'}];ENV=ENVS[0];SECRETS=[];DRAFTS={}");
+  await ui.invoke('appSettings()');
+  assert.ok(ui.el('app-reuse').hasAttribute('checked'), 'the app switch defaults on');
+  ui.el('app-reuse').checked = false;
+  await ui.invoke('saveAppSettings()');
+  const appPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/apps/app-a/settings');
+  assert.ok(appPut, 'saving app settings must reach the app endpoint');
+  assert.equal(appPut.body.reuse_check, false, 'the app switch must be saved');
+});
+
+test('re-editing a draft back to its stored value does not match itself', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.click(ui.button(ui.row('DATABASE_URL'), /^Edit$/));
+  ui.el('ed-val').value = 'fixture-changed';
+  await ui.click(ui.button(ui.el('modal'), /^Stage (change|secret)$/));
+  assert.ok(!hidden(ui.el('deploybar')), 'the changed value becomes a draft');
+  await ui.click(ui.button(ui.row('DATABASE_URL'), /^Edit$/));
+  assert.equal(ui.el('ed-val').value, 'fixture-changed', 'the draft value reopens');
+  ui.el('ed-val').value = 'fixture-original';
+  await ui.click(ui.button(ui.el('modal'), /^Stage (change|secret)$/));
+  const preflights = ui.calls.filter(c => /reuse-check$/.test(c.url));
+  assert.ok(preflights.length >= 1, 'the edit must run the preflight');
+  assert.deepEqual(preflights[preflights.length - 1].body.exclude, ['saved-secret'],
+    'editing a stored secret must exclude its own id');
+  assert.ok(!ui.el('modalwrap').classList.contains('show'),
+    'returning to the stored value must not warn about itself');
+});
+
+test('a failed reuse preflight leaves staging available', async () => {
+  const ui = await consoleUI([saved], [], { reuseFail: true });
+  await ui.add({ ...draft, type: 'secret' });
+  assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
+  assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
+  assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
 });

@@ -5,10 +5,12 @@ use hmac::Mac;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -36,6 +38,7 @@ struct Server {
     base: String,
     dir: PathBuf,
     client: Client,
+    inbox: Arc<Mutex<Vec<Value>>>,
     keep: bool,
 }
 
@@ -48,6 +51,15 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
+    // Parallel test binaries must not hand the same port to two servers.
+    let base = 20000 + (std::process::id() % 30000) as u16;
+    for offset in 0..500u16 {
+        let port = base.saturating_add(offset);
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
+        }
+    }
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()
@@ -67,10 +79,12 @@ impl Server {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
+        let (inbox_url, inbox) = start_inbox();
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &base)
+            .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -87,7 +101,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("http client");
-        let server = Server { child, base, dir, client, keep: false };
+        let server = Server { child, base, dir, client, inbox, keep: false };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -141,12 +155,72 @@ impl Server {
     }
 }
 
+/// Minimal email relay: records each JSON body and answers 200.
+fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
+    let addr = listener.local_addr().expect("inbox addr");
+    let inbox = Arc::new(Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+    (format!("http://{}/mail", addr), inbox)
+}
+
+async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no email containing {:?} arrived", needle);
+}
+
+fn extract_link(text: &str, needle: &str) -> String {
+    for word in text.split_whitespace() {
+        if let Some(i) = word.find(needle) { return word[i..].to_string(); }
+    }
+    panic!("no link containing {:?} in {:?}", needle, text);
+}
+
 async fn register(s: &Server, email: &str) -> Value {
     let r = s
         .call(Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": "correct-horse-battery"})))
         .await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
-    r.body.clone()
+    let mut body = r.body.clone();
+    // Password signup always needs the verification link; finish the flow the
+    // way a real operator with a mail relay would.
+    if body["verification_required"] == json!(true) {
+        let text = wait_for_mail(&s.inbox, "/api/auth/verify?token=").await;
+        let link = extract_link(&text, "/api/auth/verify?token=");
+        let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+        let verified = s.call(Method::GET, &path, None, None).await;
+        assert_eq!(verified.status, 200, "verification failed: {} {}", verified.status, verified.text);
+        let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": "correct-horse-battery"}))).await;
+        assert_eq!(login.status, 200, "verified sign-in failed: {} {}", login.status, login.text);
+        body["token"] = login.body["token"].clone();
+        body["user_id"] = login.body["user_id"].clone();
+        body["public_key"] = login.body["public_key"].clone();
+    }
+    body
 }
 
 async fn invite(s: &Server, owner: &str, org: &str, email: &str, role: &str) {
@@ -281,6 +355,54 @@ async fn oauth_access_token(s: &Server, session: &str, scope: &str) -> String {
     let r = s.form("/oauth/token", &exchange, None).await;
     assert_eq!(r.status, 200, "token exchange failed: {}", r.text);
     r.body["access_token"].as_str().expect("access token").to_string()
+}
+
+#[tokio::test]
+async fn custom_roles_with_admin_rights_need_an_owner_to_grant() {
+    let s = Server::start().await;
+    let owner = register(&s, "owner-roles@test.invalid").await;
+    let admin = register(&s, "admin-roles@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let at = admin["token"].as_str().unwrap().to_string();
+    let au = admin["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "admin-roles@test.invalid", "admin").await;
+
+    let wide = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&at),
+        Some(json!({"name": "ops", "permissions": ["*"]}))).await;
+    assert_eq!(wide.status, 200, "admin could not create a role: {}", wide.text);
+    let narrow = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&at),
+        Some(json!({"name": "reader", "permissions": ["secrets:read"]}))).await;
+    assert_eq!(narrow.status, 200, "admin could not create a read-only role: {}", narrow.text);
+
+    // An all-powerful custom role is admin by another name: a non-owner admin
+    // must not be able to grant it, to themselves or to anyone else.
+    let self_promote = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&at),
+        Some(json!({"role": "ops"}))).await;
+    assert_eq!(self_promote.status, 403, "admin granted itself an all-powerful custom role: {}", self_promote.text);
+    let invite_wide = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&at),
+        Some(json!({"email": "newcomer@test.invalid", "role": "ops"}))).await;
+    assert_eq!(invite_wide.status, 403, "admin invited a member into an all-powerful custom role: {}", invite_wide.text);
+
+    // A machine identity is a durable principal, so it follows the same rule.
+    let machine = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&at),
+        Some(json!({"name": "ci", "role": "ops"}))).await;
+    assert_eq!(machine.status, 403, "admin minted an admin-equivalent machine identity: {}", machine.text);
+
+    // Read-only custom roles remain delegable.
+    let delegate = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&at),
+        Some(json!({"role": "reader"}))).await;
+    assert_eq!(delegate.status, 200, "admin could not grant a read-only custom role: {}", delegate.text);
+
+    // The owner can grant it, and it behaves as admin afterwards.
+    let by_owner = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&ot),
+        Some(json!({"role": "ops"}))).await;
+    assert_eq!(by_owner.status, 200, "owner could not grant the custom role: {}", by_owner.text);
+    let machine_owner = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&ot),
+        Some(json!({"name": "ci-owner", "role": "ops"}))).await;
+    assert_eq!(machine_owner.status, 200, "owner could not mint an identity with the custom role: {}", machine_owner.text);
+    let settings = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(&at), None).await;
+    assert_eq!(settings.status, 200, "the granted role does not carry admin access: {}", settings.text);
 }
 
 #[tokio::test]
@@ -930,6 +1052,626 @@ async fn scim_discovery_and_paging_are_available() {
     assert_eq!(r.body["totalResults"], 1, "{}", r.text);
 }
 
+#[tokio::test]
+async fn service_token_scopes_and_last_used_are_enforced() {
+    let s = Server::start().await;
+    let u = register(&s, "scoped-token@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "READABLE", "one").await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(token), Some(json!({"name": "ro", "env_id": envs[0], "scopes": "secrets:read"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let tid = r.body["id"].as_str().unwrap().to_string();
+    let ro = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&ro), None).await;
+    assert_eq!(r.status, 200, "a read-only token must read: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(&ro), Some(json!({"secrets": [{"key": "NOPE", "value": "x"}]}))).await;
+    assert_eq!(r.status, 403, "a read-only token must not write, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/api/apps/{}/tokens", app), Some(token), None).await;
+    let row = r.body.as_array().unwrap().iter().find(|x| x["id"] == tid).expect("token row");
+    assert_eq!(row["scopes"], "secrets:read");
+    assert!(row["last_used_at"].as_i64().unwrap_or(0) > 0, "last_used_at should be recorded: {}", r.text);
+}
+
+#[tokio::test]
+async fn team_grants_open_a_restricted_environment() {
+    let s = Server::start().await;
+    let owner = register(&s, "team-owner@test.invalid").await;
+    let member = register(&s, "team-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let mid = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, ot, org, "team-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/teams", org), Some(ot), Some(json!({"name": "platform"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let tid = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/teams/{}/members", org, tid), Some(ot), Some(json!({"user_id": mid}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"restricted": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 403, "a restricted env must deny a non-granted member: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/team-grants", envs[0]), Some(ot), Some(json!({"team_id": tid}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 200, "a team grant must open the env: {}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/orgs/{}/teams/{}/members/{}", org, tid, mid), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 403, "removing team membership must revoke access: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn secret_listing_is_paginated() {
+    let s = Server::start().await;
+    let u = register(&s, "page@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    for key in ["ONE", "TWO", "THREE"] { set_secret(&s, token, &envs[0], key, "v").await; }
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets?limit=2&offset=1", envs[0]), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["total"], 3, "{}", r.text);
+    assert_eq!(r.body["secrets"].as_array().unwrap().len(), 2, "{}", r.text);
+    assert_eq!(r.body["limit"], 2, "{}", r.text);
+    assert_eq!(r.body["offset"], 1, "{}", r.text);
+}
+
+#[tokio::test]
+async fn secret_scanning_flags_high_confidence_keys() {
+    let s = Server::start().await;
+    let u = register(&s, "scan@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(token), Some(json!({"secrets": [{"key": "AWS_ACCESS_KEY_ID", "value": "AKIAABCDEFGHIJKLMNOP"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["scan_findings"].as_array().unwrap().iter().any(|f| f["rules"].as_array().unwrap().iter().any(|x| x == "aws_access_key")), "deploy should report the finding: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/scan", envs[0]), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["findings"].as_array().unwrap().iter().any(|f| f["key"] == "AWS_ACCESS_KEY_ID"), "{}", r.text);
+    assert!(!r.text.contains("AKIAABCDEFGHIJKLMNOP"), "the scanned value must not be returned: {}", r.text);
+}
+
+#[tokio::test]
+async fn crl_lists_revoked_certificates() {
+    let s = Server::start().await;
+    let u = register(&s, "crl@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "test-ca"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let ca = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"cn": "service"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let cert = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/certs/{}/revoke", cert), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/crl", ca), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.header("content-type").contains("pkix-crl"), "{}", r.header("content-type"));
+    assert!(r.text.contains("BEGIN X509 CRL"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn master_key_rotation_keeps_existing_data_readable() {
+    let s = Server::start().await;
+    let u = register(&s, "rotate-master@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "KEEP", "value").await;
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"oidc_issuer": "https://idp.example", "oidc_client_id": "c", "oidc_client_secret": "s"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let new_key = { use base64ct::{Base64, Encoding}; Base64::encode_string(&[7u8; 32]) };
+    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token), Some(json!({"new_key": new_key}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
+    assert!(r.body["secrets"].as_array().unwrap().iter().any(|x| x["key"] == "KEEP" && x["value"] == "value"), "{}", r.text);
+    set_secret(&s, token, &envs[0], "AFTER", "works").await;
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
+    assert_eq!(r.body["oidc_client_secret_set"], true, "{}", r.text);
+}
+
+#[tokio::test]
+async fn ocsp_reports_good_then_revoked() {
+    let s = Server::start().await;
+    let u = register(&s, "ocsp@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "ocsp-ca"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let ca = r.body["id"].as_str().unwrap().to_string();
+    let ca_pem = r.body["certificate"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"cn": "svc"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let cert = r.body["id"].as_str().unwrap().to_string();
+    let leaf_pem = r.body["certificate"].as_str().unwrap().to_string();
+
+    let ca_der = keystore_ocsp::pem::decode("CERTIFICATE", &ca_pem).expect("CA DER");
+    let leaf_der = keystore_ocsp::pem::decode("CERTIFICATE", &leaf_pem).expect("leaf DER");
+    let cert_id = keystore_ocsp::CertificateId::from_certificate(&leaf_der, &ca_der, keystore_ocsp::HashAlgorithm::Sha256).expect("cert id");
+    let request = keystore_ocsp::OcspRequestBuilder::new().add_request(cert_id.clone()).build().to_der();
+    let resp = s.client.post(s.url(&format!("/api/pki/cas/{}/ocsp", ca))).header("content-type", "application/ocsp-request").body(request).send().await.expect("OCSP request");
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").contains("ocsp-response"));
+    let body = resp.bytes().await.expect("OCSP body");
+    let parsed = keystore_ocsp::OcspResponse::from_der(&body).expect("parse OCSP response");
+    let basic = parsed.basic_response().expect("basic OCSP response");
+    assert!(matches!(basic.tbs_response_data.responses[0].cert_status, keystore_ocsp::CertStatus::Good), "expected Good");
+
+    let r = s.call(Method::POST, &format!("/api/pki/certs/{}/revoke", cert), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let request = keystore_ocsp::OcspRequestBuilder::new().add_request(cert_id).build().to_der();
+    let resp = s.client.post(s.url(&format!("/api/pki/cas/{}/ocsp", ca))).header("content-type", "application/ocsp-request").body(request).send().await.expect("OCSP request");
+    let body = resp.bytes().await.expect("OCSP body");
+    let parsed = keystore_ocsp::OcspResponse::from_der(&body).expect("parse OCSP response");
+    let basic = parsed.basic_response().expect("basic OCSP response");
+    assert!(matches!(basic.tbs_response_data.responses[0].cert_status, keystore_ocsp::CertStatus::Revoked { .. }), "expected Revoked");
+}
+
+#[tokio::test]
+async fn saml_sp_round_trip_signs_validates_and_provisions() {
+    use risaml::{AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, IdpConfig,
+        IdpValidationPolicy, MetadataTrustPolicy, NameId, PrivateKeyPem, ReplayPolicy, RespondSso,
+        Saml, SamlValidationContext, SpDescriptor, SsoEndpoint, Subject};
+
+    let s = Server::start().await;
+    let owner = register(&s, "saml-owner@test.invalid").await;
+    let token = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+
+    let idp_rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("idp rsa key");
+    use rsa::pkcs8::EncodePrivateKey;
+    let idp_key_pem = idp_rsa.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).expect("idp key pem").to_string();
+    let idp_key = rcgen::KeyPair::from_pem(&idp_key_pem).expect("idp key");
+    let idp_params = rcgen::CertificateParams::new(vec!["idp.test".into()]).expect("idp params");
+    let idp_cert = idp_params.self_signed(&idp_key).expect("idp cert");
+    let idp_entity = "https://idp.test/metadata";
+    let idp = Saml::idp(IdpConfig::builder(EntityId::try_new(idp_entity).unwrap())
+        .sso_endpoint(SsoEndpoint::post("https://idp.test/sso").unwrap())
+        .sso_endpoint(SsoEndpoint::redirect("https://idp.test/sso").unwrap())
+        .credentials(Credentials {
+            signing_key: Some(PrivateKeyPem::new(idp_key_pem)),
+            signing_certificate: Some(CertificatePem::new(idp_cert.pem())),
+            ..Credentials::default()
+        })
+        .validation(IdpValidationPolicy::strict())
+        .build().unwrap()).unwrap();
+    let idp_metadata = idp.metadata_xml().to_string();
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({
+        "idp_entity_id": idp_entity,
+        "metadata_xml": idp_metadata,
+        "allow_unsigned_metadata": true,
+        "auto_provision": true,
+        "allowed_domains": "test.invalid"
+    }))).await;
+    assert_eq!(r.status, 200, "SAML config failed: {}", r.text);
+
+    let sp_entity = format!("{}/api/auth/saml/{}/metadata", s.base, org);
+    let r = s.call(Method::GET, &format!("/api/auth/saml/{}/metadata", org), None, None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.text.contains("EntityDescriptor"), "{}", r.text);
+    let sp = SpDescriptor::from_metadata_xml_for(EntityId::try_new(sp_entity).unwrap(), &r.text, MetadataTrustPolicy::UnsignedForCompatibility).expect("SP descriptor");
+
+    let r = s.call(Method::GET, &format!("/api/auth/saml/{}/start", org), None, None).await;
+    assert_eq!(r.status, 307, "{}", r.text);
+    let location = r.header("location");
+    let query = location.split_once('?').expect("SAML redirect query").1.to_string();
+    let validation = || SamlValidationContext::new(SystemTime::now(), ReplayPolicy::DisabledForCompatibility);
+    let request = idp.receive_sso(&sp, BrowserInput::<AuthnRequest>::redirect(query), validation()).expect("IdP receives AuthnRequest");
+    let response = idp.respond_sso(&sp, &request, Subject::new(NameId::new("saml-user@test.invalid", None), Vec::new()), RespondSso::post()).expect("IdP responds");
+    let form = response.post_form().expect("SAML response form");
+    let fields: Vec<(&str, String)> = form.fields().iter().map(|f| (f.name(), f.value().to_string())).collect();
+    let r = s.form(&format!("/api/auth/saml/{}/acs", org), &fields, None).await;
+    assert_eq!(r.status, 303, "ACS failed: {} {}", r.status, r.text);
+    let replay = s.form(&format!("/api/auth/saml/{}/acs", org), &fields, None).await;
+    assert_ne!(replay.status, 303, "a completed SAML response must not be reusable");
+    let cookie = r.header("set-cookie");
+    assert!(cookie.contains("ow_session="), "session cookie missing: {}", cookie);
+    let session = cookie.split(';').next().unwrap().trim().strip_prefix("ow_session=").unwrap().to_string();
+    let me = s.client.get(s.url("/api/me")).header("cookie", format!("ow_session={}", session)).send().await.expect("session request");
+    assert_eq!(me.status(), 200);
+    let body: Value = me.json().await.expect("session body");
+    assert_eq!(body["email"], "saml-user@test.invalid");
+}
+
+#[tokio::test]
+async fn rotation_hook_receives_a_signed_payload() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("hook bind");
+    let addr = listener.local_addr().expect("hook addr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("hook accept");
+        let mut buf = Vec::new(); let mut chunk = [0u8; 4096]; let mut end = None;
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0); if n == 0 { break; }
+            buf.extend_from_slice(&chunk[..n]);
+            if end.is_none() { end = buf.windows(4).position(|w| w == b"\r\n\r\n"); }
+            if let Some(pos) = end {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                if buf.len() >= pos + 4 + len { break; }
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    });
+
+    let s = Server::start().await;
+    let u = register(&s, "hook@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "ROTATE_ME", "old").await;
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/rotation-hook", org), Some(token), Some(json!({"url": format!("http://{}/hook", addr), "secret": "hook-secret"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/rotate", envs[0]), Some(token), Some(json!({"key": "ROTATE_ME", "value": "new-value"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["rotation_hook_error"].is_null(), "{}", r.text);
+    let captured = rx.recv_timeout(Duration::from_secs(5)).expect("rotation hook request");
+    assert!(captured.to_lowercase().contains("x-openwarp-signature"), "{}", captured);
+    assert!(captured.contains("\"event\":\"secret.rotated\""), "{}", captured);
+    assert!(captured.contains("\"key\":\"ROTATE_ME\""), "{}", captured);
+    assert!(captured.contains("\"value\":\"new-value\""), "{}", captured);
+}
+
+#[tokio::test]
+async fn rotation_schedules_store_provider_adapters_without_leaking_config() {
+    let s = Server::start().await;
+    let u = register(&s, "adapter@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "MAIL_KEY", "interval_secs": 60,
+        "config": {"kind": "resend", "api_key": "re_parent", "key_id": "old-key"}
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["provider_rotation"], json!(true));
+    assert_eq!(r.body["kind"], json!("resend"));
+    let listed = s.call(Method::GET, &format!("/api/envs/{}/rotations", envs[0]), Some(token), None).await;
+    assert_eq!(listed.status, 200, "{}", listed.text);
+    let row = listed.body.as_array().and_then(|rows| rows.first()).expect("rotation row");
+    assert_eq!(row["provider_rotation"], json!(1));
+    assert!(!row.as_object().unwrap().contains_key("config_enc"), "encrypted config must not be returned: {}", listed.text);
+    let bad = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "OTHER", "interval_secs": 60, "config": {"kind": "unknown"}
+    }))).await;
+    assert_eq!(bad.status, 400, "{}", bad.text);
+    let incomplete = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "OPENAI_KEY", "interval_secs": 60, "config": {"kind": "openai", "admin_key": "sk"}
+    }))).await;
+    assert_eq!(incomplete.status, 400, "{}", incomplete.text);
+    let relay = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "RELAY_KEY", "interval_secs": 60, "config": {"rotation_url": "https://rotate.example.com/hook", "rotation_token": "tok"}
+    }))).await;
+    assert_eq!(relay.status, 200, "{}", relay.text);
+    assert_eq!(relay.body["kind"], json!("webhook"));
+}
+
+#[tokio::test]
+async fn reuse_check_confines_environment_scoped_tokens() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-scope@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "scoped-value").await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(token), Some(json!({"name": "scoped", "env_id": envs[1]}))).await;
+    assert_eq!(r.status, 200, "token create failed: {}", r.text);
+    let scoped = r.body["token"].as_str().expect("scoped token").to_string();
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "scoped-value", "path": "/", "type": "secret"}]);
+
+    let r = reuse_check(&s, &scoped, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0),
+        "an environment-scoped token must not see another environment: {}", r.text);
+
+    let r = reuse_check(&s, &scoped, &envs[0], candidates, json!([])).await;
+    assert_eq!(r.status, 403, "the token is confined to its own environment: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_refreshes_fingerprints_after_restore() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-restore@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "RESTORED_PASSWORD", "old-value").await;
+    set_secret(&s, token, &envs[0], "RESTORED_PASSWORD", "new-value").await;
+    let sid = secret_id(&s, token, &envs[0], "RESTORED_PASSWORD").await;
+    let r = s.call(Method::POST, &format!("/api/secrets/{}/restore/1", sid), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "restore failed: {}", r.text);
+
+    let r = check_value(&s, token, &envs[1], "old-value").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1),
+        "the restored value must be indexed again: {}", r.text);
+    let r = check_value(&s, token, &envs[1], "new-value").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0),
+        "the replaced value must not match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_survives_master_key_rotation() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-rotate@test.invalid").await;
+    let token = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "rotation-value").await;
+
+    // 32 bytes of 0x01, base64. The value is irrelevant as long as it is not
+    // the generated key already in use.
+    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token),
+        Some(json!({"new_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}))).await;
+    assert_eq!(r.status, 200, "rotation failed: {}", r.text);
+
+    // The re-index runs off the request, so poll for the rebuilt fingerprint.
+    let mut matched = false;
+    for _ in 0..60 {
+        let r = check_value(&s, token, &envs[1], "rotation-value").await;
+        if r.body["matches"].as_array().map(|m| m.len()) == Some(1) { matched = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(matched, "the index must be rebuilt under the new master key");
+}
+
+// ---------- password reuse detection ----------
+
+async fn reuse_check(s: &Server, token: &str, env: &str, secrets: Value, exclude: Value) -> Resp {
+    s.call(
+        Method::POST,
+        &format!("/api/envs/{}/secrets/reuse-check", env),
+        Some(token),
+        Some(json!({"secrets": secrets, "exclude": exclude})),
+    )
+    .await
+}
+
+async fn check_value(s: &Server, token: &str, env: &str, value: &str) -> Resp {
+    reuse_check(s, token, env, json!([{"key": "NEW_PASSWORD", "value": value, "path": "/", "type": "secret"}]), json!([])).await
+}
+
+async fn secret_id(s: &Server, token: &str, env: &str, key: &str) -> String {
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
+    assert_eq!(r.status, 200, "list secrets failed: {}", r.text);
+    r.body["secrets"]
+        .as_array()
+        .expect("secrets array")
+        .iter()
+        .find(|row| row["key"] == json!(key))
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("secret {} not found: {}", key, r.text))
+        .to_string()
+}
+
+#[tokio::test]
+async fn reuse_check_finds_a_value_across_app_environments() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-owner@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "hunter2").await;
+    let listing = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(token), None).await;
+    assert_eq!(listing.status, 200, "list envs failed: {}", listing.text);
+    let env_name = listing.body.as_array().expect("env array").iter()
+        .find(|e| e["id"] == json!(&envs[0]))
+        .and_then(|e| e["name"].as_str())
+        .expect("source env name")
+        .to_string();
+
+    let r = reuse_check(
+        &s, token, &envs[1],
+        json!([{"key": "NEW_PASSWORD", "value": "hunter2", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "reuse check failed: {}", r.text);
+    assert_eq!(r.body["enabled"], json!(true), "the check defaults on: {}", r.text);
+    let matches = r.body["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 1, "one candidate must be reported: {}", r.text);
+    assert_eq!(matches[0]["key"], json!("NEW_PASSWORD"), "{}", r.text);
+    assert_eq!(matches[0]["path"], json!("/"), "{}", r.text);
+    let items = matches[0]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "exactly one stored secret holds the value: {}", r.text);
+    assert_eq!(items[0]["key"], json!("SHARED_PASSWORD"), "{}", r.text);
+    assert_eq!(items[0]["path"], json!("/"), "{}", r.text);
+    assert_eq!(items[0]["env_id"], json!(&envs[0]), "{}", r.text);
+    assert_eq!(items[0]["env_name"], json!(env_name), "{}", r.text);
+    assert_eq!(items[0]["app_id"], json!(&app), "{}", r.text);
+    assert_eq!(items[0]["app_name"], json!("app"), "{}", r.text);
+    assert!(items[0]["secret_id"].as_str().map(|v| !v.is_empty()).unwrap_or(false), "{}", r.text);
+    assert!(items[0]["updated_at"].as_i64().unwrap_or(0) > 0, "{}", r.text);
+    assert!(!r.text.contains("hunter2"), "the response must never echo the value: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_stays_inside_the_workspace() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-tenancy@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org_a = u["org_id"].as_str().unwrap();
+    let (_, envs_a) = app_with_envs(&s, token, org_a).await;
+    set_secret(&s, token, &envs_a[0], "SHARED_PASSWORD", "cross-tenant-value").await;
+
+    let r = s.call(Method::POST, "/api/orgs", Some(token), Some(json!({"name": "second"}))).await;
+    assert_eq!(r.status, 200, "create second org failed: {}", r.text);
+    let org_b = r.body["id"].as_str().unwrap();
+    let (_, envs_b) = app_with_envs(&s, token, org_b).await;
+
+    let r = reuse_check(
+        &s, token, &envs_b[0],
+        json!([{"key": "NEW_PASSWORD", "value": "cross-tenant-value", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "another workspace must not match: {}", r.text);
+
+    let r = reuse_check(
+        &s, token, &envs_a[1],
+        json!([{"key": "NEW_PASSWORD", "value": "cross-tenant-value", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "the owning workspace must match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_hides_restricted_environments() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-restrict-owner@test.invalid").await;
+    let member = register(&s, "reuse-restrict-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "reuse-restrict-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    set_secret(&s, ot, &envs[0], "RESTRICTED_PASSWORD", "only-admins-see-this").await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"restricted": true}))).await;
+    assert_eq!(r.status, 200, "restrict env failed: {}", r.text);
+
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "only-admins-see-this", "path": "/", "type": "secret"}]);
+    let r = reuse_check(&s, mt, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "a member may check an env they can open: {}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "a restricted env must be omitted: {}", r.text);
+
+    let r = reuse_check(&s, ot, &envs[1], candidates, json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "an admin still sees the match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_respects_workspace_and_project_switches() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-switch-owner@test.invalid").await;
+    let dev = register(&s, "reuse-switch-dev@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let dt = dev["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "reuse-switch-dev@test.invalid", "developer").await;
+    let (app, envs) = app_with_envs(&s, ot, org).await;
+    set_secret(&s, ot, &envs[0], "SHARED_PASSWORD", "switch-value").await;
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "switch-value", "path": "/", "type": "secret"}]);
+    let enabled = |r: &Resp| r.body["enabled"].clone();
+    let match_count = |r: &Resp| r.body["matches"].as_array().map(|m| m.len()).unwrap_or(99);
+
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["reuse_check"], json!(true), "workspace switch defaults on: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/apps/{}/settings", app), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["reuse_check"], json!(true), "project switch defaults on: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let app_row = r.body.as_array().expect("app array").iter().find(|a| a["id"] == json!(&app)).expect("app row");
+    assert_eq!(app_row["reuse_check"], json!(true), "the app list carries the switch: {}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 200, "disable workspace check failed: {}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(enabled(&r), json!(false), "{}", r.text);
+    assert_eq!(match_count(&r), 0, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(ot), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 200, "disable project check failed: {}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(enabled(&r), json!(false), "{}", r.text);
+    assert_eq!(match_count(&r), 0, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(ot), Some(json!({"reuse_check": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates, json!([])).await;
+    assert_eq!(enabled(&r), json!(true), "{}", r.text);
+    assert_eq!(match_count(&r), 1, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(dt), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 403, "only an admin may change the workspace switch: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(dt), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 403, "only an admin may change the project switch: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_skips_non_secret_types_and_excluded_ids() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-types@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(token), Some(json!({"secrets": [
+        {"key": "SHARED_PASSWORD", "value": "typed-value", "type": "secret"},
+        {"key": "SHARED_CONFIG", "value": "typed-value", "type": "config"},
+        {"key": "SHARED_SEALED", "value": "typed-value", "type": "sealed"}
+    ]}))).await;
+    assert_eq!(r.status, 200, "seed secrets failed: {}", r.text);
+    let sid = secret_id(&s, token, &envs[0], "SHARED_PASSWORD").await;
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "typed-value", "path": "/", "type": "secret"}]);
+
+    let r = reuse_check(&s, token, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let matches = r.body["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1, "{}", r.text);
+    let items = matches[0]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "config and sealed values must not match: {}", r.text);
+    assert_eq!(items[0]["key"], json!("SHARED_PASSWORD"), "{}", r.text);
+
+    let r = reuse_check(&s, token, &envs[1], candidates.clone(), json!([sid])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "an excluded secret must not match itself: {}", r.text);
+
+    let r = reuse_check(&s, token, &envs[1], json!([
+        {"key": "AS_CONFIG", "value": "typed-value", "path": "/", "type": "config"},
+        {"key": "AS_SEALED", "value": "typed-value", "path": "/", "type": "sealed"}
+    ]), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "only secret candidates are checked: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_matches_exactly_and_ignores_deleted() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-exact@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "Passw0rd!").await;
+    for value in ["passw0rd!", "Passw0rd", ""] {
+        let r = check_value(&s, token, &envs[1], value).await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "value {:?} must not match: {}", value, r.text);
+    }
+    let r = check_value(&s, token, &envs[1], "Passw0rd!").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "the exact value must match: {}", r.text);
+
+    let sid = secret_id(&s, token, &envs[0], "SHARED_PASSWORD").await;
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{}", sid), Some(token), None).await;
+    assert_eq!(r.status, 200, "delete failed: {}", r.text);
+    let r = check_value(&s, token, &envs[1], "Passw0rd!").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "a deleted secret must not match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_requires_target_environment_access() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-outsider-owner@test.invalid").await;
+    let outsider = register(&s, "reuse-outsider@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let xt = outsider["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = reuse_check(&s, xt, &envs[0], json!([{"key": "NEW_PASSWORD", "value": "x", "type": "secret"}]), json!([])).await;
+    assert_eq!(r.status, 403, "a non-member must not probe another workspace: {}", r.text);
+}
+
 async fn put_secret(s: &Server, token: &str, env: &str, key: &str, value: &str, tags: &str) {
     let r = s
         .call(
@@ -940,18 +1682,6 @@ async fn put_secret(s: &Server, token: &str, env: &str, key: &str, value: &str, 
         )
         .await;
     assert_eq!(r.status, 200, "put {} failed: {}", key, r.text);
-}
-
-async fn secret_id(s: &Server, token: &str, env: &str, key: &str) -> String {
-    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
-    r.body["secrets"]
-        .as_array()
-        .expect("secrets")
-        .iter()
-        .find(|s| s["key"].as_str() == Some(key))
-        .and_then(|s| s["id"].as_str())
-        .unwrap_or_else(|| panic!("secret {} not found", key))
-        .to_string()
 }
 
 #[tokio::test]

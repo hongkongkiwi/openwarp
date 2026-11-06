@@ -1,14 +1,19 @@
 FROM rust:1.90-slim-bookworm AS build
 WORKDIR /src
+# native-tls (LDAP) links OpenSSL, so the builder needs its headers.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
-RUN cargo build --release -p openwarp-server -p openwarp-cli
+# The workspace patches lber to this vendored copy, so the build needs it.
+COPY vendor ./vendor
+RUN cargo build --release -p openwarp-server -p openwarp-cli -p openwarp-eso
 FROM debian:bookworm-slim
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home openwarp && mkdir -p /data && chown openwarp:openwarp /data
 COPY --from=build /src/target/release/openwarp-server /usr/local/bin/
 COPY --from=build /src/target/release/openwarp /usr/local/bin/
+COPY --from=build /src/target/release/openwarp-eso /usr/local/bin/
 ENV ADDR=0.0.0.0:8080 DATABASE_URL=sqlite:///data/openwarp.db OPENWARP_ENV=production
 WORKDIR /data
 USER 10001
