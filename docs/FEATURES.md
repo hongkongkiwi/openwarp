@@ -133,6 +133,42 @@ Passkeys need a secure browser context: HTTPS, or localhost in development.
 `OPENWARP_PUBLIC_URL` supplies the relying-party origin; `OPENWARP_RP_ID` and
 `OPENWARP_RP_ORIGIN` override it when a proxy or split origin requires that.
 
+## Encryption modes and key custody
+
+Environments choose one of three modes:
+
+- `sse` (managed): the server unwraps an environment key and decrypts for the
+  API and integrations. With `OPENWARP_KMS_URL`, the root and each environment
+  key are wrapped by an external KMS/HSM; without it, `OPENWARP_MASTER_KEY` or a
+  generated key in `meta` is the root.
+- `delegated`: the client generates the environment key, wraps it to itself and
+  to a customer-run sync runner, and writes ciphertext. The server queues sync
+  jobs; the runner decrypts in its own process and pushes to the provider. The
+  server cannot read the environment or the provider config.
+- `e2e`: client-held keys without a runner grant. Server-side integrations are
+  unavailable.
+
+Secret ciphertext written by the server uses `ow2` AEAD framing bound to the
+environment, secret and field, so a value cannot be moved between records.
+Legacy ciphertext remains readable. `POST /api/instance/rewrap` re-wraps every
+environment key under the current KMS key ID.
+
+Runner identities are created per organisation
+(`POST/GET /api/orgs/:id/runners`, `DELETE /api/orgs/:id/runners/:rid`). The
+token and private key are shown once. The runner polls
+`/api/runner/jobs` and reports to `/api/runner/jobs/:id/result`; a claimed job
+times out after ten minutes. Integration configuration for a delegated
+environment is sealed to the runner's X25519 key, not to the server.
+
+Removing a member from a client-encrypted environment sets a rekey flag.
+`openwarp e2e rekey --env ENV_ID` generates a new environment key, re-encrypts
+every secret, and rewraps it to the remaining users and the runner. Old
+versions are replaced because they cannot be read after the rotation.
+
+The [security model](SECURITY.md) states what each mode does and does not
+protect against, including the remaining server-sees-passwords and
+server-served-client limits.
+
 ## Trigger.dev sync
 
 Kind `trigger`, modelled directly on Trigger's env var REST API. Config:

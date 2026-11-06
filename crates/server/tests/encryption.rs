@@ -186,6 +186,49 @@ async fn kms_wraps_env_keys_and_secret_ciphertext_is_record_bound() {
 }
 
 #[tokio::test]
+async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "rekey@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let uid = u["user_id"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&t), None).await;
+    let pubkey = me.body["pubkey"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let env_key = oc::random_key();
+    let wrapped = oc::encrypt_to(&pubkey, &env_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&t), Some(json!({"name": "vault", "wrapped_key": wrapped}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let env = r.body["id"].as_str().unwrap().to_string();
+    let key_hash = oc::hash_token("/:API_KEY");
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"secrets": [{
+        "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"),
+        "value_enc": oc::encrypt_symmetric(&env_key, b"old-value"),
+        "key_hash": key_hash, "path": "/"
+    }]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let new_key = oc::random_key();
+    let new_wrapped = oc::encrypt_to(&pubkey, &new_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new-value"), "key_hash": key_hash, "path": "/"}],
+        "grants": [{"user_id": uid, "wrapped_key": new_wrapped}]
+    }))).await;
+    assert_eq!(r.status, 200, "rekey failed: {} {}", r.status, r.text);
+    assert_eq!(r.body["rekeyed"], json!(1), "{}", r.text);
+
+    let d = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), None).await;
+    let wrapped = d.body["wrapped_key"].as_str().unwrap();
+    let raw = oc::Keypair::from_secret_b64(u["recovery_kit"].as_str().unwrap()).unwrap().decrypt(wrapped).unwrap();
+    let rotated: [u8;32] = raw.try_into().unwrap();
+    let value = oc::decrypt_symmetric(&rotated, d.body["secrets"][0]["value_enc"].as_str().unwrap()).unwrap();
+    assert_eq!(value, b"new-value");
+    let meta = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&t), None).await;
+    assert_eq!(meta.body["mode"], json!("e2e"), "{}", meta.text);
+}
+
+#[tokio::test]
 async fn without_kms_the_existing_master_path_still_works() {
     let s = Server::start_env(&[]).await;
     let u = register(&s, "local@test.invalid").await;

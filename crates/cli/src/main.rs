@@ -23,10 +23,18 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String },
     Import { #[arg(long, default_value = "")] env: String, file: String },
     Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
-    E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
+    E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String,
+        /// Create a delegated environment owned by a customer-run sync runner
+        #[arg(long)] delegated: bool,
+        #[arg(long, default_value = "", env = "OPENWARP_RUNNER_ID")] runner_id: String,
+        #[arg(long, default_value = "", env = "OPENWARP_RUNNER_PUBKEY")] runner_pubkey: String },
     E2ePut { #[arg(long, default_value = "")] env: String, #[arg(long)] key: String, #[arg(long)] value: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     E2eGet { #[arg(long, default_value = "")] env: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     E2eGrant { #[arg(long, default_value = "")] env: String, #[arg(long)] email: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
+    /// Rotate a client-encrypted environment key and rewrap it to every current grantee
+    E2eRekey { #[arg(long, default_value = "")] env: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
+    /// Create a customer-run sync runner; prints its token and private key once
+    RunnerCreate { #[arg(long)] org: String, #[arg(long, default_value = "runner")] name: String },
     /// Print shell completions: openwarp completion bash|zsh|fish
     Completion { shell: String },
 }
@@ -115,6 +123,7 @@ fn save_config(v: &Value) {
     #[cfg(not(unix))] { std::fs::write(&p, data).expect("write config"); }
 }
 fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
+fn urlq(s: &str) -> String { s.bytes().map(|b| match b { b'A'..=b'Z'|b'a'..=b'z'|b'0'..=b'9'|b'-'|b'_'|b'.'|b'~' => (b as char).to_string(), _ => format!("%{:02X}", b) }).collect() }
 fn load_local_config() -> Value { std::fs::read_to_string(".openwarp.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
 fn pick(explicit: &str, local: &Value, key: &str, flag: &str) -> String {
     if !explicit.is_empty() { return explicit.to_string(); }
@@ -247,10 +256,16 @@ fn main() {
                 if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
             }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
-        Cmd::E2eCreate { app, name } => { let app = pick(app, &local, "app_id", "--app");
+        Cmd::E2eCreate { app, name, delegated, runner_id, runner_pubkey } => { let app = pick(app, &local, "app_id", "--app");
             let me = get(&format!("{}/api/me", host));
             let env_key = openwarp_crypto::random_key();
             let wrapped = openwarp_crypto::encrypt_to(me["pubkey"].as_str().expect("public key"), &env_key).expect("wrap env key");
+            if *delegated {
+                if runner_id.is_empty() || runner_pubkey.is_empty() { eprintln!("--delegated needs --runner-id and --runner-pubkey (or OPENWARP_RUNNER_ID / OPENWARP_RUNNER_PUBKEY)"); std::process::exit(2); }
+                let runner_wrapped = openwarp_crypto::encrypt_to(runner_pubkey, &env_key).expect("wrap runner env key");
+                let d: Value = client.post(format!("{}/api/apps/{}/envs", host, app)).bearer_auth(&token)
+                    .json(&json!({"name": name, "mode": "delegated", "runner_id": runner_id, "wrapped_key": wrapped, "runner_wrapped_key": runner_wrapped}))
+                    .send().expect("req").json().expect("json"); println!("{}", d); return; }
             let d: Value = client.post(format!("{}/api/apps/{}/envs/e2e", host, app)).bearer_auth(&token).json(&json!({"name": name, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
         Cmd::E2ePut { env, key, value, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let kname = key.to_uppercase(); let khash = openwarp_crypto::hash_token(&format!("/:{}", kname));
@@ -260,9 +275,37 @@ fn main() {
             let d = get(&format!("{}/api/envs/{}/e2e/secrets", host, env));
             for s in d["secrets"].as_array().cloned().unwrap_or_default() { let k = openwarp_crypto::decrypt_symmetric(&ek, s["key_enc"].as_str().unwrap_or("")).unwrap(); let v = openwarp_crypto::decrypt_symmetric(&ek, s["value_enc"].as_str().unwrap_or("")).unwrap(); println!("{}={}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v)); } }
         Cmd::E2eGrant { env, email, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
-            let u = get(&format!("{}/api/users/lookup?email={}", host, email));
+            let u = get(&format!("{}/api/users/lookup?email={}", host, urlq(email)));
             let wrapped = openwarp_crypto::encrypt_to(u["pubkey"].as_str().expect("grantee pubkey"), &ek).expect("wrap");
             let d: Value = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
+        Cmd::E2eRekey { env, privkey } => { let env = pick(env, &local, "env_id", "--env");
+            let kp = openwarp_crypto::Keypair::from_secret_b64(privkey).expect("bad privkey (recovery kit)");
+            let d = get(&format!("{}/api/envs/{}/e2e/secrets", host, env));
+            let old: [u8;32] = kp.decrypt(d["wrapped_key"].as_str().expect("wrapped key")).expect("decrypt env key").try_into().expect("env key length");
+            let new_key = openwarp_crypto::random_key();
+            let mut items = Vec::new();
+            for s in d["secrets"].as_array().cloned().unwrap_or_default() {
+                let key = openwarp_crypto::decrypt_symmetric(&old, s["key_enc"].as_str().unwrap_or("")).expect("decrypt key");
+                let value = openwarp_crypto::decrypt_symmetric(&old, s["value_enc"].as_str().unwrap_or("")).expect("decrypt value");
+                items.push(json!({"key_enc": openwarp_crypto::encrypt_symmetric(&new_key, &key), "value_enc": openwarp_crypto::encrypt_symmetric(&new_key, &value), "key_hash": s["key_hash"].clone(), "path": s["path"].clone()}));
+            }
+            let existing = get(&format!("{}/api/envs/{}/e2e/grants", host, env));
+            let mut grants = Vec::new();
+            for g in existing.as_array().cloned().unwrap_or_default() {
+                let uid = g["user_id"].as_str().unwrap_or(""); let email = g["email"].as_str().unwrap_or("");
+                let u = get(&format!("{}/api/users/lookup?email={}", host, urlq(email)));
+                let wrapped = openwarp_crypto::encrypt_to(u["pubkey"].as_str().expect("grantee pubkey"), &new_key).expect("wrap grant");
+                grants.push(json!({"user_id": uid, "wrapped_key": wrapped}));
+            }
+            let meta = get(&format!("{}/api/envs/{}/e2e/meta", host, env));
+            let mut body = json!({"secrets": items, "grants": grants});
+            if let Some(pk) = meta["runner"]["public_key"].as_str() {
+                body["runner_wrapped_key"] = json!(openwarp_crypto::encrypt_to(pk, &new_key).expect("wrap runner key"));
+            }
+            let d: Value = client.post(format!("{}/api/envs/{}/e2e/rekey", host, env)).bearer_auth(&token).json(&body).send().expect("req").json().expect("json"); println!("{}", d); }
+        Cmd::RunnerCreate { org, name } => { let kp = openwarp_crypto::Keypair::generate();
+            let d: Value = client.post(format!("{}/api/orgs/{}/runners", host, org)).bearer_auth(&token).json(&json!({"name": name, "public_key": kp.public})).send().expect("req").json().expect("json");
+            println!("runner_id: {}\nrunner_token: {}\nrunner_key: {}", d["id"].as_str().unwrap_or(""), d["token"].as_str().unwrap_or(""), kp.secret_b64()); }
         Cmd::Completion { shell } => { use clap::CommandFactory; let mut cmd = Cli::command(); let sh = match shell.as_str() { "zsh" => clap_complete::Shell::Zsh, "fish" => clap_complete::Shell::Fish, "powershell" => clap_complete::Shell::PowerShell, _ => clap_complete::Shell::Bash }; clap_complete::generate(sh, &mut cmd, "openwarp", &mut std::io::stdout()); }
     }
 }

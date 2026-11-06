@@ -30,8 +30,11 @@ docker compose up -d --build
 | --- | --- |
 | `DATABASE_URL` | `sqlite://file.db` or `postgres://...` |
 | `ADDR` | Listen address, default `0.0.0.0:8080` |
-| `OPENWARP_ENV` | `production` refuses to start without an external master key |
-| `OPENWARP_MASTER_KEY` | 32 bytes base64; wraps every environment data key |
+| `OPENWARP_ENV` | `production` refuses to start without an external root key or KMS |
+| `OPENWARP_MASTER_KEY` | 32 bytes base64; local root key. Optional when `OPENWARP_KMS_URL` is set |
+| `OPENWARP_KMS_URL` | KMS bridge base URL; enables external root and environment-key wrapping |
+| `OPENWARP_KMS_TOKEN` | Optional bearer token sent to the KMS bridge |
+| `OPENWARP_KMS_KEY_ID` | Key identifier recorded with each wrapped value; default `primary` |
 | `OPENWARP_PUBLIC_URL` | Public origin used for OAuth issuers and redirects |
 | `OPENWARP_SECURE_COOKIES` | `1` forces the `Secure` cookie flag |
 | `OPENWARP_TRUST_PROXY` | `1` enables `X-Forwarded-For` from trusted proxies |
@@ -55,6 +58,60 @@ Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
 GitHub callback URL: `{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback`.
 GitHub needs the `read:user` and `user:email` scopes; only a verified address
 can create or match an account.
+
+## Key management and encryption modes
+
+Set `OPENWARP_KMS_URL` to keep the root key and every managed environment key
+outside the database. The bridge protocol is in the [security model](SECURITY.md).
+A fresh database stores only a KMS-wrapped root; an existing database that
+already has a local master adopts it under the KMS on first boot. After changing
+`OPENWARP_KMS_KEY_ID`, call `POST /api/instance/rewrap` as the instance owner to
+wrap every environment key under the new key ID. Old key IDs must remain
+unwrappable by the KMS adapter until that finishes.
+
+Without a KMS, `OPENWARP_MASTER_KEY` is still required in production and the
+database is only as private as the host. Use managed (`sse`) environments for
+dynamic leases, PKI and any feature that needs server-side plaintext.
+
+## Delegated environments and the runner
+
+A delegated environment moves the environment key to the client and the
+customer-run sync runner. The server stores ciphertext, seals integration
+configuration to the runner, and queues sync jobs instead of calling providers.
+
+Create a runner from the console or the CLI:
+
+```bash
+openwarp runner create --org ORG_ID --name vpc-runner
+```
+
+Store the printed `runner_key` with the runner and keep the `runner_token`
+there too. Create the environment with the CLI, passing the same runner's ID
+and public key:
+
+```bash
+openwarp e2e create --app APP_ID --name production --delegated \
+  --runner-id RUNNER_ID --runner-pubkey RUNNER_PUBLIC_KEY
+```
+
+Run the runner in the customer network:
+
+```bash
+OPENWARP_URL=https://secrets.example.com \
+OPENWARP_RUNNER_TOKEN=... \
+OPENWARP_RUNNER_KEY=... \
+openwarp-runner
+```
+
+The runner polls `/api/runner/jobs`, unwraps the environment key with its own
+private key, decrypts the integration config and secrets in memory, pushes to
+the provider, and reports the result. The server never holds the plaintext or
+the provider credentials. A claimed job is reclaimable after ten minutes if the
+runner crashes.
+
+Removing a member from an `e2e` or delegated environment sets a rekey flag; run
+`openwarp e2e rekey --env ENV_ID` with a current grant to rotate the environment
+key and rewrap it to the remaining grantees and the runner.
 
 ## Signups and invitations
 
