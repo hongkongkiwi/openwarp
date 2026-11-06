@@ -5,6 +5,7 @@ set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
 wt_root="$root/.worktrees"
+repo="$(basename "$root")"
 cd "$root"
 
 die() {
@@ -20,6 +21,9 @@ usage: scripts/worktree.sh <command>
                                <name>, base to main. An existing branch is
                                attached instead of created.
   list                         list every registered worktree
+  move <path> [name]           relocate an existing registered worktree into
+                               .worktrees/; name defaults to the directory
+                               name without the "<repo>-" prefix
   remove <name> [--force]      remove a clean worktree, prune stale entries
   prune                        prune metadata for deleted worktrees
 EOF
@@ -51,6 +55,31 @@ case "${1:-}" in
 
   list)
     git worktree list
+    ;;
+
+  move)
+    src="${2:-}"
+    [ -n "$src" ] || usage
+    [ -d "$src" ] || die "$src does not exist"
+    src="$(cd "$src" && git rev-parse --show-toplevel)"
+    [ "$src" = "$root" ] && die "refusing to move the main checkout"
+    case "$src" in
+      "$wt_root"/*) die "$src is already inside $wt_root" ;;
+    esac
+    git worktree list --porcelain | grep -Fxq "worktree $src" || die "$src is not a registered worktree"
+
+    base="$(basename "$src")"
+    name="${3:-${base#"$repo"-}}"
+    case "$name" in
+      */*|.|..) die "name must be one path component" ;;
+    esac
+    dst="$wt_root/$name"
+    [ -e "$dst" ] && die "$dst already exists"
+    git check-ignore -q "$dst" || die ".worktrees/ is not gitignored; fix .gitignore first"
+    mkdir -p "$wt_root"
+
+    git worktree move "$src" "$dst"
+    echo "moved: $src -> $dst"
     ;;
 
   remove)
