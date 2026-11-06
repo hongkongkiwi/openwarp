@@ -5,10 +5,12 @@ use hmac::Mac;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -36,6 +38,7 @@ struct Server {
     base: String,
     dir: PathBuf,
     client: Client,
+    inbox: Arc<Mutex<Vec<Value>>>,
     keep: bool,
 }
 
@@ -76,10 +79,12 @@ impl Server {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
+        let (inbox_url, inbox) = start_inbox();
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &base)
+            .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -96,7 +101,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("http client");
-        let server = Server { child, base, dir, client, keep: false };
+        let server = Server { child, base, dir, client, inbox, keep: false };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -150,12 +155,72 @@ impl Server {
     }
 }
 
+/// Minimal email relay: records each JSON body and answers 200.
+fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
+    let addr = listener.local_addr().expect("inbox addr");
+    let inbox = Arc::new(Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+    (format!("http://{}/mail", addr), inbox)
+}
+
+async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no email containing {:?} arrived", needle);
+}
+
+fn extract_link(text: &str, needle: &str) -> String {
+    for word in text.split_whitespace() {
+        if let Some(i) = word.find(needle) { return word[i..].to_string(); }
+    }
+    panic!("no link containing {:?} in {:?}", needle, text);
+}
+
 async fn register(s: &Server, email: &str) -> Value {
     let r = s
         .call(Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": "correct-horse-battery"})))
         .await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
-    r.body.clone()
+    let mut body = r.body.clone();
+    // Password signup always needs the verification link; finish the flow the
+    // way a real operator with a mail relay would.
+    if body["verification_required"] == json!(true) {
+        let text = wait_for_mail(&s.inbox, "/api/auth/verify?token=").await;
+        let link = extract_link(&text, "/api/auth/verify?token=");
+        let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+        let verified = s.call(Method::GET, &path, None, None).await;
+        assert_eq!(verified.status, 200, "verification failed: {} {}", verified.status, verified.text);
+        let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": "correct-horse-battery"}))).await;
+        assert_eq!(login.status, 200, "verified sign-in failed: {} {}", login.status, login.text);
+        body["token"] = login.body["token"].clone();
+        body["user_id"] = login.body["user_id"].clone();
+        body["public_key"] = login.body["public_key"].clone();
+    }
+    body
 }
 
 async fn invite(s: &Server, owner: &str, org: &str, email: &str, role: &str) {
@@ -1061,4 +1126,150 @@ async fn master_key_rotation_keeps_existing_data_readable() {
     set_secret(&s, token, &envs[0], "AFTER", "works").await;
     let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
     assert_eq!(r.body["oidc_client_secret_set"], true, "{}", r.text);
+}
+
+#[tokio::test]
+async fn ocsp_reports_good_then_revoked() {
+    let s = Server::start().await;
+    let u = register(&s, "ocsp@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "ocsp-ca"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let ca = r.body["id"].as_str().unwrap().to_string();
+    let ca_pem = r.body["certificate"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"cn": "svc"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let cert = r.body["id"].as_str().unwrap().to_string();
+    let leaf_pem = r.body["certificate"].as_str().unwrap().to_string();
+
+    let ca_der = keystore_ocsp::pem::decode("CERTIFICATE", &ca_pem).expect("CA DER");
+    let leaf_der = keystore_ocsp::pem::decode("CERTIFICATE", &leaf_pem).expect("leaf DER");
+    let cert_id = keystore_ocsp::CertificateId::from_certificate(&leaf_der, &ca_der, keystore_ocsp::HashAlgorithm::Sha256).expect("cert id");
+    let request = keystore_ocsp::OcspRequestBuilder::new().add_request(cert_id.clone()).build().to_der();
+    let resp = s.client.post(s.url(&format!("/api/pki/cas/{}/ocsp", ca))).header("content-type", "application/ocsp-request").body(request).send().await.expect("OCSP request");
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").contains("ocsp-response"));
+    let body = resp.bytes().await.expect("OCSP body");
+    let parsed = keystore_ocsp::OcspResponse::from_der(&body).expect("parse OCSP response");
+    let basic = parsed.basic_response().expect("basic OCSP response");
+    assert!(matches!(basic.tbs_response_data.responses[0].cert_status, keystore_ocsp::CertStatus::Good), "expected Good");
+
+    let r = s.call(Method::POST, &format!("/api/pki/certs/{}/revoke", cert), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let request = keystore_ocsp::OcspRequestBuilder::new().add_request(cert_id).build().to_der();
+    let resp = s.client.post(s.url(&format!("/api/pki/cas/{}/ocsp", ca))).header("content-type", "application/ocsp-request").body(request).send().await.expect("OCSP request");
+    let body = resp.bytes().await.expect("OCSP body");
+    let parsed = keystore_ocsp::OcspResponse::from_der(&body).expect("parse OCSP response");
+    let basic = parsed.basic_response().expect("basic OCSP response");
+    assert!(matches!(basic.tbs_response_data.responses[0].cert_status, keystore_ocsp::CertStatus::Revoked { .. }), "expected Revoked");
+}
+
+#[tokio::test]
+async fn saml_sp_round_trip_signs_validates_and_provisions() {
+    use risaml::{AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, IdpConfig,
+        IdpValidationPolicy, MetadataTrustPolicy, NameId, PrivateKeyPem, ReplayPolicy, RespondSso,
+        Saml, SamlValidationContext, SpDescriptor, SsoEndpoint, Subject};
+
+    let s = Server::start().await;
+    let owner = register(&s, "saml-owner@test.invalid").await;
+    let token = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+
+    let idp_rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("idp rsa key");
+    use rsa::pkcs8::EncodePrivateKey;
+    let idp_key_pem = idp_rsa.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).expect("idp key pem").to_string();
+    let idp_key = rcgen::KeyPair::from_pem(&idp_key_pem).expect("idp key");
+    let idp_params = rcgen::CertificateParams::new(vec!["idp.test".into()]).expect("idp params");
+    let idp_cert = idp_params.self_signed(&idp_key).expect("idp cert");
+    let idp_entity = "https://idp.test/metadata";
+    let idp = Saml::idp(IdpConfig::builder(EntityId::try_new(idp_entity).unwrap())
+        .sso_endpoint(SsoEndpoint::post("https://idp.test/sso").unwrap())
+        .sso_endpoint(SsoEndpoint::redirect("https://idp.test/sso").unwrap())
+        .credentials(Credentials {
+            signing_key: Some(PrivateKeyPem::new(idp_key_pem)),
+            signing_certificate: Some(CertificatePem::new(idp_cert.pem())),
+            ..Credentials::default()
+        })
+        .validation(IdpValidationPolicy::strict())
+        .build().unwrap()).unwrap();
+    let idp_metadata = idp.metadata_xml().to_string();
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({
+        "idp_entity_id": idp_entity,
+        "metadata_xml": idp_metadata,
+        "allow_unsigned_metadata": true,
+        "auto_provision": true,
+        "allowed_domains": "test.invalid"
+    }))).await;
+    assert_eq!(r.status, 200, "SAML config failed: {}", r.text);
+
+    let sp_entity = format!("{}/api/auth/saml/{}/metadata", s.base, org);
+    let r = s.call(Method::GET, &format!("/api/auth/saml/{}/metadata", org), None, None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.text.contains("EntityDescriptor"), "{}", r.text);
+    let sp = SpDescriptor::from_metadata_xml_for(EntityId::try_new(sp_entity).unwrap(), &r.text, MetadataTrustPolicy::UnsignedForCompatibility).expect("SP descriptor");
+
+    let r = s.call(Method::GET, &format!("/api/auth/saml/{}/start", org), None, None).await;
+    assert_eq!(r.status, 307, "{}", r.text);
+    let location = r.header("location");
+    let query = location.split_once('?').expect("SAML redirect query").1.to_string();
+    let validation = || SamlValidationContext::new(SystemTime::now(), ReplayPolicy::DisabledForCompatibility);
+    let request = idp.receive_sso(&sp, BrowserInput::<AuthnRequest>::redirect(query), validation()).expect("IdP receives AuthnRequest");
+    let response = idp.respond_sso(&sp, &request, Subject::new(NameId::new("saml-user@test.invalid", None), Vec::new()), RespondSso::post()).expect("IdP responds");
+    let form = response.post_form().expect("SAML response form");
+    let fields: Vec<(&str, String)> = form.fields().iter().map(|f| (f.name(), f.value().to_string())).collect();
+    let r = s.form(&format!("/api/auth/saml/{}/acs", org), &fields, None).await;
+    assert_eq!(r.status, 303, "ACS failed: {} {}", r.status, r.text);
+    let replay = s.form(&format!("/api/auth/saml/{}/acs", org), &fields, None).await;
+    assert_ne!(replay.status, 303, "a completed SAML response must not be reusable");
+    let cookie = r.header("set-cookie");
+    assert!(cookie.contains("ow_session="), "session cookie missing: {}", cookie);
+    let session = cookie.split(';').next().unwrap().trim().strip_prefix("ow_session=").unwrap().to_string();
+    let me = s.client.get(s.url("/api/me")).header("cookie", format!("ow_session={}", session)).send().await.expect("session request");
+    assert_eq!(me.status(), 200);
+    let body: Value = me.json().await.expect("session body");
+    assert_eq!(body["email"], "saml-user@test.invalid");
+}
+
+#[tokio::test]
+async fn rotation_hook_receives_a_signed_payload() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("hook bind");
+    let addr = listener.local_addr().expect("hook addr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("hook accept");
+        let mut buf = Vec::new(); let mut chunk = [0u8; 4096]; let mut end = None;
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0); if n == 0 { break; }
+            buf.extend_from_slice(&chunk[..n]);
+            if end.is_none() { end = buf.windows(4).position(|w| w == b"\r\n\r\n"); }
+            if let Some(pos) = end {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                if buf.len() >= pos + 4 + len { break; }
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    });
+
+    let s = Server::start().await;
+    let u = register(&s, "hook@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "ROTATE_ME", "old").await;
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/rotation-hook", org), Some(token), Some(json!({"url": format!("http://{}/hook", addr), "secret": "hook-secret"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/rotate", envs[0]), Some(token), Some(json!({"key": "ROTATE_ME", "value": "new-value"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["rotation_hook_error"].is_null(), "{}", r.text);
+    let captured = rx.recv_timeout(Duration::from_secs(5)).expect("rotation hook request");
+    assert!(captured.to_lowercase().contains("x-openwarp-signature"), "{}", captured);
+    assert!(captured.contains("\"event\":\"secret.rotated\""), "{}", captured);
+    assert!(captured.contains("\"key\":\"ROTATE_ME\""), "{}", captured);
+    assert!(captured.contains("\"value\":\"new-value\""), "{}", captured);
 }

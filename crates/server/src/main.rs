@@ -1,10 +1,16 @@
 mod db; mod integrations; mod mailer; mod ui;
-use axum::{extract::{ConnectInfo, Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
+use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
 use openwarp_crypto as oc;
+use risaml::{
+    AcsEndpoint, AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, FormField,
+    IdpDescriptor, MetadataTrustPolicy, Pending, PendingSnapshot, PrivateKeyPem, RelayStateParam,
+    ReplayCache, ReplayKey, ReplayPolicy, Saml, SamlError, SamlInstant, SamlValidationContext,
+    SpConfig, SpValidationPolicy, SsoResponse, StartSso,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}, time::{SystemTime, UNIX_EPOCH}};
 
 pub struct AppState {
     db: Db,
@@ -68,6 +74,10 @@ fn valid_cidr_list(list: &str) -> bool {
 fn valid_domain_list(list: &str) -> bool {
     list.split(',').map(str::trim).filter(|s| !s.is_empty())
         .all(|d| !d.is_empty() && d.len() <= 253 && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')) }
+fn valid_email(e: &str) -> bool {
+    let e = e.trim();
+    let Some((local, domain)) = e.split_once('@') else { return false };
+    !local.is_empty() && !domain.is_empty() && e.len() <= 254 && !e.contains(char::is_whitespace) && domain.contains('.') }
 fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
     if meta_get(st, &format!("totp_enabled:{}", uid)) != "1" { return true; }
     if code.is_empty() { return false; }
@@ -206,7 +216,7 @@ impl AppState {
         match self.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(uid)]) {
             Ok(Some(row)) => {
                 if db::n(&row, "active") == 0 { return false; }
-                if verification_required() && db::n(&row, "email_verified") == 0 { return false; }
+                if db::n(&row, "email_verified") == 0 { return false; }
                 true },
             Ok(None) => self.db.one("SELECT id FROM identities WHERE id=?", &[json!(uid)]).ok().flatten().is_some(),
             Err(_) => false,
@@ -287,23 +297,19 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     st.rate_fail(&rl, 3600);
     if r.email.is_empty() || r.password.len() < 8 { return Err(bad("email and password (>=8 chars) required")); }
     if !signups_open(&st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
+    if production() && !mailer::MailConfig::from_env().enabled() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "password signup is unavailable: no email provider is configured; use a configured sign-in provider or ask an administrator")); }
     let kp = oc::Keypair::generate();
     let wrapped = oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?;
     let uid = id(); let hash = oc::hash_password(&r.password).map_err(|e| bad(&e))?;
-    let verified = if verification_required() { 0 } else { 1 };
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,?)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now()), json!(verified)]).map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
+    // A password signup proves nothing about the address until the link is opened.
+    // The instance-owner claim in particular waits for verification.
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,0)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).map_err(|e| bad(&e))?;
-    claim_instance_owner(&st, &uid);
-    if verification_required() {
-        let link_token = issue_auth_token(&st, &uid, "verify", 86400);
-        let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
-        send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
-        return Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))));
-    }
-    let token = make_session(&st, &uid)?;
-    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
-    Ok((hdr, j(json!({"token": token, "user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64()}))))
+    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(&uid)]).map_err(|e| bad(&e))?;
+    let link_token = issue_auth_token(&st, &uid, "verify", 86400);
+    let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
+    send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
+    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))))
 }
 fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
@@ -312,7 +318,7 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
     let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
-    if verification_required() && db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
+    if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key);
     let uid = db::s(&row, "id");
     if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
@@ -393,7 +399,9 @@ async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<
     let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
     let kp = oc::Keypair::generate(); let uid = id();
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(uid), json!(&email), json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+    // The invite token reached this address, which is the proof a password
+    // signup would otherwise obtain by email.
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(&email), json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).map_err(|e| bad(&e))?;
     st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).map_err(|e| bad(&e))?;
     claim_instance_owner(&st, &uid);
@@ -751,7 +759,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let initial = config.get("initial_sync").and_then(Value::as_str).unwrap_or("overwrite");
     if !matches!(initial, "overwrite" | "import_local" | "import_remote") { return Err(bad("initial_sync must be overwrite, import_local or import_remote")); }
     if initial != "overwrite" && prev.is_empty() {
-        if !matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor") {
+        if !integrations::is_stateful(&kind) {
             return Err(bad("initial_sync is only supported for stateful sync adapters"));
         }
         let imported = integrations::pull(&kind, &config).await.map_err(|e| bad(&e))?;
@@ -775,35 +783,10 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid)?;
     let pairs: Vec<(String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, _)| (k.clone(), v.clone())).collect();
-    if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor") {
+    if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let result = match kind.as_str() {
-            "trigger" => integrations::trigger_sync(&config, &pairs, &prev).await,
-            "instabox" => integrations::instabox_sync(&config, &pairs, &prev).await,
-            "boat" => integrations::boat_sync(&config, &pairs, &prev).await,
-            "daytona" => integrations::daytona_sync(&config, &pairs, &prev).await,
-            "1password" | "onepassword" => integrations::onepassword_sync(&config, &pairs, &prev).await,
-            "aws_secrets_manager" => integrations::aws_secrets_manager_sync(&config, &pairs, &prev).await,
-            "aws_parameter_store" => integrations::aws_parameter_store_sync(&config, &pairs, &prev).await,
-            "dokploy" => integrations::dokploy_sync(&config, &pairs, &prev).await,
-            "caprover" => integrations::caprover_sync(&config, &pairs, &prev).await,
-            "portainer" => integrations::portainer_sync(&config, &pairs, &prev).await,
-            "bitbucket" => integrations::bitbucket_sync(&config, &pairs, &prev).await,
-            "circleci" => integrations::circleci_sync(&config, &pairs, &prev).await,
-            "teamcity" => integrations::teamcity_sync(&config, &pairs, &prev).await,
-            "travisci" => integrations::travisci_sync(&config, &pairs, &prev).await,
-            "terraform_cloud" => integrations::terraform_cloud_sync(&config, &pairs, &prev).await,
-            "qovery" => integrations::qovery_sync(&config, &pairs, &prev).await,
-            "laravel_forge" => integrations::laravel_forge_sync(&config, &pairs, &prev).await,
-            "openwarp" => integrations::openwarp_sync(&config, &pairs, &prev).await,
-            "devin" => integrations::devin_sync(&config, &pairs, &prev).await,
-            "cloudflare_secrets_store" => integrations::cloudflare_secrets_store_sync(&config, &pairs, &prev).await,
-            "octopus_deploy" => integrations::octopus_deploy_sync(&config, &pairs, &prev).await,
-            "azure_devops" => integrations::azure_devops_sync(&config, &pairs, &prev).await,
-            "cursor" => integrations::cursor_sync(&config, &pairs, &prev).await,
-            _ => integrations::docker_swarm_sync(&config, &pairs, &prev).await,
-        };
+        let result = integrations::sync_managed(&kind, &config, &pairs, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
         let (msg, managed) = match result {
             Ok(x) => x,
             Err(e) => {
@@ -903,6 +886,36 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
             meta_set(&st, &format!("{}:{}", field, oid), &stored); } }
     st.audit(&oid, "", "", &uid, "org.settings", "");
     Ok(j(json!({"ok":true}))) }
+async fn get_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?;
+    st.check_admin(&oid, &uid)?;
+    let hook = st.db.one("SELECT url,secret_enc FROM rotation_hooks WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    Ok(j(match hook { Some(row) => json!({"configured": true, "url": db::s(&row,"url"), "secret_set": !db::s(&row,"secret_enc").is_empty()}), None => json!({"configured": false}) })) }
+async fn put_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
+    st.check_admin(&oid, &uid)?;
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !url_ok(&url) || !egress_allowed(&url) { return Err(bad("rotation hook url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
+    let secret = body.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+    let existing = st.db.one("SELECT secret_enc FROM rotation_hooks WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    let secret_enc = if secret.is_empty() { existing.as_ref().map(|r| db::s(r,"secret_enc")).unwrap_or_default() } else { oc::encrypt_symmetric(&st.master(), secret.as_bytes()) };
+    if existing.is_some() {
+        st.db.exec("UPDATE rotation_hooks SET url=?,secret_enc=? WHERE org_id=?", &[json!(&url), json!(&secret_enc), json!(&oid)]).map_err(|e| bad(&e))?;
+    } else {
+        st.db.exec("INSERT INTO rotation_hooks(org_id,url,secret_enc,created_at) VALUES(?,?,?,?)", &[json!(&oid), json!(&url), json!(&secret_enc), json!(now())]).map_err(|e| bad(&e))?;
+    }
+    st.audit(&oid, "", "", &uid, "rotation_hook.set", &url); Ok(j(json!({"ok": true}))) }
+async fn delete_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?;
+    st.check_admin(&oid, &uid)?;
+    st.db.exec("DELETE FROM rotation_hooks WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    st.audit(&oid, "", "", &uid, "rotation_hook.delete", ""); Ok(j(json!({"ok": true}))) }
+async fn fire_rotation_hook(st: &S, org: &str, env: &str, key: &str, value: &str) -> Option<String> {
+    let hook = match st.db.one("SELECT url,secret_enc FROM rotation_hooks WHERE org_id=?", &[json!(org)]) { Ok(Some(r)) => r, _ => return None };
+    let url = db::s(&hook, "url"); if url.is_empty() { return None; }
+    let secret = { let enc = db::s(&hook, "secret_enc"); if enc.is_empty() { String::new() } else { oc::decrypt_symmetric(&st.master(), &enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() } };
+    let payload = json!({"event": "secret.rotated", "org_id": org, "env_id": env, "key": key, "value": value, "ts": now()});
+    let body = payload.to_string(); let signed_at = now();
+    let mut req = http_client().post(&url).header("content-type", "application/json").body(body.clone());
+    if !secret.is_empty() { let sig = hmac_hex(secret.as_bytes(), format!("{}.{}", signed_at, body).as_bytes()); req = req.header("X-OpenWarp-Timestamp", signed_at.to_string()).header("X-OpenWarp-Signature", format!("t={},v1={}", signed_at, sig)); }
+    match req.send().await { Ok(r) if r.status().is_success() => None, Ok(r) => Some(format!("rotation hook returned HTTP {}", r.status())), Err(e) => Some(e.to_string()) } }
 async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; let (org,app)=st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "secrets:write")?;
     let key_name = body.get("key").and_then(|v|v.as_str()).unwrap_or("");
     let path = body.get("path").and_then(|v|v.as_str()).unwrap_or("/");
@@ -912,7 +925,8 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     upsert_secret(&st,&eid,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()})?;
     st.audit(&org,&app,&eid,&uid,"secret.rotate",key_name);
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
-    Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id"),"sync_errors":sync_errors}))) }
+    let rotation_hook_error = fire_rotation_hook(&st, &org, &eid, key_name, &new_val).await;
+    Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id"),"sync_errors":sync_errors,"rotation_hook_error":rotation_hook_error}))) }
 fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
     if oauth_access(st, h).is_some() { return Err(err(StatusCode::FORBIDDEN, "OAuth access tokens cannot call SCIM; use a session or a service token")); }
     let uid = st.token_user(h)?;
@@ -951,7 +965,7 @@ async fn scim_create_user(State(st): State<S>, h: HeaderMap, Query(q): Query<Has
     let org = scim_org(&st, &h, &q)?;
     let email = body.get("userName").and_then(|v| v.as_str()).unwrap_or(""); if email.is_empty() { return Err(bad("userName required")); }
     let kp = oc::Keypair::generate(); let pw = oc::random_token("scim"); let nid = id();
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(nid), json!(email.to_lowercase()), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|_| bad("user exists"))?;
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(nid), json!(email.to_lowercase()), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|_| bad("user exists"))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(org), json!(nid)]).map_err(|e| bad(&e))?;
     Ok(j(json!({"id":nid,"userName":email,"active":true,"temp_password":pw}))) }
 async fn scim_list_users(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res {
@@ -1097,7 +1111,6 @@ async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum
     let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
     Ok(axum::response::Redirect::temporary(&url)) }
 fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
-#[derive(serde::Deserialize)] struct Claims { email: Option<String>, sub: String, #[serde(default)] nonce: Option<String>, #[serde(default)] email_verified: Option<bool> }
 async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let srow = st.db.one("SELECT org_id,created_at,nonce FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
@@ -1108,22 +1121,8 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)); let client_secret = oc::decrypt_symmetric(&st.master(), &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     if !egress_allowed(&issuer) { return Err(bad("OIDC issuer is a private address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted IdP")); }
     let disc = oidc_discovery(&issuer).await?;
-    let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or(""); let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
-    if !url_ok(token_ep) || !url_ok(jwks_uri) || !egress_allowed(token_ep) || !egress_allowed(jwks_uri) { return Err(bad("OIDC discovery returned no usable token_endpoint or jwks_uri")); }
-    let client = http_client();
-    let tok: Value = client.post(token_ep).form(&[("grant_type","authorization_code"),("code",&code),("redirect_uri",&redirect_uri),("client_id",&client_id),("client_secret",&client_secret)]).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string()))?;
-    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or_else(|| bad("token response has no id_token"))?;
-    let header = jsonwebtoken::decode_header(id_token).map_err(|e| bad(&e.to_string()))?; let kid = header.kid.ok_or_else(|| bad("id_token has no kid"))?;
-    let jwks: Value = client.get(jwks_uri).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string()))?;
-    let jwk = jwks.get("keys").and_then(|v| v.as_array()).and_then(|ks| ks.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid))).ok_or_else(|| bad("kid not found in JWKS"))?;
-    let dkey = jsonwebtoken::DecodingKey::from_rsa_components(jwk.get("n").and_then(|v| v.as_str()).unwrap_or(""), jwk.get("e").and_then(|v| v.as_str()).unwrap_or("")).map_err(|e| bad(&e.to_string()))?;
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[&client_id]); validation.set_issuer(&[&issuer]);
-    let data = jsonwebtoken::decode::<Claims>(id_token, &dkey, &validation).map_err(|e| bad(&format!("id_token verification failed: {}", e)))?;
-    if let Some(returned) = &data.claims.nonce { if !expected_nonce.is_empty() && *returned != expected_nonce { return Err(bad("id_token nonce does not match this login attempt")); } }
-    let email = data.claims.email.ok_or_else(|| bad("id_token has no email"))?.to_lowercase();
-    if data.claims.email_verified == Some(false) { return Err(bad("id_token email is not verified")); }
-    let subject = data.claims.sub.clone(); let issuer_key = issuer.clone();
+    let (subject, email) = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false).await.map_err(|e| bad(&e))?;
+    let issuer_key = issuer.clone();
     // An SSO login may attach an account to this organisation only through a
     // pending invite, or when the org explicitly enables auto-provisioning for
     // this email domain. Instance-wide signups are not enough.
@@ -1137,7 +1136,8 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
         if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity")); }
         if !provision_allowed { return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings")); }
         let kp = oc::Keypair::generate(); let pw = oc::random_token("oidc"); let nid = id();
-        st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(nid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+        // The organisation's IdP asserted this address; no local verification.
+        st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(nid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO oidc_subjects(issuer,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(issuer_key), json!(subject), json!(nid), json!(now())]).map_err(|e| bad(&e))?;
         claim_instance_owner(&st, &nid);
         nid };
@@ -1151,19 +1151,198 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
         } else {
             return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
         } }
-    st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
+    st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, subject));
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
 
+// ---------- SAML 2.0 service provider ----------
+struct SamlReplayCache { st: S }
+impl ReplayCache for SamlReplayCache {
+    fn check_and_store(&mut self, key: ReplayKey, expires_at: SystemTime) -> Result<(), SamlError> {
+        let cache_key = key.cache_key();
+        let expires = expires_at.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_else(|_| now() + 600);
+        match self.st.db.exec("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(cache_key), json!(expires)]) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(SamlError::ReplayDetected { key: cache_key }),
+        } } }
+fn saml_config_row(st: &S, org: &str) -> Result<Row, (StatusCode, Json<Value>)> {
+    st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(org)]).map_err(|e| bad(&e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "SAML is not configured for this organisation")) }
+fn saml_sp_entity(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/metadata", base.trim_end_matches('/'), org) }
+fn saml_acs_url(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/acs", base.trim_end_matches('/'), org) }
+fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
+    let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| e.to_string())?.to_string();
+    let kp = rcgen::KeyPair::from_pem(&pem).map_err(|e| e.to_string())?;
+    let cert = ca_params(cn, false).self_signed(&kp).map_err(|e| e.to_string())?;
+    Ok((pem, cert.pem())) }
+fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsigned: bool) -> Result<IdpDescriptor, String> {
+    let entity = EntityId::try_new(idp_entity).map_err(|e| e.to_string())?;
+    if !trusted_cert.trim().is_empty() {
+        let certs = [CertificatePem::new(trusted_cert.trim().to_string())];
+        IdpDescriptor::from_metadata_xml_for(entity, xml, MetadataTrustPolicy::RequireSignature { trusted_certificates: &certs }).map_err(|e| e.to_string())
+    } else if allow_unsigned {
+        IdpDescriptor::from_metadata_xml_for(entity, xml, MetadataTrustPolicy::UnsignedForCompatibility).map_err(|e| e.to_string())
+    } else { Err("SAML metadata must be signed by metadata_trusted_cert, or set allow_unsigned_metadata".into()) } }
+fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, String> {
+    let key_pem = oc::decrypt_symmetric(&st.master(), &db::s(cfg,"sp_key_enc")).map_err(|e| e.to_string())?;
+    let creds = Credentials {
+        signing_key: Some(PrivateKeyPem::new(String::from_utf8_lossy(&key_pem).into_owned())),
+        signing_certificate: Some(CertificatePem::new(db::s(cfg,"sp_cert_pem"))),
+        ..Credentials::default() };
+    SpConfig::builder(EntityId::try_new(saml_sp_entity(base, org)).map_err(|e| e.to_string())?)
+        .acs_endpoint(AcsEndpoint::post(saml_acs_url(base, org)).map_err(|e| e.to_string())?)
+        .credentials(creds)
+        .validation(SpValidationPolicy::strict())
+        .build().map_err(|e| e.to_string()) }
+async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?;
+    st.check_admin(&oid, &uid)?;
+    let cfg = saml_config_row(&st, &oid)?; let base = issuer(&st, &h);
+    Ok(j(json!({
+        "configured": true,
+        "idp_entity_id": db::s(&cfg,"idp_entity_id"),
+        "metadata_xml": db::s(&cfg,"idp_metadata_xml"),
+        "sp_metadata_url": saml_sp_entity(&base, &oid),
+        "acs_url": saml_acs_url(&base, &oid),
+        "allow_unsigned_metadata": db::n(&cfg,"allow_unsigned_metadata") == 1,
+        "metadata_trusted_cert_set": !db::s(&cfg,"metadata_trusted_cert").is_empty(),
+        "auto_provision": db::n(&cfg,"auto_provision") == 1,
+        "allowed_domains": db::s(&cfg,"allowed_domains"),
+    }))) }
+async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
+    st.check_admin(&oid, &uid)?;
+    let idp_entity_id = body.get("idp_entity_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if idp_entity_id.is_empty() { return Err(bad("idp_entity_id is required")); }
+    let mut xml = body.get("metadata_xml").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let metadata_url = body.get("metadata_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if xml.is_empty() && !metadata_url.is_empty() {
+        if !url_ok(&metadata_url) || !egress_allowed(&metadata_url) { return Err(bad("metadata_url must be an http(s) URL outside private networks")); }
+        let text = http_client().get(&metadata_url).send().await.map_err(|e| bad(&e.to_string()))?.text().await.map_err(|e| bad(&e.to_string()))?;
+        if text.len() > 2_000_000 { return Err(bad("SAML metadata is too large")); }
+        xml = text;
+    }
+    if xml.is_empty() { return Err(bad("metadata_xml or metadata_url is required")); }
+    let trusted_cert = body.get("metadata_trusted_cert").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let allow_unsigned = body.get("allow_unsigned_metadata").and_then(|v| v.as_bool()).unwrap_or(false);
+    let auto = body.get("auto_provision").and_then(|v| v.as_bool()).unwrap_or(false);
+    let domains = body.get("allowed_domains").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !valid_domain_list(&domains) { return Err(bad("allowed_domains must be comma-separated DNS domains")); }
+    saml_descriptor(&idp_entity_id, &xml, &trusted_cert, allow_unsigned).map_err(|e| bad(&format!("invalid IdP metadata: {}", e)))?;
+    let existing = st.db.one("SELECT sp_key_enc,sp_cert_pem FROM saml_configs WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    let (key_enc, cert_pem) = match existing {
+        Some(ref row) => (db::s(row,"sp_key_enc"), db::s(row,"sp_cert_pem")),
+        None => {
+            let (key_pem, cert_pem) = saml_signing_keypair(&format!("openwarp-saml-{}", oid)).map_err(|e| bad(&e))?;
+            (oc::encrypt_symmetric(&st.master(), key_pem.as_bytes()), cert_pem)
+        }
+    };
+    if existing.is_some() {
+        st.db.exec("UPDATE saml_configs SET idp_entity_id=?,idp_metadata_xml=?,allow_unsigned_metadata=?,metadata_trusted_cert=?,auto_provision=?,allowed_domains=? WHERE org_id=?",
+            &[json!(&idp_entity_id), json!(&xml), json!(if allow_unsigned {1} else {0}), json!(&trusted_cert), json!(if auto {1} else {0}), json!(&domains), json!(&oid)]).map_err(|e| bad(&e))?;
+    } else {
+        st.db.exec("INSERT INTO saml_configs(org_id,idp_entity_id,idp_metadata_xml,sp_key_enc,sp_cert_pem,allow_unsigned_metadata,metadata_trusted_cert,auto_provision,allowed_domains,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            &[json!(&oid), json!(&idp_entity_id), json!(&xml), json!(&key_enc), json!(&cert_pem), json!(if allow_unsigned {1} else {0}), json!(&trusted_cert), json!(if auto {1} else {0}), json!(&domains), json!(now())]).map_err(|e| bad(&e))?;
+    }
+    st.audit(&oid, "", "", &uid, "saml.configure", &idp_entity_id);
+    Ok(j(json!({"ok": true, "sp_metadata_url": saml_sp_entity(&issuer(&st,&h), &oid)}))) }
+async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
+    let cfg = match saml_config_row(&st, &oid) { Ok(c) => c, Err(e) => return e.into_response() };
+    let sp = match saml_sp_config(&st, &issuer(&st,&h), &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
+    let mut resp = sp.metadata_xml().to_string().into_response();
+    resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/samlmetadata+xml"));
+    resp }
+async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
+    let cfg = match saml_config_row(&st, &oid) { Ok(c) => c, Err(e) => return e.into_response() };
+    let base = issuer(&st, &h);
+    let sp = match saml_sp_config(&st, &base, &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
+    let idp = match saml_descriptor(&db::s(&cfg,"idp_entity_id"), &db::s(&cfg,"idp_metadata_xml"), &db::s(&cfg,"metadata_trusted_cert"), db::n(&cfg,"allow_unsigned_metadata") == 1) { Ok(d) => d, Err(e) => return bad(&e).into_response() };
+    let state = oc::random_token("saml");
+    let relay = match RelayStateParam::try_from_option(Some(state.clone())) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    let started = match sp.start_sso(&idp, StartSso::redirect().relay_state(relay)) { Ok(s) => s, Err(e) => return bad(&e.to_string()).into_response() };
+    let url = match started.outbound.redirect_url() { Ok(u) => u.to_string(), Err(e) => return bad(&e.to_string()).into_response() };
+    let snap = started.pending.snapshot();
+    let snapshot = json!({
+        "id": snap.id, "peer": snap.peer_entity_id, "expected": snap.expected_binding,
+        "acs": snap.acs_url, "acs_binding": snap.acs_binding,
+        "issued": snap.issued_at.as_ref().map(|v| v.as_str()), "expires": snap.expires_at.as_ref().map(|v| v.as_str())
+    }).to_string();
+    let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]);
+    if let Err(e) = st.db.exec("INSERT INTO saml_pending(state,org_id,snapshot,created_at) VALUES(?,?,?,?)", &[json!(&state), json!(&oid), json!(&snapshot), json!(now())]) { return bad(&e).into_response(); }
+    axum::response::Redirect::temporary(&url).into_response() }
+fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).map_err(|e| bad(&e))? {
+        let uid = db::s(&bound, "user_id");
+        if !st.principal_active(&uid) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+        return Ok(uid);
+    }
+    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.is_some() {
+        return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password or ask an admin to link this SAML identity"));
+    }
+    let cfg = saml_config_row(st, org)?;
+    let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(email), json!(org), json!(now())]).map_err(|e| bad(&e))?;
+    let auto = db::n(&cfg, "auto_provision") == 1;
+    let domains = db::s(&cfg, "allowed_domains");
+    let domain = email.split('@').nth(1).unwrap_or("");
+    let domain_ok = domains.is_empty() || domains.split(',').any(|d| d.trim().eq_ignore_ascii_case(domain));
+    if pending.is_none() && !(auto && domain_ok && signups_open(st)) {
+        return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SAML self-provisioning; ask an administrator to invite you"));
+    }
+    let kp = oc::Keypair::generate(); let pw = oc::random_token("saml"); let uid = id();
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)",
+        &[json!(&uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO saml_subjects(org_id,idp_entity_id,name_id,user_id,created_at) VALUES(?,?,?,?,?)",
+        &[json!(org), json!(idp_entity), json!(name_id), json!(&uid), json!(now())]).map_err(|e| bad(&e))?;
+    let role = pending.as_ref().map(|p| db::s(p, "role")).unwrap_or_else(|| "developer".to_string());
+    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(org), json!(&uid), json!(role)]).map_err(|e| bad(&e))?;
+    if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv,"token_hash"))]); }
+    claim_instance_owner(st, &uid);
+    st.audit(org, "", "", &uid, "auth.saml_provision", &format!("{} {}", email, name_id));
+    Ok(uid) }
+async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
+    let pending_row = match st.db.one("SELECT * FROM saml_pending WHERE org_id=? AND state=?", &[json!(&oid), json!(form.get("RelayState").cloned().unwrap_or_default())]) { Ok(Some(r)) => r, _ => return bad("SAML request is missing, expired, or already used").into_response() };
+    if db::n(&pending_row,"created_at") + 600 < now() { return bad("SAML request expired").into_response(); }
+    let snapshot: Value = match serde_json::from_str(&db::s(&pending_row,"snapshot")) { Ok(v) => v, Err(_) => return bad("SAML pending request is corrupt").into_response() };
+    let cfg = match saml_config_row(&st, &oid) { Ok(c) => c, Err(e) => return e.into_response() };
+    let base = issuer(&st, &h);
+    let sp = match saml_sp_config(&st, &base, &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
+    let idp = match saml_descriptor(&db::s(&cfg,"idp_entity_id"), &db::s(&cfg,"idp_metadata_xml"), &db::s(&cfg,"metadata_trusted_cert"), db::n(&cfg,"allow_unsigned_metadata") == 1) { Ok(d) => d, Err(e) => return bad(&e).into_response() };
+    let relay = match RelayStateParam::try_from_option(form.get("RelayState").cloned()) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    let mut snap = PendingSnapshot::<AuthnRequest>::authn_request(
+        snapshot["id"].as_str().unwrap_or("").to_string(), relay,
+        snapshot["peer"].as_str().unwrap_or("").to_string(),
+        snapshot["expected"].as_str().unwrap_or("post").to_string(),
+        snapshot["acs"].as_str().unwrap_or("").to_string(),
+        snapshot["acs_binding"].as_str().unwrap_or("post").to_string());
+    if let Some(i) = snapshot["issued"].as_str() { if let Ok(v) = SamlInstant::try_new(i) { snap.issued_at = Some(v); } }
+    if let Some(e) = snapshot["expires"].as_str() { if let Ok(v) = SamlInstant::try_new(e) { snap.expires_at = Some(v); } }
+    let pending = match Pending::<AuthnRequest>::from_snapshot(snap) { Ok(p) => p, Err(e) => return bad(&e.to_string()).into_response() };
+    let mut cache = SamlReplayCache { st: st.clone() };
+    let ctx = SamlValidationContext::new(SystemTime::now(), ReplayPolicy::RequireCache(&mut cache));
+    let fields: Vec<FormField> = form.iter().map(|(k,v)| FormField::new(k.clone(), v.clone())).collect();
+    let session = match sp.finish_sso(&idp, &pending, BrowserInput::<SsoResponse>::post(fields), ctx) { Ok(s) => s, Err(e) => return bad(&format!("SAML validation failed: {}", e)).into_response() };
+    let name_id = session.name_id().value().to_string(); let email = name_id.to_lowercase();
+    if !valid_email(&email) { return bad("SAML NameID must be an email address; configure the IdP NameID format").into_response(); }
+    let uid = match provision_saml_user(&st, &oid, &db::s(&cfg,"idp_entity_id"), &name_id, &email) { Ok(u) => u, Err(e) => return e.into_response() };
+    let _ = st.db.exec("DELETE FROM saml_pending WHERE state=?", &[json!(form.get("RelayState").cloned().unwrap_or_default())]);
+    let token = match make_session(&st, &uid) { Ok(t) => t, Err(e) => return e.into_response() };
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    (hdr, axum::response::Redirect::to(&format!("/#org={}", oid))).into_response() }
+
 // ---------- email, verification and password reset ----------
-fn verification_required() -> bool {
-    matches!(std::env::var("OPENWARP_REQUIRE_EMAIL_VERIFICATION").unwrap_or_default().to_ascii_lowercase().as_str(), "1" | "true" | "yes") }
+fn production() -> bool {
+    std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) }
 // The operator supplies a small HTTP relay that forwards {to,subject,text} to
-// their mail provider. Without one, mail is suppressed and logged, never queued.
+// their mail provider. Without one, mail is suppressed; outside production the
+// rendered message (including its link) is written to the log so a local
+// operator can finish signup or recovery.
 async fn send_template(to: &str, kind: &str, vars: &[(&str, &str)]) {
     let cfg = mailer::MailConfig::from_env();
-    if !cfg.enabled() { eprintln!("email suppressed (no provider configured): {} -> {}", kind, to); return; }
     let msg = mailer::render(kind, to, vars);
+    if !cfg.enabled() {
+        eprintln!("email suppressed (no provider configured): {} -> {}", kind, to);
+        if !production() { eprintln!("{}", msg.text); }
+        return; }
     if let Err(e) = mailer::send(&cfg, &msg).await { eprintln!("email delivery failed: {}", e); } }
 async fn test_email(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
@@ -1188,6 +1367,7 @@ async fn verify_email(State(st): State<S>, Query(q): Query<HashMap<String,String
         Some(row) => { let uid = db::s(&row, "user_id");
             let _ = st.db.exec("UPDATE users SET email_verified=1 WHERE id=?", &[json!(&uid)]);
             let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]);
+            claim_instance_owner_on_verify(&st, &uid);
             st.audit("", "", "", &uid, "auth.email_verified", "");
             (StatusCode::OK, "Email verified", "You can sign in now.") }
         None => (StatusCode::BAD_REQUEST, "Link not valid", "This verification link is invalid, already used, or expired.") };
@@ -1256,50 +1436,142 @@ fn signups_open(st: &S) -> bool {
 // written once, so two accounts created in the same second cannot both win.
 fn claim_instance_owner(st: &S, uid: &str) {
     if meta_get(st, "instance_owner").is_empty() { let _ = st.db.exec("INSERT INTO meta(k,v) VALUES('instance_owner',?)", &[json!(uid)]); } }
+// A password account owns the instance only once its address is proven. The
+// oldest verified account wins if the original registration was never opened.
+fn claim_instance_owner_on_verify(st: &S, uid: &str) {
+    if !meta_get(st, "instance_owner").is_empty() { return; }
+    if let Ok(Some(row)) = st.db.one("SELECT id FROM users WHERE email_verified=1 ORDER BY created_at, id LIMIT 1", &[]) {
+        if db::s(&row, "id") == uid { claim_instance_owner(st, uid); } } }
 fn instance_owner(st: &S) -> Option<String> {
     let stored = meta_get(st, "instance_owner");
     if !stored.is_empty() { return Some(stored); }
-    let uid = st.db.one("SELECT id FROM users ORDER BY created_at, id LIMIT 1", &[]).ok().flatten().map(|r| db::s(&r, "id"));
+    let uid = st.db.one("SELECT id FROM users WHERE email_verified=1 ORDER BY created_at, id LIMIT 1", &[]).ok().flatten().map(|r| db::s(&r, "id"));
     if let Some(u) = &uid { claim_instance_owner(st, u); }
     uid }
+fn env_nonempty(key: &str) -> String { std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_default() }
 fn social_provider(provider: &str) -> Option<(String, String)> {
+    // Any OIDC issuer this instance trusts. The secret is optional because a
+    // public client relies on PKCE instead.
+    if provider == "oidc" {
+        let id = env_nonempty("OPENWARP_OIDC_CLIENT_ID");
+        if id.is_empty() || env_nonempty("OPENWARP_OIDC_ISSUER").is_empty() { return None; }
+        return Some((id, env_nonempty("OPENWARP_OIDC_CLIENT_SECRET"))); }
     let (id_key, secret_key) = match provider {
         "google" => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
         "github" => ("OPENWARP_GITHUB_CLIENT_ID", "OPENWARP_GITHUB_CLIENT_SECRET"),
+        "apple" => ("OPENWARP_APPLE_CLIENT_ID", "OPENWARP_APPLE_CLIENT_SECRET"),
+        "openai" => ("OPENWARP_OPENAI_CLIENT_ID", "OPENWARP_OPENAI_CLIENT_SECRET"),
         _ => return None };
-    let id = std::env::var(id_key).ok().unwrap_or_default();
-    let secret = std::env::var(secret_key).ok().unwrap_or_default();
-    if id.trim().is_empty() || secret.trim().is_empty() { None } else { Some((id, secret)) } }
+    let id = env_nonempty(id_key);
+    let secret = env_nonempty(secret_key);
+    if id.is_empty() || secret.is_empty() { None } else { Some((id, secret)) } }
 fn google_issuer() -> String { std::env::var("OPENWARP_GOOGLE_ISSUER").unwrap_or_else(|_| "https://accounts.google.com".into()) }
+// Apple's client secret is a short-lived JWT the operator generates with their
+// Sign in with Apple key; OpenAI issues a regular OAuth client secret.
+fn social_issuer(provider: &str) -> Option<String> {
+    match provider {
+        "google" => Some(google_issuer()),
+        "apple" => Some(std::env::var("OPENWARP_APPLE_ISSUER").unwrap_or_else(|_| "https://appleid.apple.com".into())),
+        "openai" => Some(std::env::var("OPENWARP_OPENAI_ISSUER").unwrap_or_else(|_| "https://auth.openai.com".into())),
+        "oidc" => { let issuer = env_nonempty("OPENWARP_OIDC_ISSUER"); if issuer.is_empty() { None } else { Some(issuer) } },
+        _ => None } }
+// Apple rejects scopes outside its advertised set (openid, email, name).
+fn social_scope(provider: &str) -> &'static str {
+    if provider == "apple" { "openid email" } else { "openid email profile" } }
+fn oidc_custom_name() -> String { let name = env_nonempty("OPENWARP_OIDC_NAME"); if name.is_empty() { "SSO".into() } else { name } }
+fn oidc_custom_scope() -> String {
+    let raw = env_nonempty("OPENWARP_OIDC_SCOPES");
+    if raw.is_empty() { return "openid email profile".into(); }
+    let mut parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
+    if !parts.iter().any(|s| s == "openid") { parts.insert(0, "openid".into()); }
+    parts.join(" ") }
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    oc::b64(&Sha256::digest(verifier.as_bytes())).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string() }
+// OIDC says email_verified is a boolean, but Apple has also emitted the string
+// form; accept both and reject anything that is not a clear true.
+fn claim_bool(v: &Value) -> Option<bool> {
+    match v { Value::Bool(b) => Some(*b), Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true), "false" => Some(false), _ => None }, _ => None } }
+fn email_verified_claim(claims: &Value) -> Option<bool> { claims.get("email_verified").and_then(claim_bool) }
 fn github_web() -> String { std::env::var("OPENWARP_GITHUB_WEB").unwrap_or_else(|_| "https://github.com".into()) }
 fn github_api() -> String { std::env::var("OPENWARP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()) }
 fn social_redirect(st: &S, h: &HeaderMap, provider: &str) -> String { format!("{}/api/auth/social/{}/callback", issuer(st, h), provider) }
+// Generic OIDC providers sign with RS*, PS* or ES*; the key type comes from the
+// JWKS entry, and the token header must agree with it.
+fn jwk_signing_algorithm(jwk: &Value, header: jsonwebtoken::Algorithm) -> Result<jsonwebtoken::Algorithm, String> {
+    use jsonwebtoken::Algorithm::*;
+    let declared = jwk.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+    let header_name = serde_json::to_value(header).ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+    if !declared.is_empty() && declared != header_name { return Err(format!("id_token alg {} does not match the JWK algorithm {}", header_name, declared)); }
+    let name = if declared.is_empty() { header_name.as_str() } else { declared };
+    match name {
+        "RS256" => Ok(RS256), "RS384" => Ok(RS384), "RS512" => Ok(RS512),
+        "PS256" => Ok(PS256), "PS384" => Ok(PS384), "PS512" => Ok(PS512),
+        "ES256" => Ok(ES256), "ES384" => Ok(ES384),
+        _ => Err(format!("unsupported id_token signature algorithm: {}", name)) } }
+fn jwk_decoding_key(jwk: &Value, alg: jsonwebtoken::Algorithm) -> Result<jsonwebtoken::DecodingKey, String> {
+    use jsonwebtoken::Algorithm::*;
+    match alg {
+        RS256 | RS384 | RS512 | PS256 | PS384 | PS512 => jsonwebtoken::DecodingKey::from_rsa_components(
+            jwk.get("n").and_then(|v| v.as_str()).ok_or("the JWK has no RSA modulus")?,
+            jwk.get("e").and_then(|v| v.as_str()).ok_or("the JWK has no RSA exponent")?).map_err(|e| e.to_string()),
+        ES256 | ES384 => jsonwebtoken::DecodingKey::from_ec_components(
+            jwk.get("x").and_then(|v| v.as_str()).ok_or("the JWK has no EC x coordinate")?,
+            jwk.get("y").and_then(|v| v.as_str()).ok_or("the JWK has no EC y coordinate")?).map_err(|e| e.to_string()),
+        _ => Err(format!("unsupported id_token signature algorithm: {:?}", alg)) } }
 async fn verify_id_token(id_token: &str, issuer: &str, audience: &str, jwks_uri: &str) -> Result<Value, String> {
     let header = jsonwebtoken::decode_header(id_token).map_err(|e| e.to_string())?;
-    let kid = header.kid.ok_or("id_token has no kid")?;
+    let kid = header.kid.clone().unwrap_or_default();
     let jwks: Value = http_client().get(jwks_uri).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
-    let jwk = jwks.get("keys").and_then(|v| v.as_array()).and_then(|ks| ks.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid))).ok_or("kid not found in JWKS")?;
-    let dkey = jsonwebtoken::DecodingKey::from_rsa_components(jwk.get("n").and_then(|v| v.as_str()).unwrap_or(""), jwk.get("e").and_then(|v| v.as_str()).unwrap_or("")).map_err(|e| e.to_string())?;
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    let keys = jwks.get("keys").and_then(|v| v.as_array()).ok_or("the JWKS has no keys")?;
+    // A provider with one signing key may omit kid from the token.
+    let jwk = if kid.is_empty() {
+        if keys.len() == 1 { &keys[0] } else { return Err("the id_token has no kid and the JWKS has multiple keys".into()); }
+    } else { keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid)).ok_or("kid not found in the JWKS")? };
+    let alg = jwk_signing_algorithm(jwk, header.alg)?;
+    let dkey = jwk_decoding_key(jwk, alg)?;
+    let mut validation = jsonwebtoken::Validation::new(alg);
     validation.set_audience(&[audience]); validation.set_issuer(&[issuer]);
     let data = jsonwebtoken::decode::<Value>(id_token, &dkey, &validation).map_err(|e| e.to_string())?;
     Ok(data.claims) }
-async fn google_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
-    let issuer = google_issuer();
-    let disc = oidc_discovery(&issuer).await.map_err(|(_, j)| j.to_string())?;
+fn oidc_token_auth_basic(disc: &Value) -> bool {
+    match env_nonempty("OPENWARP_OIDC_TOKEN_AUTH_METHOD").as_str() {
+        "client_secret_basic" => true,
+        "client_secret_post" => false,
+        _ => { let methods: Vec<&str> = disc.get("token_endpoint_auth_methods_supported").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            methods.contains(&"client_secret_basic") && !methods.contains(&"client_secret_post") } } }
+#[allow(clippy::too_many_arguments)] // every argument is a distinct token-exchange value
+async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str, custom: bool) -> Result<(String, String), String> {
     let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or("");
     let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
-    if !url_ok(token_ep) || !url_ok(jwks_uri) { return Err("Google discovery returned no usable endpoints".into()); }
-    let tok: Value = http_client().post(token_ep)
-        .form(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect), ("client_id", client_id), ("client_secret", client_secret)])
+    if !issuer_url_ok(token_ep) || !issuer_url_ok(jwks_uri) { return Err("the OIDC token and JWKS endpoints must be https, or http on a loopback address".into()); }
+    if !egress_allowed(token_ep) || !egress_allowed(jwks_uri) { return Err("OIDC endpoints are refused by egress policy".into()); }
+    // Validate iss against the issuer the discovery document identifies, not the
+    // configured URL: providers commonly differ by a trailing slash.
+    let expected_issuer = disc.get("issuer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(issuer);
+    let basic = custom && !client_secret.is_empty() && oidc_token_auth_basic(disc);
+    let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)];
+    if !basic { form.push(("client_id", client_id)); }
+    if !client_secret.is_empty() && !basic { form.push(("client_secret", client_secret)); }
+    if !verifier.is_empty() { form.push(("code_verifier", verifier)); }
+    let mut req = http_client().post(token_ep);
+    if basic { req = req.basic_auth(client_id, Some(client_secret)); }
+    let tok: Value = req.form(&form)
         .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
-    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or("Google token response has no id_token")?;
-    let claims = verify_id_token(id_token, &issuer, client_id, jwks_uri).await?;
-    if claims.get("email_verified").and_then(|v| v.as_bool()) == Some(false) { return Err("Google account email is not verified".into()); }
-    let email = claims.get("email").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    if let Some(err) = tok.get("error").and_then(|v| v.as_str()) { return Err(format!("the token endpoint rejected the code: {}", err)); }
+    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or("the token response has no id_token")?;
+    let claims = verify_id_token(id_token, expected_issuer, client_id, jwks_uri).await?;
+    if let Some(returned) = claims.get("nonce").and_then(|v| v.as_str()) { if !expected_nonce.is_empty() && returned != expected_nonce { return Err("id_token nonce does not match this sign-in attempt".into()); } }
+    if email_verified_claim(&claims) == Some(false) { return Err("the provider reports this email address as unverified".into()); }
+    let email = claims.get("email").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
     let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if email.is_empty() || subject.is_empty() { return Err("Google id_token has no email or subject".into()); }
+    if email.is_empty() || subject.is_empty() { return Err("the id_token has no email or subject".into()); }
     Ok((subject, email)) }
+async fn oidc_social_identity(issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str) -> Result<(String, String), String> {
+    let disc = oidc_discovery(issuer).await.map_err(|(_, j)| j.to_string())?;
+    oidc_identity_from_doc(&disc, issuer, client_id, client_secret, redirect, code, verifier, expected_nonce, false).await }
 async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
     let tok: Value = http_client().post(format!("{}/login/oauth/access_token", github_web()))
         .header("Accept", "application/json").header("User-Agent", "openwarp")
@@ -1332,7 +1604,9 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
     let invite = st.db.one("SELECT * FROM invites WHERE email=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(email), json!(now())]).map_err(|e| bad(&e))?;
     if invite.is_none() && !signups_open(st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     let kp = oc::Keypair::generate(); let pw = oc::random_token("social"); let uid = id();
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+    // The provider asserted a verified address, so this account needs no
+    // separate email round-trip.
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(provider), json!(subject), json!(uid), json!(now())]).map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid);
     match invite {
@@ -1347,36 +1621,83 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email));
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
+    let oidc = social_provider("oidc").is_some();
     Ok(j(json!({
         "password": true,
         "google": social_provider("google").is_some(),
         "github": social_provider("github").is_some(),
+        "apple": social_provider("apple").is_some(),
+        "openai": social_provider("openai").is_some(),
+        "oidc": oidc,
+        "oidc_name": if oidc { oidc_custom_name() } else { String::new() },
         "signups": if signups_open(&st) { "open" } else { "invite" },
     }))) }
+// Composed from discovery plus optional explicit endpoints, for IdPs that do not
+// publish usable metadata.
+async fn custom_oidc_metadata() -> Result<Value, (StatusCode, Json<Value>)> {
+    let issuer = env_nonempty("OPENWARP_OIDC_ISSUER");
+    let auth_ep = env_nonempty("OPENWARP_OIDC_AUTHORIZATION_ENDPOINT");
+    let token_ep = env_nonempty("OPENWARP_OIDC_TOKEN_ENDPOINT");
+    let jwks_uri = env_nonempty("OPENWARP_OIDC_JWKS_URI");
+    if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("OPENWARP_OIDC_ISSUER must be https, or http on a loopback address; private addresses need OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
+    let explicit = !auth_ep.is_empty() && !token_ep.is_empty() && !jwks_uri.is_empty();
+    let mut disc = match oidc_discovery(&issuer).await { Ok(d) => d, Err(e) => { if explicit { json!({"issuer": &issuer}) } else { return Err(e); } } };
+    if let Some(obj) = disc.as_object_mut() {
+        if !auth_ep.is_empty() { obj.insert("authorization_endpoint".into(), json!(auth_ep)); }
+        if !token_ep.is_empty() { obj.insert("token_endpoint".into(), json!(token_ep)); }
+        if !jwks_uri.is_empty() { obj.insert("jwks_uri".into(), json!(jwks_uri)); }
+        obj.entry("issuer").or_insert(json!(&issuer)); }
+    Ok(disc) }
 async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
     let state = oc::random_token("sst");
-    st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
-    let url = if provider == "google" {
-        let disc = oidc_discovery(&google_issuer()).await?;
-        let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
-        if !url_ok(auth_ep) { return Err(bad("Google discovery returned no authorization_endpoint")); }
-        format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}", auth_ep, urlencode(&client_id), urlencode(&redirect), state)
-    } else {
-        format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state) };
+    if provider == "github" {
+        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
+        let url = format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state);
+        return Ok(axum::response::Redirect::temporary(&url)); }
+    let disc = if provider == "oidc" { custom_oidc_metadata().await? } else {
+        let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+        if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("the provider issuer must be https, or http on a loopback address")); }
+        oidc_discovery(&issuer).await? };
+    let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
+    if !url_ok(auth_ep) || !egress_allowed(auth_ep) { return Err(bad("OIDC discovery returned no usable authorization_endpoint")); }
+    if provider == "oidc" && !issuer_url_ok(auth_ep) { return Err(bad("OPENWARP_OIDC_AUTHORIZATION_ENDPOINT must be https, or http on a loopback address")); }
+    let nonce = oc::random_token("n");
+    // OpenAI documents PKCE for confidential clients too; the custom provider
+    // always uses it so a public client (no secret) also works. Apple does not.
+    let verifier = if provider == "openai" || provider == "oidc" { oc::random_token("pkce") } else { String::new() };
+    st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier) VALUES(?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier)]).map_err(|e| bad(&e))?;
+    let scope = if provider == "oidc" { oidc_custom_scope() } else { social_scope(&provider).to_string() };
+    let mut url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect), urlencode(&scope), state, nonce);
+    if provider == "apple" { url.push_str("&response_mode=form_post"); }
+    if !verifier.is_empty() { url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", pkce_challenge(&verifier))); }
     Ok(axum::response::Redirect::temporary(&url)) }
-async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let (client_id, client_secret) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
-    let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
-    let row = st.db.one("SELECT provider,created_at FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
+    // Apple answers with a form POST; every other provider uses the query string.
+    let params = if q.contains_key("code") || q.contains_key("state") { q } else { form.ok().map(|axum::extract::Form(f)| f).unwrap_or_default() };
+    let code = params.get("code").cloned().unwrap_or_default(); let state = params.get("state").cloned().unwrap_or_default();
+    let row = st.db.one("SELECT provider,created_at,nonce,code_verifier FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     let _ = st.db.exec("DELETE FROM social_states WHERE state=?", &[json!(state)]);
     if db::s(&row, "provider") != provider || db::n(&row, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     if code.is_empty() { return Err(bad("missing authorization code")); }
     let redirect = social_redirect(&st, &h, &provider);
-    let (subject, email) = if provider == "google" { google_identity(&client_id, &client_secret, &redirect, &code).await }
-        else { github_identity(&client_id, &client_secret, &redirect, &code).await }.map_err(|e| bad(&e))?;
-    let uid = resolve_social(&st, &provider, &subject, &email)?;
+    let (subject, email) = if provider == "github" {
+        github_identity(&client_id, &client_secret, &redirect, &code).await.map_err(|e| bad(&e))?
+    } else if provider == "oidc" {
+        let disc = custom_oidc_metadata().await?;
+        let issuer = env_nonempty("OPENWARP_OIDC_ISSUER");
+        let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
+        oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce, true).await.map_err(|e| bad(&e))?
+    } else {
+        let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+        let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
+        oidc_social_identity(&issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))? };
+    // Bind a custom-OIDC identity to its issuer so a changed issuer cannot
+    // inherit the bindings of the previous one.
+    let bound_provider = if provider == "oidc" { format!("oidc:{}", env_nonempty("OPENWARP_OIDC_ISSUER")) } else { provider.clone() };
+    let uid = resolve_social(&st, &bound_provider, &subject, &email)?;
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
@@ -1387,6 +1708,9 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
         "instance_owner": instance_owner(&st).as_deref() == Some(uid.as_str()),
         "google": social_provider("google").is_some(),
         "github": social_provider("github").is_some(),
+        "apple": social_provider("apple").is_some(),
+        "openai": social_provider("openai").is_some(),
+        "oidc": social_provider("oidc").is_some(),
     }))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
@@ -1434,6 +1758,20 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
             .map_err(|_| bad("a log stream secret cannot be decrypted with the current master key; refusing rotation"))?;
         stream_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
     }
+    let samls = st.db.query("SELECT org_id,sp_key_enc FROM saml_configs", &[]).map_err(|e| bad(&e))?;
+    let mut saml_updates = Vec::new();
+    for r in &samls {
+        let plain = oc::decrypt_symmetric(&old, &db::s(r, "sp_key_enc"))
+            .map_err(|_| bad("a SAML signing key cannot be decrypted with the current master key; refusing rotation"))?;
+        saml_updates.push((db::s(r, "org_id"), oc::encrypt_symmetric(&new, &plain)));
+    }
+    let hooks = st.db.query("SELECT org_id,secret_enc FROM rotation_hooks WHERE secret_enc<>''", &[]).map_err(|e| bad(&e))?;
+    let mut hook_updates = Vec::new();
+    for r in &hooks {
+        let plain = oc::decrypt_symmetric(&old, &db::s(r, "secret_enc"))
+            .map_err(|_| bad("a rotation hook secret cannot be decrypted with the current master key; refusing rotation"))?;
+        hook_updates.push((db::s(r, "org_id"), oc::encrypt_symmetric(&new, &plain)));
+    }
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).map_err(|e| bad(&e))?.is_some();
 
     // Block new encryptions with the old key while the database is updated.
@@ -1442,11 +1780,13 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     for (k, value) in &meta_updates { st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(k)]).map_err(|e| bad(&e))?; }
     for (id, key_enc) in &ca_updates { st.db.exec("UPDATE pki_cas SET key_enc=? WHERE id=?", &[json!(key_enc), json!(id)]).map_err(|e| bad(&e))?; }
     for (id, secret) in &stream_updates { st.db.exec("UPDATE log_streams SET secret=? WHERE id=?", &[json!(secret), json!(id)]).map_err(|e| bad(&e))?; }
+    for (org, key_enc) in &saml_updates { st.db.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?", &[json!(key_enc), json!(org)]).map_err(|e| bad(&e))?; }
+    for (org, secret) in &hook_updates { st.db.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?", &[json!(secret), json!(org)]).map_err(|e| bad(&e))?; }
     if generated_master { st.db.exec("UPDATE meta SET v=? WHERE k='master'", &[json!(oc::b64(&new))]).map_err(|e| bad(&e))?; }
     *guard = new;
     drop(guard);
-    st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={}", env_updates.len(), meta_updates.len(), ca_updates.len(), stream_updates.len()));
-    Ok(j(json!({"ok": true, "rotated": {"envs": env_updates.len(), "meta": meta_updates.len(), "cas": ca_updates.len(), "streams": stream_updates.len()}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
+    st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={} saml={} hooks={}", env_updates.len(), meta_updates.len(), ca_updates.len(), stream_updates.len(), saml_updates.len(), hook_updates.len()));
+    Ok(j(json!({"ok": true, "rotated": {"envs": env_updates.len(), "meta": meta_updates.len(), "cas": ca_updates.len(), "streams": stream_updates.len(), "saml": saml_updates.len(), "hooks": hook_updates.len()}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 
 // ---------- SCIM groups + user lifecycle ----------
 fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
@@ -1623,6 +1963,27 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, creds.to_string().as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
+    if matches!(typ, "openrouter" | "resend" | "openai") {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        let issued = match typ {
+            "openrouter" => integrations::openrouter_create_key(&config, &name, ttl).await,
+            "resend" => integrations::resend_create_key(&config, &name).await,
+            _ => integrations::openai_create_key(&config, &name, ttl).await,
+        }.map_err(|e| bad(&e))?;
+        let (secret, remote_id, base_url) = match typ {
+            "openrouter" => (issued["key"].as_str().unwrap_or("").to_string(), issued["hash"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://openrouter.ai/api/v1")),
+            "resend" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.resend.com")),
+            _ => (issued["value"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.openai.com/v1")),
+        };
+        // The parent credential is encrypted for the revoke call only. The response carries the child secret.
+        let mut stored = json!({"type": typ, "base_url": base_url, "remote_id": remote_id});
+        let parent = match typ { "openrouter" => config.get("management_key"), "resend" => config.get("api_key"), _ => config.get("admin_key") }.and_then(|v| v.as_str()).unwrap_or("");
+        stored["parent"] = json!(parent);
+        if typ == "openai" { stored["project_id"] = json!(config.get("project_id").and_then(|v| v.as_str()).unwrap_or("")); }
+        let config_enc = oc::encrypt_symmetric(&key, stored.to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, secret.as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
+        return Ok(j(json!({"id": lid, "value": secret, "remote_id": remote_id, "expires_at": now()+ttl, "type": typ})));
+    }
     let value = oc::random_token("dyn");
     st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, value.as_bytes())), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
     Ok(j(json!({"id": lid, "value": value, "expires_at": now()+ttl}))) }
@@ -1630,8 +1991,25 @@ async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>
     let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(lid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
     let eid = db::s(&row,"env_id"); let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "leases:write")?; let key = st.env_key(&eid)?;
     if !db::s(&row,"config_enc").is_empty() { if let Ok(plain) = oc::decrypt_symmetric(&key, &db::s(&row,"config_enc")) { if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
-        if cfg.get("type").and_then(|v| v.as_str()) == Some("postgres") { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
-            let _ = std::thread::spawn(move || { if let Ok(mut cl) = postgres::Client::connect(&conn, postgres::NoTls) { let _ = cl.execute(&format!("DROP ROLE IF EXISTS \"{}\"", username), &[]); } }).join(); } } } }
+        match cfg.get("type").and_then(|v| v.as_str()) {
+            Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
+                let _ = std::thread::spawn(move || { if let Ok(mut cl) = postgres::Client::connect(&conn, postgres::NoTls) { let _ = cl.execute(&format!("DROP ROLE IF EXISTS \"{}\"", username), &[]); } }).join(); }
+            Some(kind @ ("openrouter" | "resend" | "openai")) => {
+                let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let project = cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kind = kind.to_string();
+                // A failed remote delete must not mark the local lease revoked.
+                let remote_result = match kind.as_str() {
+                    "openrouter" => integrations::openrouter_revoke_key(&base, &parent, &remote).await,
+                    "resend" => integrations::resend_revoke_key(&base, &parent, &remote).await,
+                    _ => integrations::openai_revoke_key(&base, &parent, &project, &remote).await,
+                };
+                remote_result.map_err(|e| bad(&e))?;
+            }
+            _ => {}
+        } } } }
     st.db.exec("UPDATE leases SET revoked=1 WHERE id=?", &[json!(lid)]).map_err(|e| bad(&e))?; Ok(j(json!({"revoked": lid}))) }
 
 fn ca_params(cn: &str, is_ca: bool) -> rcgen::CertificateParams {
@@ -1678,6 +2056,28 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     let cert_id = id(); let serial = hex_encode(&leaf_serial);
     st.db.exec("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(cert_id), json!(caid), json!(cn), json!(leaf.pem()), json!(serial), json!(now()+days*86400), json!(now())]).map_err(|e| bad(&e))?;
     Ok(j(json!({"id": cert_id, "certificate": leaf.pem(), "private_key": leaf_kp.serialize_pem(), "ca_certificate": db::s(&ca,"cert_pem")}))) }
+async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
+    let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]) { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
+    let cert_der = match keystore_ocsp::pem::decode("CERTIFICATE", &db::s(&ca,"cert_pem")) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
+    let key_pem = match oc::decrypt_symmetric(&st.master(), &db::s(&ca,"key_enc")) { Ok(k) => k, Err(e) => return bad(&e).into_response() };
+    let key_text = String::from_utf8_lossy(&key_pem);
+    let label = if key_text.contains("BEGIN EC PRIVATE KEY") { "EC PRIVATE KEY" } else { "PRIVATE KEY" };
+    let key_der = match keystore_ocsp::pem::decode(label, &key_text) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
+    let request = match keystore_ocsp::OcspRequest::from_der(&body) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    let responder = match keystore_ocsp::Responder::new(&cert_der, &key_der, keystore_pki::SignatureAlgorithm::Sha256WithEcdsa) {
+        Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    let response = match responder.respond(&request, |cert_id| {
+        let serial = cert_id.serial_hex();
+        let revoked = st.db.one("SELECT revoked FROM pki_certs WHERE ca_id=? AND lower(serial)=lower(?)", &[json!(&caid), json!(serial)]).ok().flatten().map(|r| db::n(&r,"revoked") == 1);
+        match revoked {
+            Some(true) => keystore_ocsp::CertStatus::Revoked { revocation_time: now(), reason: None },
+            Some(false) => keystore_ocsp::CertStatus::Good,
+            None => keystore_ocsp::CertStatus::Unknown,
+        }
+    }) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    let mut resp = response.to_der().into_response();
+    resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/ocsp-response"));
+    resp }
 async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.require_org(&db::s(&ca,"org_id"),&uid)?;
     let rows = st.db.query("SELECT id,ca_id,cn,serial,revoked,expires_at,created_at FROM pki_certs WHERE ca_id=?", &[json!(caid)]).map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -1918,6 +2318,8 @@ fn try_leader(st: &S, name: &str, owner: &str, ttl: i64) -> bool {
     st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?)", &[json!(name), json!(owner), json!(expires)]).is_ok() }
 async fn process_rotations(st: &S) {
     let _ = st.db.exec("DELETE FROM instance_leases WHERE expires_at<?", &[json!(now() - 3600)]);
+    let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]);
+    let _ = st.db.exec("DELETE FROM saml_replay WHERE expires_at<?", &[json!(now() - 3600)]);
     let _ = st.db.exec("DELETE FROM rate_limits WHERE window_start<?", &[json!(now() - 86400)]);
     let due = st.db.query("SELECT * FROM rotation_schedules WHERE enabled=1 AND next_run<=?", &[json!(now())]).unwrap_or_default();
     for r in &due {
@@ -1943,9 +2345,15 @@ async fn process_rotations(st: &S) {
             }
         };
         if let Ok(key) = st.env_key(&eid) {
-            let s = SecretIn{ key: key_name.clone(), value: oc::random_token("rot"), path: path.clone(), comment: "scheduled rotation".into(), tags: "".into(), secret_type: stype };
+            let new_val = oc::random_token("rot");
+            let s = SecretIn{ key: key_name.clone(), value: new_val.clone(), path: path.clone(), comment: "scheduled rotation".into(), tags: "".into(), secret_type: stype };
             if upsert_secret(st, &eid, &key, "rotation-scheduler", &s).is_ok() {
-                if let Ok((org, app)) = st.env_org_app(&eid) { st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&key_name); }
+                if let Ok((org, app)) = st.env_org_app(&eid) {
+                    st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&key_name);
+                    if let Some(err) = fire_rotation_hook(st, &org, &eid, &key_name, &new_val).await {
+                        st.audit(&org,&app,&eid,"rotation-scheduler","rotation_hook_failed",&err);
+                    }
+                }
                 let _ = trigger_sync_internal(st, &eid).await;
             }
         }
@@ -2243,9 +2651,12 @@ async fn main() {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openwarp.db".into());
     let db = Db::open(&db_url).expect("open database (sqlite://file.db or postgres://...)");
     let master = load_master(&db).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
-    if verification_required() && !mailer::MailConfig::from_env().enabled() {
-        eprintln!("OPENWARP_REQUIRE_EMAIL_VERIFICATION is set but no email provider is configured (SMTP, Resend, SendGrid, Mailgun, Postmark, Cloudflare or a webhook relay)");
-        std::process::exit(1);
+    if !mailer::MailConfig::from_env().enabled() {
+        if production() {
+            eprintln!("no email provider is configured: password signup is disabled until one is set; configured SSO sign-in still works");
+        } else {
+            eprintln!("no email provider is configured: verification and reset links are written to this log");
+        }
     }
     #[cfg(feature = "redis-cache")]
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
@@ -2257,13 +2668,13 @@ async fn main() {
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
-        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
+        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
-        .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
+        .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/v1/machine/auth/universal/login", post(universal_login))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))
         .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
@@ -2273,10 +2684,10 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
-        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
+        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))

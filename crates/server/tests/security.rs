@@ -5,10 +5,12 @@ use hmac::Mac;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -36,6 +38,7 @@ struct Server {
     base: String,
     dir: PathBuf,
     client: Client,
+    inbox: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Drop for Server {
@@ -76,10 +79,12 @@ impl Server {
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
         let public = public_url.map(|s| s.to_string()).unwrap_or_else(|| base.clone());
+        let (inbox_url, inbox) = start_inbox();
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &public)
+            .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -95,7 +100,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("http client");
-        let server = Server { child, base, dir, client };
+        let server = Server { child, base, dir, client, inbox };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -141,12 +146,72 @@ async fn finish(result: Result<reqwest::Response, reqwest::Error>) -> Resp {
     Resp { status, text, body, headers }
 }
 
+/// Minimal email relay: records each JSON body and answers 200.
+fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
+    let addr = listener.local_addr().expect("inbox addr");
+    let inbox = Arc::new(Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+    (format!("http://{}/mail", addr), inbox)
+}
+
+async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no email containing {:?} arrived", needle);
+}
+
+fn extract_link(text: &str, needle: &str) -> String {
+    for word in text.split_whitespace() {
+        if let Some(i) = word.find(needle) { return word[i..].to_string(); }
+    }
+    panic!("no link containing {:?} in {:?}", needle, text);
+}
+
 async fn register(s: &Server, email: &str) -> Value {
     let r = s
         .call(Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": "correct-horse-battery"})))
         .await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
-    r.body.clone()
+    let mut body = r.body.clone();
+    // Password signup always needs the verification link; finish the flow the
+    // way a real operator with a mail relay would.
+    if body["verification_required"] == json!(true) {
+        let text = wait_for_mail(&s.inbox, "/api/auth/verify?token=").await;
+        let link = extract_link(&text, "/api/auth/verify?token=");
+        let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+        let verified = s.call(Method::GET, &path, None, None).await;
+        assert_eq!(verified.status, 200, "verification failed: {} {}", verified.status, verified.text);
+        let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": "correct-horse-battery"}))).await;
+        assert_eq!(login.status, 200, "verified sign-in failed: {} {}", login.status, login.text);
+        body["token"] = login.body["token"].clone();
+        body["user_id"] = login.body["user_id"].clone();
+        body["public_key"] = login.body["public_key"].clone();
+    }
+    body
 }
 
 async fn app_with_envs(s: &Server, token: &str, org: &str) -> (String, Vec<String>) {
@@ -939,6 +1004,12 @@ async fn secure_cookie_flag_follows_the_public_url() {
     let plain = Server::start().await;
     let r = plain.call(Method::POST, "/api/auth/register", None, Some(json!({"email": "cookie@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
+    let text = wait_for_mail(&plain.inbox, "/api/auth/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/verify?token=");
+    let path = link[link.find("/api/auth/verify").expect("verification path")..].to_string();
+    assert_eq!(plain.call(Method::GET, &path, None, None).await.status, 200, "verification failed");
+    let r = plain.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "cookie@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(r.status, 200, "sign-in failed: {}", r.text);
     let cookie = r.header("set-cookie");
     assert!(cookie.contains("HttpOnly"), "session cookie must be HttpOnly: {}", cookie);
     assert!(cookie.contains("SameSite=Lax"), "session cookie must set SameSite: {}", cookie);
@@ -947,6 +1018,12 @@ async fn secure_cookie_flag_follows_the_public_url() {
     let tls = Server::start_with_public(Some("https://openwarp.example")).await;
     let r = tls.call(Method::POST, "/api/auth/register", None, Some(json!({"email": "cookie2@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
+    let text = wait_for_mail(&tls.inbox, "/api/auth/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/verify?token=");
+    let path = link[link.find("/api/auth/verify").expect("verification path")..].to_string();
+    assert_eq!(tls.call(Method::GET, &path, None, None).await.status, 200, "verification failed");
+    let r = tls.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "cookie2@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(r.status, 200, "sign-in failed: {}", r.text);
     assert!(r.header("set-cookie").contains("Secure"), "https public URL must set the Secure flag: {}", r.header("set-cookie"));
 }
 
