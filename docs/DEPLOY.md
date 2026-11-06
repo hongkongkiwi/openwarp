@@ -1,0 +1,68 @@
+# Deploying OpenWarp
+
+Docker compose is the supported path. `docker compose up --build` starts the
+server, Postgres 17 and Redis 7. The compose file refuses to start until
+`OPENWARP_MASTER_KEY` and `POSTGRES_PASSWORD` are set.
+
+```bash
+# 32 random bytes, base64
+export OPENWARP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+export POSTGRES_PASSWORD="$(head -c 24 /dev/urandom | base64)"
+docker compose up -d --build
+```
+
+## Before going live
+
+1. Terminate TLS in front of the server and set `OPENWARP_PUBLIC_URL` to the
+   public HTTPS origin. It fixes the OAuth issuer and marks the session cookie
+   `Secure`; without it the issuer is derived from the `Host` header.
+2. If you run behind a reverse proxy, set `OPENWARP_TRUST_PROXY=1` and list the
+   proxy addresses in `OPENWARP_TRUSTED_PROXIES` (comma-separated IPs or CIDRs).
+   `X-Forwarded-For` is only honoured when the peer connection comes from one of
+   those addresses, so an exposed port cannot spoof the client IP.
+3. Register the first account immediately. The first account is the instance
+   owner and is the only one that can change the signup policy.
+4. Create the recovery kit backup for every user. It is shown once.
+
+## Environment
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | `sqlite://file.db` or `postgres://...` |
+| `ADDR` | Listen address, default `0.0.0.0:8080` |
+| `OPENWARP_ENV` | `production` refuses to start without an external master key |
+| `OPENWARP_MASTER_KEY` | 32 bytes base64; wraps every environment data key |
+| `OPENWARP_PUBLIC_URL` | Public origin used for OAuth issuers and redirects |
+| `OPENWARP_SECURE_COOKIES` | `1` forces the `Secure` cookie flag |
+| `OPENWARP_TRUST_PROXY` | `1` enables `X-Forwarded-For` from trusted proxies |
+| `OPENWARP_TRUSTED_PROXIES` | Peer addresses allowed to send `X-Forwarded-For` |
+| `OPENWARP_SIGNUPS` | `open` or `closed`; when set it overrides the console toggle |
+| `OPENWARP_GOOGLE_CLIENT_ID` / `OPENWARP_GOOGLE_CLIENT_SECRET` | Google sign-in |
+| `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
+| `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
+| `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
+| `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
+| `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
+| `REDIS_URL` | Optional session cache |
+
+Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
+GitHub callback URL: `{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback`.
+GitHub needs the `read:user` and `user:email` scopes; only a verified address
+can create or match an account.
+
+## Signups and invitations
+
+Signups are open on a fresh instance. The instance owner can close them under
+Settings, or set `OPENWARP_SIGNUPS=closed` to pin the policy. With signups
+closed, an admin invites an address from Members: existing accounts are added
+directly, new addresses get a single-use link valid for seven days. The invitee
+sets a password from that link, or signs in with a configured social provider,
+which redeems the invite and applies its role.
+
+## Operational checks
+
+- `GET /health` is unauthenticated and returns `{"ok":true}`.
+- `GET /metrics` is disabled unless `OPENWARP_METRICS_TOKEN` is set. Scrape with
+  `Authorization: Bearer $OPENWARP_METRICS_TOKEN`.
+- The server drains connections on `SIGTERM` and `SIGINT`.
+- Backups: see [BACKUP.md](BACKUP.md).

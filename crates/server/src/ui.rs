@@ -57,7 +57,8 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••••" onkeydown="if(event.key==='Enter')doAuth()"></div>
       <div class="field" id="mfafield" style="display:none"><label>Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
-      <p class="small mut" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
+      <div id="social" class="row" style="margin-top:12px"></div>
+      <p class="small mut" id="signupnote" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
     </div>
   </div>
 </div>
@@ -95,12 +96,39 @@ async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==und
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
 function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+// For values interpolated into an inline handler's JS string literal. HTML
+// escaping alone is not enough: the parser turns &#39; back into a quote before
+// the JS is parsed, which would let a secret key break out of the string.
+function jsq(s){return String(s??'').replace(/&/g,'&amp;').replace(/\\/g,'\\\\').replace(/'/g,"\\u0027").replace(/"/g,'\\u0022').replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
 function modal(html){$('modal').innerHTML=html;$('modalwrap').classList.add('show')}
 function closeModal(){$('modalwrap').classList.remove('show')}
 $('modalwrap').addEventListener('click',e=>{if(e.target.id==='modalwrap')closeModal()});
 document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()} if(e.key==='Escape'){closeModal();$('palette').style.display='none'}});
 
 // ---------- auth ----------
+async function loadProviders(){try{
+  let p=await api('GET','/api/auth/providers');
+  let btns=[];
+  if(p.google)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/google/start'">Continue with Google</button>`);
+  if(p.github)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/github/start'">Continue with GitHub</button>`);
+  $('social').innerHTML=btns.join('');
+  if(p.signups!=='open'){
+    $('segreg').style.display='none';
+    if(MODE==='register')authMode('login');
+    $('signupnote').textContent='Signups are closed. Ask an administrator for an invitation.';
+  }
+}catch(e){}}
+function showInvite(token){
+  $('auth').style.display='grid';$('shell').style.display='none';
+  $('authtitle').textContent='Accept invitation';
+  $('authform').innerHTML=`<p class="mut">Choose a password for your new account.</p>
+    <div class="field"><label>Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters"></div>
+    <button class="primary" style="width:100%;padding:11px" onclick="acceptInvite()">Create account</button>`;
+  $('authform').dataset.invite=token;}
+async function acceptInvite(){try{
+  let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
+  T=d.token;localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);enterApp();
+}catch(e){toast(e.message,true)}}
 let MODE='login';
 function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');$('authtitle').textContent=m==='login'?'Welcome back':'Create your account';$('authbtn').textContent=m==='login'?'Sign in':'Create account'}
 async function doAuth(){try{
@@ -174,8 +202,8 @@ function drawSecrets(){let q=($('sfilter')?.value||'').toLowerCase();
       ${s.type!=='sealed'?`<button class="iconbtn" title="Reveal" onclick="revealVal(this)">◉</button><button class="iconbtn" title="Copy value" onclick="copyVal(this)">⧉</button>`:''}
       <button class="iconbtn" title="Edit" onclick="editRow('${s.id}')">✎</button>
       <button class="iconbtn" title="History" onclick="showHistory('${s.id}')">↺</button>
-      <button class="iconbtn" title="Personal override" onclick="overrideRow('${s.id}','${esc(s.key)}')">♟</button>
-      <button class="iconbtn" title="Delete" onclick="delSecret('${s.id}','${esc(s.key)}')">🗑</button></td></tr>`}).join('')}
+      <button class="iconbtn" title="Personal override" onclick="overrideRow('${s.id}','${jsq(s.key)}')">♟</button>
+      <button class="iconbtn" title="Delete" onclick="delSecret('${s.id}','${jsq(s.key)}')">🗑</button></td></tr>`}).join('')}
   </tbody></table>`}
 function findValEl(btn){return btn.closest('tr').querySelector('.val')}
 function revealVal(btn){let el=findValEl(btn);let show=el.dataset.show==='1';el.dataset.show=show?'0':'1';el.textContent=show?'••••••••••':el.dataset.val}
@@ -219,7 +247,11 @@ async function renderAccess(){if(!needAppEnv()&&!ORG)return;$('pagetitle').textC
   <div class="row" style="margin-top:12px"><button onclick="requestAccess()">Request access to current env</button></div></div>
   <div class="card"><h3>Machine identities</h3><p>For CI and workloads. Universal Auth exchanges client credentials for a 1-hour token.</p><div class="row"><input id="id-name" placeholder="github-actions"><button onclick="mkIdentity()">Create identity</button></div><pre class="val" id="ident-out"></pre></div>
   <div class="card"><h3>Service tokens ${APP?('· '+esc(APP.name)):''}</h3><div class="row"><button onclick="mkToken()">Create token</button><button onclick="loadTokens()">List / revoke</button></div><pre class="val" id="tok-out"></pre><div id="tok-list"></div></div>`}
-async function invite(){try{await api('POST',`/api/orgs/${ORG}/members`,{email:$('inv-email').value,role:$('inv-role').value});toast('Member invited')}catch(e){toast(e.message,true)}}
+async function invite(){try{let d=await api('POST',`/api/orgs/${ORG}/members`,{email:$('inv-email').value,role:$('inv-role').value});
+  if(d.invite_token){let link=location.origin+'/#invite='+encodeURIComponent(d.invite_token);
+    modal(`<h3>Invitation created</h3><p class="mut">Send this single-use link to ${esc($('inv-email').value)}. It expires in 7 days.</p><textarea rows="3" readonly>${esc(link)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Invite link copied')">Copy link</button><button class="primary" onclick="closeModal()">Done</button></div>`);}
+  else toast('Member added');
+  $('inv-email').value='';renderAccess()}catch(e){toast(e.message,true)}}
 async function mkRole(){try{await api('POST',`/api/orgs/${ORG}/roles`,{name:$('role-name').value,permissions:$('role-perms').value.split(',').map(s=>s.trim()).filter(Boolean)});toast('Role created');renderAccess()}catch(e){toast(e.message,true)}}
 async function mkTeam(){try{await api('POST',`/api/orgs/${ORG}/teams`,{name:$('team-name').value});toast('Team created');renderAccess()}catch(e){toast(e.message,true)}}
 async function decideProp(id,a){try{let d=await api('POST',`/api/proposals/${id}/${a}`,{});toast('Proposal '+d.status);renderAccess()}catch(e){toast(e.message,true)}}
@@ -261,7 +293,12 @@ async function mkStream(){try{await api('POST',`/api/orgs/${ORG}/log-streams`,{n
 async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-streams/deliveries`);$('delivs').textContent=JSON.stringify(d.slice(0,25),null,2)}catch(e){toast(e.message,true)}}
 
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
-  $('view').innerHTML=`
+  let inst=await api('GET','/api/instance').catch(()=>null);
+  let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
+    <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
+    <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
+    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
+  $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label>IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" placeholder="203.0.113.0/24"></div>
   <div class="field"><label>OIDC issuer</label><input id="set-oidc-iss" placeholder="https://accounts.google.com"></div>
@@ -273,6 +310,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
 async function saveSettings(){try{await api('PUT',`/api/orgs/${ORG}/settings`,{ip_allowlist:$('set-ip').value,oidc_issuer:$('set-oidc-iss').value,oidc_client_id:$('set-oidc-cid').value,oidc_client_secret:$('set-oidc-sec').value,oidc_redirect_uri:$('set-oidc-redir').value});toast('Settings saved')}catch(e){toast(e.message,true)}}
+async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
 async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
 async function loadE2E(){try{let d=await api('GET',`/api/envs/${$('e2e-env').value}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
@@ -283,11 +321,18 @@ async function loadTokensSettings(){$('sess-out').textContent='Use openwarp logi
 // ---------- command palette ----------
 function openPalette(){$('palette').style.display='block';$('paletteinput').value='';$('paletteresults').innerHTML='';setTimeout(()=>$('paletteinput').focus(),30)}
 async function paletteSearch(){let q=$('paletteinput').value;if(q.length<2){$('paletteresults').innerHTML='';return}
-  try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${esc(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
+  try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${jsq(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
 function paletteGo(key){$('palette').style.display='none';if(APP&&ENV){nav('apps');renderEnv().then(()=>{let f=$('sfilter');if(f){f.value=key;drawSecrets()}})}}
 $('palette').addEventListener('click',e=>{if(e.target.id==='palette')$('palette').style.display='none'});
 
-if(T){$('auth').style.display='none';enterApp().catch(()=>{$('auth').style.display='grid';$('shell').style.display='none'})}
+loadProviders();
+(function boot(){
+  if(typeof location==='undefined')return;
+  let h=(location.hash||'').slice(1);
+  if(h.startsWith('token=')){T=decodeURIComponent(h.slice(6));localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);}
+  else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7)));return;}
+})();
+if(T){$('auth').style.display='none';enterApp().catch(()=>{T='';localStorage.removeItem('owt');$('auth').style.display='grid';$('shell').style.display='none'})}
 </script>
 <script src="/e2e.js"></script>
 </body></html>

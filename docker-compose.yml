@@ -3,21 +3,27 @@ services:
     build: .
     ports: ["8080:8080"]
     environment:
-      DATABASE_URL: "postgres://${POSTGRES_USER:-openwarp}:${POSTGRES_PASSWORD:-openwarp}@db:5432/${POSTGRES_DB:-openwarp}"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-openwarp}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-openwarp}"
       REDIS_URL: "redis://cache:6379"
-      OPENWARP_MASTER_KEY: ${OPENWARP_MASTER_KEY}
+      OPENWARP_ENV: production
+      OPENWARP_MASTER_KEY: ${OPENWARP_MASTER_KEY:?set OPENWARP_MASTER_KEY to 32 random bytes, base64}
     depends_on:
       db:
         condition: service_healthy
       cache:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     volumes: ["./data:/data"]
     restart: unless-stopped
   db:
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-openwarp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openwarp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-openwarp}
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:

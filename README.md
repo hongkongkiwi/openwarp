@@ -47,7 +47,21 @@ openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
 
 Access tokens are refreshed automatically from the saved refresh token when
 one exists; `init` defaults remove the need to pass `--env` on every call.
-```
+
+## Sign-in and signups
+
+Password sign-in is always available. Google and GitHub sign-in appear on the
+login screen when `OPENWARP_GOOGLE_CLIENT_ID`/`_SECRET` or
+`OPENWARP_GITHUB_CLIENT_ID`/`_SECRET` are set; an unconfigured provider returns
+404 and is not advertised. Verified email addresses are required, and an account
+that already has a password is never linked to a social identity silently.
+
+Signups are open on a new instance. The instance owner (the first account) can
+close them under Settings, or pin the policy with `OPENWARP_SIGNUPS=closed`.
+With signups closed, new users join only through an invitation: an admin invites
+an address, an existing account is added directly, a new address receives a
+single-use link valid for seven days, and the invitee either sets a password or
+signs in with a configured provider. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Security model
 
@@ -71,13 +85,27 @@ one exists; `init` defaults remove the need to pass `--env` on every call.
   take over an account by configuring its own issuer. SCIM users and groups
   require `org_id` and admin rights in that organisation, and deactivation
   removes that organisation's membership only.
-- TOTP MFA with recovery codes (also enforced on the OAuth consent flow),
-  enforced IP allowlists covering `/api`, `/mcp` and `/scim`, login rate
-  limiting, custom RBAC roles, env-scoped service tokens that cannot escape
-  their environment (including over MCP) or mint wider tokens, machine
-  identities (Universal Auth), approval workflows, log streams, a rotation
-  scheduler, dynamic Postgres leases and a basic PKI round out the Phase +
-  Infisical takeaways.
+- TOTP MFA with recovery codes (also enforced on the OAuth consent flow, with
+  per-address guess limits; changing an active enrolment requires the
+  password), enforced IP allowlists covering `/api`, `/mcp` and `/scim`, login
+  and registration rate limiting, and custom RBAC roles that are deny by
+  default: a role only receives the permissions in its list, managed roles keep
+  their documented breadth, and every read, write, delete, integration, lease,
+  rotation, token and org-admin route checks one of them. Environment and
+  application grant lists narrow the default, and an environment marked
+  restricted admits only its members (or holders of an approved access
+  request). Env-scoped service tokens cannot escape their environment over REST
+  or MCP, cannot call SCIM, and cannot mint wider tokens. Machine identities
+  (Universal Auth) issue 1-hour tokens and cannot mint longer-lived ones.
+  Approval workflows, log streams, a rotation scheduler, allowlisted dynamic
+  Postgres leases and a basic PKI round out the Phase + Infisical takeaways.
+- OIDC issuer changes drop the stored client secret unless a new secret is
+  supplied in the same request, so a secret is never sent to a different
+  identity provider. OIDC states expire after ten minutes and the nonce is
+  checked when the provider returns one.
+- OAuth clients only receive scopes they registered; PKCE verifiers must be
+  non-empty; MCP rejects any `Origin` that is not an exact match for the
+  request host or the configured public URL.
 - OAuth access tokens are scope-checked on every REST call (`secrets:read`
   for reads, `secrets:write` for mutations) and `/mcp` validates the token
   audience. The authorize page escapes all parameters and sets a
@@ -98,7 +126,11 @@ cargo test --workspace     # crypto, DB and HTTP integration tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`crates/server/tests/security.rs` spawns the real server on a private SQLite
-file and covers tenant isolation, SCIM scoping, OAuth scope and audience,
-MFA on consent, token scoping, IP allowlists, HTML escaping, member
-management and rate limiting. CI runs it on every push and pull request.
+The integration suites spawn the real server on a private SQLite file:
+`tests/security.rs` covers tenant isolation, SCIM scoping, OAuth scope and
+audience, MFA on consent, token scoping, IP allowlists, HTML escaping, member
+management and rate limiting; `tests/authorization.rs` covers custom-role
+enforcement, admin gates, OIDC secret handling, the Postgres lease boundary,
+scope escapes and account deactivation; `tests/accounts.rs` covers the signup
+policy, invite provisioning and Google/GitHub sign-in against mock providers.
+CI runs them on every push and pull request.
