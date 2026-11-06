@@ -36,8 +36,13 @@ Config is stored encrypted under the env key. Secrets are pushed decrypted
 `aws_secrets_manager` + `aws_parameter_store` (SigV4 signed, per-key or
 one-JSON-secret modes), `gcp_secret_manager`, `azure_key_vault`, `kubernetes`
 (Opaque Secret), `hashicorp_vault`, `webhook` (generic JSON POST), `instabox`,
-`boat`, `daytona`, `onepassword` (Connect), `dokploy`, `caprover`, `portainer`
-(stack environment variables), and `docker_swarm` (Docker Engine secrets).
+`boat`, `daytona`, `1password` (Connect; `onepassword` is accepted as an
+alias), `dokploy`, `caprover`, `portainer`
+(stack environment variables), `docker_swarm` (Docker Engine secrets),
+`bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`,
+`laravel_forge`, `openwarp` (instance-to-instance), `devin`,
+`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, and `cursor`
+(Cloud Agents environment or team secrets).
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -102,9 +107,10 @@ SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).
 The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`,
 `include_keys` and `exclude_keys` options, and expose a connection test:
 
-- `onepassword` uses a 1Password Connect server (`connect_url`, `token`,
+- `1password` uses a 1Password Connect server (`connect_url`, `token`,
   `vault_id`, optional `value_label`). Each key becomes an item whose title is
-  the key and whose value sits in a concealed field.
+  the key and whose value sits in a concealed field. `onepassword` is accepted
+  as an alias.
 - `aws_secrets_manager` defaults to one secret per key. Setting `secret_id`
   switches to one JSON `SecretString`; `mapping` makes the choice explicit.
   `session_token`, `kms_key_id`, `endpoint` and `force_delete` are supported.
@@ -118,10 +124,53 @@ The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`
   changing the stack file.
 - `docker_swarm` writes Docker Swarm secrets through the Docker Engine API.
   Values are delete-and-recreate because Docker secrets are immutable.
+- `bitbucket` writes repository Pipelines variables (Bearer or Basic auth).
+- `circleci` writes project environment variables; existing names are recreated
+  because CircleCI has no update call.
+- `teamcity` writes project or build-type parameters (`project_locator` or
+  `build_type_locator`).
+- `travisci` writes repository environment variables.
+- `terraform_cloud` writes workspace variables in the configured `category`
+  (`env` by default) with the `sensitive` flag.
+- `qovery` writes environment variables at the configured `scope`.
+- `laravel_forge` merges the site `.env` file and writes it back.
+- `openwarp` pushes to another OpenWarp environment and can mirror deletions.
+- `devin` writes organization-level key-value secrets.
+- `cloudflare_secrets_store` writes one store secret per key with `scopes`.
+- `octopus_deploy` updates the project variable collection.
+- `azure_devops` updates a pipeline variable group.
+- `cursor` writes Cloud Agents environment or team secrets
+  (`runtime_secret` or `environment_variable`).
+
+Shared behavioural options:
+
+- `name_template` supports `{{secretKey}}` and `{{environment}}`; `prefix` also
+  accepts `{{environment}}`.
+- `auto_sync: false` skips the integration on deploy, rotation, proposal,
+  delete, restore and point-in-time restore; manual Sync still runs it.
+- `initial_sync` accepts `overwrite` (default), `import_local` (keep local
+  values) or `import_remote` (remote values win). Import runs on the first
+  stateful sync and is available for AWS Secrets Manager, AWS Parameter Store,
+  1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
+  Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps and
+  OpenWarp. Adapters that never return values reject import explicitly.
+- AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
+  assumes the role and signs with the temporary credentials.
 
 Kamal has no server API or central secret store, so there is no `kamal` adapter.
 Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
 `.kamal/secrets` at deploy time.
+
+Cursor Cloud Agents is supported because it documents environment and team
+secret endpoints. Grok Bot Vault and ChatGPT/Codex cloud environments document
+environment variables and secrets as UI settings, not as a public API. Keeper
+requires Commander in Service Mode. Pandacode's other providers are machine
+lifecycle APIs that accept environment variables or SSH keys only at creation;
+they are not secret-sync destinations.
+
+Still pending from the wider Infisical-style list: Spacelift, OCI Vault, OVH,
+Northflank, Rundeck, Cloud 66 and Humanitec. Each needs its own auth or API
+contract before it can be implemented without guessing.
 
 ## Trigger.dev sync
 

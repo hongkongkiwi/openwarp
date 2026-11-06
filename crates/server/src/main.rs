@@ -568,7 +568,7 @@ fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pe
 async fn delete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:delete")?;
-    st.db.exec("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?", &[json!(now()), json!(now()), json!(sid)]).map_err(|e| bad(&e))?; st.audit(&org, &app, &eid, &uid, "secret.delete", &sid); Ok(j(json!({"ok": true}))) }
+    st.db.exec("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?", &[json!(now()), json!(now()), json!(sid)]).map_err(|e| bad(&e))?; st.audit(&org, &app, &eid, &uid, "secret.delete", &sid); let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
 async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let key = st.env_key(&eid)?; let sealed = st.db.one("SELECT secret_type FROM secrets WHERE id=?", &[json!(sid)]).map(|r| r.map(|x| db::s(&x,"secret_type") == "sealed").unwrap_or(false)).unwrap_or(false);
@@ -581,7 +581,7 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?; let new_ver = cur.map(|r| db::n(&r,"version")).unwrap_or(0) + 1;
     st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
-    st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)); Ok(j(json!({"ok":true,"version":new_ver}))) }
+    st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)); let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.require_env(&eid,&uid)?;
     let key = st.env_key(&eid)?; let val = r.secrets.first().map(|s| s.value.clone()).unwrap_or_default();
@@ -728,29 +728,54 @@ async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<S
     let mut errors = Vec::new();
     if let Ok(rows) = st.db.query("SELECT id FROM integrations WHERE env_id=?", &[json!(eid)]) {
         for r in &rows { let iid = db::s(r, "id");
-            if let Err((_, Json(v))) = sync_one_inner(st, &iid, uid, enforce).await {
+            if let Err((_, Json(v))) = sync_one_inner(st, &iid, uid, enforce, false).await {
                 let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("integration sync failed").to_string();
                 if let Ok((org, app)) = st.env_org_app(eid) { st.audit(&org, &app, eid, uid, "integration.sync_failed", &format!("{}: {}", iid, msg)); }
                 errors.push(format!("{}: {}", iid, msg)); } }
     }
     errors
 }
-async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true).await }
-async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool) -> Result<String, (StatusCode, Json<Value>)> {
+async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true).await }
+async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: bool) -> Result<String, (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id");
     let (org, app) = if enforce { st.require_env(&eid, uid)? } else { st.env_org_app(&eid)? };
     let key = st.env_key(&eid)?;
-    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let mut config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let kind = db::s(&row, "kind");
+    if !manual && config.get("auto_sync").and_then(Value::as_bool) == Some(false) { return Ok(format!("{}: skipped (auto_sync is disabled)", kind)); }
+    let env_name = st.db.one("SELECT name FROM envs WHERE id=?", &[json!(&eid)]).map(|r| r.map(|x| db::s(&x, "name")).unwrap_or_default()).unwrap_or_default();
+    config["_environment"] = json!(env_name);
+    let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
+    let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
+    let initial = config.get("initial_sync").and_then(Value::as_str).unwrap_or("overwrite");
+    if !matches!(initial, "overwrite" | "import_local" | "import_remote") { return Err(bad("initial_sync must be overwrite, import_local or import_remote")); }
+    if initial != "overwrite" && prev.is_empty() {
+        if !matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor") {
+            return Err(bad("initial_sync is only supported for stateful sync adapters"));
+        }
+        let imported = integrations::pull(&kind, &config).await.map_err(|e| bad(&e))?;
+        let existing: HashMap<String, String> = st.list_secrets_base(&eid)?.iter().map(|(k, _, raw)| (k.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
+        let env_key = st.env_key(&eid)?;
+        let mut count = 0; let mut skipped: Vec<String> = Vec::new();
+        for (name, value) in imported {
+            let kname = name.trim().to_uppercase();
+            if !valid_secret_key(&kname) { skipped.push(name); continue; }
+            if initial == "import_local" && existing.contains_key(&kname) { continue; }
+            if initial == "import_remote" && existing.get(&kname).map(String::as_str) == Some("sealed") { skipped.push(format!("{} (sealed)", kname)); continue; }
+            let s = SecretIn { key: kname, value, path: "/".into(), comment: "imported by integration sync".into(), tags: "import".into(), secret_type: "secret".into() };
+            upsert_secret(st, &eid, &env_key, uid, &s)?;
+            count += 1;
+        }
+        st.audit(&org, &app, &eid, uid, "integration.import", &format!("{} keys from {}", count, kind));
+        if !skipped.is_empty() { return Err(bad(&format!("imported {} keys but skipped: {}", count, skipped.join(", ")))); }
+    }
     // Sealed secrets are never readable, so they must never be pushed: an empty
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid)?;
     let pairs: Vec<(String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, _)| (k.clone(), v.clone())).collect();
-    let kind = db::s(&row, "kind");
-    if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm") {
-        let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
-        let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
+    if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor") {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let result = match kind.as_str() {
@@ -758,12 +783,25 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool) -> Result<S
             "instabox" => integrations::instabox_sync(&config, &pairs, &prev).await,
             "boat" => integrations::boat_sync(&config, &pairs, &prev).await,
             "daytona" => integrations::daytona_sync(&config, &pairs, &prev).await,
-            "onepassword" => integrations::onepassword_sync(&config, &pairs, &prev).await,
+            "1password" | "onepassword" => integrations::onepassword_sync(&config, &pairs, &prev).await,
             "aws_secrets_manager" => integrations::aws_secrets_manager_sync(&config, &pairs, &prev).await,
             "aws_parameter_store" => integrations::aws_parameter_store_sync(&config, &pairs, &prev).await,
             "dokploy" => integrations::dokploy_sync(&config, &pairs, &prev).await,
             "caprover" => integrations::caprover_sync(&config, &pairs, &prev).await,
             "portainer" => integrations::portainer_sync(&config, &pairs, &prev).await,
+            "bitbucket" => integrations::bitbucket_sync(&config, &pairs, &prev).await,
+            "circleci" => integrations::circleci_sync(&config, &pairs, &prev).await,
+            "teamcity" => integrations::teamcity_sync(&config, &pairs, &prev).await,
+            "travisci" => integrations::travisci_sync(&config, &pairs, &prev).await,
+            "terraform_cloud" => integrations::terraform_cloud_sync(&config, &pairs, &prev).await,
+            "qovery" => integrations::qovery_sync(&config, &pairs, &prev).await,
+            "laravel_forge" => integrations::laravel_forge_sync(&config, &pairs, &prev).await,
+            "openwarp" => integrations::openwarp_sync(&config, &pairs, &prev).await,
+            "devin" => integrations::devin_sync(&config, &pairs, &prev).await,
+            "cloudflare_secrets_store" => integrations::cloudflare_secrets_store_sync(&config, &pairs, &prev).await,
+            "octopus_deploy" => integrations::octopus_deploy_sync(&config, &pairs, &prev).await,
+            "azure_devops" => integrations::azure_devops_sync(&config, &pairs, &prev).await,
+            "cursor" => integrations::cursor_sync(&config, &pairs, &prev).await,
             _ => integrations::docker_swarm_sync(&config, &pairs, &prev).await,
         };
         let (msg, managed) = match result {
@@ -818,6 +856,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
         }
     }
     st.audit(&org,&app,&eid,&uid,"env.pitr",&format!("ts={} restored={} removed={}",ts,restored,removed));
+    let _ = trigger_sync(&st, &eid, &uid).await;
     Ok(j(json!({"restored": restored, "removed": removed}))) }
 
 
