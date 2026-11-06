@@ -2735,6 +2735,109 @@ async fn ca_crl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> 
     } }
 
 
+// ---------- step-up verification ----------
+// This is the same protocol as the auth-hardening branch (428 plus an
+// X-OpenWarp-Step-Up grant), kept to the minimum SSH issuance needs so the two
+// implementations collapse when that branch merges. Only privileged SSH
+// principals enforce it here.
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum StepUpRisk { Ok, TwoFactor, VeryRisky }
+impl StepUpRisk {
+    fn as_str(self) -> &'static str { match self { StepUpRisk::Ok => "ok", StepUpRisk::TwoFactor => "two_factor", StepUpRisk::VeryRisky => "very_risky" } }
+    fn parse(s: &str) -> Self { match s { "very_risky" => StepUpRisk::VeryRisky, "two_factor" => StepUpRisk::TwoFactor, _ => StepUpRisk::Ok } }
+    fn rank(self) -> u8 { match self { StepUpRisk::Ok => 0, StepUpRisk::TwoFactor => 1, StepUpRisk::VeryRisky => 2 } } }
+
+fn six_digit_code() -> String { use rand_core::RngCore; let mut b = [0u8; 4]; rand_core::OsRng.fill_bytes(&mut b); format!("{:06}", u32::from_le_bytes(b) % 1_000_000) }
+
+/// Only a real account can satisfy a second factor. A machine identity has no
+/// TOTP secret and no mailbox, so it must never look like a stepped-up human.
+async fn step_up_user(st: &S, h: &HeaderMap) -> Option<String> {
+    let uid = st.token_user(h).await.ok()?;
+    st.db.one("SELECT id FROM users WHERE id=?", &[json!(&uid)]).await.ok().flatten().map(|_| uid) }
+
+async fn has_totp(st: &S, uid: &str) -> bool { meta_get(st, &format!("totp_enabled:{}", uid)).await == "1" }
+
+async fn consume_step_up_grant(st: &S, uid: &str, risk: StepUpRisk, raw: &str) -> bool {
+    let hash = oc::hash_token(raw.trim());
+    let Ok(Some(row)) = st.db.one("SELECT risk FROM step_up_grants WHERE token_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(uid), json!(now())]).await else { return false };
+    if StepUpRisk::parse(&db::s(&row, "risk")).rank() < risk.rank() { return false; }
+    st.db.exec("UPDATE step_up_grants SET used=1 WHERE token_hash=? AND used=0", &[json!(&hash)]).await.unwrap_or(0) > 0 }
+
+async fn require_step_up(st: &S, h: &HeaderMap, uid: &str, risk: StepUpRisk) -> Result<(), (StatusCode, Json<Value>)> {
+    let totp = has_totp(st, uid).await;
+    let email = mailer::MailConfig::from_env().enabled();
+    if risk == StepUpRisk::TwoFactor && !totp { return Ok(()); }
+    if risk == StepUpRisk::VeryRisky && !email {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "this action needs an emailed verification code, but no email provider is configured")); }
+    if let Some(raw) = h.get("x-openwarp-step-up").and_then(|v| v.to_str().ok()) {
+        if consume_step_up_grant(st, uid, risk, raw).await { return Ok(()); } }
+    Err((StatusCode::PRECONDITION_REQUIRED, Json(json!({
+        "error": "step-up verification required",
+        "step_up_required": true,
+        "risk": risk.as_str(),
+        "totp_required": totp,
+        "email_required": risk == StepUpRisk::VeryRisky,
+        "email_available": email,
+    })))) }
+
+#[derive(Deserialize)] struct StepUpStartReq { #[serde(default)] risk: String }
+async fn step_up_start(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpStartReq>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let risk = StepUpRisk::parse(&r.risk);
+    if risk == StepUpRisk::Ok { return Err(bad("risk must be two_factor or very_risky")); }
+    if step_up_user(&st, &h).await.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "machine identities cannot complete step-up verification; ask an admin to sign this certificate")); }
+    let key = format!("stepup-start:{}", uid);
+    if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification requests; try again later")); }
+    st.rate_fail(&key, 900).await;
+    let totp = has_totp(&st, &uid).await;
+    if risk == StepUpRisk::TwoFactor && !totp { return Ok(j(json!({"not_required": true, "methods": []}))); }
+    let need_email = risk == StepUpRisk::VeryRisky;
+    if need_email && !mailer::MailConfig::from_env().enabled() {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "this action needs an emailed verification code, but no email provider is configured")); }
+    let challenge = oc::random_token("stepup");
+    let mut code_hash = String::new();
+    if need_email {
+        let user = st.db.one("SELECT email FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+        let email = db::s(&user, "email");
+        let code = six_digit_code();
+        code_hash = oc::hash_token(&code);
+        send_template(&email, "stepup", &[("code", &code), ("email", &email)]).await; }
+    st.db.exec("INSERT INTO step_up_challenges(challenge_hash,user_id,risk,need_totp,need_email,email_code_hash,attempts,created_at,expires_at,used) VALUES(?,?,?,?,?,?,0,?,?,0)",
+        &[json!(oc::hash_token(&challenge)), json!(&uid), json!(risk.as_str()), json!(if totp {1} else {0}), json!(if need_email {1} else {0}), json!(&code_hash), json!(now()), json!(now() + 600)]).await.map_err(|e| bad(&e))?;
+    let methods = match (totp, need_email) { (true, true) => vec!["totp", "email"], (true, false) => vec!["totp"], _ => vec!["email"] };
+    Ok(j(json!({"challenge": challenge, "risk": risk.as_str(), "methods": methods, "email_sent": need_email}))) }
+
+#[derive(Deserialize)] struct StepUpVerifyReq { challenge: String, #[serde(default)] totp: String, #[serde(default)] email_code: String }
+async fn step_up_verify(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpVerifyReq>) -> Res {
+    let uid = st.token_user(&h).await?;
+    if step_up_user(&st, &h).await.is_none() { return Err(err(StatusCode::FORBIDDEN, "machine identities cannot complete step-up verification")); }
+    let key = format!("stepup-verify:{}", uid);
+    if !st.rate_ok(&key, 10, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification attempts; try again later")); }
+    let hash = oc::hash_token(r.challenge.trim());
+    let row = st.db.one("SELECT * FROM step_up_challenges WHERE challenge_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| bad("verification request is invalid or expired"))?;
+    let risk = StepUpRisk::parse(&db::s(&row, "risk"));
+    let need_totp = db::n(&row, "need_totp") == 1; let need_email = db::n(&row, "need_email") == 1;
+    let mut ok = true;
+    if need_email {
+        let expected = db::s(&row, "email_code_hash");
+        if expected.is_empty() || oc::hash_token(r.email_code.trim()) != expected { ok = false; } }
+    if ok && need_totp && !otp_ok(&st, &uid, &r.totp).await { ok = false; }
+    if !ok {
+        st.rate_fail(&key, 900).await;
+        let attempts = db::n(&row, "attempts") + 1;
+        let _ = st.db.exec("UPDATE step_up_challenges SET attempts=?,used=CASE WHEN ?>=5 THEN 1 ELSE used END WHERE challenge_hash=?", &[json!(attempts), json!(attempts), json!(&hash)]).await;
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid verification code")); }
+    let _ = st.db.exec("UPDATE step_up_challenges SET used=1 WHERE challenge_hash=?", &[json!(&hash)]).await;
+    let grant = oc::random_token("stepupg");
+    st.db.exec("INSERT INTO step_up_grants(token_hash,user_id,risk,created_at,expires_at,used) VALUES(?,?,?,?,?,0)",
+        &[json!(oc::hash_token(&grant)), json!(&uid), json!(risk.as_str()), json!(now()), json!(now() + 300)]).await.map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "auth.step_up", risk.as_str()).await;
+    Ok(j(json!({"token": grant, "risk": risk.as_str(), "expires_in": 300}))) }
+
+
 // ---------- SSH certificate authority ----------
 // An SSH CA lives in pki_cas with kind='ssh' so its private key shares the
 // sealed key column, and master-key rotation, with X.509 CAs. Everything below
@@ -2836,6 +2939,13 @@ async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, J
     let patterns = ssh_grants(&db::s(&grant, "principals"));
     if !ssh_ca::principal_allowed(&patterns, &principal) {
         return Err(err(StatusCode::FORBIDDEN, &format!("role {} may not request principal {:?}", role, principal))); }
+    // root, or any principal admitted by a bare * grant, is root-equivalent on
+    // every host that trusts this CA, so it needs a fresh second factor.
+    let privileged = principal == "root" || patterns.iter().any(|p| p == "*");
+    if privileged {
+        if step_up_user(&st, &h).await.is_none() {
+            return Err(err(StatusCode::FORBIDDEN, "a machine identity cannot request a privileged principal; an admin must sign it from a signed-in session")); }
+        require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; }
     let ttl = ssh_ca::clamp_ttl(body.get("ttl").and_then(|v| v.as_i64()), db::n(&grant, "max_ttl"));
     let key = oc::decrypt_symmetric(&st.master(), &db::s(&ca, "key_enc")).map_err(|e| bad(&e))?;
     let cert_id = id();
@@ -2858,7 +2968,7 @@ async fn list_ssh_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
     st.check_admin(&db::s(&ca, "org_id"), &uid).await?;
-    let rows = st.db.query("SELECT id,key_id,principal,serial,actor,revoked,valid_after,valid_before,created_at FROM ssh_certs WHERE ca_id=? ORDER BY created_at DESC LIMIT 200", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,key_id,principal,serial,actor,revoked,cert_type,valid_after,valid_before,created_at FROM ssh_certs WHERE ca_id=? ORDER BY created_at DESC LIMIT 200", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 
 async fn revoke_ssh_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res {
@@ -2883,6 +2993,91 @@ async fn ssh_revoked_keys(State(st): State<S>, h: HeaderMap, Path(caid): Path<St
     let mut resp = ssh_ca::revoked_keys_file(&certs).into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("text/plain; charset=utf-8"));
     resp }
+
+// The same list in OpenSSH's own revocation format. Serial-based, so it stays
+// small and does not need the certificate body.
+async fn ssh_krl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response {
+    let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
+    let ca = match ssh_ca_row(&st, &caid).await { Ok(c) => c, Err(e) => return e.into_response() };
+    if let Err(e) = st.check_admin(&db::s(&ca, "org_id"), &uid).await { return e.into_response(); }
+    let rows = match st.db.query("SELECT serial FROM ssh_certs WHERE ca_id=? AND revoked=1 ORDER BY created_at", &[json!(&caid)]).await {
+        Ok(r) => r, Err(e) => return bad(&e).into_response() };
+    let serials: Vec<u64> = rows.iter().map(|r| db::n(r, "serial").max(0) as u64).collect();
+    let bytes = match ssh_ca::krl(&db::s(&ca, "cert_pem"), &serials, now()) { Ok(b) => b, Err(e) => return bad(&e).into_response() };
+    let mut resp = bytes.into_response();
+    resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/octet-stream"));
+    resp.headers_mut().insert("content-disposition", axum::http::HeaderValue::from_static("attachment; filename=\"openwarp.krl\""));
+    resp }
+
+// ---------- SSH host certificates ----------
+// A host certificate is only as trustworthy as the key it certifies, so an
+// admin registers the hostname together with its public key. Issuance then
+// matches that pair, which lets anyone deploy the certificate without letting
+// anyone invent a host.
+
+async fn add_ssh_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    let org = db::s(&ca, "org_id");
+    st.check_admin(&org, &uid).await?;
+    let hostname = body.get("hostname").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !ssh_ca::valid_hostname(&hostname) { return Err(bad("hostname must be a literal name or address: letters, digits, dots and hyphens, no wildcards")); }
+    let public_key = body.get("public_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if public_key.is_empty() { return Err(bad("public_key is required: send the host's OpenSSH public key")); }
+    let fingerprint = ssh_ca::key_fingerprint(&public_key).map_err(|e| bad(&e))?;
+    if let Some(row) = st.db.one("SELECT id FROM ssh_hosts WHERE ca_id=? AND hostname=? AND fingerprint=?", &[json!(&caid), json!(&hostname), json!(&fingerprint)]).await.map_err(|e| bad(&e))? {
+        return Ok(j(json!({"id": db::s(&row, "id"), "hostname": hostname, "fingerprint": fingerprint, "existing": true}))); }
+    let hid = id();
+    st.db.exec("INSERT INTO ssh_hosts(id,ca_id,hostname,public_key,fingerprint,created_at) VALUES(?,?,?,?,?,?)",
+        &[json!(&hid), json!(&caid), json!(&hostname), json!(&public_key), json!(&fingerprint), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, "", "", &uid, "ssh.host.add", &format!("{} {}", hostname, fingerprint)).await;
+    Ok(j(json!({"id": hid, "hostname": hostname, "fingerprint": fingerprint}))) }
+
+async fn list_ssh_hosts(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    st.check_admin(&db::s(&ca, "org_id"), &uid).await?;
+    let rows = st.db.query("SELECT id,hostname,fingerprint,created_at FROM ssh_hosts WHERE ca_id=? ORDER BY hostname", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+
+// Removing a registration is how a host key is rotated: delete, then register
+// the new key. Outstanding certificates keep working until they expire.
+async fn delete_ssh_host(State(st): State<S>, h: HeaderMap, Path((caid, hid)): Path<(String, String)>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    let org = db::s(&ca, "org_id");
+    st.check_admin(&org, &uid).await?;
+    let removed = st.db.exec("DELETE FROM ssh_hosts WHERE id=? AND ca_id=?", &[json!(&hid), json!(&caid)]).await.map_err(|e| bad(&e))?;
+    if removed == 0 { return Err(err(StatusCode::NOT_FOUND, "host not found")); }
+    st.audit(&org, "", "", &uid, "ssh.host.remove", &hid).await;
+    Ok(j(json!({"deleted": hid}))) }
+
+async fn ssh_sign_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    let org = db::s(&ca, "org_id");
+    st.require_org(&org, &uid).await?;
+    let hostname = body.get("hostname").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !ssh_ca::valid_hostname(&hostname) { return Err(bad("hostname must be a literal name or address")); }
+    let public_key = body.get("public_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if public_key.is_empty() { return Err(bad("public_key is required: send the host's OpenSSH public key")); }
+    let fingerprint = ssh_ca::key_fingerprint(&public_key).map_err(|e| bad(&e))?;
+    if st.db.one("SELECT id FROM ssh_hosts WHERE ca_id=? AND hostname=? AND fingerprint=?", &[json!(&caid), json!(&hostname), json!(&fingerprint)]).await.map_err(|e| bad(&e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "this hostname and key are not registered on the CA; an admin registers a host before it can be certified")); }
+    let requested = body.get("ttl").and_then(|v| v.as_i64()).unwrap_or(ssh_ca::DEFAULT_HOST_TTL);
+    let ttl = requested.clamp(60, ssh_ca::MAX_HOST_TTL);
+    let key = oc::decrypt_symmetric(&st.master(), &db::s(&ca, "key_enc")).map_err(|e| bad(&e))?;
+    let cert_id = id();
+    let key_id = format!("{}{}", ssh_ca::KEY_ID_PREFIX, cert_id);
+    let signed = ssh_ca::sign_host_cert(&String::from_utf8_lossy(&key), &hostname, &public_key, &key_id, ttl, now()).map_err(|e| bad(&e))?;
+    let verified = ssh_ca::describe(&signed.certificate).map_err(|e| bad(&format!("the minted certificate did not parse back: {}", e)))?;
+    st.db.exec("INSERT INTO ssh_certs(id,ca_id,key_id,principal,public_key,cert,serial,actor,revoked,cert_type,valid_after,valid_before,created_at) VALUES(?,?,?,?,?,?,?,?,0,'host',?,?,?)",
+        &[json!(&cert_id), json!(&caid), json!(&key_id), json!(&hostname), json!(&public_key), json!(&signed.certificate),
+          json!(signed.serial as i64), json!(&uid), json!(signed.valid_after), json!(signed.valid_before), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, "", "", &uid, "ssh.sign_host", &format!("{} {} serial={}", hostname, key_id, signed.serial)).await;
+    Ok(j(json!({"id": cert_id, "certificate": signed.certificate, "key_id": key_id, "serial": signed.serial,
+        "hostname": hostname, "cert_type": "host", "valid_after": signed.valid_after, "valid_before": signed.valid_before,
+        "verified": verified, "ca_public_key": db::s(&ca, "cert_pem")}))) }
 
 
 // ---------- IP allowlist enforcement (T01) ----------
@@ -3603,7 +3798,7 @@ async fn main() {
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
-        .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
+        .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification)).route("/api/auth/step-up/start", post(step_up_start)).route("/api/auth/step-up/verify", post(step_up_verify))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
@@ -3620,7 +3815,7 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/api/orgs/{oid}/ssh/cas", get(list_ssh_cas).post(create_ssh_ca)).route("/api/ssh/cas/{caid}", get(get_ssh_ca)).route("/api/ssh/cas/{caid}/grants", put(put_ssh_grants)).route("/api/ssh/cas/{caid}/sign", post(ssh_sign)).route("/api/ssh/cas/{caid}/certs", get(list_ssh_certs)).route("/api/ssh/cas/{caid}/revoked-keys", get(ssh_revoked_keys)).route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/api/orgs/{oid}/ssh/cas", get(list_ssh_cas).post(create_ssh_ca)).route("/api/ssh/cas/{caid}", get(get_ssh_ca)).route("/api/ssh/cas/{caid}/grants", put(put_ssh_grants)).route("/api/ssh/cas/{caid}/sign", post(ssh_sign)).route("/api/ssh/cas/{caid}/certs", get(list_ssh_certs)).route("/api/ssh/cas/{caid}/revoked-keys", get(ssh_revoked_keys)).route("/api/ssh/cas/{caid}/krl", get(ssh_krl)).route("/api/ssh/cas/{caid}/hosts", get(list_ssh_hosts).post(add_ssh_host)).route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host)).route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));

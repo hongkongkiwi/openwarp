@@ -538,9 +538,19 @@ async function openSshCA(id){let detail=$('ssh-ca-detail');if(!detail)return;try
     <pre class="val">${esc(d.sshd)}</pre>
     <div class="field"><label>Principal grants, one role per line as role: pattern, pattern (15m)</label><textarea id="ssh-grants" rows="4" placeholder="developer: web-*, db-*&#10;admin: *">${esc(grants)}</textarea></div>
     <p class="small mut" style="margin:0 0 8px">A certificate can only name a principal its role is granted. A bare * means any local account, root included, so only an owner can grant it.</p>
-    <div class="row"><button class="primary" onclick="saveSshGrants('${jsq(id)}')">Save grants</button><a class="mono small" style="align-self:center" href="/api/ssh/cas/${id}/revoked-keys" download="openwarp_revoked_keys">revoked keys file</a></div>
+    <div class="row"><button class="primary" onclick="saveSshGrants('${jsq(id)}')">Save grants</button><a class="mono small" style="align-self:center" href="/api/ssh/cas/${id}/revoked-keys" download="openwarp_revoked_keys">revoked keys</a><a class="mono small" style="align-self:center" href="/api/ssh/cas/${id}/krl" download="openwarp.krl">KRL</a></div>
+    <h4 style="margin:16px 0 6px">Hosts</h4>
+    <p class="small mut" style="margin:0 0 8px">A host certificate is only issued for a name and key registered here, so a member can deploy one but cannot invent a host.</p>
+    <div class="row"><input id="ssh-host-name" placeholder="db-1.internal"><input id="ssh-host-key" placeholder="ssh-ed25519 AAAA… host key" style="min-width:280px"><button onclick="addSshHost('${jsq(id)}')">Register host</button></div>
+    <div id="ssh-hosts"></div>
     <div id="ssh-certs"></div>`;
-  loadSshCerts(id)}catch(e){toast(e.message,true)}}
+  loadSshHosts(id);loadSshCerts(id)}catch(e){toast(e.message,true)}}
+async function loadSshHosts(id){let host=$('ssh-hosts');if(!host)return;try{let d=await api('GET',`/api/ssh/cas/${id}/hosts`);
+  host.innerHTML=d.length?`<table><thead><tr><th>Hostname</th><th>Key fingerprint</th><th></th></tr></thead><tbody>`+d.map(h=>`<tr><td class="mono">${esc(h.hostname)}</td><td class="mut small">${esc(h.fingerprint)}</td><td><button class="danger" onclick="deleteSshHost('${jsq(h.id)}','${jsq(id)}')">Remove</button></td></tr>`).join('')+'</tbody></table>':'<p class="mut small">No hosts registered.</p>'}catch(e){host.textContent=e.message}}
+async function addSshHost(id){try{let d=await api('POST',`/api/ssh/cas/${id}/hosts`,{hostname:$('ssh-host-name').value.trim(),public_key:$('ssh-host-key').value.trim()});
+  $('ssh-host-name').value='';$('ssh-host-key').value='';toast('Host registered: '+d.fingerprint);loadSshHosts(id)}catch(e){toast(e.message,true)}}
+async function deleteSshHost(hid,ca){if(!confirm('Remove this host registration? Certificates already issued keep working until they expire.'))return;
+  try{await api('DELETE',`/api/ssh/cas/${ca}/hosts/${hid}`);toast('Host removed');loadSshHosts(ca)}catch(e){toast(e.message,true)}}
 async function saveSshGrants(id){let box=$('ssh-grants');if(!box)return;try{
   let grants=box.value.split('\n').map(l=>l.trim()).filter(Boolean).map(l=>{
     let i=l.indexOf(':'); let role=(i<0?l:l.slice(0,i)).trim(); let rest=i<0?'':l.slice(i+1);
@@ -551,8 +561,8 @@ async function saveSshGrants(id){let box=$('ssh-grants');if(!box)return;try{
   if(!grants.length)return toast('Format each line as role: pattern, pattern',true);
   await api('PUT',`/api/ssh/cas/${id}/grants`,{grants:grants});toast('Grants saved');openSshCA(id)}catch(e){toast(e.message,true)}}
 async function loadSshCerts(id){let host=$('ssh-certs');if(!host)return;try{let d=await api('GET',`/api/ssh/cas/${id}/certs`);
-  host.innerHTML=`<h4 style="margin:16px 0 6px">Issued certificates</h4><table><thead><tr><th>Principal</th><th>Key id</th><th>Expires</th><th>State</th><th></th></tr></thead><tbody>`+
-    (d.map(c=>`<tr><td class="mono">${esc(c.principal)}</td><td class="mut small">${esc(c.key_id)}</td><td class="mut small">${new Date((c.valid_before||0)*1000).toLocaleString()}</td><td>${c.revoked?'<span style="color:var(--bad)">revoked</span>':'active'}</td><td>${c.revoked?'':`<button class="danger" onclick="revokeSshCert('${jsq(c.id)}','${jsq(id)}')">Revoke</button>`}</td></tr>`).join('')||'<tr><td colspan="5" class="mut">No certificates issued yet</td></tr>')+'</tbody></table>'}catch(e){host.textContent=e.message}}
+  host.innerHTML=`<h4 style="margin:16px 0 6px">Issued certificates</h4><table><thead><tr><th>Type</th><th>Principal</th><th>Key id</th><th>Expires</th><th>State</th><th></th></tr></thead><tbody>`+
+    (d.map(c=>`<tr><td class="mut small">${esc(c.cert_type||'user')}</td><td class="mono">${esc(c.principal)}</td><td class="mut small">${esc(c.key_id)}</td><td class="mut small">${new Date((c.valid_before||0)*1000).toLocaleString()}</td><td>${c.revoked?'<span style="color:var(--bad)">revoked</span>':'active'}</td><td>${c.revoked?'':`<button class="danger" onclick="revokeSshCert('${jsq(c.id)}','${jsq(id)}')">Revoke</button>`}</td></tr>`).join('')||'<tr><td colspan="6" class="mut">No certificates issued yet</td></tr>')+'</tbody></table>'}catch(e){host.textContent=e.message}}
 async function revokeSshCert(cid,ca){if(!confirm('Revoke this certificate? A host only enforces it once its RevokedKeys file is refreshed.'))return;
   try{await api('POST',`/api/ssh/certs/${cid}/revoke`,{});toast('Revoked');openSshCA(ca)}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}

@@ -472,10 +472,25 @@ Certificates default to least privilege: `permit-pty` and nothing else, with a
 per-CA `allow_forwarding` switch for agent and port forwarding. Lifetime
 defaults to 15 minutes, is capped per grant, and can never exceed 8 hours.
 
-Revocation is deliberately limited: OpenSSH's KRL format has no writer here.
-`GET /api/ssh/cas/:id/revoked-keys` returns the plain list of revoked
-certificate lines for sshd's `RevokedKeys`, and short lifetimes do the rest.
-Host certificates and a KRL writer are not implemented.
+Revocation has two forms. `GET /api/ssh/cas/:id/krl` returns an OpenSSH key
+revocation list (PROTOCOL.krl, serial-based), which is what sshd's `RevokedKeys`
+should point at; `.../revoked-keys` returns the plain list of revoked
+certificate lines for the same directive. A host still has to refresh the file,
+so short lifetimes remain the backstop.
+
+Host certificates certify a server's own host key, so a client that knows the CA
+stops trusting on first use. A host certificate is only as trustworthy as the
+key it names, so an admin registers each hostname together with its public key
+and issuance matches that pair: `POST /api/ssh/cas/:id/hosts` registers,
+`POST .../sign-host` certifies, and removing the registration is how a host key
+is rotated. Wildcards are refused.
+
+A certificate for `root`, or for any principal admitted by a bare `*` grant, is
+root-equivalent wherever the CA is trusted, so it needs a step-up: the request
+returns 428 until the caller completes an emailed second factor (plus TOTP when
+configured) and retries with `X-OpenWarp-Step-Up`. A machine identity has no
+second factor, so it cannot request a privileged principal at all; an admin
+signs those from a signed-in session.
 
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores

@@ -1748,6 +1748,7 @@ async fn pitr_restores_creates_deletes_and_tags() {
 // An SSH certificate's principal decides which local account it authenticates
 // as, so the grant table, not the signature, is the boundary under test here.
 const SSH_PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYQJZ7VR/OW5fqVOvmn+BRt5SLWDPx2UVO3ALmn21ZE openwarp-test";
+const SSH_HOSTKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7gwoGDIUdvHONhUdJsHLNmf0MpNCNbiyHbkC3vqzCl other-host";
 
 async fn ssh_sign(s: &Server, ca: &str, token: &str, body: Value) -> Resp {
     s.call(Method::POST, &format!("/api/ssh/cas/{}/sign", ca), Some(token), Some(body)).await
@@ -1867,4 +1868,138 @@ async fn ssh_ca_principals_are_gated_by_role_grants() {
     assert_eq!(r.status, 400, "an SSH CA has no X.509 CRL: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/pki/cas/{}/certs", ca), Some(&ot), None).await;
     assert_eq!(r.status, 400, "an SSH CA's certificates are not X.509 rows: {}", r.text);
+}
+
+#[tokio::test]
+async fn ssh_host_certificates_need_a_registered_name_and_key() {
+    let s = Server::start().await;
+    let owner = register(&s, "hostowner@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "hosts-ca"}))).await;
+    assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
+    let ca = r.body["id"].as_str().expect("ca id").to_string();
+
+    let member = register(&s, "hostdev@test.invalid").await;
+    let mt = member["token"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "hostdev@test.invalid", "developer").await;
+
+    // Registering a host is an admin action: the registry is the authorisation.
+    let hosts = format!("/api/ssh/cas/{}/hosts", ca);
+    let r = s.call(Method::POST, &hosts, Some(&mt), Some(json!({"hostname": "db-1.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 403, "a developer cannot register a host: {}", r.text);
+    let r = s.call(Method::POST, &hosts, Some(&ot), Some(json!({"hostname": "*.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 400, "a wildcard hostname must be refused: {}", r.text);
+    let r = s.call(Method::POST, &hosts, Some(&ot), Some(json!({"hostname": "db-1.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 200, "register host: {}", r.text);
+    assert!(r.body["fingerprint"].as_str().unwrap().starts_with("SHA256:"), "the registration pins the key: {}", r.text);
+    let r = s.call(Method::POST, &hosts, Some(&ot), Some(json!({"hostname": "db-1.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.body["existing"], json!(true), "registering the same pair twice is idempotent: {}", r.text);
+
+    // Anyone in the workspace may deploy the certificate for the pinned pair.
+    let r = s.call(Method::POST, &format!("/api/ssh/cas/{}/sign-host", ca), Some(&mt),
+        Some(json!({"hostname": "db-1.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 200, "a member may certify a registered host: {}", r.text);
+    assert!(r.body["certificate"].as_str().unwrap().starts_with("ssh-ed25519-cert-v01@openssh.com "), "a host certificate: {}", r.text);
+    assert_eq!(r.body["cert_type"], "host");
+    assert_eq!(r.body["verified"]["cert_type"], "host");
+    assert_eq!(r.body["verified"]["principals"], json!(["db-1.internal"]));
+    let host_cert = r.body["id"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, &format!("/api/ssh/cas/{}/sign-host", ca), Some(&mt),
+        Some(json!({"hostname": "web-9.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 403, "an unregistered hostname must be refused: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/ssh/cas/{}/sign-host", ca), Some(&mt),
+        Some(json!({"hostname": "db-1.internal", "public_key": SSH_PUBKEY}))).await;
+    assert_eq!(r.status, 403, "a different key for a registered name must be refused: {}", r.text);
+
+    // The registry is admin-readable only, and removing a host stops issuance.
+    let r = s.call(Method::GET, &hosts, Some(&mt), None).await;
+    assert_eq!(r.status, 403, "a developer cannot list the registry: {}", r.text);
+    let r = s.call(Method::GET, &hosts, Some(&ot), None).await;
+    assert_eq!(r.status, 200, "list hosts: {}", r.text);
+    let hid = r.body.as_array().unwrap().first().unwrap()["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::DELETE, &format!("{}/{}", hosts, hid), Some(&mt), None).await;
+    assert_eq!(r.status, 403, "a developer cannot remove a host: {}", r.text);
+    let r = s.call(Method::DELETE, &format!("{}/{}", hosts, hid), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "remove host: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/ssh/cas/{}/sign-host", ca), Some(&mt),
+        Some(json!({"hostname": "db-1.internal", "public_key": SSH_HOSTKEY}))).await;
+    assert_eq!(r.status, 403, "a removed host cannot be certified: {}", r.text);
+
+    // Revocation feeds both the plain file and the OpenSSH KRL.
+    let r = s.call(Method::POST, &format!("/api/ssh/certs/{}/revoke", host_cert), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "revoke host certificate: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/ssh/cas/{}/krl", ca), Some(&mt), None).await;
+    assert_eq!(r.status, 403, "the KRL is admin-only: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/ssh/cas/{}/krl", ca), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "fetch krl: {}", r.text);
+    assert!(r.text.starts_with("SSHKRL\n\0"), "the KRL magic must be present: {:?}", &r.text[..r.text.len().min(12)]);
+    assert_eq!(r.header("content-type"), "application/octet-stream");
+}
+
+fn six_digit(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_digit()).filter(|t| t.len() == 6).map(|t| t.to_string()).next()
+}
+
+#[tokio::test]
+async fn a_root_equivalent_certificate_needs_a_second_factor() {
+    let s = Server::start().await;
+    let owner = register(&s, "stepowner@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "step-ca"}))).await;
+    let ca = r.body["id"].as_str().expect("ca id").to_string();
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "owner", "principals": ["*"]}]})).await;
+    assert_eq!(r.status, 200, "grant the star pattern: {}", r.text);
+
+    // root is privileged, so the first attempt is refused with 428 and no work.
+    let body = json!({"principal": "root", "public_key": SSH_PUBKEY});
+    let r = ssh_sign(&s, &ca, &ot, body.clone()).await;
+    assert_eq!(r.status, 428, "a root certificate needs step-up: {}", r.text);
+    assert_eq!(r.body["step_up_required"], json!(true));
+    assert_eq!(r.body["risk"], "very_risky");
+    assert_eq!(r.body["email_required"], json!(true));
+
+    // Complete the emailed challenge, then retry with the grant.
+    let r = s.call(Method::POST, "/api/auth/step-up/start", Some(&ot), Some(json!({"risk": "very_risky"}))).await;
+    assert_eq!(r.status, 200, "step-up start: {}", r.text);
+    let challenge = r.body["challenge"].as_str().expect("challenge").to_string();
+    assert_eq!(r.body["methods"], json!(["email"]), "no TOTP is configured, so email only: {}", r.text);
+    let text = wait_for_mail(&s.inbox, "verification code").await;
+    let code = six_digit(&text).expect("a six digit code in the step-up email");
+    let r = s.call(Method::POST, "/api/auth/step-up/verify", Some(&ot), Some(json!({"challenge": challenge, "email_code": code}))).await;
+    assert_eq!(r.status, 200, "step-up verify: {}", r.text);
+    let grant = r.body["token"].as_str().expect("grant").to_string();
+
+    // The grant is single use: the same one cannot mint a second root cert.
+    let url = format!("/api/ssh/cas/{}/sign", ca);
+    let r = s.call_with_headers(&url, &ot, body.clone(), &[("x-openwarp-step-up", &grant)]).await;
+    assert_eq!(r.status, 200, "a stepped-up root certificate: {}", r.text);
+    assert_eq!(r.body["verified"]["principals"], json!(["root"]));
+    let r = s.call_with_headers(&url, &ot, body.clone(), &[("x-openwarp-step-up", &grant)]).await;
+    assert_eq!(r.status, 428, "a used grant must not work twice: {}", r.text);
+
+    // The ordinary case stays frictionless: a named principal needs no step-up.
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "owner", "principals": ["*"]}, {"role": "developer", "principals": ["web-*"]}]})).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let member = register(&s, "stepdev@test.invalid").await;
+    let mt = member["token"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "stepdev@test.invalid", "developer").await;
+    let r = ssh_sign(&s, &ca, &mt, json!({"principal": "web-1", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 200, "a non-privileged principal needs no second factor: {}", r.text);
+
+    // A machine identity cannot step up, so it cannot reach a privileged principal.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&ot), Some(json!({"name": "super", "permissions": ["*"]}))).await;
+    assert_eq!(r.status, 200, "create a privileged custom role: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&ot), Some(json!({"name": "root-bot", "role": "super"}))).await;
+    assert_eq!(r.status, 200, "create the identity: {}", r.text);
+    let client_id = r.body["client_id"].as_str().unwrap().to_string();
+    let client_secret = r.body["client_secret"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/v1/machine/auth/universal/login", None, Some(json!({"client_id": client_id, "client_secret": client_secret}))).await;
+    let machine = r.body["accessToken"].as_str().expect("machine token").to_string();
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "super", "principals": ["*"]}]})).await;
+    assert_eq!(r.status, 200, "grant the machine role the star: {}", r.text);
+    let r = ssh_sign(&s, &ca, &machine, json!({"principal": "root", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 403, "a machine identity cannot reach a privileged principal: {}", r.text);
 }

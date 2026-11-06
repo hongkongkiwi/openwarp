@@ -87,7 +87,11 @@ The private key of the subject never reaches the server. The server holds only t
 
 The principal, not the signature, is the authorisation boundary. A certificate granted for `root` authenticates as root on every host that trusts the CA, so issuance requires a per-CA role grant that matches the requested principal. Patterns are an exact name, one trailing `*`, or a bare `*`; a bare `*` is owner-only and should be treated as root-equivalent. A CA with no grant issues nothing. Adding a grant for a role you do not intend is equivalent to granting that role shell access to the matching accounts.
 
-Revocation is bounded by design. There is no KRL writer: revoked certificates appear in the `RevokedKeys` file, which each host must refresh, and otherwise a certificate simply expires. Keep lifetimes short. There is no way to withdraw a delegated certificate from a host that is offline, and a compromised CA key cannot be contained by revocation, only by replacing the CA on every host.
+Revocation is bounded by what the host has. The KRL and the plain `RevokedKeys` file are both served from the revocation table, but a host only enforces them after it refreshes the file, and a host that is offline keeps honouring a revoked certificate until it expires. Keep lifetimes short. A compromised CA key cannot be contained by revocation at all, only by replacing the CA on every host.
+
+Host certificates carry the same weight in the other direction: a client that trusts the CA for host names will accept any host certificate it signed. That is why host issuance is limited to a hostname and public key an admin registered, and why the registry has no wildcards. Rotating a host key means removing and re-registering the pair; outstanding certificates keep working until they expire, so rotate the registry before the old certificate's lifetime runs out.
+
+A certificate for `root`, or one issued under a bare `*` grant, is root-equivalent on every trusting host, so issuance requires a step-up: an emailed code, plus TOTP when the account has it, exchanged for a single-use `X-OpenWarp-Step-Up` grant. Machine identities cannot satisfy a second factor and are refused privileged principals outright, so a stolen machine token cannot mint a root certificate.
 
 Machine certificates use the same path: a workspace identity signs with its own role, so a token minted for a developer identity cannot request a principal outside that role's grant.
 

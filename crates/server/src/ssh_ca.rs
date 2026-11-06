@@ -16,6 +16,10 @@ use ssh_key::{Algorithm, LineEnding, PrivateKey, PublicKey};
 
 pub const DEFAULT_TTL: i64 = 900;
 pub const MAX_TTL: i64 = 8 * 3600;
+/// Host certificates are provisioned once per server, not per session, so they
+/// live in days. They are still short enough that a lost host key ages out.
+pub const DEFAULT_HOST_TTL: i64 = 30 * 86_400;
+pub const MAX_HOST_TTL: i64 = 90 * 86_400;
 /// sshd logs this value on an accepted certificate login, so it is the join
 /// between a server's auth log and a row in `ssh_certs`.
 pub const KEY_ID_PREFIX: &str = "openwarp:";
@@ -38,9 +42,22 @@ pub fn generate_ca() -> Result<(String, String), String> {
 
 /// The SHA256 fingerprint in the form `ssh-keygen -lf` prints, so an operator
 /// can compare what we show with what the host has installed.
-pub fn ca_fingerprint(public_key: &str) -> Result<String, String> {
+pub fn key_fingerprint(public_key: &str) -> Result<String, String> {
     let key = PublicKey::from_openssh(public_key.trim()).map_err(|e| format!("not a usable OpenSSH public key: {}", e))?;
     Ok(key.fingerprint(ssh_key::HashAlg::Sha256).to_string())
+}
+
+pub fn ca_fingerprint(public_key: &str) -> Result<String, String> { key_fingerprint(public_key) }
+
+/// A hostname in a host certificate is a principal that clients match against
+/// the name they dialled, so wildcards and ports are refused rather than
+/// interpreted.
+pub fn valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 pub fn valid_principal(principal: &str) -> bool {
@@ -99,6 +116,18 @@ pub fn sign_user_cert(ca_key_openssh: &str, input: &SignInput<'_>, allow_forward
     if !valid_principal(input.principal) {
         return Err(format!("{:?} is not a valid principal (letters, digits, . _ - @)", input.principal));
     }
+    mint(ca_key_openssh, input, CertType::User, allow_forwarding, now)
+}
+
+/// A host certificate names the hostname the client dialled. It gets no
+/// extensions: host keys never get a shell or a forwarding channel.
+pub fn sign_host_cert(ca_key_openssh: &str, hostname: &str, public_key: &str, key_id: &str, ttl: i64, now: i64) -> Result<Signed, String> {
+    if !valid_hostname(hostname) { return Err(format!("{:?} is not a valid hostname", hostname)); }
+    let input = SignInput { public_key, principal: hostname, key_id, ttl };
+    mint(ca_key_openssh, &input, CertType::Host, false, now)
+}
+
+fn mint(ca_key_openssh: &str, input: &SignInput<'_>, cert_type: CertType, allow_forwarding: bool, now: i64) -> Result<Signed, String> {
     let ca = PrivateKey::from_openssh(ca_key_openssh)
         .map_err(|_| "the stored SSH CA key is not a usable OpenSSH private key; create a new CA".to_string())?;
     let subject = PublicKey::from_openssh(input.public_key.trim())
@@ -113,17 +142,19 @@ pub fn sign_user_cert(ca_key_openssh: &str, input: &SignInput<'_>, allow_forward
     let valid_before = now.saturating_add(input.ttl);
     let mut b = Builder::new_with_random_nonce(&mut OsRng, subject.key_data().clone(), valid_after as u64, valid_before as u64)
         .map_err(|e| format!("could not start the certificate: {}", e))?;
-    b.cert_type(CertType::User).map_err(|e| e.to_string())?;
+    b.cert_type(cert_type).map_err(|e| e.to_string())?;
     b.serial(serial).map_err(|e| e.to_string())?;
     b.key_id(input.key_id).map_err(|e| e.to_string())?;
     // Never all_principals_valid(): that is a certificate good for root
     // anywhere the CA is trusted.
     b.valid_principal(input.principal).map_err(|e| e.to_string())?;
     // Least privilege by default: a shell, nothing else.
-    b.extension(PERMIT_PTY, "").map_err(|e| e.to_string())?;
-    if allow_forwarding {
-        b.extension(PERMIT_AGENT, "").map_err(|e| e.to_string())?;
-        b.extension(PERMIT_PORT, "").map_err(|e| e.to_string())?;
+    if cert_type == CertType::User {
+        b.extension(PERMIT_PTY, "").map_err(|e| e.to_string())?;
+        if allow_forwarding {
+            b.extension(PERMIT_AGENT, "").map_err(|e| e.to_string())?;
+            b.extension(PERMIT_PORT, "").map_err(|e| e.to_string())?;
+        }
     }
     let cert = b.sign(&ca).map_err(|e| format!("could not sign the certificate: {}", e))?;
     let certificate = cert.to_openssh().map_err(|e| format!("could not encode the certificate: {}", e))?;
@@ -145,9 +176,9 @@ pub fn describe(certificate: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
-/// sshd's `RevokedKeys` file: one public key or certificate per line. There is
-/// no KRL writer here, so revocation is this file plus the certificate's own
-/// short lifetime.
+/// sshd's `RevokedKeys` file: one public key or certificate per line. Prefer
+/// [`krl`], which is the actual OpenSSH revocation format; this plain list
+/// remains because it needs no parser at all.
 pub fn revoked_keys_file(certificates: &[String]) -> String {
     let mut out = String::new();
     for cert in certificates {
@@ -158,6 +189,38 @@ pub fn revoked_keys_file(certificates: &[String]) -> String {
         }
     }
     out
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_be_bytes()); }
+fn put_u64(out: &mut Vec<u8>, v: u64) { out.extend_from_slice(&v.to_be_bytes()); }
+fn put_string(out: &mut Vec<u8>, data: &[u8]) { put_u32(out, data.len() as u32); out.extend_from_slice(data); }
+
+/// An OpenSSH key revocation list, per PROTOCOL.krl. It revokes by serial under
+/// one CA: section 1 (certificates) with a serial-list subsection, which is one
+/// `uint64` per revoked certificate and needs no per-certificate key id.
+pub fn krl(ca_public_key: &str, serials: &[u64], generated: i64) -> Result<Vec<u8>, String> {
+    let ca = PublicKey::from_openssh(ca_public_key.trim()).map_err(|e| format!("not a usable CA public key: {}", e))?;
+    let ca_blob = ca.to_bytes().map_err(|e| format!("could not encode the CA key: {}", e))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SSHKRL\n\0");
+    put_u32(&mut out, 1);                      // KRL_FORMAT_VERSION
+    put_u64(&mut out, 1);                      // krl_version, incremented per revision
+    put_u64(&mut out, generated.max(0) as u64); // generated_date
+    put_u64(&mut out, 0);                      // flags, none defined
+    put_string(&mut out, b"");                 // reserved
+    put_string(&mut out, b"OpenWarp revoked certificates");
+    if !serials.is_empty() {
+        let mut section = Vec::new();
+        put_string(&mut section, &ca_blob);
+        put_string(&mut section, b"");         // reserved
+        let mut list = Vec::new();
+        for serial in serials { put_u64(&mut list, *serial); }
+        section.push(0x20);                    // KRL_SECTION_CERT_SERIAL_LIST
+        put_string(&mut section, &list);
+        out.push(1);                           // KRL_SECTION_CERTIFICATES
+        put_string(&mut out, &section);
+    }
+    Ok(out)
 }
 
 pub fn sshd_snippet(public_key: &str) -> String {
@@ -266,5 +329,61 @@ mod tests {
         let snippet = sshd_snippet(&public);
         assert!(snippet.contains(&public));
         assert!(snippet.contains("TrustedUserCAKeys /etc/ssh/openwarp/ca.pub"));
+    }
+
+    #[test]
+    fn hostnames_are_literal_names_or_addresses() {
+        assert!(valid_hostname("web-1"));
+        assert!(valid_hostname("web-1.internal"));
+        assert!(valid_hostname("10.0.0.5"));
+        for bad in ["", "*", "*.internal", "-web", "web-", "web..internal", "web_1", "web:22", "web internal"] {
+            assert!(!valid_hostname(bad), "{:?} must not be a hostname", bad);
+        }
+    }
+
+    #[test]
+    fn a_host_certificate_is_a_host_certificate() {
+        let (ca_secret, _) = generate_ca().unwrap();
+        let key = subject_key();
+        let signed = sign_host_cert(&ca_secret, "db-1.internal", &key, "openwarp:h1", DEFAULT_HOST_TTL, 1_700_000_000).unwrap();
+        let d = describe(&signed.certificate).unwrap();
+        assert_eq!(d["cert_type"], "host");
+        assert_eq!(d["principals"], serde_json::json!(["db-1.internal"]));
+        assert_eq!(signed.valid_before - signed.valid_after, DEFAULT_HOST_TTL + 60);
+        assert!(sign_host_cert(&ca_secret, "*", &key, "openwarp:h2", 600, 1_700_000_000).is_err());
+    }
+
+    /// Offset of the first section: 8 magic + 4 version + 8 krl_version +
+    /// 8 generated + 8 flags, then the reserved and comment strings.
+    fn sections_start(bytes: &[u8]) -> usize {
+        let mut at = 36;
+        for _ in 0..2 {
+            let n = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + n;
+        }
+        at
+    }
+
+    #[test]
+    fn krl_has_the_openssh_header_and_a_serial_list() {
+        let (_, public) = generate_ca().unwrap();
+        let bytes = krl(&public, &[7, 42], 1_700_000_000).unwrap();
+        assert_eq!(&bytes[..8], b"SSHKRL\n\0", "KRL magic");
+        assert_eq!(&bytes[8..12], &[0, 0, 0, 1], "format version 1");
+        assert_eq!(&bytes[20..28], &1_700_000_000u64.to_be_bytes(), "generated date");
+        let start = sections_start(&bytes);
+        assert_eq!(bytes[start], 1, "section type CERTIFICATES");
+        let section_len = u32::from_be_bytes(bytes[start + 1..start + 5].try_into().unwrap()) as usize;
+        assert_eq!(section_len, bytes.len() - start - 5, "the section length covers the rest of the file");
+        assert!(bytes.windows(8).any(|w| w == 42u64.to_be_bytes()), "the serial appears as a big-endian u64");
+        assert!(bytes.windows(8).any(|w| w == 7u64.to_be_bytes()));
+    }
+
+    #[test]
+    fn an_empty_krl_is_a_header_only() {
+        let (_, public) = generate_ca().unwrap();
+        let bytes = krl(&public, &[], 1_700_000_000).unwrap();
+        assert_eq!(&bytes[..8], b"SSHKRL\n\0");
+        assert_eq!(bytes.len(), sections_start(&bytes), "no sections when nothing is revoked");
     }
 }

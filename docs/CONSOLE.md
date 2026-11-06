@@ -91,7 +91,9 @@ Workspace settings include IP allowlists and OIDC configuration. Test policy cha
 
 The PKI card creates two kinds of authority. An X.509 CA issues service certificates with a CRL. An SSH CA mints short-lived OpenSSH user certificates: create it once, copy the printed `TrustedUserCAKeys` block to every host that should accept those certificates, then grant each workspace role the principals it may request. Save grants as one role per line, `role: pattern, pattern`, with an optional trailing `(30m)` to cap that role's lifetime.
 
-Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certificates and a revoke action. A certificate can only name a principal its role is granted; a bare `*` means any local account including `root`, so only a workspace owner can save one. Revoking records the certificate here, but a host enforces it only after its `RevokedKeys` file is refreshed from the download link.
+Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certificates and a revoke action. A certificate can only name a principal its role is granted; a bare `*` means any local account including `root`, so only a workspace owner can save one. Certificates for `root` or under a bare `*` grant need a second factor, so the command line prompts for the emailed code rather than the console issuing one.
+
+Register hosts here too: a host certificate is only issued for a hostname and public key pair an admin registered, because a host certificate is exactly as trustworthy as the key it names. Removing a registration is how a host key is rotated. Revoking records the certificate, but a host enforces it only after refreshing its `RevokedKeys` file, served here as both the plain list and an OpenSSH KRL.
 
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 

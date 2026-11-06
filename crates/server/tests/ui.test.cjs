@@ -201,7 +201,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/ssh/cas': [],
     '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
-    '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000 }],
+    '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
+    '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
   };
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
@@ -232,6 +233,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'POST' && url === '/api/orgs/org-a/ssh/cas') body = { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub' };
       else if (options.method === 'PUT' && url === '/api/ssh/cas/ca-ssh-1/grants') body = { ca_id: 'ca-ssh-1', roles: call.body.grants.map(g => g.role) };
       else if (options.method === 'POST' && url === '/api/ssh/certs/ssh-cert-1/revoke') body = { revoked: 'ssh-cert-1' };
+      else if (options.method === 'POST' && url === '/api/ssh/cas/ca-ssh-1/hosts') body = { id: 'host-2', hostname: call.body.hostname, fingerprint: 'SHA256:newhost' };
+      else if (options.method === 'DELETE' && url === '/api/ssh/cas/ca-ssh-1/hosts/host-1') body = { deleted: 'host-1' };
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -654,6 +657,18 @@ test('SSH CA settings create a CA, edit grants and revoke a certificate', async 
   ui.confirm = true;
   await ui.invoke("revokeSshCert('ssh-cert-1','ca-ssh-1')");
   assert.ok(ui.calls.some(c => c.method === 'POST' && c.url === '/api/ssh/certs/ssh-cert-1/revoke'), 'confirming revokes');
+  assert.ok(ui.el('ssh-hosts').textContent.includes('db-1.internal'), 'the registered hosts are listed');
+  ui.el('ssh-host-name').value = 'cache-1.internal';
+  ui.el('ssh-host-key').value = 'ssh-ed25519 AAAAC3Nza host';
+  await ui.invoke("addSshHost('ca-ssh-1')");
+  const hostPost = ui.calls.find(c => c.method === 'POST' && c.url === '/api/ssh/cas/ca-ssh-1/hosts');
+  assert.ok(hostPost, 'registering a host must reach the CA');
+  assert.equal(hostPost.body.hostname, 'cache-1.internal');
+  assert.ok(hostPost.body.public_key.includes('ssh-ed25519'), 'the host key is sent for pinning');
+  assert.ok(!ui.el('ssh-host-name').value, 'the form clears after registering');
+  ui.confirm = true;
+  await ui.invoke("deleteSshHost('host-1','ca-ssh-1')");
+  assert.ok(ui.calls.some(c => c.method === 'DELETE' && c.url === '/api/ssh/cas/ca-ssh-1/hosts/host-1'), 'removing a host reaches the CA');
 });
 
 test('re-editing a draft back to its stored value does not match itself', async () => {

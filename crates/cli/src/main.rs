@@ -60,6 +60,14 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
         #[arg(long)] principal: String,
         #[arg(long)] key: Option<String>,
     },
+    /// Sign a server's host key and write <key>-cert.pub
+    HostCert {
+        #[arg(long, env = "OPENWARP_SSH_CA")] ca: String,
+        #[arg(long)] hostname: String,
+        #[arg(long)] key: String,
+        #[arg(long, default_value = "30d")] ttl: String,
+        #[arg(long)] print: bool,
+    },
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -229,17 +237,57 @@ fn write_cert(path: &Path, certificate: &str) -> std::io::Result<()> {
         } }
     std::fs::write(path, format!("{}\n", certificate.trim())) }
 
-fn ssh_sign(client: &reqwest::blocking::Client, host: &str, token: &str, ca: &str, principal: &str, ttl: i64, public_key: &str) -> Value {
-    let resp = match client.post(format!("{}/api/ssh/cas/{}/sign", host, ca)).bearer_auth(token)
-        .json(&json!({"principal": principal, "ttl": ttl, "public_key": public_key})).send() {
-        Ok(r) => r,
-        Err(e) => { eprintln!("could not reach {}: {}", host, e); std::process::exit(1) } };
-    let status = resp.status();
-    let body: Value = resp.json().unwrap_or_else(|_| json!({"error": "the server did not return JSON"}));
+fn prompt(label: &str) -> String {
+    eprint!("{}", label);
+    let mut line = String::new();
+    // A closed stdin is a refusal, not an empty code.
+    std::io::stdin().read_line(&mut line).unwrap_or(0);
+    line.trim().to_string() }
+
+/// Complete a step-up challenge for an operation that returned 428. The server
+/// emails a code and, when configured, also wants the authenticator code.
+fn step_up(client: &reqwest::blocking::Client, host: &str, token: &str, required: &Value) -> String {
+    let risk = required["risk"].as_str().unwrap_or("very_risky");
+    let started: Value = client.post(format!("{}/api/auth/step-up/start", host)).bearer_auth(token).json(&json!({"risk": risk}))
+        .send().ok().and_then(|r| r.json().ok()).unwrap_or_else(|| { eprintln!("could not start step-up verification"); std::process::exit(1) });
+    let challenge = match started["challenge"].as_str() {
+        Some(c) => c.to_string(),
+        None => { eprintln!("step-up failed: {}", started["error"].as_str().unwrap_or("no challenge returned")); std::process::exit(1) } };
+    let methods: Vec<String> = started["methods"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    if methods.iter().any(|m| m == "email") { eprintln!("A verification code was emailed to you."); }
+    let mut totp = String::new();
+    let mut email_code = String::new();
+    if methods.iter().any(|m| m == "totp") { totp = prompt("authenticator code: "); }
+    if methods.iter().any(|m| m == "email") { email_code = prompt("emailed code: "); }
+    let verified: Value = client.post(format!("{}/api/auth/step-up/verify", host)).bearer_auth(token)
+        .json(&json!({"challenge": challenge, "totp": totp, "email_code": email_code}))
+        .send().ok().and_then(|r| r.json().ok()).unwrap_or_else(|| { eprintln!("could not complete step-up verification"); std::process::exit(1) });
+    match verified["token"].as_str() {
+        Some(t) => t.to_string(),
+        None => { eprintln!("step-up failed: {}", verified["error"].as_str().unwrap_or("no grant returned")); std::process::exit(1) } } }
+
+/// POST a signing request, completing step-up once if the server asks for it.
+fn ssh_sign_request(client: &reqwest::blocking::Client, host: &str, token: &str, path: &str, body: &Value) -> Value {
+    let send = |grant: Option<&str>| {
+        let mut req = client.post(format!("{}{}", host, path)).bearer_auth(token).json(body);
+        if let Some(g) = grant { req = req.header("x-openwarp-step-up", g); }
+        req.send() };
+    let mut resp = match send(None) { Ok(r) => r, Err(e) => { eprintln!("could not reach {}: {}", host, e); std::process::exit(1) } };
+    let mut status = resp.status();
+    let mut parsed: Value = resp.json().unwrap_or_else(|_| json!({"error": "the server did not return JSON"}));
+    if status.as_u16() == 428 {
+        let grant = step_up(client, host, token, &parsed);
+        resp = match send(Some(&grant)) { Ok(r) => r, Err(e) => { eprintln!("could not reach {}: {}", host, e); std::process::exit(1) } };
+        status = resp.status();
+        parsed = resp.json().unwrap_or_else(|_| json!({"error": "the server did not return JSON"})); }
     if !status.is_success() {
-        eprintln!("signing failed ({}): {}", status.as_u16(), body.get("error").and_then(|e| e.as_str()).unwrap_or("no message"));
+        eprintln!("signing failed ({}): {}", status.as_u16(), parsed.get("error").and_then(|e| e.as_str()).unwrap_or("no message"));
         std::process::exit(1); }
-    body }
+    parsed }
+
+fn ssh_sign(client: &reqwest::blocking::Client, host: &str, token: &str, ca: &str, principal: &str, ttl: i64, public_key: &str) -> Value {
+    let body = json!({"principal": principal, "ttl": ttl, "public_key": public_key});
+    ssh_sign_request(client, host, token, &format!("/api/ssh/cas/{}/sign", ca), &body) }
 
 fn ssh_summary(signed: &Value, path: Option<&Path>) {
     if let Some(p) = path { println!("certificate: {}", p.display()); }
@@ -373,7 +421,21 @@ fn main() {
                          Match host *.internal exec \"openwarp ssh cert --ca {ca} --principal {principal} --quiet\"\n\
                          \x20 IdentityFile {key}\n\
                          \x20 CertificateFile {cert}",
-                    ca = ca, principal = principal, key = key_path.display(), cert = cert_path.display()); } },
+                    ca = ca, principal = principal, key = key_path.display(), cert = cert_path.display()); }
+            SshCmd::HostCert { ca, hostname, key, ttl, print } => {
+                let (key_path, cert_path) = ssh_key_paths(&Some(key.clone()));
+                let public = read_public_key(&key_path);
+                let body = json!({"hostname": hostname, "ttl": parse_ttl(ttl), "public_key": public});
+                let signed = ssh_sign_request(&client, &host, &token, &format!("/api/ssh/cas/{}/sign-host", ca), &body);
+                let certificate = signed["certificate"].as_str().unwrap_or_else(|| { eprintln!("the server returned no certificate: {}", signed); std::process::exit(1) }).to_string();
+                if *print {
+                    println!("{}", certificate);
+                } else {
+                    if let Err(e) = write_cert(&cert_path, &certificate) { eprintln!("could not write {}: {}", cert_path.display(), e); std::process::exit(1); }
+                    println!("certificate: {}", cert_path.display()); }
+                println!("hostname:    {}", signed["hostname"].as_str().unwrap_or(""));
+                println!("key id:      {}", signed["key_id"].as_str().unwrap_or(""));
+                println!("expires in:  {}d", (signed["valid_before"].as_i64().unwrap_or(0) - now_secs()) / 86_400); } },
         Cmd::E2eCreate { app, name } => { let app = pick(app, &local, "app_id", "--app");
             let me = get(&format!("{}/api/me", host));
             let env_key = openwarp_crypto::random_key();

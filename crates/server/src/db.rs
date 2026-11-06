@@ -280,6 +280,15 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_ssh_certs_ca ON ssh_certs(ca_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ssh_grants_ca ON ssh_principal_grants(ca_id)",
     ]),
+    // Host certificates are issued only for a hostname and key an admin
+    // registered, so the registry is the authorisation for host issuance.
+    (15, &[
+        "ALTER TABLE ssh_certs ADD COLUMN cert_type TEXT DEFAULT 'user'",
+        "CREATE TABLE IF NOT EXISTS ssh_hosts(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,hostname TEXT NOT NULL,public_key TEXT NOT NULL,fingerprint TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_hosts_key ON ssh_hosts(ca_id,hostname,fingerprint)",
+        "CREATE TABLE IF NOT EXISTS step_up_challenges(challenge_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,need_totp BIGINT DEFAULT 0,need_email BIGINT DEFAULT 0,email_code_hash TEXT DEFAULT '',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS step_up_grants(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -313,9 +322,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 14, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 15, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 14, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 15, "each migration must be recorded exactly once");
     }
 }

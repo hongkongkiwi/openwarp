@@ -137,9 +137,12 @@ openwarp ssh cert --ca CA_ID --principal deploy --print
 openwarp ssh cert --ca CA_ID --principal deploy --key ~/.ssh/id_ed25519 --ttl 30m
 openwarp ssh login --ca CA_ID --principal deploy -- deploy@host.internal
 openwarp ssh config --ca CA_ID --principal deploy
+openwarp ssh host-cert --ca CA_ID --hostname db-1.internal --key /etc/ssh/ssh_host_ed25519_key
 ```
 
-`cert` signs and writes the certificate beside your key as `<key>-cert.pub`, which OpenSSH loads automatically, or prints it with `--print`. `login` mints a certificate and then runs `ssh -i <key> -o IdentitiesOnly=yes`, so the host sees the certificate rather than an agent key. `config` prints an `~/.ssh/config` block that mints a certificate before each matching connection.
+`cert` signs and writes the certificate beside your key as `<key>-cert.pub`, which OpenSSH loads automatically, or prints it with `--print`. `login` mints a certificate and then runs `ssh -i <key> -o IdentitiesOnly=yes`, so the host sees the certificate rather than an agent key. `config` prints an `~/.ssh/config` block that mints a certificate before each matching connection. `host-cert` signs a server's host key for a hostname an admin registered, defaulting to 30 days and capped at 90; sshd picks the result up from `<key>-cert.pub` next to its host key.
+
+A certificate for `root`, or one issued under a bare `*` grant, needs a second factor. The server answers 428 and these commands prompt for the emailed code, and for the authenticator code when the account has TOTP, then retry once. A machine token cannot step up and is refused instead.
 
 The CA is selected with `--ca` or `OPENWARP_SSH_CA`. `--key` defaults to `~/.ssh/id_ed25519`. `--ttl` accepts `90s`, `15m`, `2h`, `1d` or a number of seconds, and the workspace's grant can cap it lower. `--quiet` suppresses the summary, which is what the `Match exec` snippet uses.
 
