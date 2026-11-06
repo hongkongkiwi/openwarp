@@ -21,3 +21,11 @@ for (const [file, digest] of Object.entries(expected)) {
 test('the libsodium licence is present', () => {
   assert.match(fs.readFileSync(path.join(__dirname, '../src/vendor/LICENSE.libsodium'), 'utf8'), /ISC|Permission to use/i);
 });
+test('the console policy permits the libsodium WebAssembly build', () => {
+  const main = fs.readFileSync(path.join(__dirname, '../src/main.rs'), 'utf8');
+  const start = main.indexOf('async fn index()');
+  const end = main.indexOf('async fn security_headers');
+  assert.ok(start > 0 && end > start, 'the index handler must be findable');
+  assert.match(main.slice(start, end), /wasm-unsafe-eval/,
+    'the console CSP must allow the WASM build, or the browser E2E editor cannot load libsodium');
+});

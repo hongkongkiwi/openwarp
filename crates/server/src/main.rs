@@ -4032,7 +4032,7 @@ out.innerHTML='';var pre=document.createElement('pre');pre.textContent=d.value!=
 async fn index() -> Response {
     let mut r = Html(ui::INDEX).into_response();
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
     r }
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     let mut res = next.run(req).await;
