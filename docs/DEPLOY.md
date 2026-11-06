@@ -24,6 +24,21 @@ docker compose up -d --build
    owner and is the only one that can change the signup policy.
 4. Create the recovery kit backup for every user. It is shown once.
 
+## Platform limits
+
+OpenWarp is a native service. A Cloudflare Workers or other WASM build cannot
+open raw TCP/TLS sockets, so it must be built with `--no-default-features`:
+the `ldap` feature is then off, the LDAP routes are not registered, and
+`/api/auth/providers` reports `ldap: false`, which hides the console entry.
+Directories that publish OIDC (Entra ID, Keycloak, Authentik, Dex) still work
+on that target through the OIDC flow.
+
+On a native deployment the directory is usually on a private network. Add its
+CA to the host trust store, or paste the CA PEM into the directory settings.
+`OPENWARP_ENV=production` treats loopback and private targets as blocked
+egress; set `OPENWARP_ALLOW_PRIVATE_EGRESS=1` to allow the internal directory,
+exactly as for a self-hosted OIDC issuer.
+
 ## Environment
 
 | Variable | Purpose |

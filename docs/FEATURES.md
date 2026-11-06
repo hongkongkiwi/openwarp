@@ -22,6 +22,7 @@
 | Audit logs + forwarding | Pro/Ent | per-org audit table, webhook forwarding via settings |
 | Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default) |
 | OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, RS256 `id_token` verified against provider JWKS, iss/aud/exp checked, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
+| LDAP directory sign-in | Enterprise | **Per-org LDAPS directory**: admin `GET/PUT/DELETE /api/orgs/:id/ldap` stores the URL, service bind DN and encrypted password, base DN, user filter, attribute names and group map; `POST /api/auth/ldap {org_id, username, password}` searches with the service account (RFC 4515 escaping), then binds as the found entry. Only `ldaps://` is accepted, so no password crosses the wire unencrypted. Invite or auto-provision plus allowed-domain gating, `Group=role` mapping, TOTP parity and audit entries. Absent from builds without the `ldap` cargo feature (Workers/WASM) |
 | External KMS | Enterprise | master key via `OPENWARP_MASTER_KEY` (BYO KMS/HSM wrapper point) |
 | Licence checks / seat limits | n/a | **none, by design** |
 
@@ -274,6 +275,15 @@ create the sandbox with `env` and replace it.
 - OIDC binds accounts by issuer plus subject in `oidc_subjects`. A first SSO
   login whose email already exists is refused instead of linked, closing the
   attacker-configured-issuer takeover.
+- LDAP binds accounts by organisation plus the directory DN in `ldap_subjects`.
+  Only `ldaps://` is accepted; `ldap://` and STARTTLS are refused, so the
+  service password and the user's password never travel in clear text. An
+  empty password is rejected before any bind, because many servers treat it as
+  an unauthenticated bind that succeeds for any DN. `{username}` is escaped per
+  RFC 4515, a first login for an existing email is refused instead of linked,
+  and a group mapping never demotes an owner. The `ldap` cargo feature is on by
+  default for native builds and absent from a Workers/WASM build, where the
+  routes and the console entry do not exist.
 - OAuth consent enforces TOTP when the account has it enabled, rejects
   deactivated accounts, rate-limits password attempts, escapes every
   parameter and serves a restrictive Content-Security-Policy.

@@ -1,4 +1,5 @@
 mod db; mod integrations; mod mailer; mod ui;
+#[cfg(feature = "ldap")] mod ldap;
 use axum::{extract::{ConnectInfo, Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
 use openwarp_crypto as oc;
@@ -1155,6 +1156,179 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
 
+// ---------- LDAP directory sign-in ----------
+// The directory validates the password, so this path shares the password
+// login's rate limits, MFA challenge and audit trail. It is compiled out when
+// the `ldap` feature is off (a Workers/WASM build has no raw TCP sockets).
+#[cfg(feature = "ldap")]
+fn ldap_row(st: &S, org: &str) -> Option<Row> {
+    st.db.one("SELECT * FROM ldap_configs WHERE org_id=?", &[json!(org)]).ok().flatten() }
+#[cfg(feature = "ldap")]
+fn role_known(st: &S, org: &str, role: &str) -> bool {
+    matches!(role, "owner" | "admin" | "developer")
+        || st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(org), json!(role)]).ok().flatten().is_some() }
+#[cfg(feature = "ldap")]
+fn ldap_config_from_row(st: &S, row: &Row) -> Result<ldap::DirectoryConfig, (StatusCode, Json<Value>)> {
+    let enc = db::s(row, "bind_password_enc");
+    let bind_password = if enc.is_empty() { String::new() } else {
+        oc::decrypt_symmetric(&st.master(), &enc).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| bad(&e))? };
+    Ok(ldap::DirectoryConfig {
+        url: db::s(row, "url"), bind_dn: db::s(row, "bind_dn"), bind_password,
+        base_dn: db::s(row, "base_dn"), user_filter: db::s(row, "user_filter"),
+        email_attr: db::s(row, "email_attr"), name_attr: db::s(row, "name_attr"),
+        group_attr: db::s(row, "group_attr"), group_roles: db::s(row, "group_roles"),
+        ca_cert_pem: db::s(row, "ca_cert_pem"), allowed_domains: db::s(row, "allowed_domains") }) }
+#[cfg(feature = "ldap")]
+async fn get_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
+    let Some(row) = ldap_row(&st, &oid) else { return Ok(j(json!({"configured": false}))) };
+    Ok(j(json!({
+        "configured": !db::s(&row, "url").is_empty(),
+        "url": db::s(&row, "url"), "bind_dn": db::s(&row, "bind_dn"),
+        "bind_password_set": !db::s(&row, "bind_password_enc").is_empty(),
+        "base_dn": db::s(&row, "base_dn"), "user_filter": db::s(&row, "user_filter"),
+        "email_attr": db::s(&row, "email_attr"), "name_attr": db::s(&row, "name_attr"),
+        "group_attr": db::s(&row, "group_attr"), "group_roles": db::s(&row, "group_roles"),
+        "default_role": db::s(&row, "default_role"),
+        "auto_provision": db::n(&row, "auto_provision") == 1,
+        "allowed_domains": db::s(&row, "allowed_domains"),
+        "ca_cert_pem": db::s(&row, "ca_cert_pem"),
+    }))) }
+#[cfg(feature = "ldap")]
+fn ldap_field(body: &Value, row: Option<&Row>, key: &str) -> String {
+    body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string())
+        .or_else(|| row.map(|r| db::s(r, key))).unwrap_or_default() }
+#[cfg(feature = "ldap")]
+async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
+    let existing = ldap_row(&st, &oid);
+    let url = ldap_field(&body, existing.as_ref(), "url");
+    if !ldap::url_ok(&url) { return Err(bad("LDAP URL must be ldaps:// (TLS is required); ldap:// and STARTTLS are not accepted")); }
+    if !egress_allowed(&url) { return Err(bad("LDAP URL resolves to a private or loopback address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted directory")); }
+    let bind_dn = ldap_field(&body, existing.as_ref(), "bind_dn");
+    if bind_dn.is_empty() || bind_dn.contains('\0') { return Err(bad("bind_dn is required: LDAP search needs a service account")); }
+    let base_dn = ldap_field(&body, existing.as_ref(), "base_dn");
+    if base_dn.is_empty() { return Err(bad("base_dn is required")); }
+    let user_filter = ldap_field(&body, existing.as_ref(), "user_filter");
+    let user_filter = if user_filter.is_empty() { "(uid={username})".to_string() } else { user_filter };
+    if !user_filter.contains("{username}") { return Err(bad("user_filter must contain the {username} placeholder")); }
+    if user_filter.contains('\0') || user_filter.contains('\n') { return Err(bad("user_filter must be a single LDAP filter")); }
+    let email_attr = ldap_field(&body, existing.as_ref(), "email_attr");
+    let email_attr = if email_attr.is_empty() { "mail".to_string() } else { email_attr };
+    let name_attr = ldap_field(&body, existing.as_ref(), "name_attr");
+    let name_attr = if name_attr.is_empty() { "displayName".to_string() } else { name_attr };
+    let group_attr = ldap_field(&body, existing.as_ref(), "group_attr");
+    let group_attr = if group_attr.is_empty() { "memberOf".to_string() } else { group_attr };
+    if !ldap::valid_attr(&email_attr) || !ldap::valid_attr(&name_attr) { return Err(bad("email_attr and name_attr must be LDAP attribute names")); }
+    if !group_attr.is_empty() && !ldap::valid_attr(&group_attr) { return Err(bad("group_attr must be an LDAP attribute name")); }
+    let group_roles = ldap_field(&body, existing.as_ref(), "group_roles");
+    if !ldap::valid_mapping(&group_roles) { return Err(bad("group_roles must be Group=role pairs separated by semicolons")); }
+    let default_role = ldap_field(&body, existing.as_ref(), "default_role");
+    let default_role = if default_role.is_empty() { "developer".to_string() } else { default_role };
+    if !role_known(&st, &oid, &default_role) { return Err(bad("default_role must be owner, admin, developer or a custom role in this organisation")); }
+    let allowed_domains = ldap_field(&body, existing.as_ref(), "allowed_domains");
+    if !valid_domain_list(&allowed_domains) { return Err(bad("allowed_domains must be comma-separated DNS domains")); }
+    let ca_cert_pem = ldap_field(&body, existing.as_ref(), "ca_cert_pem");
+    if !ca_cert_pem.is_empty() && native_tls::Certificate::from_pem(ca_cert_pem.as_bytes()).is_err() {
+        return Err(bad("ca_cert_pem is not a PEM certificate")); }
+    if url.len() > 512 || bind_dn.len() > 512 || base_dn.len() > 512 || user_filter.len() > 512 || group_roles.len() > 1024 || ca_cert_pem.len() > 16384 {
+        return Err(bad("LDAP configuration value is too long")); }
+    let auto = body.get("auto_provision").and_then(|v| v.as_bool())
+        .unwrap_or_else(|| existing.as_ref().map(|r| db::n(r, "auto_provision") == 1).unwrap_or(false));
+    let supplied = body.get("bind_password").and_then(|v| v.as_str()).unwrap_or("");
+    let stored = existing.as_ref().map(|r| db::s(r, "bind_password_enc")).unwrap_or_default();
+    let password_enc = if supplied.is_empty() { stored } else { oc::encrypt_symmetric(&st.master(), supplied.as_bytes()) };
+    if password_enc.is_empty() { return Err(bad("bind_password is required: LDAP search needs a service account")); }
+    if existing.is_some() {
+        st.db.exec("UPDATE ldap_configs SET url=?,bind_dn=?,bind_password_enc=?,base_dn=?,user_filter=?,email_attr=?,name_attr=?,group_attr=?,group_roles=?,default_role=?,auto_provision=?,allowed_domains=?,ca_cert_pem=?,updated_at=? WHERE org_id=?",
+            &[json!(&url), json!(&bind_dn), json!(&password_enc), json!(&base_dn), json!(&user_filter), json!(&email_attr), json!(&name_attr), json!(&group_attr), json!(&group_roles), json!(&default_role), json!(if auto {1} else {0}), json!(&allowed_domains), json!(&ca_cert_pem), json!(now()), json!(&oid)]).map_err(|e| bad(&e))?;
+    } else {
+        st.db.exec("INSERT INTO ldap_configs(org_id,url,bind_dn,bind_password_enc,base_dn,user_filter,email_attr,name_attr,group_attr,group_roles,default_role,auto_provision,allowed_domains,ca_cert_pem,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            &[json!(&oid), json!(&url), json!(&bind_dn), json!(&password_enc), json!(&base_dn), json!(&user_filter), json!(&email_attr), json!(&name_attr), json!(&group_attr), json!(&group_roles), json!(&default_role), json!(if auto {1} else {0}), json!(&allowed_domains), json!(&ca_cert_pem), json!(now())]).map_err(|e| bad(&e))?;
+    }
+    st.audit(&oid, "", "", &uid, "ldap.configure", &url);
+    Ok(j(json!({"ok": true}))) }
+#[cfg(feature = "ldap")]
+async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
+    st.db.exec("DELETE FROM ldap_configs WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    st.audit(&oid, "", "", &uid, "ldap.delete", "");
+    Ok(j(json!({"ok": true}))) }
+#[cfg(feature = "ldap")]
+#[derive(Deserialize)] struct LdapLoginReq { org_id: String, username: String, password: String }
+#[cfg(feature = "ldap")]
+async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<LdapLoginReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let org = r.org_id.trim().to_string();
+    let username = r.username.trim().to_string();
+    // Two budgets: one per account and one per address, so spraying many names
+    // from one host is limited even when each name is tried only once.
+    let ip_key = format!("ldap-ip:{}", addr.ip());
+    if !st.rate_ok(&ip_key, 30, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many directory sign-in attempts from this address; try again later")); }
+    let key = format!("ldap:{}:{}:{}", addr.ip(), org, username.to_lowercase());
+    if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed directory sign-in attempts; try again later")); }
+    if org.is_empty() { return Err(bad("org_id is required")); }
+    let Some(row) = ldap_row(&st, &org) else { return Err(bad("LDAP sign-in is not configured for this workspace; ask an administrator to set it up")); };
+    let cfg = ldap_config_from_row(&st, &row)?;
+    if !egress_allowed(&cfg.url) { return Err(bad("LDAP URL is on a private or loopback address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted directory")); }
+    let attempt = tokio::time::timeout(std::time::Duration::from_secs(20), ldap::authenticate(&cfg, &username, &r.password)).await;
+    let user = match attempt {
+        Err(_) => return Err(err(StatusCode::SERVICE_UNAVAILABLE, "the directory did not answer in time")),
+        Ok(Err(ldap::DirectoryError::Denied)) => {
+            st.rate_fail(&key, 900); st.rate_fail(&ip_key, 900);
+            return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+        Ok(Err(ldap::DirectoryError::Ambiguous)) => return Err(bad("this username matches more than one directory entry; narrow user_filter")),
+        Ok(Err(ldap::DirectoryError::Unavailable(e))) => return Err(err(StatusCode::SERVICE_UNAVAILABLE, &format!("directory unavailable: {}", e))),
+        Ok(Ok(u)) => u };
+    st.rate_clear(&key);
+    if !ldap::valid_email(&user.email) { return Err(bad("the directory entry has no usable email attribute; check email_attr")); }
+    let mapped = ldap::mapping_role(&cfg.group_roles, &user.groups).filter(|role| role_known(&st, &org, role));
+    let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&user.email), json!(&org), json!(now())]).map_err(|e| bad(&e))?;
+    let domain = user.email.rsplit_once('@').map(|(_, d)| d).unwrap_or("").to_string();
+    let domain_ok = cfg.allowed_domains.is_empty() || cfg.allowed_domains.split(',').any(|d| d.trim().eq_ignore_ascii_case(&domain));
+    let bound = st.db.one("SELECT user_id FROM ldap_subjects WHERE org_id=? AND dn=?", &[json!(&org), json!(&user.dn)]).map_err(|e| bad(&e))?;
+    let uid = if let Some(b) = &bound {
+        let uid = db::s(b, "user_id");
+        if !st.principal_active(&uid) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+        uid
+    } else {
+        if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&user.email)]).map_err(|e| bad(&e))?.is_some() {
+            return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity"));
+        }
+        // Same gate as OIDC: an invitation, or explicitly enabled
+        // self-provisioning for an allowed email domain while signups are open.
+        if pending.is_none() && !(db::n(&row, "auto_provision") == 1 && domain_ok && signups_open(&st)) {
+            return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow LDAP self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
+        }
+        let kp = oc::Keypair::generate(); let pw = oc::random_token("ldap"); let nid = id();
+        st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)",
+            &[json!(&nid), json!(&user.email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO ldap_subjects(org_id,dn,user_id,created_at) VALUES(?,?,?,?)",
+            &[json!(&org), json!(&user.dn), json!(&nid), json!(now())]).map_err(|e| bad(&e))?;
+        claim_instance_owner(&st, &nid);
+        st.audit(&org, "", "", &nid, "auth.ldap_provision", &format!("{} {} dn={}", user.email, user.name, user.dn));
+        nid };
+    if st.org_role(&org, &uid).is_none() {
+        let role = mapped.clone().or_else(|| pending.as_ref().map(|p| db::s(p, "role"))).unwrap_or_else(|| db::s(&row, "default_role"));
+        st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(role)]).map_err(|e| bad(&e))?;
+        if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]); }
+    } else if let Some(role) = &mapped {
+        // The directory's group mapping stays authoritative, except that it
+        // never demotes an owner: a group change must not lock out the only one.
+        let current = st.org_role(&org, &uid).unwrap_or_default();
+        if &current != role && current != "owner" {
+            st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&org), json!(&uid)]).map_err(|e| bad(&e))?;
+        }
+    }
+    st.audit(&org, "", "", &uid, "auth.ldap_login", &format!("{} {} dn={}", user.email, user.name, user.dn));
+    if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" {
+        let challenge = oc::random_token("mfa");
+        st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(&challenge), json!(&uid), json!(now())]).map_err(|e| bad(&e))?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+    let token = make_session(&st, &uid)?;
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    let pubkey = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "pubkey")).unwrap_or_default();
+    Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": pubkey})))) }
+
 // ---------- email, verification and password reset ----------
 fn verification_required() -> bool {
     matches!(std::env::var("OPENWARP_REQUIRE_EMAIL_VERIFICATION").unwrap_or_default().to_ascii_lowercase().as_str(), "1" | "true" | "yes") }
@@ -1349,6 +1523,7 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
 async fn auth_providers(State(st): State<S>) -> Res {
     Ok(j(json!({
         "password": true,
+        "ldap": cfg!(feature = "ldap"),
         "google": social_provider("google").is_some(),
         "github": social_provider("github").is_some(),
         "signups": if signups_open(&st) { "open" } else { "invite" },
@@ -2276,14 +2451,21 @@ async fn main() {
         .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
-        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
+        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));
+    // LDAP needs raw TCP/TLS sockets, so the feature is off in a Workers build
+    // and these routes do not exist there.
+    #[cfg(feature = "ldap")]
+    let app = app
+        .route("/api/orgs/{oid}/ldap", get(get_ldap_config).put(put_ldap_config).delete(delete_ldap_config))
+        .route("/api/auth/ldap", post(ldap_login));
+    let app = app
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(metrics_middleware))
         .layer(axum::middleware::from_fn(timeout_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
-        .with_state(state);
+        .with_state::<()>(state);
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     println!("openwarp listening on {} db={}", addr, db_url);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

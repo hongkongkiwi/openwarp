@@ -129,6 +129,7 @@ async function loadProviders(){try{
   let btns=[];
   if(p.google)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/google/start'">Continue with Google</button>`);
   if(p.github)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/github/start'">Continue with GitHub</button>`);
+  if(p.ldap)btns.push(`<button style="flex:1" onclick="ldapPrompt()">Sign in with directory (LDAP)</button>`);
   $('social').innerHTML=btns.join('');
   if(p.signups!=='open'){
     $('segreg').style.display='none';
@@ -150,6 +151,18 @@ async function acceptInvite(){try{
 function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()">Send link</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Reset password')}
+function ldapPrompt(){modal(`<h3>Sign in with your directory</h3><p class="mut">Your password goes to this server over the API and is checked by your directory over TLS.</p>
+  <div class="field"><label for="ld-org">Workspace ID</label><input id="ld-org" placeholder="workspace id"></div>
+  <div class="field"><label for="ld-user">Directory username</label><input id="ld-user" autocomplete="username"></div>
+  <div class="field"><label for="ld-pw">Password</label><input id="ld-pw" type="password" autocomplete="current-password"></div>
+  <div class="row"><button class="primary" onclick="ldapSignIn()">Sign in</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Directory sign-in')}
+async function ldapSignIn(){try{
+  let d=await api('POST','/api/auth/ldap',{org_id:$('ld-org').value.trim(),username:$('ld-user').value,password:$('ld-pw').value});
+  if(d.mfa_required){MFA=d.mfa_token;
+    $('modal').innerHTML=`<h3>Two-factor code</h3><div class="field"><label for="ld-mfa">Authenticator / recovery code</label><input id="ld-mfa" placeholder="123456"></div><div class="row"><button class="primary" onclick="ldapMfa()">Verify</button></div>`;return}
+  T='';closeModal();enterApp();
+}catch(e){toast(e.message,true)}}
+async function ldapMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('ld-mfa').value});T='';closeModal();enterApp()}catch(e){toast(e.message,true)}}
 async function sendForgot(){try{await api('POST','/api/auth/forgot',{email:$('fp-email').value});closeModal();toast('If that address has an account, a reset link is on its way')}catch(e){toast(e.message,true)}}
 function showReset(token){
   $('auth').style.display='grid';$('shell').style.display='none';$('authtitle').textContent='Choose a new password';
@@ -381,6 +394,19 @@ async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
+  let prov=await api('GET','/api/auth/providers').catch(()=>null);
+  let ldap=prov?.ldap?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
+  let ldapCard=prov?.ldap?`<div class="card"><h3>LDAP directory</h3><p>Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
+  <div class="field"><label for="ld-url">Directory URL (ldaps:// only)</label><input id="ld-url" value="${esc(ldap?.url||'')}" placeholder="ldaps://dc01.example.com:636" style="width:100%"></div>
+  <div class="row"><input id="ld-bind-dn" value="${esc(ldap?.bind_dn||'')}" placeholder="service bind DN" style="min-width:280px"><input id="ld-bind-pw" type="password" placeholder="${ldap?.bind_password_set?'stored; leave blank to keep':'service account password'}"></div>
+  <div class="field"><label for="ld-base-dn">Base DN</label><input id="ld-base-dn" value="${esc(ldap?.base_dn||'')}" placeholder="OU=People,DC=example,DC=com" style="width:100%"></div>
+  <div class="field"><label for="ld-filter">User filter ({username} is escaped per RFC 4515)</label><input id="ld-filter" value="${esc(ldap?.user_filter||'(uid={username})')}" style="width:100%"></div>
+  <div class="row"><input id="ld-email-attr" value="${esc(ldap?.email_attr||'mail')}" placeholder="mail"><input id="ld-name-attr" value="${esc(ldap?.name_attr||'displayName')}" placeholder="displayName"><input id="ld-group-attr" value="${esc(ldap?.group_attr||'memberOf')}" placeholder="memberOf"></div>
+  <div class="field"><label for="ld-roles">Group to role map (Group=role;Group=role)</label><input id="ld-roles" value="${esc(ldap?.group_roles||'')}" placeholder="Admins=admin;Developers=developer" style="width:100%"></div>
+  <div class="row"><input id="ld-default-role" value="${esc(ldap?.default_role||'developer')}" placeholder="default role"><input id="ld-domains" value="${esc(ldap?.allowed_domains||'')}" placeholder="allowed email domains" style="min-width:260px"></div>
+  <div class="field"><label for="ld-ca">Internal CA certificate (PEM, optional)</label><textarea id="ld-ca" rows="3">${esc(ldap?.ca_cert_pem||'')}</textarea></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="ld-auto" ${ldap?.auto_provision?'checked':''}> Auto-provision first-time users in allowed domains</label>
+  <div class="row"><button class="primary" onclick="saveLdap()">Save LDAP</button><button class="danger" onclick="removeLdap()">Remove</button></div></div>`:'';
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
@@ -393,6 +419,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
+  ${ldapCard}
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
@@ -405,6 +432,12 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_aut
   if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
+async function saveLdap(){try{
+  let b={url:$('ld-url').value,bind_dn:$('ld-bind-dn').value,base_dn:$('ld-base-dn').value,user_filter:$('ld-filter').value,email_attr:$('ld-email-attr').value,name_attr:$('ld-name-attr').value,group_attr:$('ld-group-attr').value,group_roles:$('ld-roles').value,default_role:$('ld-default-role').value,allowed_domains:$('ld-domains').value,ca_cert_pem:$('ld-ca').value,auto_provision:$('ld-auto').checked};
+  if($('ld-bind-pw').value)b.bind_password=$('ld-bind-pw').value;
+  await api('PUT',`/api/orgs/${ORG}/ldap`,b);toast('LDAP saved');renderSettings()}catch(e){toast(e.message,true)}}
+async function removeLdap(){if(!confirm('Remove LDAP sign-in for this workspace?'))return;
+  try{await api('DELETE',`/api/orgs/${ORG}/ldap`);toast('LDAP removed');renderSettings()}catch(e){toast(e.message,true)}}
 async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
