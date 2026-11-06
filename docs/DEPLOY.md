@@ -41,6 +41,7 @@ docker compose up -d --build
 | `OPENWARP_TRUSTED_PROXIES` | Peer addresses allowed to send `X-Forwarded-For` |
 | `OPENWARP_SIGNUPS` | `open` or `closed`; when set it overrides the console toggle |
 | `OPENWARP_AUTH_PROVIDERS` | Comma list of `password`, `google`, `github`, `oidc`; pins sign-in methods and overrides the console |
+| `OPENWARP_APP_ENV_POLICY` | `managed` or `delegated`; pins the default environment mode for new apps and overrides the instance owner's setting |
 | `OPENWARP_GOOGLE_CLIENT_ID` / `OPENWARP_GOOGLE_CLIENT_SECRET` | Google sign-in |
 | `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
 | `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
@@ -82,10 +83,21 @@ dynamic leases, PKI and any feature that needs server-side plaintext.
 ## Delegated environments and the runner
 
 A delegated environment moves the environment key to the client and the
-customer-run sync runner. The server stores ciphertext, seals integration
-configuration to the runner, and queues sync jobs instead of calling providers.
+customer-run sync runner. The server stores ciphertext, stores integration
+configuration sealed to the runner, and queues sync jobs instead of calling
+providers.
 
-Create a runner from the console or the CLI:
+New apps get managed environments by default. An instance owner can choose
+delegated under Settings, and `OPENWARP_APP_ENV_POLICY=delegated` locks that
+choice for the instance. Existing apps keep their environment modes. Pure
+end-to-end environments remain a per-environment choice in the console.
+
+A delegated app needs a runner in its organisation. From the console, choose
+`+ New runner` in the new-app dialog or under Settings; the browser generates
+the X25519 keypair and posts only the public key, then shows the token and
+private key once. The same flow creates per-environment delegated environments.
+Members with `secrets:write` can read runner names and public keys so they can
+wrap keys, but only admins create or delete runners. From the CLI, create a runner with:
 
 ```bash
 openwarp runner create --org ORG_ID --name vpc-runner
@@ -111,16 +123,18 @@ openwarp-runner
 
 The runner polls `/api/runner/jobs`, unwraps the environment key with its own
 private key, decrypts the integration config and secrets in memory, pushes to
-the provider, and reports the result. The server never holds the plaintext or
-the provider credentials. A claimed job is reclaimable after ten minutes if the
-runner crashes.
+the provider, and reports the result. The server never holds the environment
+plaintext. Integration config is sent to the server when it is created, then
+stored sealed to the runner; a claimed job is reclaimable after ten minutes if
+the runner crashes.
 
-Removing a member from an `e2e` or delegated environment sets a rekey flag. Run
-`openwarp e2e revoke --env ENV_ID --email ADDRESS` to remove the grant and
-rotate in one command, or `openwarp e2e rekey --env ENV_ID` if the grant was
-already removed. The revoke command sends the removal and the new grants in one
-rekey request, so the grant is never absent while the old ciphertext is still
-readable. Rotation rewraps the new key to the remaining grantees and the runner.
+Removing a member from an `e2e` or delegated environment sets a rekey flag. Use
+`Rotate key now` in the console, `openwarp e2e revoke --env ENV_ID --email
+ADDRESS` to remove the grant and rotate in one command, or `openwarp e2e rekey
+--env ENV_ID` if the grant was already removed. The revoke command sends the
+removal and the new grants in one rekey request, so the grant is never absent
+while the old ciphertext is still readable. Rotation rewraps the new key to the
+remaining grantees and the runner.
 
 ## Signups and invitations
 

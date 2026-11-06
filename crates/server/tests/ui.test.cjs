@@ -184,12 +184,14 @@ async function consoleUI(secrets = [saved]) {
   const calls = [], unexpected = [], confirmations = [], timers = [];
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
-    '/api/instance': { instance_owner: false },
+    '/api/instance': { instance_owner: false, app_env_policy: 'managed' },
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/me/mfa': { methods: [], required: false, totp: false, email: false, email_available: false, recovery_codes: 0, passkeys: [] },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
+    '/api/orgs/org-a/runners': [],
+    '/api/orgs/org-b/runners': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -537,4 +539,44 @@ test('the E2E editor encrypts in the browser and never uses the managed secrets 
   const deploy = block.slice(block.indexOf('async function deployE2E'), block.indexOf('async function e2eGrantsModal'));
   assert.ok(deploy.indexOf("api('PUT'") < deploy.indexOf("api('DELETE'"), 'puts must be stored before a staged delete is issued');
   assert.ok(!/id="e2e-out"|id="e2e-env"|function loadE2E/.test(script), 'the settings plaintext dump must be gone');
+});
+
+test('delegated app creation wraps the env key for the caller and the runner', () => {
+  const start = script.indexOf('async function createApp');
+  const end = script.indexOf('async function openApp');
+  assert.ok(start > 0 && end > start, 'the new-app flow must be extractable');
+  const block = script.slice(start, end);
+  assert.match(block, /mode:'delegated'/);
+  assert.match(block, /runner_id:rid/, 'the selected runner id must be sent');
+  assert.match(block, /wrapped_key:await OW\.encryptAsymmetric\(MY_PUBKEY,k\)/, 'the caller must receive a wrapped key');
+  assert.match(block, /runner_wrapped_key:await OW\.encryptAsymmetric\(runner\.pubkey,k\)/, 'the runner must receive a wrapped key');
+  assert.match(block, /for\(const n of \['Development','Staging','Production'\]\)/, 'all three default environments need keys');
+  const rekey = script.slice(script.indexOf('async function e2eRekey'), script.indexOf('async function switchEnv'));
+  assert.match(rekey, /body\.runner_wrapped_key=await OW\.encryptAsymmetric\(meta\.runner\.public_key,newKey\)/, 'rotation must re-wrap the key for the runner');
+});
+
+test('delegated environments use the browser editor and keep the integration form', () => {
+  assert.match(script, /if\(isE2E\(ENV\)\|\|isDelegated\(ENV\)\)\{await renderE2eEnv\(\)/, 'delegated envs use the client editor');
+  const start = script.indexOf('async function renderIntegrations');
+  const end = script.indexOf('const KIND_HINTS');
+  assert.ok(start > 0 && end > start, 'the integrations view must be extractable');
+  const block = script.slice(start, end);
+  assert.match(block, /let delegated=isDelegated\(ENV\)/, 'the delegated path is a notice, not a dead end');
+  assert.ok(!/if\(isDelegated\(ENV\)\)/.test(block), 'delegated envs must not return before the sync form');
+  assert.match(block, /onclick="mkIntegration\(\)"/, 'the integration form stays available');
+  const runner = script.slice(script.indexOf('async function createRunner'), script.indexOf('function copyRunnerCredentials'));
+  assert.match(runner, /public_key:kp\.public/, 'runner creation posts the public key only');
+  assert.ok(runner.indexOf('kp.secret') > runner.indexOf("api('POST'"), 'the private key is used only after creation, for the one-time display');
+});
+
+test('per-environment delegated creation wraps keys for the caller and runner', () => {
+  const start = script.indexOf('async function createEnv');
+  const end = script.indexOf('async function newE2eEnv');
+  assert.ok(start > 0 && end > start, 'the new-environment flow must be extractable');
+  const block = script.slice(start, end);
+  assert.match(block, /mode==='delegated'/);
+  assert.match(block, /runner_id:rid/);
+  assert.match(block, /wrapped_key:await OW\.encryptAsymmetric\(MY_PUBKEY,k\)/);
+  assert.match(block, /runner_wrapped_key:await OW\.encryptAsymmetric\(runner\.pubkey,k\)/);
+  assert.match(script, /PUT','\/api\/instance\/app-env-policy'/, 'the instance owner saves the policy from Settings');
 });

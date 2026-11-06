@@ -169,9 +169,28 @@ Environments choose one of three modes:
 - `delegated`: the client generates the environment key, wraps it to itself and
   to a customer-run sync runner, and writes ciphertext. The server queues sync
   jobs; the runner decrypts in its own process and pushes to the provider. The
-  server cannot read the environment or the provider config.
+  server cannot read the environment. Provider config is sent to the server when
+  the integration is created, then stored sealed to the runner.
 - `e2e`: client-held keys without a runner grant. Server-side integrations are
   unavailable.
+
+New apps get three default environments in the instance's chosen mode. Managed
+is the default; an instance owner can switch new apps to delegated under
+Settings, or an operator can set `OPENWARP_APP_ENV_POLICY=delegated` (which
+locks the setting). Existing apps keep their modes. Pure `e2e` environments
+remain an explicit per-environment choice with the `+ E2E environment` action.
+
+Creating a delegated app in the console requires a runner in the organisation.
+The browser generates the runner's X25519 keypair, posts only the public key,
+and shows the token and private key once; all three default environment keys are
+generated in the page and wrapped to the creator and the runner in the same
+request. Admins create and delete runners; members with `secrets:write` can list runner
+names and public keys so they can wrap an environment key, but the token is
+never listed.
+The console edits delegated environments with the same browser editor as `e2e`,
+and rotation re-wraps the new key to every grantee and to the runner. Provider
+sync for a delegated environment is configurable from the console; Test and
+Sync queue jobs for the runner instead of calling the provider from the server.
 
 Secret ciphertext written by the server uses `ow2` AEAD framing bound to the
 environment, secret and field, so a value cannot be moved between records.
@@ -183,7 +202,8 @@ Runner identities are created per organisation
 token and private key are shown once. The runner polls
 `/api/runner/jobs` and reports to `/api/runner/jobs/:id/result`; a claimed job
 times out after ten minutes. Integration configuration for a delegated
-environment is sealed to the runner's X25519 key, not to the server.
+environment is stored sealed to the runner's X25519 key; the plaintext config is
+present when it is created, and only the runner can open the stored form.
 
 Removing a member from a client-encrypted environment sets a rekey flag.
 `openwarp e2e rekey --env ENV_ID` generates a new environment key, re-encrypts

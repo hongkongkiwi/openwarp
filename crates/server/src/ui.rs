@@ -92,7 +92,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, MFAMETHODS=[], MFA_INFO=null, LASTFOCUS=null, PENDING_ORG=null, AUTH_KEY=null, WRAP_KEY=null, WRAPPED_PRIV='', E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, MFAMETHODS=[], MFA_INFO=null, LASTFOCUS=null, PENDING_ORG=null, AUTH_KEY=null, WRAP_KEY=null, WRAPPED_PRIV='', E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='', ORGS=[], MY_ROLE='', APP_POLICY='managed', RUNNERS=[], NEW_RUNNER=null, RUNNER_AFTER='', NEWAPP_DRAFT=null, NEWENV_DRAFT=null;
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function e2eDrafts(){return (ENV&&E2E_DRAFTS[ENV.id])||{}}
 function e2eDraftList(){return Object.values(e2eDrafts())}
@@ -250,11 +250,13 @@ async function usePasskey(){try{
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';AUTH_KEY=null;WRAP_KEY=null;WRAPPED_PRIV='';E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOCKED={};E2E_ERR={};MY_PUBKEY='';MY_UID='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
-  let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
+  let orgs=await api('GET','/api/orgs');ORGS=orgs;ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
+  MY_ROLE=orgs.find(o=>o.id===ORG)?.role||'';
   $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
   $('orgs').value=ORG;
   await nav('apps')}
-async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
+async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;MY_ROLE=ORGS.find(o=>o.id===ORG)?.role||'';RUNNERS=[];await nav('apps')}
+function isAdmin(){return MY_ROLE==='owner'||MY_ROLE==='admin'}
 
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
@@ -271,11 +273,74 @@ async function renderApps(){$('topaction').style.display='';$('pagetitle').textC
   let envCounts={};for(let a of APPS){try{let es=await api('GET',`/api/apps/${a.id}/envs`);envCounts[a.id]=es}catch(e){envCounts[a.id]=[]}}
   $('view').innerHTML=`<div class="row" style="margin-bottom:14px"><input id="appfilter" placeholder="Filter apps…" style="min-width:240px" oninput="filterApps(this.value)"><span class="mut small">${APPS.length} app${APPS.length!==1?'s':''}, unlimited environments</span></div>
   <div class="grid" id="appgrid">${APPS.map(a=>appCard(a,envCounts[a.id])).join('')}</div>`}
-function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
+function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}${e.mode==='delegated'?' · delegated':isE2E(e)?' · E2E':''}</span>`).join('')}</div></div>`}
 function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.style.display=APPS[i].name.toLowerCase().includes(q.toLowerCase())?'':'none'})}
-async function newApp(){modal(`<h3>New app</h3><div class="field"><label for="na-name">App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label for="na-readme">Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
-  <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
-async function createApp(){try{await api('POST',`/api/orgs/${ORG}/apps`,{name:$('na-name').value,readme:$('na-readme').value});closeModal();toast('App created');renderApps()}catch(e){toast(e.message,true)}}
+async function newApp(draft){
+  if(draft)NEWAPP_DRAFT=draft;
+  let inst=null;try{inst=await api('GET','/api/instance')}catch(e){}
+  APP_POLICY=(inst&&inst.app_env_policy)||'managed';
+  let delegated=APP_POLICY==='delegated';
+  if(delegated){try{RUNNERS=await api('GET',`/api/orgs/${ORG}/runners`)}catch(e){RUNNERS=[]}}
+  let runners=runnersSelect(NEW_RUNNER&&NEW_RUNNER.id);
+  let canKey=!!E2E_KIT;
+  let runnerField=delegated?`<div class="field"><label for="na-runner">Sync runner</label>${RUNNERS.length?runners:'<p class="small" style="color:var(--bad)">No runner exists in this organisation yet. A runner holds the key grant for provider sync, and an admin has to create one.</p>'}
+    ${canKey?'':`<p class="small" style="color:var(--bad)">This session has no client-held key. Sign in with a client-derived account to create delegated apps.</p>`}
+    ${isAdmin()?'<button style="margin-top:8px" onclick="newRunner(\'app\')">Create a runner</button>':''}</div>`:'';
+  let d=NEWAPP_DRAFT||{};
+  modal(`<h3>New app</h3>
+    <p class="small mut">Instance policy: <b>${delegated?'Delegated':'Managed'}</b>. ${delegated?'Default environments are encrypted in this browser and synced by a runner.':'Default environments are encrypted by the server for CLI and sync use.'}</p>
+    <div class="field"><label for="na-name">App name</label><input id="na-name" value="${esc(d.name||'')}" placeholder="billing-api"></div>
+    <div class="field"><label for="na-readme">Readme (markdown, optional)</label><textarea id="na-readme" rows="4">${esc(d.readme||'')}</textarea></div>
+    ${runnerField}
+    <div class="row"><button class="primary" onclick="createApp()" ${delegated&&(!RUNNERS.length||!canKey)?'disabled':''}>Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+    <p class="small mut">Development, Staging and Production are created automatically. Add unlimited custom environments later.</p>`)}
+function runnersSelect(selected){return `<select id="na-runner" style="width:100%">${RUNNERS.map(r=>`<option value="${r.id}" ${r.id===selected?'selected':''}>${esc(r.name)}</option>`).join('')}</select>`}
+async function createApp(){try{
+  let name=$('na-name').value.trim(),readme=$('na-readme').value;
+  if(!name)throw new Error('App name required');
+  let d;
+  if(APP_POLICY==='delegated'){
+    let rid=$('na-runner')?.value;let runner=RUNNERS.find(r=>r.id===rid);
+    if(!runner)throw new Error('Select a sync runner, or ask an admin to create one');
+    if(!E2E_KIT)throw new Error('this session has no client-held private key; sign in with a client-derived account first');
+    if(!MY_PUBKEY)throw new Error('account public key unavailable; reload and sign in again');
+    let envs=[];
+    for(const n of ['Development','Staging','Production']){
+      let k=crypto.getRandomValues(new Uint8Array(32));
+      envs.push({name:n,wrapped_key:await OW.encryptAsymmetric(MY_PUBKEY,k),runner_wrapped_key:await OW.encryptAsymmetric(runner.pubkey,k)});
+    }
+    d=await api('POST',`/api/orgs/${ORG}/apps`,{name,readme,mode:'delegated',runner_id:rid,envs});
+  } else { d=await api('POST',`/api/orgs/${ORG}/apps`,{name,readme}); }
+  closeModal();NEWAPP_DRAFT=null;NEW_RUNNER=null;toast('App created');
+  await renderApps();await openApp(d.id)
+}catch(e){toast(e.message,true)}}
+function newRunner(after){
+  RUNNER_AFTER=after||'settings';
+  if(after==='app')NEWAPP_DRAFT={name:$('na-name')?.value||'',readme:$('na-readme')?.value||''};
+  if(after==='env')NEWENV_DRAFT={name:$('ne-name')?.value||'',mode:$('ne-mode')?.value||'delegated'};
+  modal(`<h3>New sync runner</h3>
+    <p class="mut">A runner holds a key grant for delegated environments and pushes secrets to providers from your network. Its private key and token are generated here and shown once.</p>
+    <div class="field"><label for="nr-name">Runner name</label><input id="nr-name" placeholder="vpc-runner"></div>
+    <div class="row"><button class="primary" onclick="createRunner()">Create runner</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'New runner')}
+async function createRunner(){try{
+  let name=$('nr-name').value.trim();if(!name)throw new Error('Runner name required');
+  let kp=await OW.generateKeypair();
+  let d=await api('POST',`/api/orgs/${ORG}/runners`,{name,public_key:kp.public});
+  NEW_RUNNER={id:d.id,name:d.name||name,pubkey:kp.public};
+  let secret=OW.b64enc(kp.secret);
+  modal(`<h3>Save the runner credentials</h3>
+    <p class="mut">Shown once. Put both values in the runner's environment, set <span class="mono">OPENWARP_URL</span>, then start <span class="mono">openwarp-runner</span>.</p>
+    <div class="field"><label for="nr-token">OPENWARP_RUNNER_TOKEN</label><textarea id="nr-token" rows="2" readonly>${esc(d.token)}</textarea></div>
+    <div class="field"><label for="nr-key">OPENWARP_RUNNER_KEY</label><textarea id="nr-key" rows="3" readonly>${esc(secret)}</textarea></div>
+    <div class="row"><button onclick="copyRunnerCredentials()">Copy both</button><button class="primary" onclick="finishRunner()">I stored them</button></div>`,'Runner credentials')
+}catch(e){toast(e.message,true)}}
+function copyRunnerCredentials(){navigator.clipboard.writeText(`OPENWARP_RUNNER_TOKEN=${$('nr-token').value}\nOPENWARP_RUNNER_KEY=${$('nr-key').value}`);toast('Runner credentials copied')}
+async function finishRunner(){
+  closeModal();
+  try{RUNNERS=await api('GET',`/api/orgs/${ORG}/runners`)}catch(e){RUNNERS=[]}
+  if(RUNNER_AFTER==='app'){await newApp(NEWAPP_DRAFT);return}
+  if(RUNNER_AFTER==='env'){await newEnv(NEWENV_DRAFT);return}
+  toast('Runner created');await renderSettings()}
 async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET',`/api/apps/${id}/envs`);
   ENV=ENVS.find(e=>e.id===ENV?.id)||ENVS[0]||null;await renderEnv()}
 
@@ -283,8 +348,7 @@ async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET
 async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
   if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
   if(!ENV)ENV=ENVS[0];
-  if(isDelegated(ENV)){await renderDelegatedEnv();return}
-  if(isE2E(ENV)){await renderE2eEnv();return}
+  if(isE2E(ENV)||isDelegated(ENV)){await renderE2eEnv();return}
   let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
   $('view').innerHTML=`
   ${envTabs()}
@@ -298,7 +362,7 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pag
   drawSecrets();updateDeployBar()}
 function envTabs(){return `<div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}${isE2E(e)?' · E2E':''}${e.mode==='delegated'?' · delegated':''}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>`}
 async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
-  let id=ENV.id;
+  let id=ENV.id,delegated=isDelegated(ENV);
   if(!E2E_DATA[id]&&E2E_LOADING[id]){$('view').innerHTML=envTabs()+'<div class="empty"><div class="big">Unlocking…</div>Decrypting this environment in the browser.</div>';updateDeployBar();return}
   if(!E2E_DATA[id]&&E2E_KIT&&!E2E_LOCKED[id]&&!E2E_LOADING[id]){
     $('view').innerHTML=envTabs()+'<div class="empty"><div class="big">Unlocking…</div>Decrypting this environment with the key from your session.</div>';
@@ -307,8 +371,8 @@ async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('
   if(!E2E_DATA[id]){
     let err=E2E_ERR[id]?`<p class="small" style="color:var(--bad)">${esc(E2E_ERR[id])}</p>`:'';
     $('view').innerHTML=`${envTabs()}
-    <div class="card"><h3>End-to-end encrypted environment</h3>
-      <p class="mut">The server stores only ciphertext here, so this console has to decrypt it in the browser. After a client-derived sign-in your private key is already in this tab. On another session, paste the recovery kit you saved at registration.</p>
+    <div class="card"><h3>${delegated?'Delegated':'End-to-end encrypted'} environment</h3>
+      <p class="mut">The server stores only ciphertext here, so this console has to decrypt it in the browser.${delegated?' A runner you host also holds a key grant for provider sync.':''} After a client-derived sign-in your private key is already in this tab. On another session, paste the recovery kit you saved at registration.</p>
       ${err}
       <div class="field"><label for="e2e-kit">Recovery kit</label><input id="e2e-kit" type="password" autocomplete="off" placeholder="base64 recovery kit" style="width:100%"></div>
       <button class="primary" onclick="unlockE2EEnv()">Unlock environment</button>
@@ -316,9 +380,11 @@ async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('
     updateDeployBar();return}
   let meta=E2E_META[id]||{};
   let banner=meta.rekey_required?`<div class="card" style="border-color:var(--bad)"><h3>Access changed</h3>
-    <p>A member's key grant was removed, but the stored ciphertext is still encrypted under the old environment key. Rotate the key to re-encrypt every secret under a new key and wrap that key to the current members. Rotation cannot take back ciphertext someone already copied.</p>
+    <p>A member's key grant was removed, but the stored ciphertext is still encrypted under the old environment key. Rotate the key to re-encrypt every secret under a new key and wrap that key to the current members${delegated?' and the runner':''}. Rotation cannot take back ciphertext someone already copied.</p>
     <button class="primary" onclick="e2eRekey()">Rotate key now</button></div>`:'';
-  $('view').innerHTML=`${envTabs()}${banner}
+  let runnerNote=delegated?`<div class="card"><h3>Delegated environment</h3>
+    <p class="mut">Provider sync runs on <span class="mono">${esc(meta.runner?.id||'your runner')}</span>: the server forwards ciphertext and the runner decrypts it in your network. Rotating the key also re-wraps it for the runner.</p></div>`:'';
+  $('view').innerHTML=`${envTabs()}${banner}${runnerNote}
   <div class="row" style="margin-bottom:12px">
     <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawE2E()">
     <button onclick="e2eGrantsModal()">Access</button>
@@ -329,12 +395,9 @@ async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('
   <p class="small mut">Decrypted in this tab only. Staged changes deploy together and are lost if you reload before deploying.</p>
   <div id="stable"></div>`;
   drawE2E();updateDeployBar()}
-async function renderDelegatedEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
-  $('view').innerHTML=`${envTabs()}<div class="card"><h3>Delegated environment</h3>
-    <p class="mut">This environment is client-encrypted, and a runner you host holds a key grant for provider sync. The console cannot read these secrets. Manage them with the CLI (<span class="mono">openwarp e2e</span>) or an E2E-capable client; provider sync runs on the runner.</p></div>`;
-  updateDeployBar()}
 function isE2E(e){return !!e&&(e.mode||'sse')==='e2e'}
 function isDelegated(e){return !!e&&e.mode==='delegated'}
+function isClientEnv(e){return isE2E(e)||isDelegated(e)}
 function enc(s){return new TextEncoder().encode(s)}
 function dec(b){return new TextDecoder().decode(b)}
 async function e2eHash(path,key){let d=await crypto.subtle.digest('SHA-256',enc(String(path||'/')+':'+String(key||'').toUpperCase()));return OW.b64enc(new Uint8Array(d))}
@@ -450,6 +513,7 @@ async function e2eGrantsModal(){
     ${g.user_id===MY_UID?'':`<button class="danger" onclick="e2eRevoke('${jsq(g.user_id)}','${jsq(g.email)}')">Remove access</button>`}</div>`).join('')||'<p class="mut">No key grants yet.</p>';
   modal(`<h3>Who can decrypt this environment</h3>
     <p class="mut">Each member gets the environment key wrapped to their account public key. The server never sees the key or the plaintext.</p>
+    ${meta.runner?`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span class="mono small">runner ${esc(meta.runner.id)} · sync only</span><span class="mut small">key grant</span></div>`:''}
     ${rows(E2E_GRANTS[id]||[])}
     <div class="field" style="margin-top:14px"><label for="eg-email">Grant access by email</label><input id="eg-email" type="email" placeholder="teammate@example.com"></div>
     <div class="row"><button class="primary" onclick="e2eGrant()">Grant access</button><button class="ghost" onclick="closeModal()">Close</button></div>
@@ -477,9 +541,9 @@ async function e2eRevoke(uid,email){
 async function e2eRekey(){
   let id=ENV.id,key=E2E_KEYS[id];if(!key)return;
   if(e2eDraftList().length){toast('Deploy or discard staged changes before rotating the key',true);return}
-  if((E2E_META[id]||{}).runner){toast('Delegated environments rotate through the runner; use the CLI',true);return}
   if(!(E2E_DATA[id]||[]).length){toast('Nothing to rotate yet: add a secret first',true);return}
-  if(!confirm('Rotate the environment key? Every secret is re-encrypted and each current member gets the new key wrapped to them.'))return;
+  let meta=E2E_META[id]||{};
+  if(!confirm(`Rotate the environment key? Every secret is re-encrypted and each current member gets the new key wrapped to them${meta.runner?' and the runner':''}.`))return;
   try{
     let newKey=crypto.getRandomValues(new Uint8Array(32));
     let secrets=[];
@@ -488,7 +552,10 @@ async function e2eRekey(){
     if(!grants.some(g=>g.user_id===MY_UID))throw new Error('your own grant is missing; refresh and try again');
     let payload=[];
     for(const g of grants){if(!g.pubkey)throw new Error('grantee '+g.email+' has no public key');payload.push({user_id:g.user_id,wrapped_key:await OW.encryptAsymmetric(g.pubkey,newKey)})}
-    await api('POST',`/api/envs/${id}/e2e/rekey`,{secrets,grants:payload});
+    let body={secrets,grants:payload};
+    if(meta.runner){if(!meta.runner.public_key)throw new Error('the runner public key is missing; refresh and try again');
+      body.runner_wrapped_key=await OW.encryptAsymmetric(meta.runner.public_key,newKey)}
+    await api('POST',`/api/envs/${id}/e2e/rekey`,body);
     E2E_KEYS[id]=newKey;await e2eLoad(id,E2E_KIT);toast('Environment key rotated');await renderE2eEnv();
   }catch(e){toast('Rotation failed: '+e.message,true)}}
 async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
@@ -496,8 +563,30 @@ async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
   if(cur){delete DRAFTS[cur];delete E2E_DRAFTS[cur]}
   ENV=ENVS.find(e=>e.id===id);await renderEnv()}
 function envMode(e){return e&&e.mode==='e2e'?'e2e':'sse'}
-async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
-async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
+async function newEnv(draft){
+  if(draft)NEWENV_DRAFT=draft;
+  try{RUNNERS=await api('GET',`/api/orgs/${ORG}/runners`)}catch(e){RUNNERS=[]}
+  let d=NEWENV_DRAFT||{},delegated=d.mode==='delegated';
+  let opts=RUNNERS.map(r=>`<option value="${r.id}" ${NEW_RUNNER&&NEW_RUNNER.id===r.id?'selected':''}>${esc(r.name)}</option>`).join('');
+  modal(`<h3>New environment</h3>
+    <div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" value="${esc(d.name||'')}" placeholder="qa-1"></div>
+    <div class="field"><label for="ne-mode">Encryption</label><select id="ne-mode" style="width:100%" onchange="envModeHint()"><option value="sse" ${delegated?'':'selected'}>Managed (server-side encryption)</option><option value="delegated" ${delegated?'selected':''}>Delegated (client keys, synced by a runner)</option></select></div>
+    <div id="ne-runner-wrap" style="display:${delegated?'':'none'}"><div class="field"><label for="ne-runner-select">Sync runner</label>${RUNNERS.length?`<select id="ne-runner-select" style="width:100%">${opts}</select>`:'<p class="small" style="color:var(--bad)">No runner exists in this organisation yet. An admin has to create one.</p>'}${E2E_KIT?'':`<p class="small" style="color:var(--bad)">This session has no client-held key. Sign in with a client-derived account to create delegated environments.</p>`}${isAdmin()?'<button style="margin-top:8px" onclick="newRunner(\'env\')">Create a runner</button>':''}</div></div>
+    <div class="row"><button class="primary" id="ne-create" onclick="createEnv()" ${delegated&&(!RUNNERS.length||!E2E_KIT)?'disabled':''}>Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+    <p class="small mut">Delegated environments are encrypted in this browser. The server stores ciphertext and the runner receives a wrapped key for provider sync.</p>`)}
+function envModeHint(){let d=$('ne-mode')?.value==='delegated';if($('ne-runner-wrap'))$('ne-runner-wrap').style.display=d?'':'none';
+  let b=$('ne-create');if(b)b.disabled=d&&(!RUNNERS.length||!E2E_KIT)}
+async function createEnv(){try{let name=$('ne-name').value,mode=$('ne-mode').value;
+  if(mode==='delegated'){
+    let rid=$('ne-runner-select')?.value;let runner=RUNNERS.find(r=>r.id===rid);
+    if(!runner)throw new Error('Select a sync runner, or ask an admin to create one');
+    if(!E2E_KIT)throw new Error('this session has no client-held private key; sign in with a client-derived account first');
+    if(!MY_PUBKEY)throw new Error('account public key unavailable; reload and sign in again');
+    let k=crypto.getRandomValues(new Uint8Array(32));
+    await api('POST',`/api/apps/${APP.id}/envs`,{name,mode:'delegated',runner_id:rid,wrapped_key:await OW.encryptAsymmetric(MY_PUBKEY,k),runner_wrapped_key:await OW.encryptAsymmetric(runner.pubkey,k)});
+  } else { await api('POST',`/api/apps/${APP.id}/envs`,{name}); }
+  closeModal();NEWENV_DRAFT=null;ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()
+}catch(e){toast(e.message,true)}}
 async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3>
   <p class="mut">The environment key is generated in this browser and wrapped to your account key. The server stores only ciphertext and cannot read these secrets.</p>
   <div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div>
@@ -569,12 +658,12 @@ async function delSecret(id,key){let d=drafts()[id];
   let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
   if(!confirm('Delete '+key+'? You can restore it from history.'))return;
   try{await api('DELETE',`/api/secrets/${id}`);delete drafts()[id];toast('Secret deleted');await renderEnv()}catch(e){toast(e.message,true)}}
-function updateDeployBar(){let n=isE2E(ENV)?e2eDraftList().length:draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
+function updateDeployBar(){let n=isClientEnv(ENV)?e2eDraftList().length:draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
   $('deploybar').classList.toggle('show',active);
   $('deploytext').innerHTML=active?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
 function discardStage(){if(!ENV)return;delete DRAFTS[ENV.id];delete E2E_DRAFTS[ENV.id];
-  if(isE2E(ENV))drawE2E();else drawSecrets();updateDeployBar()}
-async function deployStage(){if(isE2E(ENV))return deployE2E();try{let items=draftList().map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));
+  if(isClientEnv(ENV))drawE2E();else drawSecrets();updateDeployBar()}
+async function deployStage(){if(isClientEnv(ENV))return deployE2E();try{let items=draftList().map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));
   if(!items.length)return;let envId=ENV.id;
   let d=await api('PUT',`/api/envs/${envId}/secrets`,{secrets:items});
   if(ENV&&ENV.id===envId)delete DRAFTS[envId];
@@ -624,18 +713,19 @@ async function revokeToken(id){try{await api('DELETE',`/api/tokens/${id}`);toast
 const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','webhook','instabox','boat','daytona'];
 async function renderIntegrations(){if(!needAppEnv())return;$('pagetitle').textContent='Integrations';$('crumb').textContent=ENV?('/ '+ENV.name):'';
   if(isE2E(ENV)){$('view').innerHTML=`<div class="card"><h3>Provider sync is unavailable for this environment</h3>
-    <p class="mut">The server cannot decrypt end-to-end secrets, so it cannot push them to a provider. To sync secrets an integration needs, create a delegated environment and run a customer-hosted runner (see the CLI <span class="mono">openwarp e2e create --delegated</span>). Keep secrets that no integration needs in an end-to-end environment like this one.</p></div>`;return}
-  if(isDelegated(ENV)){$('view').innerHTML=`<div class="card"><h3>Delegated environment sync</h3>
-    <p class="mut">Provider sync for this environment runs on the runner you host; the server forwards ciphertext and never sees plaintext. Configure integrations with the CLI or the API, then let the runner claim the job.</p></div>`;return}
+    <p class="mut">The server cannot decrypt end-to-end secrets, so it cannot push them to a provider. To sync secrets an integration needs, create a delegated environment and run a customer-hosted runner. Keep secrets that no integration needs in an end-to-end environment like this one.</p></div>`;return}
+  let delegated=isDelegated(ENV);
   setTimeout(kindHint,0);
   let ints=ENV?await api('GET',`/api/envs/${ENV.id}/integrations`).catch(()=>[]):[];
-  $('view').innerHTML=`<div class="card"><h3>Sync secrets to a platform</h3><p>Integrations run automatically on every deploy, or on demand. Config is stored encrypted. Trigger.dev example config: <span class="mono">{"token":"tr_pat_…","project_ref":"proj_…","target_env":"prod"}</span></p>
+  let notice=delegated?`<div class="card"><h3>Provider sync through your runner</h3><p class="mut">Integrations here are queued for the runner you host. Config is sealed to that runner before storage, and secrets are forwarded as ciphertext; Test and Sync run in your network. The runner sees provider credentials when it decrypts a job.</p></div>`:'';
+  let dynamic=delegated?'':`<div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><pre class="val" id="leases"></pre>
+  <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>`;
+  $('view').innerHTML=`${notice}<div class="card"><h3>Sync secrets to a platform</h3><p>Integrations run automatically on every deploy, or on demand. Config is stored encrypted. Trigger.dev example config: <span class="mono">{"token":"tr_pat_…","project_ref":"proj_…","target_env":"prod"}</span></p>
   <div class="row"><select id="ikind" onchange="kindHint()">${KINDS.map(k=>`<option>${k}</option>`).join('')}</select></div>
   <p class="small" id="ikind-hint"></p><textarea id="icfg" rows="4" placeholder='{"token":"…"}'></textarea>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="mkIntegration()">Add integration</button></div></div>
   <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button> <button class="danger" onclick="delInt('${i.id}')">Delete</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
-  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><pre class="val" id="leases"></pre>
-  <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>
+  ${dynamic}
   <div class="card"><h3>Lockbox: one-time secret sharing</h3><div class="row"><input id="lb-val" placeholder="value to share once" style="min-width:280px"><button onclick="mkLockbox()">Create link</button></div><pre class="val" id="lb-out"></pre></div>`}
 const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer"}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}',instabox:'Instabox: {"api_key":"ibk_…","org":"team","hosts":["api.example.com"],"delivery":"proxy"}',boat:'Boat: {"api_key":"boat_…","environment":"base","upgrade":true}',daytona:'Daytona: {"api_key":"…","organization_id":"…","hosts":["api.example.com"]}'};
 function kindHint(){if(!$('ikind'))return;let k=$('ikind').value;$('ikind-hint').textContent=KIND_HINTS[k]||('Config for '+k+' as JSON. Common keys: token, base_url for self-hosted instances. Stored encrypted at rest.')}
@@ -671,7 +761,11 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
       <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-github" ${inst.github?'checked':''} ${configured.includes('github')?'':'disabled'}> GitHub${configured.includes('github')?'':' (client credentials not configured)'}</label>
       <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-oidc" ${inst.oidc?'checked':''} ${configured.includes('oidc')?'':'disabled'}> Organisation SSO (OIDC)${configured.includes('oidc')?'':' (configure an issuer under Organisation security first)'}</label>
       <div class="row" style="margin-top:8px"><button class="primary" onclick="saveAuthMethods()" ${inst.env_locked?'disabled':''}>Save sign-in methods</button></div>
-      <p class="small mut">${inst.env_locked?'Locked by OPENWARP_AUTH_PROVIDERS.':'Every configured method is enabled until you change it here.'}</p></div>`;}
+      <p class="small mut">${inst.env_locked?'Locked by OPENWARP_AUTH_PROVIDERS.':'Every configured method is enabled until you change it here.'}</p></div>
+    <div class="card"><h3>New app environments</h3><p>Managed environments are encrypted by the server so the CLI and provider sync can read them. Delegated environments are encrypted in the client and synced by a runner you host, so the server never holds the key.</p>
+      <div class="field"><label for="set-app-policy">Mode for new apps</label><select id="set-app-policy" style="width:100%" ${inst.app_env_policy_locked?'disabled':''}><option value="managed" ${inst.app_env_policy!=='delegated'?'selected':''}>Managed (server-side encryption)</option><option value="delegated" ${inst.app_env_policy==='delegated'?'selected':''}>Delegated (client encryption, runner sync)</option></select></div>
+      <button class="primary" onclick="saveAppPolicy()" ${inst.app_env_policy_locked?'disabled':''}>Save environment policy</button>
+      <p class="small mut">${inst.app_env_policy_locked?'Locked by OPENWARP_APP_ENV_POLICY.':'Existing apps keep their current environments. Pure end-to-end environments stay an explicit per-environment choice.'}</p></div>`;}
   let pk=(m?.passkeys||[]);
   let mfaCard=`<div class="card"><h3>Two-factor authentication</h3>
     <p>${m&&m.required?'A second factor is required when you sign in.':'No second factor yet. Add one to protect this account.'}</p>
@@ -686,6 +780,13 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
     <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
     <h3>Email codes</h3><p>${m?.email_available?'Send a one-time code to your account email when you sign in.':'Set OPENWARP_EMAIL_WEBHOOK to enable emailed codes.'}</p>
     <div class="row"><button onclick="startEmailMfa()" ${m?.email_available?'':'disabled'}>Send code</button><input id="email-mfa-code" placeholder="code from email"><button onclick="verifyEmailMfa()">Enable</button><button class="danger" onclick="disableEmailMfa()">Disable</button></div></div>`;
+  let runnerCard='';
+  if(isAdmin()){
+    let runners=await api('GET',`/api/orgs/${ORG}/runners`).catch(()=>[]);RUNNERS=runners;
+    runnerCard=`<div class="card"><h3>Sync runners</h3><p>Runners hold a key grant for delegated environments and push secrets from your network. Only admins create or delete them; members can use an existing runner.</p>
+      <div class="row" style="margin-bottom:8px"><button class="primary" onclick="newRunner('settings')">+ New runner</button></div>
+      ${runners.length?runners.map(r=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0"><span class="small">${esc(r.name)} <span class="mut">· created ${new Date((r.created_at||0)*1000).toLocaleDateString()}</span></span><button class="danger" onclick="delRunner('${jsq(r.id)}')">Delete</button></div>`).join(''):'<p class="mut small">No runner yet. Create one before making a delegated app.</p>'}</div>`;
+  }
   $('view').innerHTML=`${instanceCard}${mfaCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
@@ -695,6 +796,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Open an E2E environment from its app to decrypt and edit it in this browser. The key stays in this tab; Settings no longer prints a plaintext dump of every secret.</p></div>
+  ${runnerCard}
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
@@ -709,6 +811,12 @@ async function saveAuthMethods(){try{
   for(let k of ['google','github','oidc']){let el=$('ap-'+k);if(el)body[k]=el.checked;}
   await api('PUT','/api/instance/auth',body);toast('Sign-in methods saved');renderSettings();
 }catch(e){toast(e.message,true)}}
+async function saveAppPolicy(){try{
+  let d=await api('PUT','/api/instance/app-env-policy',{policy:$('set-app-policy').value});
+  toast('New apps will use '+d.policy+' environments');renderSettings()
+}catch(e){toast(e.message,true)}}
+async function delRunner(id){if(!confirm('Delete this runner? Delegated environments using it must be removed or moved first.'))return;
+  try{await api('DELETE',`/api/orgs/${ORG}/runners/${id}`);toast('Runner deleted');renderSettings()}catch(e){toast(e.message,true)}}
 function reauthPrompt(msg){let p=prompt(msg||'Current password (leave blank if you sign in with a provider)');return p===null?null:(p||'')}
 async function regenRecovery(){let pw=reauthPrompt('Current password to replace recovery codes');if(pw===null)return;
   try{let d=await api('POST','/api/me/mfa/recovery-codes',{password:pw});$('totp-out').textContent='New recovery codes (save now):\n'+d.recovery_codes.join('\n');toast('Recovery codes replaced')}catch(e){toast(e.message,true)}}

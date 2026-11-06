@@ -86,10 +86,14 @@ fn valid_domain_list(list: &str) -> bool {
         .all(|d| !d.is_empty() && d.len() <= 253 && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')) }
 
 #[derive(Deserialize, Default)] struct AuthReq { email: String, password: String }
-#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64,
+#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64,
     // Delegated environments: the client generates the environment key and
     // supplies it wrapped to itself and to the customer-run sync runner.
     #[serde(default)] mode: String, #[serde(default)] runner_id: String, #[serde(default)] wrapped_key: String, #[serde(default)] runner_wrapped_key: String }
+#[derive(Deserialize, Default)] struct AppEnvIn { #[serde(default)] name: String, #[serde(default)] wrapped_key: String, #[serde(default)] runner_wrapped_key: String }
+// A delegated app's three default environments are created in one transaction
+// with wrapped keys the client generated. The server never sees the env keys.
+#[derive(Deserialize, Default)] struct CreateAppReq { #[serde(default)] name: String, #[serde(default)] readme: String, #[serde(default)] mode: String, #[serde(default)] runner_id: String, #[serde(default)] envs: Vec<AppEnvIn> }
 #[derive(Deserialize, Default, Clone)] struct SecretIn { key: String, value: String, #[serde(default = "def_path")] path: String, #[serde(default)] comment: String, #[serde(default)] tags: String, #[serde(default, rename = "type")] secret_type: String }
 fn def_path() -> String { "/".into() }
 #[derive(Deserialize, Default)] struct DeployReq { #[serde(default)] secrets: Vec<SecretIn>, #[serde(default)] text: String }
@@ -620,10 +624,47 @@ async fn accept_invite_v2(State(st): State<S>, axum::extract::ConnectInfo(addr):
     claim_instance_owner(&st, &uid);
     st.audit(&org, "", "", &uid, "member.accept_invite", &email);
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)) }
-async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?; st.require_org(&oid, &uid)?; st.check_perm(&oid, &uid, "secrets:write")?;
-    let aid = id(); st.db.exec("INSERT INTO apps(id,org_id,name,readme,created_at) VALUES(?,?,?,?,?)", &[json!(aid), json!(oid), json!(r.name), json!(r.readme), json!(now())]).map_err(|e| bad(&e))?;
-    for name in ["Development", "Staging", "Production"] { create_env_inner(&st, &aid, name)?; }
-    st.audit(&oid, &aid, "", &uid, "app.create", &r.name); Ok(j(json!({"id": aid}))) }
+fn valid_wrapped_blob(s: &str) -> bool { oc::unb64(s).map(|b| b.len() >= 56).unwrap_or(false) }
+async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<CreateAppReq>) -> Res { let uid = st.token_user(&h)?; st.require_org(&oid, &uid)?; st.check_perm(&oid, &uid, "secrets:write")?;
+    let name = r.name.trim(); if name.is_empty() { return Err(bad("app name required")); }
+    let policy = app_env_policy(&st);
+    let requested = r.mode.trim().to_ascii_lowercase();
+    if !requested.is_empty() && requested != policy {
+        return Err(err(StatusCode::CONFLICT, &format!("this instance creates new apps with {} environments; change the instance policy in Settings first", policy))); }
+    let aid = id();
+    if policy == "delegated" {
+        create_delegated_app(&st, &oid, &uid, &aid, name, &r)?;
+        return Ok(j(json!({"id": aid, "mode": "delegated"}))); }
+    st.db.exec("INSERT INTO apps(id,org_id,name,readme,created_at) VALUES(?,?,?,?,?)", &[json!(aid), json!(&oid), json!(name), json!(r.readme), json!(now())]).map_err(|e| bad(&e))?;
+    for env in ["Development", "Staging", "Production"] { create_env_inner(&st, &aid, env)?; }
+    st.audit(&oid, &aid, "", &uid, "app.create", name); Ok(j(json!({"id": aid, "mode": "managed"}))) }
+fn create_delegated_app(st: &S, org: &str, uid: &str, aid: &str, name: &str, r: &CreateAppReq) -> Result<(), (StatusCode, Json<Value>)> {
+    if r.runner_id.is_empty() { return Err(bad("delegated app creation needs a runner_id; create a runner in this organisation first")); }
+    if st.db.one("SELECT id FROM runners WHERE id=? AND org_id=?", &[json!(&r.runner_id), json!(org)]).map_err(|e| bad(&e))?.is_none() {
+        return Err(bad("runner not found in this organisation")); }
+    let defaults = ["Development", "Staging", "Production"];
+    let mut keys: std::collections::HashMap<&str, &AppEnvIn> = std::collections::HashMap::new();
+    for env in &r.envs {
+        if !defaults.contains(&env.name.as_str()) { return Err(bad("delegated app environments must be Development, Staging and Production")); }
+        if !valid_wrapped_blob(&env.wrapped_key) || !valid_wrapped_blob(&env.runner_wrapped_key) {
+            return Err(bad("every default environment needs a valid wrapped_key and runner_wrapped_key")); }
+        if keys.insert(env.name.as_str(), env).is_some() { return Err(bad("duplicate default environment")); }
+    }
+    if keys.len() != defaults.len() { return Err(bad("delegated app creation needs wrapped keys for Development, Staging and Production")); }
+    let mut stmts: Vec<(String, Vec<Value>)> = vec![
+        ("INSERT INTO apps(id,org_id,name,readme,created_at) VALUES(?,?,?,?,?)".into(), vec![json!(aid), json!(org), json!(name), json!(&r.readme), json!(now())])];
+    for env_name in defaults {
+        let env = keys[env_name]; let eid = id();
+        stmts.push(("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,runner_id,created_at) VALUES(?,?,?,'','delegated',?,?)".into(),
+            vec![json!(&eid), json!(aid), json!(env_name), json!(&r.runner_id), json!(now())]));
+        stmts.push(("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)".into(), vec![json!(&eid), json!(uid), json!(&env.wrapped_key)]));
+        stmts.push(("INSERT INTO runner_env_keys(runner_id,env_id,wrapped_key) VALUES(?,?,?)".into(), vec![json!(&r.runner_id), json!(&eid), json!(&env.runner_wrapped_key)]));
+    }
+    // One transaction: an app must never exist with some of its default
+    // environments missing a key grant.
+    st.db.batch(&stmts).map_err(|e| bad(&format!("app creation did not complete: {}", e)))?;
+    st.audit(org, aid, "", uid, "app.create.delegated", &format!("{} runner={}", name, r.runner_id));
+    Ok(()) }
 fn create_env_inner(st: &S, app_id: &str, name: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let eid = id(); let key = oc::random_key();
     let wrapped = match &st.kms {
@@ -638,15 +679,22 @@ async fn create_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, 
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; let org = db::s(&app,"org_id"); st.require_org(&org, &uid)?; st.check_perm(&org, &uid, "secrets:write")?;
     if !r.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || r.name.is_empty() || r.name.len() > 32 { return Err(bad("env name must match ^[a-zA-Z0-9-_]{1,32}$")); }
     if r.mode == "delegated" {
-        if r.runner_id.is_empty() || r.wrapped_key.is_empty() || r.runner_wrapped_key.is_empty() {
-            return Err(bad("delegated environments need runner_id, wrapped_key and runner_wrapped_key")); }
+        if r.runner_id.is_empty() || !valid_wrapped_blob(&r.wrapped_key) || !valid_wrapped_blob(&r.runner_wrapped_key) {
+            return Err(bad("delegated environments need runner_id and valid wrapped_key and runner_wrapped_key values")); }
         if st.db.one("SELECT id FROM runners WHERE id=? AND org_id=?", &[json!(&r.runner_id), json!(&org)]).map_err(|e| bad(&e))?.is_none() {
             return Err(bad("runner not found in this organisation")); }
         let eid = id();
-        st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,runner_id,created_at) VALUES(?,?,?,'','delegated',?,?)",
-            &[json!(&eid), json!(&aid), json!(&r.name), json!(&r.runner_id), json!(now())]).map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(&eid), json!(&uid), json!(&r.wrapped_key)]).map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO runner_env_keys(runner_id,env_id,wrapped_key) VALUES(?,?,?)", &[json!(&r.runner_id), json!(&eid), json!(&r.runner_wrapped_key)]).map_err(|e| bad(&e))?;
+        // One transaction: an environment must never exist without both key
+        // grants, or nobody could read it and the runner could not sync it.
+        let stmts: Vec<(String, Vec<Value>)> = vec![
+            ("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,runner_id,created_at) VALUES(?,?,?,'','delegated',?,?)".into(),
+                vec![json!(&eid), json!(&aid), json!(&r.name), json!(&r.runner_id), json!(now())]),
+            ("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)".into(),
+                vec![json!(&eid), json!(&uid), json!(&r.wrapped_key)]),
+            ("INSERT INTO runner_env_keys(runner_id,env_id,wrapped_key) VALUES(?,?,?)".into(),
+                vec![json!(&r.runner_id), json!(&eid), json!(&r.runner_wrapped_key)]),
+        ];
+        st.db.batch(&stmts).map_err(|e| bad(&format!("environment creation did not complete: {}", e)))?;
         st.audit(&org, &aid, &eid, &uid, "env.create.delegated", &r.runner_id);
         return Ok(j(json!({"id": eid, "mode": "delegated", "runner_id": r.runner_id}))); }
     let eid = create_env_inner(&st, &aid, &r.name)?; Ok(j(json!({"id": eid}))) }
@@ -1547,6 +1595,16 @@ fn instance_owner(st: &S) -> Option<String> {
     let uid = st.db.one("SELECT id FROM users ORDER BY created_at, id LIMIT 1", &[]).ok().flatten().map(|r| db::s(&r, "id"));
     if let Some(u) = &uid { claim_instance_owner(st, u); }
     uid }
+const APP_ENV_POLICIES: &[&str] = &["managed", "delegated"];
+fn app_env_policy_env() -> Option<String> {
+    let v = std::env::var("OPENWARP_APP_ENV_POLICY").unwrap_or_default().trim().to_ascii_lowercase();
+    if APP_ENV_POLICIES.contains(&v.as_str()) { Some(v) } else { None } }
+// New apps get managed (server-encrypted) environments unless the operator or
+// the instance owner selects delegated (client-encrypted, synced by a runner).
+fn app_env_policy(st: &S) -> String {
+    if let Some(p) = app_env_policy_env() { return p; }
+    let stored = meta_get(st, "app_env_policy");
+    if APP_ENV_POLICIES.contains(&stored.as_str()) { stored } else { "managed".into() } }
 fn social_provider(provider: &str) -> Option<(String, String)> {
     let (id_key, secret_key) = match provider {
         "google" => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
@@ -1715,7 +1773,18 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     auth["signups_env_locked"] = json!(std::env::var("OPENWARP_SIGNUPS").is_ok());
     auth["instance_owner"] = json!(instance_owner(&st).as_deref() == Some(uid.as_str()));
     auth["mfa_email"] = json!(mfa::email_available());
+    auth["app_env_policy"] = json!(app_env_policy(&st));
+    auth["app_env_policy_locked"] = json!(app_env_policy_env().is_some());
     Ok(j(auth)) }
+async fn set_app_env_policy(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h)?;
+    if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change the new-app environment mode")); }
+    if app_env_policy_env().is_some() { return Err(err(StatusCode::CONFLICT, "OPENWARP_APP_ENV_POLICY controls new app environments on this instance")); }
+    let policy = body.get("policy").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
+    if !APP_ENV_POLICIES.contains(&policy.as_str()) { return Err(bad("policy must be managed or delegated")); }
+    meta_set(&st, "app_env_policy", &policy);
+    st.audit("", "", "", &uid, "instance.app_env_policy", &policy);
+    Ok(j(json!({"ok": true, "policy": policy}))) }
 async fn set_auth_providers(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change sign-in methods")); }
@@ -1904,7 +1973,9 @@ async fn create_runner(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     st.audit(&oid, "", "", &uid, "runner.create", name);
     Ok(j(json!({"id": rid, "name": name, "public_key": r.public_key, "token": token, "note": "token shown once; store it with the runner"}))) }
 async fn list_runners(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
-    let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
+    // Writers need the runner public key to wrap a delegated app's environment
+    // keys. Tokens and private keys are never listed; only admins create runners.
+    let uid = st.token_user(&h)?; st.check_perm(&oid, &uid, "secrets:write")?;
     let rows = st.db.query("SELECT id,name,pubkey,created_at FROM runners WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn delete_runner(State(st): State<S>, h: HeaderMap, Path((oid, rid)): Path<(String, String)>) -> Res {
@@ -2745,6 +2816,12 @@ async fn main() {
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
     let state = Arc::new(AppState { db, db_url: db_url.clone(), pub_url, master, kms, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
     if let Err(e) = validate_auth_env(&state) { eprintln!("{}", e); std::process::exit(1); }
+    if let Ok(v) = std::env::var("OPENWARP_APP_ENV_POLICY") {
+        if !APP_ENV_POLICIES.contains(&v.trim().to_ascii_lowercase().as_str()) {
+            eprintln!("OPENWARP_APP_ENV_POLICY must be managed or delegated");
+            std::process::exit(1);
+        }
+    }
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; process_rotations(&st2).await; } }); }
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
@@ -2755,7 +2832,7 @@ async fn main() {
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/app-env-policy", put(set_app_env_policy)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/me/auth", get(me_auth))

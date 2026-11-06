@@ -53,11 +53,16 @@ customer-run sync runner. The server stores only ciphertext:
 - The creator's copy is in `env_keys`; the runner's copy is in
   `runner_env_keys`.
 - Secrets are written through the E2E endpoint with client-side ciphertext.
-- Integration configuration is sealed to the runner's X25519 key, not to the
-  server. The server cannot read provider tokens either.
-- A deploy or sync call queues a `sync_jobs` row. The runner polls
+- Integration configuration is sent to the server when the integration is
+  created, then stored sealed to the runner's X25519 key. The server sees the
+  config during creation; at rest, only the runner can open it.
+- Test and Sync calls queue a `sync_jobs` row; a secret deploy updates the
+  ciphertext and the next sync picks it up. The runner polls
   `/api/runner/jobs`, decrypts in its own process, pushes to the provider, and
   reports the result. It can also return the managed names for mirror syncs.
+- Members with `secrets:write` can list runner names and public keys (never
+  tokens) so they can wrap an environment key. Only organisation admins create
+  or delete runners.
 - **The server cannot decrypt.** The operator can still modify the served web
   console (see the client-trust caveat).
 
@@ -135,9 +140,13 @@ guarantee:
 For version 2 accounts, `delegated` and `e2e` protect the data from a stolen
 database, backup, disk or server that only sees protocol traffic. They do not
 protect against an operator who can replace the client code. Version 1 accounts
-retain the old exposure until migrated. The console writes E2E ciphertext only
-through `PUT /api/envs/:id/e2e/secrets`; `GET /api/envs/:id/secrets` returns
-409 for these environments, which is what the browser acceptance test asserts.
+retain the old exposure until migrated. The console writes E2E and delegated
+ciphertext only through `PUT /api/envs/:id/e2e/secrets`;
+`GET /api/envs/:id/secrets` returns 409 for these environments, which is what the
+browser acceptance test asserts. A delegated environment is edited with the same
+in-memory editor, and rotation wraps the new key to every grantee and to the
+runner. New apps follow the instance's managed or delegated policy; the choice
+changes only where future environment keys are generated, never existing ones.
 
 ## Recovery and revocation
 
