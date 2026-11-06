@@ -44,7 +44,7 @@ alias), `dokploy`, `caprover`, `portainer`
 `cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`
 (Cloud Agents environment or team secrets), `northflank`, `spacelift`,
 `rundeck`, `cloud66`, `humanitec`, `ovh_kms` (OVHcloud KMS), `keeper`
-(Commander Service Mode), and `oci_vault`.
+(Commander Service Mode), `oci_vault`, and `bitwarden` (Secrets Manager).
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -155,6 +155,9 @@ The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`
   Mode (`instance_url`, `api_key`, `folder_uid`).
 - `oci_vault` writes one OCI Vault secret per key with RSA-signed requests;
   deletions are scheduled seven days out.
+- `bitwarden` writes Secrets Manager secrets through a machine-account token.
+  `api_url` and `identity_url` cover cloud US/EU and self-hosted installations;
+  `project_ids` and `note` are optional.
 
 Shared behavioural options:
 
@@ -168,8 +171,8 @@ Shared behavioural options:
   1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
   Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps,
   OpenWarp, Northflank, Spacelift, Rundeck, Cloud 66, Humanitec, OVHcloud KMS,
-  Keeper and OCI Vault. Adapters that never return values reject import
-  explicitly.
+  Keeper, OCI Vault and Bitwarden. Adapters that never return values reject
+  import explicitly.
 - AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
   assumes the role and signs with the temporary credentials.
 - GCP Secret Manager accepts `service_account_json` and Azure Key Vault accepts
@@ -184,13 +187,22 @@ Cursor Cloud Agents is supported because it documents environment and team
 secret endpoints. Grok Bot Vault and ChatGPT/Codex cloud environments document
 environment variables and secrets as UI settings, not as a public API. Keeper
 is supported through Commander Service Mode; it has no plain REST API.
+
+Bitwarden Secrets Manager is supported as `bitwarden`, for cloud US/EU and
+self-hosted installations. Vaultwarden does not implement the Secrets Manager
+API, so it is not a `bitwarden` target. LastPass, Dashlane, NordPass and Proton
+Pass do not document a server-side secret API: LastPass's Enterprise API covers
+user and group provisioning, and its vault is reached through the CLI with the
+master password rather than a service API.
+
 Pandacode's other providers are machine lifecycle APIs that accept environment
 variables or SSH keys only at creation; they are not secret-sync destinations.
 
-All of the listed Infisical-style adapters are implemented. Keeper uses
-Commander Service Mode, OCI Vault uses OCI request signing, and OVHcloud KMS
-uses a bearer token or client certificate. Machine provisioning remains out of
-scope: OpenWarp writes only to providers that already hold secrets.
+All of the listed Infisical-style adapters are implemented, plus Bitwarden
+Secrets Manager. Keeper uses Commander Service Mode, OCI Vault uses OCI request
+signing, OVHcloud KMS uses a bearer token or client certificate, and Bitwarden
+uses a machine-account OAuth token. Machine provisioning remains out of scope:
+OpenWarp writes only to providers that already hold secrets.
 
 ## Trigger.dev sync
 

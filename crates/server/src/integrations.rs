@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use std::collections::{BTreeMap, HashMap};
 type HmacSha256 = Hmac<Sha256>;
 
-pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","keeper","oci_vault"];
+pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","keeper","oci_vault","bitwarden"];
 
 fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
@@ -2003,6 +2003,69 @@ pub async fn oci_vault_test(config: &Value) -> Result<String, String> {
     Ok(format!("OCI Vault connection OK: {} active secret(s) visible", list.len()))
 }
 
+// ---------- Bitwarden Secrets Manager ----------
+fn bitwarden_parts(config: &Value) -> Result<(String, String, String, String, String), String> {
+    let api = { let a = cfg(config, "api_url"); if a.is_empty() { "https://api.bitwarden.com".to_string() } else { a.trim_end_matches('/').to_string() } };
+    let identity = { let i = cfg(config, "identity_url"); if i.is_empty() { "https://identity.bitwarden.com/connect/token".to_string() } else { i.to_string() } };
+    let (client_id, client_secret, org) = (cfg(config, "client_id"), cfg(config, "client_secret"), cfg(config, "organization_id"));
+    if client_id.is_empty() || client_secret.is_empty() || org.is_empty() { return Err("Bitwarden requires client_id, client_secret and organization_id".into()); }
+    Ok((api, identity, client_id.to_string(), client_secret.to_string(), org.to_string()))
+}
+async fn bitwarden_token(client: &reqwest::Client, config: &Value) -> Result<String, String> {
+    let (_, identity, client_id, client_secret, _) = bitwarden_parts(config)?;
+    let body = format!("grant_type=client_credentials&scope=api.secrets&client_id={}&client_secret={}", form_encode(&client_id), form_encode(&client_secret));
+    let text = req(client.post(identity).header("Content-Type", "application/x-www-form-urlencoded").body(body)).await.map_err(|e| format!("Bitwarden token exchange failed: {}", e))?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Bitwarden token response is invalid: {}", e))?;
+    value.get("access_token").and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("Bitwarden token response is missing access_token: {}", text.chars().take(300).collect::<String>()))
+}
+async fn bitwarden_list(client: &reqwest::Client, api: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
+    let text = req(client.get(format!("{}/organizations/{}/secrets", api, enc(org))).bearer_auth(token)).await.map_err(|e| format!("Bitwarden list secrets failed: {}", e))?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Bitwarden invalid secret list: {}", e))?;
+    Ok(value.get("secrets").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+async fn bitwarden_get(client: &reqwest::Client, api: &str, token: &str, id: &str) -> Result<Value, String> {
+    let text = req(client.get(format!("{}/secrets/{}", api, enc(id))).bearer_auth(token)).await.map_err(|e| format!("Bitwarden read secret failed: {}", e))?;
+    serde_json::from_str(&text).map_err(|e| format!("Bitwarden invalid secret: {}", e))
+}
+pub async fn bitwarden_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (api, _, _, _, org) = bitwarden_parts(config)?;
+    let mode = sync_mode(config, "bitwarden")?; let dry = is_dry(config);
+    let project_ids = config.get("project_ids").cloned().unwrap_or(json!([]));
+    let default_note = { let n = cfg(config, "note"); if n.is_empty() { "Managed by OpenWarp" } else { n } };
+    let desired = trigger_desired(config, secrets);
+    let client = http_client(); let token = bitwarden_token(&client, config).await?;
+    let remote = bitwarden_list(&client, &api, &token, &org).await?;
+    let by_key: HashMap<String, String> = remote.iter().filter_map(|v| Some((v.get("key")?.as_str()?.to_string(), v.get("id")?.as_str()?.to_string()))).collect();
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    if !dry {
+        for (name, value) in &desired {
+            if let Some(id) = by_key.get(name) {
+                let detail = bitwarden_get(&client, &api, &token, id).await?;
+                if detail.get("value").and_then(Value::as_str) == Some(value.as_str()) { unchanged += 1; continue; }
+                let note = detail.get("note").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(default_note);
+                req(client.put(format!("{}/secrets/{}", api, enc(id))).bearer_auth(&token).json(&json!({"key": name, "value": value, "note": note, "projectIds": project_ids.clone(), "valueChanged": true}))).await.map_err(|e| format!("Bitwarden update {} failed: {}", name, e))?;
+                updated += 1;
+            } else {
+                req(client.post(format!("{}/organizations/{}/secrets", api, enc(&org))).bearer_auth(&token).json(&json!({"key": name, "value": value, "note": default_note, "projectIds": project_ids.clone()}))).await.map_err(|e| format!("Bitwarden create {} failed: {}", name, e))?;
+                created += 1;
+            }
+        }
+        if mode == "mirror" {
+            let ids: Vec<Value> = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n)).filter_map(|n| by_key.get(n).map(|id| json!(id))).collect();
+            if !ids.is_empty() { req(client.post(format!("{}/secrets/delete", api)).bearer_auth(&token).json(&ids)).await.map_err(|e| format!("Bitwarden delete failed: {}", e))?; }
+        }
+    } else { for (name, _) in &desired { if by_key.contains_key(name) { updated += 1; } else { created += 1; } } }
+    let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_key.contains_key(*n)).count();
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Bitwarden sync{}: created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, unchanged, deleted), managed))
+}
+pub async fn bitwarden_test(config: &Value) -> Result<String, String> {
+    let (api, _, _, _, org) = bitwarden_parts(config)?;
+    let client = http_client(); let token = bitwarden_token(&client, config).await?;
+    let list = bitwarden_list(&client, &api, &token, &org).await?;
+    Ok(format!("Bitwarden connection OK: {} secret(s) visible", list.len()))
+}
+
 // ---------- Initial import ----------
 fn resolved_prefix(config: &Value) -> String { cfg(config, "prefix").replace("{{environment}}", cfg(config, "_environment")) }
 fn strip_remote_prefix(config: &Value, name: &str, path_prefix: &str) -> String {
@@ -2213,6 +2276,20 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             }
             Ok(out)
         }
+        "bitwarden" => {
+            let (api, _, _, _, org) = bitwarden_parts(config)?;
+            let client = http_client(); let token = bitwarden_token(&client, config).await?;
+            let list = bitwarden_list(&client, &api, &token, &org).await?;
+            let mut out = Vec::new();
+            for item in list {
+                let name = item.get("key").and_then(Value::as_str).unwrap_or("");
+                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() || id.is_empty() { continue; }
+                let detail = bitwarden_get(&client, &api, &token, id).await?;
+                if let Some(value) = detail.get("value").and_then(Value::as_str) { out.push((strip_remote_prefix(config, name, ""), value.to_string())); }
+            }
+            Ok(out)
+        }
         "cursor" => Err("Cursor does not expose secret values, so initial import is not possible".into()),
         "devin" => Err("Devin does not expose secret values, so initial import is not possible".into()),
         "cloudflare_secrets_store" => Err("Cloudflare Secrets Store values are write-only, so initial import is not possible".into()),
@@ -2222,7 +2299,7 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
 }
 
 pub fn is_stateful(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault")
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault" | "bitwarden")
 }
 /// Stateful adapters return a report and the remote names they now own.
 pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
@@ -2259,13 +2336,14 @@ pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String
         "ovh_kms" => ovh_kms_sync(config, secrets, previous_managed).await,
         "keeper" => keeper_sync(config, secrets, previous_managed).await,
         "oci_vault" => oci_vault_sync(config, secrets, previous_managed).await,
+        "bitwarden" => bitwarden_sync(config, secrets, previous_managed).await,
         _ => return None,
     };
     Some(result)
 }
 
 pub fn has_test(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault")
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault" | "bitwarden")
 }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
     match kind {
@@ -2301,6 +2379,7 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "ovh_kms" => ovh_kms_test(config).await,
         "keeper" => keeper_test(config).await,
         "oci_vault" => oci_vault_test(config).await,
+        "bitwarden" => bitwarden_test(config).await,
         _ => Err(format!("connection test is not implemented for kind {}", kind)),
     }
 }
@@ -3424,4 +3503,29 @@ mod tests {
         assert_eq!(body["secretContent"]["content"], openwarp_crypto::b64(b"v1"));
         assert!(post.2.to_lowercase().contains("authorization: signature version=\"1\""), "{}", post.2);
     }
+    #[tokio::test]
+    async fn bitwarden_creates_and_mirrors_secrets() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /identity/connect/token", 200, "{\"access_token\":\"bw_token\"}"),
+            ("GET /organizations/org/secrets", 200, "{\"secrets\":[{\"id\":\"s1\",\"key\":\"OLD\"}],\"projects\":[]}"),
+            ("GET /secrets/s1", 200, "{\"id\":\"s1\",\"key\":\"OLD\",\"value\":\"1\",\"note\":\"old note\"}"),
+            ("POST /organizations/org/secrets", 200, "{\"id\":\"s2\",\"key\":\"API_KEY\"}"),
+            ("POST /secrets/delete", 200, "[]"),
+        ]));
+        let config = json!({"api_url":base,"identity_url":format!("{}/identity/connect/token",base),"client_id":"user.abc","client_secret":"secret","organization_id":"org","mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = bitwarden_sync(&config, &secrets, &["OLD".to_string()]).await.expect("bitwarden sync");
+        assert!(report.contains("created=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let token = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/identity/connect/token").expect("token");
+        assert!(token.3.contains("grant_type=client_credentials"), "{}", token.3);
+        let create = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/organizations/org/secrets").expect("create");
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["key"], "API_KEY");
+        assert_eq!(body["value"], "v1");
+        let delete = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/secrets/delete").expect("delete");
+        let ids: Value = serde_json::from_str(&delete.3).expect("json");
+        assert_eq!(ids[0], "s1");
+    }
+
 }
