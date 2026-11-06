@@ -285,7 +285,9 @@ create the sandbox with `env` and replace it.
   deactivated accounts, rate-limits password attempts, escapes every
   parameter and serves a restrictive Content-Security-Policy.
 - OAuth access tokens are scope-checked on REST (`secrets:read` for reads,
-  `secrets:write` for mutations) and `/mcp` checks the token audience.
+  `secrets:write` for mutations, `org:admin` for membership, settings, audit,
+  token minting, PKI and SCIM) and bound to their audience (`<issuer>` for
+  `/api`, `<issuer>/mcp` for MCP).
 - Environment-scoped service tokens are rejected over MCP for other
   environments and cannot mint new tokens.
 - The IP allowlist covers `/api`, `/mcp` and `/scim`, not just `/api`.
@@ -500,11 +502,18 @@ treat CRL support as an OCSP replacement.
   already be a member with an active, verified account; the caller becomes an
   admin. The console's Members table exposes the same transfer, role changes and
   member removal.
+- `DELETE /api/orgs/:id?confirm=true` deletes a workspace and everything under
+  it: apps, environments, secrets and versions, integrations, leases, tokens,
+  identities, teams, roles, PKI, SSO configuration, invitations and its audit
+  rows. Only an owner may call it. This is how a solo account removes the last
+  workspace it owns.
 - `DELETE /api/me` deletes the calling account. It requires a signed-in console
   session, so an API key, service token or OAuth token cannot delete the account
   that issued it. A user who owns any workspace gets `409` with the workspace
-  list until ownership is transferred; the instance owner is refused for the
-  same reason.
+  list until ownership is transferred or the workspace is deleted.
+- `PUT /api/instance/owner {user_id|email}` moves instance policy to another
+  active, verified account. The last remaining account may delete itself
+  instead; that clears the bootstrap claim so the next signup owns the instance.
 - Live credentials turn the request into a `409` warning with
   `confirmation_required`, `api_keys` and `oauth_sessions` counts; repeat with
   `DELETE /api/me?confirm=true` to proceed. The delete revokes sessions, OAuth
@@ -514,3 +523,9 @@ treat CRL support as an OCSP replacement.
 - OAuth consent with email and password now refuses an unverified account,
   matching the console sign-in gate. Verified accounts continue through the
   normal authorization-code flow.
+- Tokens are audience-bound: the CLI requests the issuer root for `/api`, and
+  MCP clients request `<issuer>/mcp`. A token issued for one audience is refused
+  by the other. Tokens minted before this change must re-authenticate.
+- `org:admin` separates organisation administration from secret writes. Service
+  tokens with an explicit scope list need it too; empty-scope tokens keep their
+  legacy full-access meaning.

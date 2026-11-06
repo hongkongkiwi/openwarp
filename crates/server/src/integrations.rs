@@ -2310,7 +2310,7 @@ fn ssh_stage_dir() -> std::path::PathBuf {
 }
 // hash_token is base64, and a slash in a filename silently becomes a directory.
 fn ssh_stage_name(prefix: &str, value: &str) -> String {
-    format!("{}-{}", prefix, openwarp_crypto::hash_token(value).replace('/', "-").replace('+', "-").chars().take(12).collect::<String>()) }
+    format!("{}-{}", prefix, openwarp_crypto::hash_token(value).replace(['/', '+'], "-").chars().take(12).collect::<String>()) }
 fn wait_bounded(child: std::process::Child, budget: std::time::Duration) -> std::io::Result<std::process::Output> {
     let started = std::time::Instant::now();
     let mut child = child;

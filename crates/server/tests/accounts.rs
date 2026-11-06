@@ -994,3 +994,62 @@ async fn oauth_authorization_requires_a_verified_email() {
     assert_eq!(r.status, 303, "a verified account must authorize, got {} {}", r.status, r.text);
     assert!(r.header("location").contains("code="), "expected a code redirect, got {}", r.header("location"));
 }
+
+#[tokio::test]
+async fn solo_account_can_delete_its_workspace_then_itself() {
+    let s = Server::start().await;
+    let owner = register(&s, "solo@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+
+    let app = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(ot), Some(json!({"name": "svc"}))).await;
+    assert_eq!(app.status, 200, "{}", app.text);
+    let aid = app.body["id"].as_str().unwrap();
+    let key = s.call(Method::POST, &format!("/api/apps/{}/tokens", aid), Some(ot), Some(json!({"name": "ci"}))).await;
+    assert_eq!(key.status, 200, "{}", key.text);
+    let api_key = key.body["token"].as_str().unwrap();
+
+    let r = s.call(Method::DELETE, &format!("/api/orgs/{}", org), Some(ot), None).await;
+    assert_eq!(r.status, 409, "deleting a workspace needs confirmation, got {} {}", r.status, r.text);
+    assert_eq!(r.body["confirmation_required"], json!(true), "{}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/orgs/{}?confirm=true", org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "workspace delete failed: {}", r.text);
+    let orgs = s.call(Method::GET, "/api/orgs", Some(ot), None).await;
+    assert_eq!(orgs.body.as_array().map(|a| a.len()).unwrap_or(1), 0, "the workspace must be gone: {}", orgs.text);
+    let r = s.call(Method::GET, "/api/me", Some(api_key), None).await;
+    assert_eq!(r.status, 401, "workspace tokens must die with it, got {} {}", r.status, r.text);
+
+    // An abandoned unverified registration is not a usable owner, so it must
+    // not trap the last active account on the instance.
+    let pending = register_raw(&s, "pending@test.invalid").await;
+    assert_eq!(pending.status, 200, "{}", pending.text);
+
+    // Last usable account: deleting it releases the bootstrap claim.
+    let r = s.call(Method::DELETE, "/api/me", Some(ot), None).await;
+    assert_eq!(r.status, 200, "a solo account must be able to delete itself: {}", r.text);
+    let r = s.call(Method::GET, "/api/me", Some(ot), None).await;
+    assert_eq!(r.status, 401, "the session must die with the account, got {} {}", r.status, r.text);
+
+    let next = register(&s, "next@test.invalid").await;
+    let nt = next.body["token"].as_str().unwrap();
+    let info = s.call(Method::GET, "/api/instance", Some(nt), None).await;
+    assert_eq!(info.body["instance_owner"], json!(true), "the next signup must bootstrap the instance: {}", info.text);
+}
+
+#[tokio::test]
+async fn instance_ownership_can_be_transferred() {
+    let s = Server::start().await;
+    let a = register(&s, "instance-a@test.invalid").await;
+    let at = a.body["token"].as_str().unwrap();
+    let b = register(&s, "instance-b@test.invalid").await;
+    let bt = b.body["token"].as_str().unwrap();
+
+    let r = s.call(Method::PUT, "/api/instance/owner", Some(at), Some(json!({"email": "instance-b@test.invalid"}))).await;
+    assert_eq!(r.status, 200, "instance transfer failed: {}", r.text);
+    let info_a = s.call(Method::GET, "/api/instance", Some(at), None).await;
+    assert_eq!(info_a.body["instance_owner"], json!(false), "{}", info_a.text);
+    let info_b = s.call(Method::GET, "/api/instance", Some(bt), None).await;
+    assert_eq!(info_b.body["instance_owner"], json!(true), "{}", info_b.text);
+    let r = s.call(Method::PUT, "/api/instance/owner", Some(at), Some(json!({"email": "instance-b@test.invalid"}))).await;
+    assert_eq!(r.status, 403, "only the current owner may transfer, got {} {}", r.status, r.text);
+}

@@ -358,7 +358,12 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
             "workspaces": workspaces }))));
     }
     if meta_get(&st, "instance_owner") == uid {
-        return Err((StatusCode::CONFLICT, Json(json!({"error": "this account owns the instance; point the instance_owner meta key at another account before deleting it"}))));
+        // The last usable account may close the instance; an abandoned
+        // unverified registration must not trap it. Clearing the claim lets the
+        // next signup bootstrap it again, which is how the first run works.
+        let others = st.db.one("SELECT COUNT(*) AS n FROM users WHERE id<>? AND active=1 AND email_verified=1", &[json!(&uid)]).map_err(|e| bad(&e))?.map(|r| db::n(&r, "n")).unwrap_or(0);
+        if others > 0 { return Err((StatusCode::CONFLICT, Json(json!({"error": "this account owns the instance; transfer instance ownership before deleting it"})))); }
+        st.db.exec("DELETE FROM meta WHERE k='instance_owner'", &[]).map_err(|e| bad(&e))?;
     }
     let api_keys = st.db.one("SELECT COUNT(*) AS n FROM tokens WHERE created_by=?", &[json!(&uid)]).map_err(|e| bad(&e))?.map(|r| db::n(&r,"n")).unwrap_or(0);
     let oauth_sessions = st.db.one("SELECT COUNT(DISTINCT pair_id) AS n FROM oauth_tokens WHERE user_id=? AND kind='access' AND expires_at>?", &[json!(&uid), json!(now())]).map_err(|e| bad(&e))?.map(|r| db::n(&r,"n")).unwrap_or(0);
@@ -405,6 +410,62 @@ async fn update_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     if r.name.trim().is_empty() { return Err(bad("organisation name required")); }
     st.db.exec("UPDATE orgs SET name=? WHERE id=?", &[json!(r.name.trim()), json!(&oid)]).map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "org.rename", r.name.trim()); Ok(j(json!({"ok": true}))) }
+// Deleting a workspace is the escape hatch for a solo account: it removes
+// everything the workspace owns, then the account can be deleted too.
+async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h)?;
+    if st.require_org(&oid, &uid)? != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can delete a workspace")); }
+    let confirm = q.get("confirm").map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")).unwrap_or(false);
+    let name = st.db.one("SELECT name FROM orgs WHERE id=?", &[json!(&oid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "name")).unwrap_or_default();
+    if !confirm { return Err((StatusCode::CONFLICT, Json(json!({
+        "error": format!("deleting {} removes every app, environment, secret, token and identity in it", name),
+        "confirmation_required": true, "hint": "repeat with ?confirm=true to delete the workspace" })))); }
+    // The per-org audit trail goes with the workspace; keep one global line.
+    st.audit("", "", "", &uid, "org.delete", &format!("{} ({})", name, oid));
+    let envs = "SELECT e.id FROM envs e JOIN apps a ON a.id=e.app_id WHERE a.org_id=?";
+    let apps = "SELECT id FROM apps WHERE org_id=?";
+    let teams = "SELECT id FROM teams WHERE org_id=?";
+    let cas = "SELECT id FROM pki_cas WHERE org_id=?";
+    let streams = "SELECT id FROM log_streams WHERE org_id=?";
+    let integrations = "SELECT i.id FROM integrations i JOIN envs e ON e.id=i.env_id JOIN apps a ON a.id=e.app_id WHERE a.org_id=?";
+    let statements: Vec<String> = vec![
+        format!("DELETE FROM secret_versions WHERE secret_id IN (SELECT s.id FROM secrets s WHERE s.env_id IN ({}))", envs),
+        format!("DELETE FROM overrides WHERE secret_id IN (SELECT s.id FROM secrets s WHERE s.env_id IN ({}))", envs),
+        format!("DELETE FROM env_keys WHERE env_id IN ({})", envs),
+        format!("DELETE FROM leases WHERE env_id IN ({})", envs),
+        format!("DELETE FROM integration_sync_state WHERE integration_id IN ({})", integrations),
+        format!("DELETE FROM integrations WHERE env_id IN ({})", envs),
+        format!("DELETE FROM proposals WHERE env_id IN ({})", envs),
+        format!("DELETE FROM access_requests WHERE env_id IN ({})", envs),
+        format!("DELETE FROM rotation_schedules WHERE env_id IN ({})", envs),
+        format!("DELETE FROM env_members WHERE env_id IN ({})", envs),
+        format!("DELETE FROM secrets WHERE env_id IN ({})", envs),
+        format!("DELETE FROM envs WHERE app_id IN ({})", apps),
+        format!("DELETE FROM app_members WHERE app_id IN ({})", apps),
+        "DELETE FROM apps WHERE org_id=?".to_string(),
+        format!("DELETE FROM team_env_grants WHERE team_id IN ({})", teams),
+        format!("DELETE FROM team_members WHERE team_id IN ({})", teams),
+        "DELETE FROM teams WHERE org_id=?".to_string(),
+        "DELETE FROM roles WHERE org_id=?".to_string(),
+        format!("DELETE FROM log_deliveries WHERE stream_id IN ({})", streams),
+        "DELETE FROM log_streams WHERE org_id=?".to_string(),
+        format!("DELETE FROM pki_certs WHERE ca_id IN ({})", cas),
+        "DELETE FROM pki_cas WHERE org_id=?".to_string(),
+        "DELETE FROM saml_configs WHERE org_id=?".to_string(),
+        "DELETE FROM saml_pending WHERE org_id=?".to_string(),
+        "DELETE FROM saml_subjects WHERE org_id=?".to_string(),
+        "DELETE FROM oidc_states WHERE org_id=?".to_string(),
+        "DELETE FROM rotation_hooks WHERE org_id=?".to_string(),
+        "DELETE FROM tokens WHERE org_id=?".to_string(),
+        "DELETE FROM invites WHERE org_id=?".to_string(),
+        "DELETE FROM identity_credentials WHERE identity_id IN (SELECT id FROM identities WHERE org_id=?)".to_string(),
+        "DELETE FROM identities WHERE org_id=?".to_string(),
+        "DELETE FROM audit WHERE org_id=?".to_string(),
+        "DELETE FROM live_events WHERE org_id=?".to_string(),
+        "DELETE FROM org_members WHERE org_id=?".to_string(),
+        "DELETE FROM orgs WHERE id=?".to_string(),
+    ];
+    for sql in statements { st.db.exec(&sql, &[json!(&oid)]).map_err(|e| bad(&e))?; }
+    Ok(j(json!({"deleted": true, "workspace": name}))) }
 async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let role = st.require_org(&oid, &uid)?;
     if role == "owner" {
@@ -714,7 +775,7 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
     }
     let token = oc::random_token("owp"); let tid = id();
     let scopes: Vec<&str> = r.scopes.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-    for s in &scopes { if !matches!(*s, "secrets:read" | "secrets:write" | "*") { return Err(bad("scopes may contain secrets:read, secrets:write or *")); } }
+    for s in &scopes { if !matches!(*s, "secrets:read" | "secrets:write" | "org:admin" | "*") { return Err(bad("scopes may contain secrets:read, secrets:write, org:admin or *")); } }
     let scopes = scopes.join(" ");
     let expires_at = if r.expires_in > 0 { now() + r.expires_in.clamp(60, 365 * 86400) } else { 0 };
     st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
@@ -1913,6 +1974,20 @@ async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>)
     meta_set(&st, "signups_open", if open { "1" } else { "0" });
     st.audit("", "", "", &uid, "instance.signups", if open { "open" } else { "invite" });
     Ok(j(json!({"signups_open": open}))) }
+async fn set_instance_owner(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h)?;
+    if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can transfer instance ownership")); }
+    let target = if let Some(id) = body.get("user_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) { id.to_string() } else {
+        let email = body.get("email").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        if email.is_empty() { return Err(bad("user_id or email required")); }
+        st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "id")).ok_or_else(|| err(StatusCode::NOT_FOUND, "account not found"))?
+    };
+    if target == uid { return Err(bad("choose another account")); }
+    let row = st.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(&target)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "account not found"))?;
+    if db::n(&row, "active") == 0 || db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::CONFLICT, "the new instance owner needs an active, verified account")); }
+    meta_set(&st, "instance_owner", &target);
+    st.audit("", "", "", &uid, "instance.owner", &target);
+    Ok(j(json!({"ok": true, "instance_owner": target}))) }
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
@@ -2394,8 +2469,11 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
     if !allowed { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("source IP {} not in organisation allowlist", client_ip)}))).into_response(); }
     next.run(req).await }
 
-// OAuth access tokens carry explicit scopes; REST reads need secrets:read and
-// mutations need secrets:write. Sessions, PATs and machine tokens are unchanged.
+// OAuth access tokens carry explicit scopes and an audience. Secret reads and
+// writes use secrets:read/secrets:write; membership, settings, audit, token
+// minting, PKI and SCIM need org:admin. A token issued for the API is bound to
+// the issuer root, an MCP token to <issuer>/mcp. Sessions, unscoped PATs and
+// machine tokens keep their existing behaviour.
 async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     // SCIM is governed too: an environment-scoped credential must not be able to
@@ -2404,22 +2482,33 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     let token = bearer_token(req.headers());
     if token.is_empty() { return next.run(req).await; }
     let hash = oc::hash_token(&token);
-    if let Ok(Some(row)) = st.db.one("SELECT scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]) {
-        let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
-        let need = if read { "secrets:read" } else { "secrets:write" };
-        let scope = db::s(&row, "scope");
-        if !scope.split_whitespace().any(|s| s == "*" || s == need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("OAuth token lacks scope {}", need)}))).into_response(); }
+    let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
+    let need = if admin_scope_path(req.method(), &path) { "org:admin" } else if read { "secrets:read" } else { "secrets:write" };
+    if let Ok(Some(row)) = st.db.one("SELECT scope,resource FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]) {
+        if db::s(&row, "resource") != issuer(&st, req.headers()) { return (StatusCode::FORBIDDEN, Json(json!({"error": "OAuth token audience does not match this API; sign in again"}))).into_response(); }
+        if !scope_has(&db::s(&row, "scope"), need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("OAuth token lacks scope {}", need)}))).into_response(); }
     } else if let Ok(Some(row)) = st.db.one("SELECT scopes FROM tokens WHERE token_hash=?", &[json!(&hash)]) {
         let scope = db::s(&row, "scopes");
-        if !scope.is_empty() {
-            let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
-            let need = if read { "secrets:read" } else { "secrets:write" };
-            if !scope.split_whitespace().any(|s| s == "*" || s == need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("token lacks scope {}", need)}))).into_response(); }
-        }
+        // An empty scope list is the legacy full-access form; when a list is
+        // present, administration needs org:admin just like an OAuth token.
+        if !scope.is_empty() && !scope_has(&scope, need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("token lacks scope {}", need)}))).into_response(); }
     }
     let scoped = env_scope_of(&st, req.headers());
     if !scoped.is_empty() && !scope_path_ok(&st, &scoped, &path) { return (StatusCode::FORBIDDEN, Json(json!({"error": "this token is scoped to a different environment"}))).into_response(); }
     next.run(req).await }
+fn scope_has(scope: &str, need: &str) -> bool { scope.split_whitespace().any(|s| s == "*" || s == need) }
+fn admin_scope_path(method: &axum::http::Method, path: &str) -> bool {
+    if path.starts_with("/scim/") || path.starts_with("/api/pki/") { return true; }
+    if path == "/api/instance" || path.starts_with("/api/instance/") { return method != axum::http::Method::GET; }
+    if path == "/api/orgs" { return method == axum::http::Method::POST; }
+    if let Some(rest) = path.strip_prefix("/api/orgs/") {
+        let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if tail.is_empty() { return method != axum::http::Method::GET; }
+        let sub = tail.split('/').next().unwrap_or("");
+        return matches!(sub, "members" | "roles" | "teams" | "settings" | "saml" | "log-streams" | "rotation-hook" | "pki" | "identities" | "audit" | "leave" | "transfer");
+    }
+    if path.starts_with("/api/apps/") && path.ends_with("/tokens") { return method == axum::http::Method::POST; }
+    path.starts_with("/api/tokens/") }
 fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
     if path == "/api/me" || path == "/api/auth/logout" { return true; }
     if let Some(rest) = path.strip_prefix("/api/envs/") {
@@ -2619,7 +2708,7 @@ pub fn oauth_access(st: &S, h: &HeaderMap) -> Option<(String, String, String)> {
 async fn prm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
     Json(json!({"resource": format!("{}/mcp", iss), "authorization_servers": [iss], "scopes_supported": ["secrets:read","secrets:write","mcp"], "bearer_methods_supported": ["header"]})) }
 async fn asm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
-    Json(json!({"issuer": iss, "authorization_endpoint": format!("{}/oauth/authorize", iss), "token_endpoint": format!("{}/oauth/token", iss), "registration_endpoint": format!("{}/oauth/register", iss), "revocation_endpoint": format!("{}/oauth/revoke", iss), "response_types_supported": ["code"], "grant_types_supported": ["authorization_code","refresh_token"], "code_challenge_methods_supported": ["S256"], "token_endpoint_auth_methods_supported": ["client_secret_post","none"], "scopes_supported": ["secrets:read","secrets:write","mcp"], "revocation_endpoint_auth_methods_supported": ["client_secret_post","none"]})) }
+    Json(json!({"issuer": iss, "authorization_endpoint": format!("{}/oauth/authorize", iss), "token_endpoint": format!("{}/oauth/token", iss), "registration_endpoint": format!("{}/oauth/register", iss), "revocation_endpoint": format!("{}/oauth/revoke", iss), "response_types_supported": ["code"], "grant_types_supported": ["authorization_code","refresh_token"], "code_challenge_methods_supported": ["S256"], "token_endpoint_auth_methods_supported": ["client_secret_post","none"], "scopes_supported": ["secrets:read","secrets:write","org:admin","mcp"], "revocation_endpoint_auth_methods_supported": ["client_secret_post","none"]})) }
 async fn oauth_register(State(st): State<S>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let redirects = body.get("redirect_uris").cloned().unwrap_or(json!([]));
     if !redirects.as_array().map(|a| !a.is_empty()).unwrap_or(false) { return (StatusCode::BAD_REQUEST, Json(json!({"error":"redirect_uris required"}))); }
@@ -2629,13 +2718,19 @@ async fn oauth_register(State(st): State<S>, Json(body): Json<Value>) -> (Status
     match st.db.exec("INSERT INTO oauth_clients(client_id,client_secret_hash,name,redirect_uris,scopes,created_at) VALUES(?,?,?,?,?,?)", &[json!(client_id), json!(if secret.is_empty(){String::new()}else{oc::hash_token(&secret)}), json!(body.get("client_name").and_then(|v| v.as_str()).unwrap_or("client")), json!(redirects.to_string()), json!(scope), json!(now())]) {
         Ok(_) => { let mut out = json!({"client_id": client_id, "redirect_uris": redirects, "scope": scope, "token_endpoint_auth_method": auth_method}); if !secret.is_empty() { out["client_secret"] = json!(secret); } (StatusCode::CREATED, Json(out)) }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))) } }
-const KNOWN_SCOPES: &[&str] = &["secrets:read", "secrets:write", "mcp"];
-fn authorize_params_ok(st: &S, q: &HashMap<String, String>) -> Result<(String, String, String), String> {
+const KNOWN_SCOPES: &[&str] = &["secrets:read", "secrets:write", "org:admin", "mcp"];
+fn authorize_params_ok(st: &S, q: &HashMap<String, String>, iss: &str) -> Result<(String, String, String), String> {
     let client_id = q.get("client_id").cloned().unwrap_or_default(); let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
     let client = st.db.one("SELECT redirect_uris,scopes FROM oauth_clients WHERE client_id=?", &[json!(client_id)]).ok().flatten().ok_or("unknown client_id")?;
     let uris: Vec<String> = serde_json::from_str(&db::s(&client, "redirect_uris")).unwrap_or_default();
     if !uris.iter().any(|u| u == &redirect) { return Err("redirect_uri does not exactly match a registered URI".into()); }
     if q.get("response_type").map(|s| s.as_str()) != Some("code") { return Err("response_type must be code".into()); }
+    // An empty resource is kept for clients that predate audience binding; the
+    // token is simply refused at /api and /mcp. A named resource must be the API
+    // issuer or its MCP endpoint.
+    if let Some(res) = q.get("resource").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if res != iss && res != format!("{}/mcp", iss) { return Err("resource must be the API issuer or its /mcp endpoint".into()); }
+    }
     if q.get("code_challenge_method").map(|s| s.as_str()) != Some("S256") || q.get("code_challenge").map(|s| s.is_empty()).unwrap_or(true) { return Err("PKCE with S256 is required".into()); }
     let scope = q.get("scope").cloned().unwrap_or_else(|| "secrets:read".into());
     let registered_scopes = db::s(&client, "scopes");
@@ -2647,7 +2742,7 @@ fn authorize_params_ok(st: &S, q: &HashMap<String, String>) -> Result<(String, S
     if scope.split_whitespace().next().is_none() { return Err("at least one scope is required".into()); }
     Ok((client_id, redirect, scope)) }
 async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Response {
-    if let Err(e) = authorize_params_ok(&st, &q) { return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>OAuth error</h1><p>{}</p></body></html>", esc(&e))); }
+    if let Err(e) = authorize_params_ok(&st, &q, &issuer(&st, &h)) { return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>OAuth error</h1><p>{}</p></body></html>", esc(&e))); }
     let hidden = hidden_fields(&q);
     let client = esc(q.get("client_id").map(|s| s.as_str()).unwrap_or(""));
     let scope = esc(q.get("scope").map(|s| s.as_str()).unwrap_or(""));
@@ -2658,7 +2753,7 @@ async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<Hash
     html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><input name=otp placeholder=\"authenticator code (if enabled)\" autocomplete=one-time-code style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>", hidden))
 }
 async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
-    let (client_id, redirect, scope) = match authorize_params_ok(&st, &form) { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
+    let (client_id, redirect, scope) = match authorize_params_ok(&st, &form, &issuer(&st, &h)) { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
     let uid = if let Some(u) = oauth_user(&st, &h) { u } else {
         let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr.ip(), email.to_lowercase());
@@ -2681,7 +2776,9 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
     st.rate_clear(&otp_key);
     let state = form.get("state").cloned().unwrap_or_default();
     if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::to(&format!("{}?error=access_denied&state={}", redirect, urlencode(&state))).into_response(); }
-    let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));
+    // An omitted resource means the API audience. MCP clients send their own
+    // <issuer>/mcp resource, which mcp_auth enforces.
+    let code = oc::random_token("code"); let resource = form.get("resource").cloned().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| issuer(&st, &h));
     if st.db.exec("INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,code_challenge,scope,resource,expires_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(oc::hash_token(&code)), json!(client_id), json!(uid), json!(redirect), json!(form.get("code_challenge").cloned().unwrap_or_default()), json!(scope), json!(resource), json!(now()+300)]).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, "could not create code").into_response(); }
     axum::response::Redirect::to(&format!("{}?code={}&state={}", redirect, code, urlencode(&state))).into_response() }
 fn issue_oauth_tokens(st: &S, client_id: &str, uid: &str, scope: &str, resource: &str, pair: &str) -> Value {
@@ -2997,10 +3094,10 @@ async fn main() {
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
-        .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
+        .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org).delete(delete_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/v1/machine/auth/universal/login", post(universal_login))

@@ -398,6 +398,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
   let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
+  let orgs=await api('GET','/api/orgs').catch(()=>[]);let myOrg=orgs.find(o=>o.id===ORG)||{};
   let samlCard=`<div class="card"><h3>SAML SSO</h3><p>Service provider metadata: <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
     <div class="field"><label for="set-saml-entity">IdP entity ID</label><input id="set-saml-entity" value="${esc(saml?.idp_entity_id||'')}" placeholder="https://idp.example/metadata"></div>
     <div class="field"><label for="set-saml-url">IdP metadata URL</label><input id="set-saml-url" placeholder="https://idp.example/metadata.xml" style="width:100%"></div>
@@ -409,7 +410,9 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
-    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
+    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button>
+    <div class="row" style="margin-top:12px"><input id="set-instance-owner" type="email" placeholder="new instance owner email" style="min-width:260px"><button onclick="transferInstance()">Transfer instance</button></div>
+    <p class="small mut" style="margin-top:6px">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
   $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
@@ -424,7 +427,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>
-  <div class="card"><h3>Account</h3><p>Signed in as <span class="mono">${esc(ME?.email||'')}</span>. Deleting your account revokes every key and signs you out everywhere. Transfer each workspace you own first.</p><button class="danger" onclick="deleteAccount()">Delete account</button></div>`}
+  ${myOrg.role==='owner'?`<div class="card"><h3>Delete workspace</h3><p>Type <span class="mono">${esc(myOrg.name||'')}</span> to confirm. Every app, environment, secret, token and identity in this workspace is removed.</p><div class="row"><input id="del-org-name" placeholder="workspace name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')">Delete workspace</button></div></div>`:''}
+  <div class="card"><h3>Account</h3><p>Signed in as <span class="mono">${esc(ME?.email||'')}</span>. Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</p><button class="danger" onclick="deleteAccount()">Delete account</button></div>`}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
@@ -439,12 +443,22 @@ async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await 
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
+async function transferInstance(){try{await api('PUT','/api/instance/owner',{email:$('set-instance-owner').value});toast('Instance ownership transferred');renderSettings()}catch(e){toast(e.message,true)}}
+async function deleteWorkspace(name){
+  if($('del-org-name').value.trim()!==name){toast('Type the workspace name exactly to confirm',true);return}
+  if(!confirm(`Delete ${name} and everything in it? This cannot be undone.`))return;
+  let r=await apiRaw('DELETE',`/api/orgs/${ORG}?confirm=true`);
+  if(r.ok){toast('Workspace deleted');location.reload();return}
+  toast(r.body.error||'Could not delete workspace',true)}
 async function deleteAccount(){
   if(!confirm('Delete your account? This revokes every key, ends all sessions and cannot be undone.'))return;
   let r=await apiRaw('DELETE','/api/me');
   if(r.ok){T='';location.reload();return}
   if(r.body.workspaces&&r.body.workspaces.length){
-    modal(`<h3>Transfer ownership first</h3><p>You own these workspaces. Another member must become the owner before this account can be deleted.</p><ul>${r.body.workspaces.map(w=>`<li class="mono">${esc(w.name)}</li>`).join('')}</ul><div class="row" style="margin-top:12px"><button class="primary" onclick="closeModal();nav('access')">Open Members &amp; access</button><button class="ghost" onclick="closeModal()">Close</button></div>`);
+    modal(`<h3>Transfer ownership first</h3><p>You own these workspaces. Another member must become the owner before this account can be deleted, or you can delete the workspace from Settings.</p><ul>${r.body.workspaces.map(w=>`<li class="mono">${esc(w.name)}</li>`).join('')}</ul><div class="row" style="margin-top:12px"><button class="primary" onclick="closeModal();nav('access')">Open Members &amp; access</button><button class="ghost" onclick="closeModal()">Close</button></div>`);
+    return}
+  if((r.body.error||'').includes('instance ownership')){
+    modal(`<h3>Transfer instance ownership first</h3><p>${esc(r.body.error)}</p><p class="small mut">Use Transfer instance above, or delete your last workspace if this instance is being closed.</p><div class="row" style="margin-top:12px"><button class="primary" onclick="closeModal()">Close</button></div>`);
     return}
   if(r.body.confirmation_required){
     let what=[r.body.api_keys?r.body.api_keys+' API key'+(r.body.api_keys===1?'':'s'):'',r.body.oauth_sessions?r.body.oauth_sessions+' CLI/OAuth session'+(r.body.oauth_sessions===1?'':'s'):''].filter(Boolean).join(' and ');

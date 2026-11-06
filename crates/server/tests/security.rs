@@ -399,7 +399,7 @@ async fn oauth_read_scope_cannot_write_over_rest() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     let (_, envs) = app_with_envs(&s, token, org).await;
-    let (oat, _) = oauth_token(&s, token, "secrets:read", &format!("{}/mcp", s.base)).await;
+    let (oat, _) = oauth_token(&s, token, "secrets:read", &s.base).await;
 
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&oat), None).await;
     assert_eq!(r.status, 200, "read scope should allow reads: {}", r.text);
@@ -412,6 +412,59 @@ async fn oauth_read_scope_cannot_write_over_rest() {
         )
         .await;
     assert_eq!(r.status, 403, "read-only OAuth token must not write, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn oauth_admin_scope_is_required_for_membership_and_audit() {
+    let s = Server::start().await;
+    let u = register(&s, "admin-scope@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+
+    let (secret_token, _) = oauth_token(&s, token, "secrets:read secrets:write", &s.base).await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&secret_token), Some(json!({"email": "invitee@test.invalid", "role": "developer"}))).await;
+    assert_eq!(r.status, 403, "a secrets:write token must not invite members, got {} {}", r.status, r.text);
+    assert!(r.text.contains("org:admin"), "the refusal must name the scope: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(&secret_token), None).await;
+    assert_eq!(r.status, 403, "a secrets token must not list members, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/audit", org), Some(&secret_token), None).await;
+    assert_eq!(r.status, 403, "a secrets token must not read the audit log, got {} {}", r.status, r.text);
+
+    let (admin_token, _) = oauth_token(&s, token, "org:admin", &s.base).await;
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(&admin_token), None).await;
+    assert_eq!(r.status, 200, "an org:admin token must list members: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&admin_token), Some(json!({"email": "invitee@test.invalid", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "an org:admin token must invite members: {}", r.text);
+}
+
+#[tokio::test]
+async fn oauth_token_audience_is_bound_to_the_api_or_mcp() {
+    let s = Server::start().await;
+    let u = register(&s, "audience-scope@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+
+    let (mcp_token, _) = oauth_token(&s, token, "secrets:read", &format!("{}/mcp", s.base)).await;
+    let r = s.call(Method::GET, "/api/me", Some(&mcp_token), None).await;
+    assert_eq!(r.status, 403, "an MCP-audience token must not call the API, got {} {}", r.status, r.text);
+    assert!(r.text.contains("audience"), "the refusal must name the audience: {}", r.text);
+
+    let (api_token, _) = oauth_token(&s, token, "secrets:read", &s.base).await;
+    let r = s.call(Method::GET, "/api/me", Some(&api_token), None).await;
+    assert_eq!(r.status, 200, "an API-audience token must call the API: {}", r.text);
+
+    // The consent endpoint only accepts the issuer or its MCP endpoint.
+    let client = s.call(Method::POST, "/oauth/register", None, Some(json!({"redirect_uris": ["http://127.0.0.1:8917/callback"], "token_endpoint_auth_method": "none", "scope": "secrets:read"}))).await;
+    let cid = client.body["client_id"].as_str().unwrap().to_string();
+    let form = vec![
+        ("response_type", "code".to_string()), ("client_id", cid),
+        ("redirect_uri", "http://127.0.0.1:8917/callback".to_string()),
+        ("scope", "secrets:read".to_string()), ("state", "s".to_string()),
+        ("code_challenge", "challenge".to_string()), ("code_challenge_method", "S256".to_string()),
+        ("resource", "https://evil.example".to_string()), ("approve", "1".to_string()),
+    ];
+    let r = s.form("/oauth/authorize/decision", &form, Some(token)).await;
+    assert_eq!(r.status, 400, "a foreign resource must be refused, got {} {}", r.status, r.text);
+    assert!(r.text.contains("resource must be"), "{}", r.text);
 }
 
 #[tokio::test]
