@@ -1,4 +1,4 @@
-mod db; mod inference_leases; mod integrations; mod kms; mod mailer; mod ssh_keys; mod ui;
+mod db; mod inference_leases; mod integrations; mod kms; mod mailer; mod mfa; mod ssh_keys; mod ui;
 #[cfg(feature = "ldap")] mod ldap;
 use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
@@ -95,25 +95,6 @@ fn valid_email(e: &str) -> bool {
     let e = e.trim();
     let Some((local, domain)) = e.split_once('@') else { return false };
     !local.is_empty() && !domain.is_empty() && e.len() <= 254 && !e.contains(char::is_whitespace) && domain.contains('.') }
-async fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
-    if meta_get(st, &format!("totp_enabled:{}", uid)).await != "1" { return true; }
-    if code.is_empty() { return false; }
-    if let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) {
-        let counter = (now() / 30) as u64;
-        for c in [counter.wrapping_sub(1), counter, counter + 1] {
-            if totp_code(&secret, c) == code {
-                let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
-                if c <= last { return false; }
-                meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
-                return true;
-            }
-        }
-    }
-    let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await; let hash = oc::hash_token(code);
-    let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; return true; }
-    false }
-
 #[derive(Deserialize, Default)] struct AuthReq { email: String, password: String }
 #[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64, #[serde(default)] scopes: String }
 #[derive(Deserialize, Default, Clone)] struct SecretIn { key: String, value: String, #[serde(default = "def_path")] path: String, #[serde(default)] comment: String, #[serde(default)] tags: String, #[serde(default, rename = "type")] secret_type: String }
@@ -380,6 +361,7 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,0)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    mfa::note_password_login(&st, &uid).await;
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
@@ -395,7 +377,11 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
     if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key).await;
     let uid = db::s(&row, "id");
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+    mfa::note_password_login(&st, &uid).await;
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await})))); }
     let token = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")}))))
@@ -1846,11 +1832,11 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
         }
     }
     st.audit(&org, "", "", &uid, "auth.ldap_credentials", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn))).await;
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" {
+    if mfa::required(&st, &uid).await {
         st.audit(&org, "", "", &uid, "auth.ldap_mfa_challenge", &audit_safe(&user.email)).await;
-        let challenge = oc::random_token("mfa");
-        st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(&challenge), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?;
-        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await})))); }
     let token = make_session(&st, &uid).await?;
     st.audit(&org, "", "", &uid, "auth.ldap_login", &format!("{} dn={}", audit_safe(&user.email), audit_safe(&user.dn))).await;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
@@ -1872,6 +1858,20 @@ async fn send_template(to: &str, kind: &str, vars: &[(&str, &str)]) {
         if !production() { eprintln!("{}", msg.text); }
         return; }
     if let Err(e) = mailer::send(&cfg, &msg).await { eprintln!("email delivery failed: {}", e); } }
+// Security codes need the delivery outcome, so they use the fallible variant.
+// Outside production a suppressed message still counts as delivered: the code
+// is written to the operator log, which is how the local walkthrough works.
+async fn send_email_result(to: &str, subject: &str, text: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let cfg = mailer::MailConfig::from_env();
+    if !cfg.enabled() {
+        if production() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "email delivery is not configured on this instance")); }
+        eprintln!("email suppressed (no provider configured): {} -> {}\n{}", subject, to, text);
+        return Ok(());
+    }
+    let msg = mailer::MailMessage { to: to.to_string(), subject: subject.to_string(), text: text.to_string(),
+        html: format!("<p>{}</p>", esc(text).replace('\n', "<br>")) };
+    mailer::send(&cfg, &msg).await.map_err(|_| err(StatusCode::BAD_GATEWAY, "the email relay rejected the message"))
+}
 async fn test_email(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "instance owner required")); }
@@ -3013,39 +3013,33 @@ fn totp_code(secret: &[u8], counter: u64) -> String { use sha1::Sha1; use hmac::
     let off = (hash[19] & 0x0f) as usize; let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off+1] as u32) << 16) | ((hash[off+2] as u32) << 8) | hash[off+3] as u32; format!("{:06}", code % 1_000_000) }
 async fn meta_set(st: &S, k: &str, v: &str) { if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k), json!(v)]).await.is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(k)]).await; } }
 async fn totp_setup(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    // Re-enrolling is equivalent to removing the second factor, so it needs the
-    // password once MFA is already active.
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" {
-        let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-        let row = st.db.one("SELECT pass_hash FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
-        if password.is_empty() || !oc::verify_password(password, &db::s(&row, "pass_hash")) { return Err(err(StatusCode::UNAUTHORIZED, "current password required to change two-factor settings")); } }
+    // Adding a factor to an account that already has one needs the password.
+    mfa::reauth_add(&st, &uid, &body).await?;
     let provided = body.get("secret").and_then(|v| v.as_str()).unwrap_or("");
     let secret_bytes: Vec<u8> = if provided.is_empty() { oc::random_key()[..20].to_vec() } else { let d = b32decode(provided); if d.len() < 10 { return Err(bad("provided TOTP secret must be base32, at least 10 bytes")); } d };
     let secret_b32 = b32encode(&secret_bytes);
-    meta_set(&st, &format!("totp_secret:{}", uid), &oc::encrypt_symmetric(&st.master(), &secret_bytes)).await;
-    meta_set(&st, &format!("totp_enabled:{}", uid), "0").await;
-    let codes: Vec<String> = (0..8).map(|_| oc::random_token("rc")).collect();
-    let hashed: Vec<String> = codes.iter().map(|c| oc::hash_token(c)).collect();
-    meta_set(&st, &format!("totp_recovery:{}", uid), &hashed.join(",")).await;
-    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).await.map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default(); let _ = &secret_bytes;
+    // Keep the new secret pending until a code proves it. A re-enrolment must
+    // not disable the factor that is already protecting the account.
+    meta_set(&st, &format!("totp_pending:{}", uid), &oc::encrypt_symmetric(&st.master(), &secret_bytes)).await;
+    let codes = if mfa::recovery_count(&st, &uid).await == 0 { mfa::issue_recovery_codes(&st, &uid).await } else { Vec::new() };
+    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).await.map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default();
     Ok(j(json!({"secret": secret_b32, "otpauth_url": format!("otpauth://totp/OpenWarp:{}?secret={}&issuer=OpenWarp", email, secret_b32), "recovery_codes": codes, "note": "call POST /api/me/totp/verify {code} with a current TOTP code to enable"}))) }
 async fn totp_verify(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    let enc = meta_get(&st, &format!("totp_secret:{}", uid)).await; let secret = oc::decrypt_symmetric(&st.master(), &enc).map_err(|_| bad("TOTP not set up"))?;
-    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or(""); let counter = (now() / 30) as u64;
-    if ![counter.wrapping_sub(1), counter, counter + 1].iter().any(|c| totp_code(&secret, *c) == code) { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
-    meta_set(&st, &format!("totp_enabled:{}", uid), "1").await; Ok(j(json!({"enabled": true}))) }
+    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    if !mfa::confirm_totp(&st, &uid, code).await { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
+    st.audit("", "", "", &uid, "auth.totp_enabled", "").await;
+    Ok(j(json!({"enabled": true}))) }
 async fn mfa_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let token = body.get("mfa_token").and_then(|v| v.as_str()).unwrap_or(""); let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let row = st.db.one("SELECT user_id,created_at FROM mfa_challenges WHERE token=?", &[json!(token)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid MFA challenge"))?;
-    if db::n(&row,"created_at") + 300 < now() { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired")); }
-    let uid = db::s(&row,"user_id");
+    let uid = mfa::challenge_user(&st, token).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or expired MFA challenge"))?;
     // The password was already accepted upstream, so this step guards the second
     // factor itself: cap guesses per address and account.
     let key = format!("mfa:{}:{}", addr.ip(), uid);
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
-    if !otp_ok(&st, &uid, code).await { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
+    if !mfa::second_factor_ok(&st, &uid, code).await { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
     st.rate_clear(&key).await;
-    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(token)]).await;
+    mfa::consume_challenge(&st, token).await;
+    st.audit("", "", "", &uid, "auth.mfa", "").await;
     let session = make_session(&st, &uid).await?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
 
@@ -3244,7 +3238,7 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
     if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).await.ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
     let otp_key = format!("otp:{}:{}", addr.ip(), uid);
     if !st.rate_ok(&otp_key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
-    if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")).await {
+    if !mfa::second_factor_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")).await {
         st.rate_fail(&otp_key, 900).await;
         let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
         return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
@@ -3608,7 +3602,7 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable)).route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate)).route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable)).route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete)).route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send)).route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));

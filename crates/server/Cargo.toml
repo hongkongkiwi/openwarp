@@ -32,6 +32,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 time = "0.3"
 ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
 native-tls = { version = "0.2", optional = true }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [features]
 default = ["redis-cache", "ldap"]
@@ -44,3 +45,5 @@ ldap = ["dep:ldap3", "dep:native-tls"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Resolves to the vendored parse-depth-capped fork through [patch.crates-io].
 lber = "0.4"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"

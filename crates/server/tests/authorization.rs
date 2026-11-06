@@ -98,7 +98,10 @@ impl Server {
         let client = Client::builder()
             .no_proxy()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(10))
+            // Argon2 registrations and OCSP signing can take longer than 10s
+            // when two test servers share the machine; a generous client timeout
+            // keeps a slow response from being reported as a connection error.
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("http client");
         let server = Server { child, base, dir, client, inbox, keep: false };
