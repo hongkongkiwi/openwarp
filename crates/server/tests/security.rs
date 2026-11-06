@@ -314,7 +314,7 @@ async fn oauth_consent_requires_mfa_when_enabled() {
 
     form.push(("otp", totp(&secret)));
     let r = s.form("/oauth/authorize/decision", &form, None).await;
-    assert_eq!(r.status, 307, "valid TOTP should issue a code, got {} {}", r.status, r.text);
+    assert_eq!(r.status, 303, "valid TOTP should redirect with 303 so the POST body is not replayed, got {} {}", r.status, r.text);
     assert!(r.header("location").contains("code="), "expected an authorization code, got {}", r.header("location"));
 }
 
