@@ -245,6 +245,10 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (10, &[
         "CREATE TABLE IF NOT EXISTS link_challenges(token_hash TEXT PRIMARY KEY,provider TEXT NOT NULL,subject TEXT NOT NULL,issuer TEXT DEFAULT '',verified_issuer TEXT DEFAULT '',user_id TEXT NOT NULL,org_id TEXT DEFAULT '',email TEXT DEFAULT '',groups TEXT DEFAULT '[]',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
     ]),
+    (11, &[
+        "CREATE TABLE IF NOT EXISTS step_up_challenges(challenge_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,need_totp BIGINT DEFAULT 0,need_email BIGINT DEFAULT 0,email_code_hash TEXT DEFAULT '',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS step_up_grants(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[

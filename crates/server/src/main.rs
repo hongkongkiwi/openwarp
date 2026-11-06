@@ -2112,6 +2112,122 @@ async fn link_verify(State(st): State<S>, axum::extract::ConnectInfo(addr): axum
     let token = match make_session(&st, &uid) { Ok(t) => t, Err((status, body)) => return link_html(status, "Link failed", body.0.get("error").and_then(|v| v.as_str()).unwrap_or("could not create a session")) };
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     (hdr, axum::response::Redirect::temporary(&format!("/#token={}", token))).into_response() }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum StepUpRisk { Ok, TwoFactor, VeryRisky }
+impl StepUpRisk {
+    fn as_str(self) -> &'static str { match self { StepUpRisk::Ok => "ok", StepUpRisk::TwoFactor => "two_factor", StepUpRisk::VeryRisky => "very_risky" } }
+    fn parse(s: &str) -> Self { match s { "very_risky" => StepUpRisk::VeryRisky, "two_factor" => StepUpRisk::TwoFactor, _ => StepUpRisk::Ok } }
+    fn rank(self) -> u8 { match self { StepUpRisk::Ok => 0, StepUpRisk::TwoFactor => 1, StepUpRisk::VeryRisky => 2 } } }
+// Step-up policy. The default is no extra factor. Very risky actions can change
+// authentication, ownership, bulk-export plaintext or create a root CA, so they
+// always need an emailed code, plus TOTP when configured. The lower tier needs
+// TOTP only for users who configured it. Service tokens, machine identities and
+// OAuth access tokens are not browser sessions and are not challenged here.
+fn action_risk(method: &str, path: &str) -> StepUpRisk {
+    use StepUpRisk::*;
+    if method == "GET" && path.starts_with("/api/envs/") && path.ends_with("/export") { return VeryRisky; }
+    if method == "PUT" && path.starts_with("/api/orgs/") && (path.ends_with("/settings") || path.ends_with("/saml")) { return VeryRisky; }
+    if method == "POST" && path.starts_with("/api/orgs/") && (path.ends_with("/transfer") || path.ends_with("/pki/cas")) { return VeryRisky; }
+    if method == "POST" && path == "/api/instance/rotate-master" { return VeryRisky; }
+    if method == "DELETE" && ["/api/apps/", "/api/envs/", "/api/secrets/", "/api/tokens/", "/api/leases/", "/api/rotations/", "/api/integrations/", "/api/orgs/"].iter().any(|p| path.starts_with(p)) { return TwoFactor; }
+    if method == "PUT" && path.starts_with("/api/envs/") && (path.ends_with("/secrets") || path.ends_with("/e2e/secrets") || path.ends_with("/policy")) { return TwoFactor; }
+    if method == "POST" && path.starts_with("/api/envs/") && (path.ends_with("/secrets") || path.ends_with("/import") || path.ends_with("/clone") || path.ends_with("/e2e/grant") || path.ends_with("/dynamic") || path.ends_with("/rotations") || path.ends_with("/rotate") || path.ends_with("/restore-point") || path.ends_with("/integrations") || path.ends_with("/team-grants")) { return TwoFactor; }
+    if method == "POST" && path.starts_with("/api/leases/") && path.ends_with("/renew") { return TwoFactor; }
+    if method == "POST" && path.starts_with("/api/orgs/") && (path.ends_with("/members") || path.ends_with("/roles") || path.ends_with("/identities") || path.ends_with("/leave") || path.ends_with("/log-streams") || path.ends_with("/rotate")) { return TwoFactor; }
+    if method == "PATCH" && path.starts_with("/api/orgs/") && path.contains("/members/") { return TwoFactor; }
+    if method == "PUT" && path.starts_with("/api/orgs/") && path.ends_with("/rotation-hook") { return TwoFactor; }
+    if method == "POST" && path.starts_with("/api/apps/") && path.ends_with("/tokens") { return TwoFactor; }
+    if method == "POST" && (path.starts_with("/api/proposals/") || path.starts_with("/api/access-requests/") || path.starts_with("/api/secrets/")) { return TwoFactor; }
+    if method == "POST" && (path.starts_with("/api/pki/cas/") || path.starts_with("/api/pki/certs/")) { return TwoFactor; }
+    if method == "POST" && path == "/api/lockbox" { return TwoFactor; }
+    if method == "POST" && path == "/api/me/identities/unlink" { return TwoFactor; }
+    if method == "PUT" && path == "/api/instance/signups" { return TwoFactor; }
+    if method == "POST" && path.starts_with("/api/integrations/") { return TwoFactor; }
+    if method == "PATCH" && path.starts_with("/api/integrations/") { return TwoFactor; }
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && path.starts_with("/scim/v2/") { return TwoFactor; }
+    Ok }
+fn step_up_user(st: &S, h: &HeaderMap) -> Option<String> {
+    let bearer = bearer_token(h); let token = if bearer.is_empty() { cookie_val(h, "ow_session") } else { bearer };
+    if token.is_empty() { return None; }
+    let row = st.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(oc::hash_token(&token))]).ok().flatten()?;
+    let uid = db::s(&row, "user_id");
+    if !st.principal_active(&uid) { return None; }
+    Some(uid) }
+fn consume_step_up_grant(st: &S, uid: &str, risk: StepUpRisk, raw: &str) -> bool {
+    let hash = oc::hash_token(raw.trim());
+    let Ok(Some(row)) = st.db.one("SELECT risk FROM step_up_grants WHERE token_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(uid), json!(now())]) else { return false; };
+    if StepUpRisk::parse(&db::s(&row, "risk")).rank() < risk.rank() { return false; }
+    st.db.exec("UPDATE step_up_grants SET used=1 WHERE token_hash=? AND used=0", &[json!(&hash)]).unwrap_or(0) > 0 }
+async fn step_up_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    let risk = action_risk(req.method().as_str(), req.uri().path());
+    if risk == StepUpRisk::Ok { return next.run(req).await; }
+    let Some(uid) = step_up_user(&st, req.headers()) else { return next.run(req).await; };
+    let has_totp = meta_get(&st, &format!("totp_enabled:{}", uid)) == "1";
+    let email_available = mailer::MailConfig::from_env().enabled();
+    let need_email = risk == StepUpRisk::VeryRisky;
+    if risk == StepUpRisk::TwoFactor && !has_totp { return next.run(req).await; }
+    if need_email && !email_available {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "this action needs an emailed verification code, but no email provider is configured"}))).into_response(); }
+    if let Some(raw) = req.headers().get("x-openwarp-step-up").and_then(|v| v.to_str().ok()) {
+        if consume_step_up_grant(&st, &uid, risk, raw) { return next.run(req).await; } }
+    (StatusCode::PRECONDITION_REQUIRED, Json(json!({
+        "error": "step-up verification required",
+        "step_up_required": true,
+        "risk": risk.as_str(),
+        "totp_required": has_totp,
+        "email_required": need_email,
+        "email_available": email_available,
+    }))).into_response() }
+fn six_digit_code() -> String { use rand_core::RngCore; let mut b = [0u8; 4]; rand_core::OsRng.fill_bytes(&mut b); format!("{:06}", u32::from_le_bytes(b) % 1_000_000) }
+#[derive(Deserialize)] struct StepUpStartReq { #[serde(default)] risk: String }
+async fn step_up_start(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpStartReq>) -> Res {
+    let uid = st.token_user(&h)?;
+    let risk = StepUpRisk::parse(&r.risk);
+    if risk == StepUpRisk::Ok { return Err(bad("risk must be two_factor or very_risky")); }
+    let key = format!("stepup-start:{}", uid);
+    if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification requests; try again later")); }
+    st.rate_fail(&key, 900);
+    let has_totp = meta_get(&st, &format!("totp_enabled:{}", uid)) == "1";
+    if risk == StepUpRisk::TwoFactor && !has_totp { return Ok(j(json!({"not_required": true, "methods": []}))); }
+    let need_email = risk == StepUpRisk::VeryRisky;
+    if need_email && !mailer::MailConfig::from_env().enabled() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "this action needs an emailed verification code, but no email provider is configured")); }
+    let challenge = oc::random_token("stepup");
+    let mut code_hash = String::new();
+    if need_email {
+        let user = st.db.one("SELECT email FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+        let email = db::s(&user, "email");
+        let code = six_digit_code();
+        code_hash = oc::hash_token(&code);
+        send_template(&email, "stepup", &[("code", &code), ("email", &email)]).await; }
+    let need_totp = has_totp;
+    st.db.exec("INSERT INTO step_up_challenges(challenge_hash,user_id,risk,need_totp,need_email,email_code_hash,attempts,created_at,expires_at,used) VALUES(?,?,?,?,?,?,0,?,?,0)",
+        &[json!(oc::hash_token(&challenge)), json!(&uid), json!(risk.as_str()), json!(if need_totp {1} else {0}), json!(if need_email {1} else {0}), json!(&code_hash), json!(now()), json!(now() + 600)]).map_err(|e| bad(&e))?;
+    let methods = if need_totp && need_email { vec!["totp", "email"] } else if need_totp { vec!["totp"] } else { vec!["email"] };
+    Ok(j(json!({"challenge": challenge, "risk": risk.as_str(), "methods": methods, "email_sent": need_email}))) }
+#[derive(Deserialize)] struct StepUpVerifyReq { challenge: String, #[serde(default)] totp: String, #[serde(default)] email_code: String }
+async fn step_up_verify(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpVerifyReq>) -> Res {
+    let uid = st.token_user(&h)?;
+    let key = format!("stepup-verify:{}", uid);
+    if !st.rate_ok(&key, 10, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification attempts; try again later")); }
+    let hash = oc::hash_token(r.challenge.trim());
+    let row = st.db.one("SELECT * FROM step_up_challenges WHERE challenge_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(&uid), json!(now())]).map_err(|e| bad(&e))?.ok_or_else(|| bad("verification request is invalid or expired"))?;
+    let risk = StepUpRisk::parse(&db::s(&row, "risk"));
+    let need_totp = db::n(&row, "need_totp") == 1; let need_email = db::n(&row, "need_email") == 1;
+    let mut ok = true;
+    if need_email {
+        let expected = db::s(&row, "email_code_hash");
+        if expected.is_empty() || oc::hash_token(r.email_code.trim()) != expected { ok = false; } }
+    if ok && need_totp && !otp_ok(&st, &uid, &r.totp) { ok = false; }
+    if !ok {
+        st.rate_fail(&key, 900);
+        let attempts = db::n(&row, "attempts") + 1;
+        let _ = st.db.exec("UPDATE step_up_challenges SET attempts=?,used=CASE WHEN ?>=5 THEN 1 ELSE used END WHERE challenge_hash=?", &[json!(attempts), json!(attempts), json!(&hash)]);
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid verification code")); }
+    let _ = st.db.exec("UPDATE step_up_challenges SET used=1 WHERE challenge_hash=?", &[json!(&hash)]);
+    let grant = oc::random_token("stepupg");
+    st.db.exec("INSERT INTO step_up_grants(token_hash,user_id,risk,created_at,expires_at,used) VALUES(?,?,?,?,?,0)", &[json!(oc::hash_token(&grant)), json!(&uid), json!(risk.as_str()), json!(now()), json!(now() + 300)]).map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "auth.step_up", risk.as_str());
+    Ok(j(json!({"token": grant, "risk": risk.as_str(), "expires_in": 300}))) }
 fn logout_claims(token: &str) -> Result<Value, String> {
     let payload = token.split('.').nth(1).ok_or("logout_token is not a JWT")?;
     b64url_json(payload).ok_or_else(|| "logout_token payload is not JSON".into()) }
@@ -2626,7 +2742,7 @@ fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
 async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let protected = path.starts_with("/api/") || path == "/mcp" || path.starts_with("/scim/");
-    if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
+    if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/auth/step-up/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
     let headers = req.headers().clone(); let uid = match st.token_user(&headers) { Ok(u) => u, Err(_) => return next.run(req).await };
     let trust_proxy = std::env::var("OPENWARP_TRUST_PROXY").map(|v| v == "1").unwrap_or(false);
     let conn_ip = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string());
@@ -3245,7 +3361,7 @@ async fn main() {
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
-        .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification)).route("/api/auth/link/complete", post(link_complete)).route("/api/auth/link/email", post(link_email)).route("/api/auth/link/verify", get(link_verify))
+        .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification)).route("/api/auth/link/complete", post(link_complete)).route("/api/auth/link/email", post(link_email)).route("/api/auth/link/verify", get(link_verify)).route("/api/auth/step-up/start", post(step_up_start)).route("/api/auth/step-up/verify", post(step_up_verify))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback)).route("/api/auth/social/{provider}/backchannel-logout", post(social_backchannel_logout))
         .route("/api/me/identities", get(my_identities)).route("/api/me/identities/unlink", post(unlink_identity))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
@@ -3268,6 +3384,7 @@ async fn main() {
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/{oid}/backchannel-logout", post(org_backchannel_logout)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), step_up_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(metrics_middleware))

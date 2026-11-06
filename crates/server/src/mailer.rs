@@ -178,6 +178,8 @@ fn builtin(kind: &str) -> (&'static str, &'static str) {
             "{{inviter}} invited you to join {{org}} on OpenWarp.\n\nSet your password here:\n{{link}}\n\nThis link expires in seven days."),
         "link" => ("Confirm a sign-in link for OpenWarp",
             "A sign-in attempt wants to link a provider identity to your OpenWarp account.\n\nConfirm it by opening this link:\n{{link}}\n\nIt expires in 10 minutes. If you did not start this, ignore this message."),
+        "stepup" => ("Your OpenWarp verification code",
+            "Use this code to confirm a sensitive action: {{code}}\n\nIt expires in 10 minutes. If you did not start this, change your password and review active sessions."),
         "test" => ("OpenWarp test email",
             "This is a test message from OpenWarp. If you can read it, outbound email is configured."),
         _ => ("OpenWarp notification",

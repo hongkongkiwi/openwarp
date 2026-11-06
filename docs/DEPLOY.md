@@ -105,6 +105,32 @@ bound. A wrong password or code links nothing, challenges are single use, and
 they expire after 10 minutes. The endpoints are `POST /api/auth/link/complete`,
 `POST /api/auth/link/email` and `GET /api/auth/link/verify`.
 
+## Step-up verification
+
+Sensitive API actions are classified in three tiers. The check applies to
+browser sessions, whether the session arrives as the `ow_session` cookie or as
+a bearer session token. Service tokens, machine identities and OAuth access
+tokens are not interactive human sessions and are not challenged; their scopes
+remain the control.
+
+| Tier | Requirement | Examples |
+| --- | --- | --- |
+| Standard | None | Reads, app and environment creation, proposals and access requests, MFA enrollment, sign-in |
+| Major | TOTP when the account has it configured | Secret writes and deletion, environment policy, clone, team grants, leases, rotations, integrations, invites and role changes, machine identities, service tokens, approval decisions, PKI issue and revoke, lockbox, identity unlink |
+| Very risky | Emailed code always, plus TOTP when configured | Workspace settings including SSO and IP allowlist, SAML config, ownership transfer, bulk secret export, root CA creation, master key rotation |
+
+Without TOTP configured, a major action proceeds without an extra factor. A
+very risky action always needs the emailed code. If no email provider is
+configured, very risky actions are refused rather than downgraded.
+
+The browser flow is automatic. A challenged request returns `428` with
+`step_up_required`, `risk`, `totp_required` and `email_required`. The console
+opens a confirmation dialog, calls `POST /api/auth/step-up/start` with the
+risk, and sends the emailed code through `POST /api/auth/step-up/verify`. The
+verified grant is valid for one action and five minutes and is sent on the
+retry as `X-OpenWarp-Step-Up`. Challenges expire after ten minutes and allow
+five code attempts. Other clients can follow the same contract.
+
 ## Back-channel logout
 
 Register these endpoints with the IdP:

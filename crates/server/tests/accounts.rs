@@ -122,6 +122,14 @@ impl Server {
     fn url(&self, path: &str) -> String { format!("{}{}", self.base, path) }
 
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let r = self.call_raw(method.clone(), path, token, body.clone()).await;
+        if r.status == 428 {
+            if let Some(t) = token {
+                if let Some(grant) = self.step_up(t, &r.body).await {
+                    return self.call_with_headers(method, path, token, body, &[("x-openwarp-step-up", &grant)]).await;
+                } } }
+        r }
+    async fn call_raw(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, self.url(path));
         if let Some(t) = token { req = req.bearer_auth(t); }
         if let Some(b) = body { req = req.json(&b); }
@@ -132,6 +140,29 @@ impl Server {
         let body = serde_json::from_str(&text).unwrap_or(Value::Null);
         Resp { status, text, body, headers }
     }
+    async fn call_with_headers(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>, headers: &[(&str, &str)]) -> Resp {
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = &body { req = req.json(b); }
+        for (k, v) in headers { req = req.header(*k, *v); }
+        let response = req.send().await.expect("http request");
+        let status = response.status().as_u16();
+        let h = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Resp { status, text, body, headers: h }
+    }
+    async fn step_up(&self, token: &str, info: &Value) -> Option<String> {
+        let risk = info["risk"].as_str().unwrap_or("very_risky");
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call_raw(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": risk}))).await;
+        if start.status != 200 { return None; }
+        let challenge = start.body["challenge"].as_str()?.to_string();
+        if !start.body["email_sent"].as_bool().unwrap_or(false) { return None; }
+        let text = wait_for_new_mail(&self.inbox, "sensitive action", before).await;
+        let code = six_digit_code_in(&text)?;
+        let verified = self.call_raw(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        verified.body["token"].as_str().map(str::to_string) }
 
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
 
@@ -853,6 +884,66 @@ async fn oidc_group_membership_admits_a_matching_group() {
 }
 
 #[tokio::test]
+async fn very_risky_actions_require_an_emailed_code() {
+    let s = Server::start().await;
+    let owner = register(&s, "stepup-risky@test.invalid").await;
+    let token = owner.body["token"].as_str().unwrap().to_string();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let path = format!("/api/orgs/{}/settings", org);
+    let blocked = s.call_raw(Method::PUT, &path, Some(&token), Some(json!({"ip_allowlist": ""}))).await;
+    assert_eq!(blocked.status, 428, "a very risky action must challenge: {} {}", blocked.status, blocked.text);
+    assert_eq!(blocked.body["risk"], json!("very_risky"), "{}", blocked.text);
+    assert_eq!(blocked.body["email_required"], json!(true), "{}", blocked.text);
+    assert_eq!(blocked.body["totp_required"], json!(false), "{}", blocked.text);
+
+    let before = s.inbox.lock().unwrap().len();
+    let start = s.call_raw(Method::POST, "/api/auth/step-up/start", Some(&token), Some(json!({"risk": "very_risky"}))).await;
+    assert_eq!(start.status, 200, "{}", start.text);
+    let challenge = start.body["challenge"].as_str().unwrap().to_string();
+    let text = wait_for_new_mail(&s.inbox, "sensitive action", before).await;
+    let code = six_digit_code_in(&text).expect("the step-up email must carry a six-digit code");
+    let wrong = s.call_raw(Method::POST, "/api/auth/step-up/verify", Some(&token), Some(json!({"challenge": challenge, "email_code": "not-a-code"}))).await;
+    assert_eq!(wrong.status, 401, "a wrong emailed code must not verify: {} {}", wrong.status, wrong.text);
+    let good = s.call_raw(Method::POST, "/api/auth/step-up/verify", Some(&token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+    assert_eq!(good.status, 200, "{}", good.text);
+    let grant = good.body["token"].as_str().unwrap().to_string();
+    let ok = s.call_with_headers(Method::PUT, &path, Some(&token), Some(json!({"ip_allowlist": ""})), &[("x-openwarp-step-up", &grant)]).await;
+    assert_eq!(ok.status, 200, "the grant must authorise the action: {}", ok.text);
+    let replay = s.call_with_headers(Method::PUT, &path, Some(&token), Some(json!({"ip_allowlist": ""})), &[("x-openwarp-step-up", &grant)]).await;
+    assert_eq!(replay.status, 428, "a step-up grant must be single use: {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn two_factor_actions_use_the_configured_totp() {
+    let s = Server::start().await;
+    let owner = register(&s, "stepup-totp@test.invalid").await;
+    let token = owner.body["token"].as_str().unwrap().to_string();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let setup = s.call(Method::POST, "/api/me/totp/setup", Some(&token), Some(json!({}))).await;
+    assert_eq!(setup.status, 200, "{}", setup.text);
+    let secret = setup.body["secret"].as_str().unwrap().to_string();
+    let enabled = s.call(Method::POST, "/api/me/totp/verify", Some(&token), Some(json!({"code": totp_now(&secret)}))).await;
+    assert_eq!(enabled.status, 200, "{}", enabled.text);
+
+    let invite = json!({"email": "totp-invite@test.invalid", "role": "developer"});
+    let path = format!("/api/orgs/{}/members", org);
+    let blocked = s.call_raw(Method::POST, &path, Some(&token), Some(invite.clone())).await;
+    assert_eq!(blocked.status, 428, "a major action must challenge a TOTP user: {} {}", blocked.status, blocked.text);
+    assert_eq!(blocked.body["totp_required"], json!(true), "{}", blocked.text);
+    assert_eq!(blocked.body["email_required"], json!(false), "{}", blocked.text);
+    let start = s.call_raw(Method::POST, "/api/auth/step-up/start", Some(&token), Some(json!({"risk": "two_factor"}))).await;
+    assert_eq!(start.status, 200, "{}", start.text);
+    let challenge = start.body["challenge"].as_str().unwrap().to_string();
+    assert_eq!(start.body["email_sent"], json!(false), "{}", start.text);
+    let verified = s.call_raw(Method::POST, "/api/auth/step-up/verify", Some(&token), Some(json!({"challenge": challenge, "totp": totp_now(&secret)}))).await;
+    assert_eq!(verified.status, 200, "{}", verified.text);
+    let grant = verified.body["token"].as_str().unwrap().to_string();
+    let ok = s.call_with_headers(Method::POST, &path, Some(&token), Some(invite), &[("x-openwarp-step-up", &grant)]).await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    assert!(ok.body["invite_token"].as_str().map(|v| !v.is_empty()).unwrap_or(false), "{}", ok.text);
+}
+
+#[tokio::test]
 async fn provider_login_with_an_existing_email_offers_account_linking() {
     let idp = start_mock("proof-owner@test.invalid", "test-google");
     let s = Server::start_env(&[
@@ -1148,12 +1239,44 @@ async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
     panic!("no email containing {:?} arrived", needle);
 }
 
+async fn wait_for_new_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str, before: usize) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if guard.len() > before {
+              if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+                  return m["text"].as_str().unwrap_or("").to_string(); } } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no new email containing {:?} arrived", needle);
+}
+
 fn extract_link(text: &str, needle: &str) -> String {
     for word in text.split_whitespace() {
         if let Some(i) = word.find(needle) { return word[i..].to_string(); }
     }
     panic!("no link containing {:?} in {:?}", needle, text);
 }
+
+fn six_digit_code_in(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).map(str::to_string) }
+
+fn b32decode(s: &str) -> Vec<u8> {
+    let mut bits = 0u32; let mut n = 0u32; let mut out = Vec::new();
+    for c in s.chars().filter(|c| *c != '=') {
+        let u = c.to_ascii_uppercase();
+        let v = match u { 'A'..='Z' => u as u32 - 'A' as u32, '2'..='7' => u as u32 - '2' as u32 + 26, _ => continue };
+        bits = (bits << 5) | v; n += 5;
+        if n >= 8 { n -= 8; out.push((bits >> n) as u8); } }
+    out }
+
+fn totp_now(secret_b32: &str) -> String {
+    use hmac::{Hmac, Mac}; use sha1::Sha1; type H = Hmac<Sha1>;
+    let counter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 30;
+    let mut m = H::new_from_slice(&b32decode(secret_b32)).expect("hmac key"); m.update(&counter.to_be_bytes());
+    let hash = m.finalize().into_bytes();
+    let off = (hash[19] & 0x0f) as usize;
+    let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off + 1] as u32) << 16) | ((hash[off + 2] as u32) << 8) | hash[off + 3] as u32;
+    format!("{:06}", code % 1_000_000) }
 
 #[tokio::test]
 async fn email_verification_gates_login() {

@@ -118,15 +118,37 @@ impl Server {
     }
 
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let r = self.call_raw(method.clone(), path, token, body.clone()).await;
+        if r.status == 428 {
+            if let Some(t) = token {
+                if let Some(grant) = self.step_up(t, &r.body).await {
+                    return self.call_with_headers(method, path, token, body, &[("x-openwarp-step-up", &grant)]).await;
+                } } }
+        r }
+    async fn call_raw(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, self.url(path));
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = body { req = req.json(&b); }
         finish(req.send().await).await
     }
+    async fn call_with_headers(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>, headers: &[(&str, &str)]) -> Resp {
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = &body { req = req.json(b); }
+        for (k, v) in headers { req = req.header(*k, *v); }
+        finish(req.send().await).await
+    }
+    async fn step_up(&self, token: &str, info: &Value) -> Option<String> {
+        let risk = info["risk"].as_str().unwrap_or("very_risky");
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call_raw(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": risk}))).await;
+        if start.status != 200 { return None; }
+        let challenge = start.body["challenge"].as_str()?.to_string();
+        if !start.body["email_sent"].as_bool().unwrap_or(false) { return None; }
+        let text = wait_for_new_mail(&self.inbox, "sensitive action", before).await;
+        let code = six_digit_code_in(&text)?;
+        let verified = self.call_raw(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        verified.body["token"].as_str().map(str::to_string) }
 
     async fn form(&self, path: &str, form: &[(&str, String)], token: Option<&str>) -> Resp {
         let mut req = self.client.post(self.url(path)).form(form);
@@ -184,12 +206,26 @@ async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
     panic!("no email containing {:?} arrived", needle);
 }
 
+async fn wait_for_new_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str, before: usize) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if guard.len() > before {
+              if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+                  return m["text"].as_str().unwrap_or("").to_string(); } } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no new email containing {:?} arrived", needle);
+}
+
 fn extract_link(text: &str, needle: &str) -> String {
     for word in text.split_whitespace() {
         if let Some(i) = word.find(needle) { return word[i..].to_string(); }
     }
     panic!("no link containing {:?} in {:?}", needle, text);
 }
+
+fn six_digit_code_in(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).map(str::to_string) }
 
 async fn register(s: &Server, email: &str) -> Value {
     let r = s

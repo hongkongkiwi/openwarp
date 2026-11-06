@@ -97,8 +97,33 @@ function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
 const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
-async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});
+  if(r.status===428){let d=await r.json().catch(()=>({}));let g=await stepUp(d);
+    if(g!==null&&g!==undefined){let h=H();h['x-openwarp-step-up']=g;r=await fetch(u,{method:m,headers:h,body:b!==undefined?JSON.stringify(b):undefined})}
+    else throw new Error(d.error||'step-up verification required')}
+  let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
+let stepUpResolve=null;
+async function stepUp(info){
+  let h=H();let r=await fetch('/api/auth/step-up/start',{method:'POST',headers:h,body:JSON.stringify({risk:info.risk||'two_factor'})});
+  let start=await r.json().catch(()=>({}));
+  if(!r.ok){toast(start.error||'could not start verification',true);return null}
+  if(start.not_required)return '';
+  let methods=start.methods||[];
+  return new Promise(resolve=>{
+    stepUpResolve=resolve;
+    let totp=methods.includes('totp')?`<div class="field"><label for="su-totp">Authenticator or recovery code</label><input id="su-totp" inputmode="numeric" autocomplete="one-time-code" placeholder="123456"></div>`:'';
+    let email=methods.includes('email')?`<div class="field"><label for="su-email">Emailed code</label><input id="su-email" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits"></div>`:'';
+    let note=start.email_sent?`<p class="mut">A code was sent to ${esc($('whoami').textContent||'your account email')}.</p>`:'';
+    modal(`<h3>Confirm this action</h3><p class="mut">${info.risk==='very_risky'?'This is a high-risk action.':'This action needs a second factor.'}</p>${note}${totp}${email}<div class="row"><button class="primary" onclick="verifyStepUp('${jsq(start.challenge)}')">Verify</button><button class="ghost" onclick="cancelStepUp()">Cancel</button></div>`,'Confirm action');
+  })}
+async function verifyStepUp(challenge){try{
+  let r=await fetch('/api/auth/step-up/verify',{method:'POST',headers:H(),body:JSON.stringify({challenge:challenge,totp:($('su-totp')?.value||''),email_code:($('su-email')?.value||'')})});
+  let d=await r.json().catch(()=>({}));
+  if(!r.ok){toast(d.error||'verification failed',true);return}
+  closeModal();let resolve=stepUpResolve;stepUpResolve=null;if(resolve)resolve(d.token);
+}catch(e){toast(e.message||String(e),true)}}
+function cancelStepUp(){closeModal();let resolve=stepUpResolve;stepUpResolve=null;if(resolve)resolve(null)}
 function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // For values interpolated into an inline handler's JS string literal. HTML
