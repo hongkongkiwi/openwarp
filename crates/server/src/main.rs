@@ -364,7 +364,7 @@ const KDF_ITERATIONS: i64 = 600_000;
 const KDF_ALGO: &str = "pbkdf2-sha256";
 fn auth_key_aad(uid: &str) -> Vec<u8> { format!("auth-key|{}", uid).into_bytes() }
 fn valid_kdf(salt: &str, iterations: i64, algo: &str) -> bool {
-    algo == KDF_ALGO && (100_000..=5_000_000).contains(&iterations) && oc::unb64(salt).map(|b| b.len() == 16).unwrap_or(false) }
+    algo == KDF_ALGO && (600_000..=5_000_000).contains(&iterations) && oc::unb64(salt).map(|b| b.len() == 16).unwrap_or(false) }
 fn valid_key32(s: &str) -> bool { oc::unb64(s).map(|b| b.len() == 32).unwrap_or(false) }
 fn valid_wrapped_key(s: &str) -> bool { s.starts_with("owv2:") && s.len() <= 4096 }
 fn login_outcome(st: &S, uid: &str, pubkey: &str, wrapped: Option<&str>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
@@ -452,8 +452,11 @@ async fn login_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let auth_key = oc::decrypt_symmetric_aad(&st.master, &auth_key_aad(&db::s(&row, "user_id")), &db::s(&row, "auth_key_enc")).map_err(|_| bad("authentication key is unavailable"))?;
     if !verify_proof(&auth_key, &db::s(&row, "challenge"), &r.challenge_id, &r.proof) {
         st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    // Consume atomically: two concurrent requests with the same proof must not
+    // both mint a session.
+    let consumed = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]).unwrap_or(0);
+    if consumed == 0 { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     st.rate_clear(&key);
-    let _ = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]);
     let uid = db::s(&row, "user_id");
     if db::n(&row, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if verification_required() && db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
@@ -581,8 +584,11 @@ async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     Ok((hdr, j(json!({"token": token, "user_id": uid, "org_id": org, "role": role})))) }
 #[derive(Deserialize, Default)] struct InviteV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
-async fn accept_invite_v2(State(st): State<S>, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+async fn accept_invite_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
+    let rl = format!("invite-accept:{}", addr.ip());
+    if !st.rate_ok(&rl, 10, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many invite attempts; try again later")); }
+    st.rate_fail(&rl, 3600);
     if !valid_kdf(&r.salt, r.iterations, &r.algo) { return Err(bad("unsupported KDF parameters")); }
     let auth_key = oc::unb64(&r.auth_key).map_err(|_| bad("auth_key must be base64"))?;
     if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
@@ -2464,8 +2470,9 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
             Ok(k) => k, Err(_) => return oauth_error_page(StatusCode::INTERNAL_SERVER_ERROR, "Authentication key is unavailable.") };
         if !verify_proof(&auth_key, &db::s(&row, "challenge"), &cid, &proof) {
             st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); }
+        let consumed = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&cid))]).unwrap_or(0);
+        if consumed == 0 { st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); }
         st.rate_clear(&key);
-        let _ = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&cid))]);
         let uid = db::s(&row, "user_id");
         if db::n(&row, "active") == 0 { return oauth_error_page(StatusCode::UNAUTHORIZED, "Account deactivated."); }
         if verification_required() && db::n(&row, "email_verified") == 0 { return oauth_error_page(StatusCode::FORBIDDEN, "Verify your email address before signing in."); }
@@ -2729,6 +2736,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
+        .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
+        .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))

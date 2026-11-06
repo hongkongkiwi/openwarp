@@ -174,7 +174,7 @@ function showKit(title,text,kit,cont){modal(`<h3>${esc(title)}</h3><p class="mut
 async function unlockE2E(){if(!(WRAP_KEY&&WRAPPED_PRIV))return;try{let secret=await AuthV2.unwrapPrivate(WRAP_KEY,WRAPPED_PRIV);E2E_KIT=OW.b64enc(secret)}catch(e){E2E_KIT=''}}
 async function acceptInvite(){try{
   let password=$('inv-pw').value;if(password.length<8){toast('Password must be at least 8 characters',true);return}
-  let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);let kp=OW.generateKeypair();
+  let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);let kp=await OW.generateKeypair();
   let wrapped=await AuthV2.wrapPrivate(keys.wrap,kp.secret);
   let d=await api('POST','/api/auth/accept-invite-v2',{token:$('authform').dataset.invite,salt,iterations:600000,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:wrapped});
   AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(kp.secret);
@@ -200,7 +200,7 @@ async function resetPassword(){try{
   let info=await api('POST','/api/auth/reset-info',{token});
   let secret,pubkey;
   if(kit){secret=AuthV2.b64dec(kit);pubkey=OW.b64enc(OW.x25519Pub(secret));if(info.public_key&&pubkey!==info.public_key){toast('The recovery kit does not match this account',true);return}}
-  else if($('rp-discard').checked){let kp=OW.generateKeypair();secret=kp.secret;pubkey=kp.public}
+  else if($('rp-discard').checked){let kp=await OW.generateKeypair();secret=kp.secret;pubkey=kp.public}
   else{toast('Recovery kit required; tick the replacement box only if you accept losing end-to-end access',true);return}
   let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);
   let wrapped=await AuthV2.wrapPrivate(keys.wrap,secret);
@@ -218,7 +218,7 @@ async function doAuth(){let email=$('email').value.trim(),password=$('pw').value
     if(MODE==='register'){
       if(kdf.version!==2){toast('This instance still uses password registration',true);return}
       if(password.length<8){toast('Password must be at least 8 characters',true);return}
-      let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations);let kp=OW.generateKeypair();
+      let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations);let kp=await OW.generateKeypair();
       let wrapped=await AuthV2.wrapPrivate(keys.wrap,kp.secret);
       let d=await api('POST','/api/auth/register-v2',{email,salt:kdf.salt,iterations:kdf.iterations,algo:kdf.algo,auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:wrapped});
       AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(kp.secret);
@@ -530,7 +530,8 @@ async function verifyEmailMfa(){try{let d=await api('POST','/api/me/mfa/email/ve
 async function disableEmailMfa(){let pw=reauthPrompt('Current password to disable email codes');if(pw===null)return;
   try{await api('DELETE','/api/me/mfa/email',{password:pw});toast('Email codes disabled');renderSettings()}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let kit=$('e2e-kit')?.value||E2E_KIT;if(!kit)throw new Error('Recovery kit required');let k=await OW.decryptAsymmetric(kit,d.wrapped_key);
-  $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
+  let lines=[];for(const s of d.secrets){let key=await OW.decryptSymmetric(k,s.key_enc);let val=await OW.decryptSymmetric(k,s.value_enc);lines.push(new TextDecoder().decode(key)+'='+new TextDecoder().decode(val))}
+  $('e2e-out').textContent=lines.join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
 
@@ -563,6 +564,8 @@ boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
 $('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
 </script>
+<script src="/libsodium.js" integrity="sha384-3KUAqev6nUaNHDSTa/UjyEycVN8iMfq/UtzKf3ZDTuGSb+P3y9kMu/WCVqnLAxUB"></script>
+<script src="/libsodium-wrappers.js" integrity="sha384-uj62oy76l27Bkf3eEP5knMYc094z6HzwAR7Rn8ZZcBBsg5nMibZXSvjRqgZMFg/L"></script>
 <script src="/e2e.js"></script>
 <script src="/auth-v2.js"></script>
 </body></html>
