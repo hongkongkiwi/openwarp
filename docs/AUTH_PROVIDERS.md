@@ -97,6 +97,17 @@ connections. Set `OPENWARP_WORKOS_PROVIDER` to another provider value, or set
 Register the callback URL as a redirect in the WorkOS dashboard.
 `OPENWARP_WORKOS_API` overrides the API origin for tests.
 
+## Not available as instance providers
+
+- OpenAI/ChatGPT does not publish a static OAuth or OIDC client that a
+  third-party app can use for general sign-in. Its "Sign in with ChatGPT" flow
+  uses dynamic per-user client registration to share ChatGPT plan tokens, so it
+  is not treated as an identity provider here.
+- Okta, Auth0, Keycloak and other identity providers are supported through the
+  per-organisation OIDC settings (`oidc_issuer`, `oidc_client_id`,
+  `oidc_client_secret`, `oidc_redirect_uri`). That flow binds users to the
+  organisation rather than to the instance.
+
 ## Account rules
 
 - An identity binds to `(provider, subject)`, so changing the email at the
