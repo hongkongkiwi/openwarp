@@ -1,0 +1,18 @@
+[package]
+authors = ["Nadja Reitzenstein <me@dequbed.space>", "Ivan Nejgebauer <inejge@gmail.com>"]
+categories = ["encoding", "parsing"]
+description = "An ASN.1/BER parser/encoder based on nom"
+keywords = ["ASN1", "BER", "nom"]
+license = "MIT"
+name = "lber"
+repository = "https://github.com/inejge/ldap3"
+documentation = "https://docs.rs/ldap3"
+version = "0.4.2"
+edition = "2015"
+
+[dependencies]
+bytes = "1.3.0"
+nom = "7.1.1"
+
+# Standalone so its regression test can run without being a workspace member.
+[workspace]

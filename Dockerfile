@@ -4,6 +4,8 @@ WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
+# The workspace patches lber to this vendored copy, so the build needs it.
+COPY vendor ./vendor
 RUN cargo build --release -p openwarp-server -p openwarp-cli -p openwarp-eso
 FROM debian:bookworm-slim
 # hadolint ignore=DL3008
