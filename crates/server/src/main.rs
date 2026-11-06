@@ -71,9 +71,10 @@ async fn shutdown_signal() {
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     eprintln!("shutdown signal received; draining connections"); }
 
-async fn put_meta(db: &Db, key: &str, value: &str) {
+async fn put_meta(db: &Db, key: &str, value: &str) -> Result<(), String> {
     if db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(key), json!(value)]).await.is_err() {
-        let _ = db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(key)]).await; } }
+        db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(key)]).await.map_err(|e| e.to_string())?; }
+    Ok(()) }
 
 async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String> {
     if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") {
@@ -99,13 +100,51 @@ async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String>
         } else { None };
         let k = local.unwrap_or_else(oc::random_key);
         let wrapped = kms.wrap(&k, "master")?;
-        put_meta(db, "kms_root", &wrapped).await;
+        // The plaintext row is only removed once the wrapped copy is confirmed
+        // writable; otherwise a failed write plus the delete would lose the
+        // root while leaving every record encrypted under it.
+        put_meta(db, "kms_root", &wrapped).await?;
         let _ = db.exec("DELETE FROM meta WHERE k='master'", &[]).await;
         return Ok(k);
     }
-    if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await { if let Ok(b) = oc::unb64(&db::s(&r,"v")) { if let Ok(k) = b.try_into() { return Ok(k); } } }
+    if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
+        let raw = oc::unb64(&db::s(&r, "v")).map_err(|_| "the stored master root is not valid base64; refusing to generate a replacement".to_string())?;
+        return raw.try_into().map_err(|_| "the stored master root is not 32 bytes; refusing to generate a replacement".to_string());
+    }
+    // A database booted with a KMS has no plaintext master row: the root lives
+    // in meta.kms_root. Generating one here would silently make every owkms:
+    // environment key and every account key unreadable.
+    if db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| e.to_string())?.is_some() {
+        return Err("this database's master root is wrapped by a KMS, but OPENWARP_KMS_URL is not configured. Restore the KMS bridge, or set OPENWARP_MASTER_KEY to the original root.".into());
+    }
     let k = oc::random_key(); let _ = db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&k))]).await;
     eprintln!("warning: OPENWARP_MASTER_KEY is not set; a generated key was stored in the database. Set OPENWARP_MASTER_KEY before production use.");
     Ok(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Neither test may inherit a supplied root, or they would take the
+    // OPENWARP_MASTER_KEY branch and prove nothing.
+    fn clear_key_env() { std::env::remove_var("OPENWARP_MASTER_KEY"); std::env::remove_var("OPENWARP_ENV"); }
+
+    #[tokio::test]
+    async fn refuses_to_generate_a_root_over_a_kms_wrapped_database() {
+        clear_key_env();
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO meta(k,v) VALUES('kms_root','owkms:test:blob')", &[]).await.unwrap();
+        let err = load_master(&db, None).await.expect_err("must not mint a replacement root");
+        assert!(err.contains("wrapped by a KMS"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn refuses_to_replace_an_unreadable_master_row() {
+        clear_key_env();
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO meta(k,v) VALUES('master','not-base64!')", &[]).await.unwrap();
+        let err = load_master(&db, None).await.expect_err("must not replace an unreadable root");
+        assert!(err.contains("refusing to generate"), "{}", err);
+    }
 }
 
