@@ -82,6 +82,7 @@ impl Db {
             "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
             "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
             "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
+            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
         ] { let _ = self.exec(alter, &[]); }
         for idx in INDEXES { let _ = self.exec(idx, &[]); }
         // One-time backfill: environments that already had an allowlist keep it.
@@ -174,6 +175,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS social_states(state TEXT PRIMARY KEY,provider TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS social_subjects(provider TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(provider,subject))",
     "CREATE TABLE IF NOT EXISTS invites(token_hash TEXT PRIMARY KEY,email TEXT NOT NULL,org_id TEXT NOT NULL,role TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,accepted BIGINT DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,kind TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
 ];
 
 const INDEXES: &[&str] = &[
@@ -188,6 +190,7 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_sync_state_integration ON integration_sync_state(integration_id)",
     "CREATE INDEX IF NOT EXISTS idx_rotations_due ON rotation_schedules(enabled,next_run)",
     "CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",
 ];
 
 #[cfg(test)]

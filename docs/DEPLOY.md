@@ -43,6 +43,9 @@ docker compose up -d --build
 | `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
 | `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
 | `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
+| `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider |
+| `OPENWARP_EMAIL_TOKEN` | Optional bearer sent to the email relay |
+| `OPENWARP_REQUIRE_EMAIL_VERIFICATION` | `1` blocks password sign-in until the emailed link is opened; requires the webhook |
 | `REDIS_URL` | Optional session cache |
 
 Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
@@ -58,6 +61,26 @@ closed, an admin invites an address from Members: existing accounts are added
 directly, new addresses get a single-use link valid for seven days. The invitee
 sets a password from that link, or signs in with a configured social provider,
 which redeems the invite and applies its role.
+
+## Password reset and email verification
+
+Password reset needs an email relay: `OPENWARP_EMAIL_WEBHOOK` receives a JSON
+body with `to`, `subject` and `text`, and the link inside it points back at
+`OPENWARP_PUBLIC_URL`. `POST /api/auth/forgot` always answers the same way, so
+it cannot be used to discover accounts.
+
+A reset link does not decrypt anything on its own. The user supplies their
+recovery kit and a new password, which re-wraps the same private key and keeps
+end-to-end environments readable. A user who has lost the kit can pass
+`discard_e2e_key: true`, which generates a new key pair and makes existing
+end-to-end environments unreadable. Either path revokes every session, OAuth
+token and pending refresh pair for the account.
+
+Email verification is opt-in with `OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`. New
+password registrations then start unverified, receive a 24-hour link, and cannot
+sign in until it is opened. Social and SSO logins arrive with verified
+addresses. The server refuses to start if verification is required but no email
+relay is configured, because nobody could complete it.
 
 ## Operational checks
 

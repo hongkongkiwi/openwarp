@@ -161,8 +161,11 @@ impl AppState {
     fn rate_clear(&self, key: &str) { let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(key)]); }
     // Deactivated users and deleted identities must lose every credential at once.
     fn principal_active(&self, uid: &str) -> bool {
-        match self.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]) {
-            Ok(Some(row)) => db::n(&row, "active") != 0,
+        match self.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(uid)]) {
+            Ok(Some(row)) => {
+                if db::n(&row, "active") == 0 { return false; }
+                if verification_required() && db::n(&row, "email_verified") == 0 { return false; }
+                true },
             Ok(None) => self.db.one("SELECT id FROM identities WHERE id=?", &[json!(uid)]).ok().flatten().is_some(),
             Err(_) => false,
         } }
@@ -231,7 +234,7 @@ fn resolve_refs(v: &str, by_path: &HashMap<String, String>, by_key: &HashMap<Str
 }
 
 // ---------- auth ----------
-async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, h: HeaderMap, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let rl = format!("register:{}", addr.ip());
     if !st.rate_ok(&rl, 5, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
     st.rate_fail(&rl, 3600);
@@ -240,10 +243,17 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let kp = oc::Keypair::generate();
     let wrapped = oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?;
     let uid = id(); let hash = oc::hash_password(&r.password).map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
+    let verified = if verification_required() { 0 } else { 1 };
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,?)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now()), json!(verified)]).map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).map_err(|e| bad(&e))?;
     claim_instance_owner(&st, &uid);
+    if verification_required() {
+        let link_token = issue_auth_token(&st, &uid, "verify", 86400);
+        let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
+        send_email(&r.email, "Verify your OpenWarp address", &format!("Confirm your email address by opening this link:\n{}\n\nIt expires in 24 hours.", link)).await;
+        return Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))));
+    }
     let token = make_session(&st, &uid)?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     Ok((hdr, j(json!({"token": token, "user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64()}))))
@@ -255,6 +265,7 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
     let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    if verification_required() && db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key);
     let uid = db::s(&row, "id");
     if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
@@ -782,6 +793,90 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
+
+// ---------- email, verification and password reset ----------
+fn verification_required() -> bool {
+    matches!(std::env::var("OPENWARP_REQUIRE_EMAIL_VERIFICATION").unwrap_or_default().to_ascii_lowercase().as_str(), "1" | "true" | "yes") }
+// The operator supplies a small HTTP relay that forwards {to,subject,text} to
+// their mail provider. Without one, mail is suppressed and logged, never queued.
+async fn send_email(to: &str, subject: &str, text: &str) {
+    let url = std::env::var("OPENWARP_EMAIL_WEBHOOK").unwrap_or_default();
+    if url.trim().is_empty() { eprintln!("email suppressed (OPENWARP_EMAIL_WEBHOOK unset): {}", subject); return; }
+    let token = std::env::var("OPENWARP_EMAIL_TOKEN").unwrap_or_default();
+    let mut req = http_client().post(&url).json(&json!({"to": to, "subject": subject, "text": text}));
+    if !token.is_empty() { req = req.bearer_auth(token); }
+    if let Err(e) = req.send().await { eprintln!("email delivery failed: {}", e); } }
+fn issue_auth_token(st: &S, uid: &str, kind: &str, ttl: i64) -> String {
+    let token = oc::random_token(kind);
+    let _ = st.db.exec("INSERT INTO auth_tokens(token_hash,user_id,kind,created_at,expires_at) VALUES(?,?,?,?,?)", &[json!(oc::hash_token(&token)), json!(uid), json!(kind), json!(now()), json!(now() + ttl)]);
+    token }
+#[derive(Deserialize)] struct EmailReq { email: String }
+#[derive(Deserialize)] struct ResetReq { token: String, password: String, #[serde(default)] recovery_kit: String, #[serde(default)] discard_e2e_key: bool }
+async fn verify_email(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Response {
+    let token = q.get("token").cloned().unwrap_or_default(); let hash = oc::hash_token(token.trim());
+    let found = st.db.one("SELECT user_id FROM auth_tokens WHERE token_hash=? AND kind='verify' AND used=0 AND expires_at>?", &[json!(&hash), json!(now())]).ok().flatten();
+    let (status, title, detail) = match found {
+        Some(row) => { let uid = db::s(&row, "user_id");
+            let _ = st.db.exec("UPDATE users SET email_verified=1 WHERE id=?", &[json!(&uid)]);
+            let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]);
+            st.audit("", "", "", &uid, "auth.email_verified", "");
+            (StatusCode::OK, "Email verified", "You can sign in now.") }
+        None => (StatusCode::BAD_REQUEST, "Link not valid", "This verification link is invalid, already used, or expired.") };
+    let mut r = Html(format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>OpenWarp</title></head><body style=\"margin:0;background:#08080c;color:#eceaf8;font:15px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh\"><main style=\"max-width:520px;padding:28px\"><h1 style=\"font-size:20px\">{}</h1><p style=\"color:#9a97b3\">{}</p><p><a style=\"color:#9d8fff\" href=\"/\">Open the console</a></p></main></body></html>", esc(title), esc(detail))).into_response();
+    *r.status_mut() = status;
+    r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP));
+    r }
+async fn forgot_password(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, h: HeaderMap, Json(r): Json<EmailReq>) -> Res {
+    let key = format!("forgot:{}", addr.ip());
+    if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many reset requests; try again later")); }
+    st.rate_fail(&key, 900);
+    let email = r.email.trim().to_lowercase();
+    if let Ok(Some(row)) = st.db.one("SELECT id FROM users WHERE email=? AND active=1", &[json!(&email)]) {
+        let uid = db::s(&row, "id"); let token = issue_auth_token(&st, &uid, "reset", 3600);
+        let link = format!("{}/#reset={}", issuer(&st, &h), token);
+        send_email(&email, "Reset your OpenWarp password", &format!("Open this link to choose a new password:\n{}\n\nIt expires in one hour. You will be asked for your recovery kit unless you choose to replace your key.", link)).await;
+        st.audit("", "", "", &uid, "auth.password_reset_requested", "");
+    }
+    // Same answer whether or not the address exists.
+    Ok(j(json!({"ok": true, "note": "if that address has an account, a reset link is on its way"}))) }
+async fn resend_verification(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, h: HeaderMap, Json(r): Json<EmailReq>) -> Res {
+    let key = format!("verify-resend:{}", addr.ip());
+    if !st.rate_ok(&key, 5, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification requests; try again later")); }
+    st.rate_fail(&key, 3600);
+    let email = r.email.trim().to_lowercase();
+    if let Ok(Some(row)) = st.db.one("SELECT id FROM users WHERE email=? AND active=1 AND email_verified=0", &[json!(&email)]) {
+        let uid = db::s(&row, "id"); let token = issue_auth_token(&st, &uid, "verify", 86400);
+        let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), token);
+        send_email(&email, "Verify your OpenWarp address", &format!("Confirm your email address by opening this link:\n{}\n\nIt expires in 24 hours.", link)).await;
+    }
+    Ok(j(json!({"ok": true}))) }
+async fn reset_password(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<ResetReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let key = format!("reset:{}", addr.ip());
+    if !st.rate_ok(&key, 10, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
+    if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
+    let hash = oc::hash_token(r.token.trim());
+    let row = st.db.one("SELECT user_id FROM auth_tokens WHERE token_hash=? AND kind='reset' AND used=0 AND expires_at>?", &[json!(&hash), json!(now())]).map_err(|e| bad(&e))?.ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
+    let uid = db::s(&row, "user_id");
+    let user = st.db.one("SELECT email,pubkey,email_verified FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    st.rate_fail(&key, 900);
+    let kit = r.recovery_kit.trim().to_string();
+    let (pubkey, wrapped, replaced) = if !kit.is_empty() {
+        let kp = oc::Keypair::from_secret_b64(&kit).map_err(|_| bad("recovery kit is not a valid key"))?;
+        if kp.public != db::s(&user, "pubkey") { return Err(bad("recovery kit does not match this account")); }
+        (db::s(&user, "pubkey"), oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?, false)
+    } else if r.discard_e2e_key {
+        let kp = oc::Keypair::generate();
+        (kp.public.clone(), oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?, true)
+    } else { return Err(bad("recovery kit required; pass discard_e2e_key=true to replace your key and lose access to end-to-end environments")); };
+    let pass = oc::hash_password(&r.password).map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE users SET pass_hash=?,pubkey=?,wrapped_privkey=?,email_verified=1 WHERE id=?", &[json!(pass), json!(pubkey), json!(wrapped), json!(&uid)]).map_err(|e| bad(&e))?;
+    let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]);
+    let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]);
+    let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]);
+    st.audit("", "", "", &uid, "auth.password_reset", if replaced { "key replaced" } else { "kit supplied" });
+    let session = make_session(&st, &uid)?;
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap());
+    Ok((hdr, j(json!({"token": session, "user_id": uid, "e2e_key_replaced": replaced})))) }
 
 // ---------- instance settings + Google/GitHub sign-in ----------
 fn signups_open(st: &S) -> bool {
@@ -1620,6 +1715,10 @@ async fn main() {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openwarp.db".into());
     let db = Db::open(&db_url).expect("open database (sqlite://file.db or postgres://...)");
     let master = load_master(&db).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+    if verification_required() && std::env::var("OPENWARP_EMAIL_WEBHOOK").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        eprintln!("OPENWARP_REQUIRE_EMAIL_VERIFICATION is set but OPENWARP_EMAIL_WEBHOOK is not; verification links could not be delivered");
+        std::process::exit(1);
+    }
     #[cfg(feature = "redis-cache")]
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
@@ -1629,6 +1728,7 @@ async fn main() {
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
+        .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))

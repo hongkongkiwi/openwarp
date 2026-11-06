@@ -9,6 +9,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -368,4 +369,143 @@ async fn social_login_requires_an_invite_when_signups_are_closed() {
     let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
     assert!(orgs.text.contains(org), "the invited social user must join the inviting org: {}", orgs.text);
     assert!(orgs.text.contains("developer"), "the invite role must apply: {}", orgs.text);
+}
+
+/// Minimal email relay: records each JSON body and answers 200.
+fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
+    let addr = listener.local_addr().expect("inbox addr");
+    let inbox = Arc::new(Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+    (format!("http://{}/mail", addr), inbox)
+}
+
+async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no email containing {:?} arrived", needle);
+}
+
+fn extract_link(text: &str, needle: &str) -> String {
+    for word in text.split_whitespace() {
+        if let Some(i) = word.find(needle) { return word[i..].to_string(); }
+    }
+    panic!("no link containing {:?} in {:?}", needle, text);
+}
+
+#[tokio::test]
+async fn email_verification_gates_login() {
+    let (inbox_url, inbox) = start_inbox();
+    let s = Server::start_env(&[
+        ("OPENWARP_REQUIRE_EMAIL_VERIFICATION", "1".to_string()),
+        ("OPENWARP_EMAIL_WEBHOOK", inbox_url),
+    ]).await;
+    let r = register(&s, "verify-me@test.invalid").await;
+    assert_eq!(r.status, 200, "registration failed: {}", r.text);
+    assert_eq!(r.body["verification_required"], json!(true), "verification must be required: {}", r.text);
+    assert!(r.body["token"].is_null(), "no session may be issued before verification: {}", r.text);
+    assert!(r.body["recovery_kit"].as_str().map(|k| !k.is_empty()).unwrap_or(false), "the kit is still shown: {}", r.text);
+
+    let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "verify-me@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(login.status, 403, "an unverified account must not sign in, got {} {}", login.status, login.text);
+
+    let text = wait_for_mail(&inbox, "/api/auth/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/verify?token=");
+    let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+    let r = s.get(&path).await;
+    assert_eq!(r.status, 200, "the verification link must work: {} {}", r.status, r.text);
+
+    let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "verify-me@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(login.status, 200, "a verified account must sign in: {}", login.text);
+    let replay = s.get(&path).await;
+    assert_eq!(replay.status, 400, "a verification link must be single use, got {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn password_reset_requires_the_recovery_kit_or_an_explicit_discard() {
+    let (inbox_url, inbox) = start_inbox();
+    let s = Server::start_env(&[("OPENWARP_EMAIL_WEBHOOK", inbox_url)]).await;
+    let reg = register(&s, "reset-me@test.invalid").await;
+    let kit = reg.body["recovery_kit"].as_str().unwrap().to_string();
+    let old_session = reg.body["token"].as_str().unwrap().to_string();
+    let pubkey = reg.body["public_key"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, "/api/auth/forgot", None, Some(json!({"email": "reset-me@test.invalid"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let text = wait_for_mail(&inbox, "#reset=").await;
+    let token = extract_link(&text, "#reset=").split("#reset=").nth(1).unwrap_or("").to_string();
+    assert!(!token.is_empty(), "no reset token in {:?}", text);
+
+    let r = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": token, "password": "brand-new-password", "recovery_kit": "not-a-real-key"}))).await;
+    assert_eq!(r.status, 400, "a mismatched kit must be refused, got {} {}", r.status, r.text);
+    let r = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": token, "password": "brand-new-password"}))).await;
+    assert_eq!(r.status, 400, "a missing kit needs an explicit discard, got {} {}", r.status, r.text);
+    assert!(r.text.contains("discard_e2e_key"), "the error must name the escape hatch: {}", r.text);
+
+    let r = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": token, "password": "brand-new-password", "recovery_kit": kit}))).await;
+    assert_eq!(r.status, 200, "reset with the kit failed: {}", r.text);
+    assert_eq!(r.body["e2e_key_replaced"], json!(false), "the kit must keep the key: {}", r.text);
+    let new_session = r.body["token"].as_str().unwrap().to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&new_session), None).await;
+    assert_eq!(me.body["pubkey"].as_str().unwrap_or(""), pubkey, "the public key must not change when the kit is used");
+    let old = s.call(Method::GET, "/api/me", Some(&old_session), None).await;
+    assert_eq!(old.status, 401, "old sessions must be revoked, got {} {}", old.status, old.text);
+    let old_pw = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "reset-me@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(old_pw.status, 401, "the old password must stop working");
+    let new_pw = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "reset-me@test.invalid", "password": "brand-new-password"}))).await;
+    assert_eq!(new_pw.status, 200, "the new password must work: {}", new_pw.text);
+    let replay = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": token, "password": "another-password", "recovery_kit": kit}))).await;
+    assert_eq!(replay.status, 400, "a reset token must be single use, got {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn password_reset_without_the_kit_replaces_the_key_only_when_asked() {
+    let (inbox_url, inbox) = start_inbox();
+    let s = Server::start_env(&[("OPENWARP_EMAIL_WEBHOOK", inbox_url)]).await;
+    let reg = register(&s, "discard-me@test.invalid").await;
+    let pubkey = reg.body["public_key"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/auth/forgot", None, Some(json!({"email": "discard-me@test.invalid"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let text = wait_for_mail(&inbox, "#reset=").await;
+    let token = extract_link(&text, "#reset=").split("#reset=").nth(1).unwrap_or("").to_string();
+
+    let r = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": token, "password": "brand-new-password", "discard_e2e_key": true}))).await;
+    assert_eq!(r.status, 200, "discarding the key failed: {}", r.text);
+    assert_eq!(r.body["e2e_key_replaced"], json!(true), "{}", r.text);
+    let session = r.body["token"].as_str().unwrap().to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&session), None).await;
+    assert_ne!(me.body["pubkey"].as_str().unwrap_or(""), pubkey, "the key must be replaced: {}", me.text);
+}
+
+#[tokio::test]
+async fn forgot_password_does_not_reveal_accounts() {
+    let (inbox_url, inbox) = start_inbox();
+    let s = Server::start_env(&[("OPENWARP_EMAIL_WEBHOOK", inbox_url)]).await;
+    let r = s.call(Method::POST, "/api/auth/forgot", None, Some(json!({"email": "nobody@test.invalid"}))).await;
+    assert_eq!(r.status, 200, "an unknown address must look the same, got {} {}", r.status, r.text);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(inbox.lock().unwrap().is_empty(), "no mail may be sent for an unknown address");
 }

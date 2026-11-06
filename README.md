@@ -110,6 +110,16 @@ signs in with a configured provider. See [docs/DEPLOY.md](docs/DEPLOY.md).
 - OAuth clients only receive scopes they registered; PKCE verifiers must be
   non-empty; MCP rejects any `Origin` that is not an exact match for the
   request host or the configured public URL.
+- Password reset re-wraps the existing private key only when the recovery kit
+  is supplied; replacing the key is a separate, explicit choice that makes
+  existing end-to-end environments unreadable. Either path revokes every
+  session and OAuth token for the account, and reset links are single use.
+- Optional email verification (`OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`) keeps
+  new password accounts unverified until they open a 24-hour link. Mail is
+  delivered through `OPENWARP_EMAIL_WEBHOOK`; the server refuses to start with
+  verification required and no relay configured.
+- Rate limits live in the database, so they survive a restart and apply across
+  replicas.
 - OAuth access tokens are scope-checked on every REST call (`secrets:read`
   for reads, `secrets:write` for mutations) and `/mcp` validates the token
   audience. The authorize page escapes all parameters and sets a

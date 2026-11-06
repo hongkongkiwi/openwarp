@@ -57,6 +57,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field"><label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••••" onkeydown="if(event.key==='Enter')doAuth()"></div>
       <div class="field" id="mfafield" style="display:none"><label for="mfacode">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
+      <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()">Forgot password?</button>
       <div id="social" class="row" style="margin-top:12px"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
     </div>
@@ -145,11 +146,32 @@ async function acceptInvite(){try{
   let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
   T=d.token;localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);enterApp();
 }catch(e){toast(e.message,true)}}
+function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
+  <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
+  <div class="row"><button class="primary" onclick="sendForgot()">Send link</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Reset password')}
+async function sendForgot(){try{await api('POST','/api/auth/forgot',{email:$('fp-email').value});closeModal();toast('If that address has an account, a reset link is on its way')}catch(e){toast(e.message,true)}}
+function showReset(token){
+  $('auth').style.display='grid';$('shell').style.display='none';$('authtitle').textContent='Choose a new password';
+  $('authform').innerHTML=`<p class="mut">Enter a new password for your account.</p>
+    <div class="field"><label for="rp-pw">New password</label><input id="rp-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters"></div>
+    <div class="field"><label for="rp-kit">Recovery kit (keeps end-to-end environments readable)</label><input id="rp-kit" placeholder="base64 recovery kit"></div>
+    <label class="row small mut" style="gap:8px"><input type="checkbox" id="rp-discard"> I no longer have my kit; replace my key and lose end-to-end access</label>
+    <button class="primary" style="width:100%;padding:11px;margin-top:10px" onclick="resetPassword()">Set new password</button>`;
+  $('authform').dataset.reset=token}
+async function resetPassword(){try{
+  let d=await api('POST','/api/auth/reset',{token:$('authform').dataset.reset,password:$('rp-pw').value,recovery_kit:$('rp-kit').value,discard_e2e_key:!!$('rp-discard').checked});
+  T=d.token;localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);
+  toast(d.e2e_key_replaced?'Password set; your key was replaced':'Password set');enterApp();
+}catch(e){toast(e.message,true)}}
 let MODE='login';
 function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');$('authtitle').textContent=m==='login'?'Welcome back':'Create your account';$('authbtn').textContent=m==='login'?'Sign in':'Create account'}
 async function doAuth(){try{
-  if(MODE==='register'){let d=await api('POST','/api/auth/register',{email:$('email').value,password:$('pw').value});T=d.token;localStorage.setItem('owt',T);
-    modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`);return}
+  if(MODE==='register'){let d=await api('POST','/api/auth/register',{email:$('email').value,password:$('pw').value});
+    if(d.verification_required){
+      modal(`<h3>Check your email</h3><p class="mut">We sent a verification link to ${esc($('email').value)}. Save your recovery kit now; it is shown once.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal()">I saved it</button></div>`,'Check your email');
+      return}
+    T=d.token;localStorage.setItem('owt',T);
+    modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`,'Save your recovery kit');return}
   let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
   if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';$('authbtn').textContent='Verify code';$('authbtn').onclick=doMfa;toast('Enter your authenticator or recovery code');return}
   T=d.token;localStorage.setItem('owt',T);enterApp();
@@ -386,6 +408,7 @@ function boot(){
     for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
     localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
+  else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
