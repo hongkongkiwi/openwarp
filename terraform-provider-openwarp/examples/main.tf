@@ -1,40 +1,65 @@
 terraform {
   required_providers {
     openwarp = {
-      source = "hongkongkiwi/openwarp"
+      source  = "hongkongkiwi/openwarp"
+      version = ">= 0.1.0"
     }
   }
 }
 
-# Set OPENWARP_BASE_URL and OPENWARP_TOKEN in the environment.
-# The source address is a scaffold convention, not a published registry entry.
-provider "openwarp" {}
-
-variable "app_id" {
-  type = string
+variable "openwarp_host" { type = string }
+variable "openwarp_token" {
+  type      = string
+  sensitive = true
 }
-
-variable "env_id" {
-  type = string
-}
-
-variable "secret_value" {
+variable "org_id" { type = string }
+variable "database_url" {
   type      = string
   sensitive = true
 }
 
-resource "openwarp_secret" "example" {
-  app_id  = var.app_id
-  env_id  = var.env_id
-  key     = "EXAMPLE_TOKEN"
-  value   = var.secret_value
-  path    = "/"
-  type    = "secret"
-  comment = "Managed by Terraform"
+provider "openwarp" {
+  host  = var.openwarp_host
+  token = var.openwarp_token
 }
 
-data "openwarp_secret" "example" {
-  env_id     = var.env_id
-  key        = openwarp_secret.example.key
-  depends_on = [openwarp_secret.example]
+resource "openwarp_app" "billing" {
+  org_id = var.org_id
+  name   = "billing-api"
+}
+
+resource "openwarp_environment" "production" {
+  app_id           = openwarp_app.billing.id
+  name             = "Production"
+  restricted       = true
+  require_approval = true
+}
+
+resource "openwarp_secret" "database_url" {
+  env_id = openwarp_environment.production.id
+  key    = "DATABASE_URL"
+  value  = var.database_url
+  tags   = "owner=platform"
+}
+
+data "openwarp_secret" "database_url" {
+  env_id     = openwarp_environment.production.id
+  key        = "DATABASE_URL"
+  depends_on = [openwarp_secret.database_url]
+}
+
+resource "openwarp_service_token" "ci" {
+  app_id = openwarp_app.billing.id
+  env_id = openwarp_environment.production.id
+  name   = "ci"
+}
+
+output "ci_token" {
+  value     = openwarp_service_token.ci.token
+  sensitive = true
+}
+
+output "database_url_readback" {
+  value     = data.openwarp_secret.database_url.value
+  sensitive = true
 }

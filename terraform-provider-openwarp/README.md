@@ -1,23 +1,123 @@
-# OpenWarp Terraform provider scaffold
+# Terraform provider for OpenWarp
 
-Go module using Terraform Plugin SDK v2 helper/schema. This is source scaffolding, not a published provider. It has not been built, dependency-resolved, schema-validated, or tested with Terraform. No go.sum is supplied because no dependencies were downloaded.
+Manages OpenWarp apps, environments, secrets and service tokens. The provider
+is built on the Terraform Plugin Framework and follows [`../openapi.json`](../openapi.json).
 
-## Configuration
+It is not published to the Registry yet. Build it locally and point Terraform
+at the binary with a development override.
 
-`base_url` is required, or supplied by `OPENWARP_BASE_URL`. Use the server origin with an optional deployment prefix, without `/api`, credentials, query, or fragment. `token` is required and sensitive, or supplied by `OPENWARP_TOKEN`. Use HTTPS in production. HTTP requests use Bearer authentication, a 30-second timeout, and no redirects. HTTP error diagnostics include only status, not response bodies that might contain secret data.
+## Build and install
 
-## Resource openwarp_secret
+```bash
+go build -o terraform-provider-openwarp .
+```
 
-Required: `app_id`, `env_id`, `key`, `value`. Value is sensitive. Optional: `path` (default `/`), `type` (default `secret`), `comment` (default empty). Changes to app, environment, key, path, or type replace the resource. Type replacement accommodates the server's sealed-secret restrictions.
+```hcl
+# ~/.terraformrc
+provider_installation {
+  dev_overrides {
+    "hongkongkiwi/openwarp" = "/absolute/path/to/terraform-provider"
+  }
+  direct {}
+}
+```
 
-Create and Update validate environment membership through `GET /api/apps/{app}/envs`, list existing secrets to preserve unmanaged tags, then upsert one secret through PUT. Read lists environment secrets and matches key case-insensitively plus exact path. A successful list without a match clears the resource ID. Delete resolves the current secret ID with the same lookup before DELETE. Authorization and transport errors are reported rather than treated as absence. The server's PUT is an upsert: a pre-existing key/path can be adopted and overwritten. Do not manage the same secret with multiple resources or enable create_before_destroy for replacements sharing its identity.
+With a dev override, run `terraform plan` directly; `terraform init` warns that
+the provider is overridden and is not needed.
 
-Import is intentionally not implemented. App ownership cannot be recovered from the optional `env_id/key` import format using only the supplied routes. Configure a resource explicitly instead. Sync errors returned by PUT are not surfaced by this scaffold; deployment and downstream integration success are separate.
+## Credentials
 
-## Data source openwarp_secret
+```hcl
+provider "openwarp" {
+  host  = "https://secrets.example.com"
+  token = var.openwarp_token
+}
+```
 
-Required: `env_id`, `key`. Returns sensitive `value`, `path`, and `type`. A missing key or a key present at multiple paths is an error, rather than an arbitrary selection.
+`host` and `token` fall back to `OPENWARP_HOST` and `OPENWARP_TOKEN`. The token
+comes from `openwarp login`, a service token, or an OAuth access token. Service
+tokens scoped to one environment can only manage that environment.
 
-Sensitive values still reside in Terraform state. Encrypt and restrict the state backend, avoid committing state or secret variable files, and do not expose values through non-sensitive outputs. API-returned sealed or redacted values follow server behavior; this scaffold does not decrypt end-to-end encrypted environments.
+## Resources
 
-See `examples/main.tf` for resource and data-source declarations. The example source address is a naming convention only. Local use requires building and configuring a Terraform CLI development override for that address after dependency downloads are authorized. No installation, build, Terraform init, plan, apply, or acceptance checks were run during scaffold creation.
+### openwarp_app
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `org_id` | string, required | Forces replacement |
+| `name` | string, required | |
+
+Creates Development, Staging and Production automatically.
+
+Import: `terraform import openwarp_app.x <app_id>` (searches the caller's
+organisations for the id).
+
+### openwarp_environment
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `app_id` | string, required | Forces replacement |
+| `name` | string, required | Letters, digits, `-`, `_` |
+| `restricted` | bool, optional | Only environment members and admins |
+| `require_approval` | bool, optional | Direct deploys become admin-only |
+
+Import: `terraform import openwarp_environment.x <env_id>`.
+
+### openwarp_secret
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `env_id` | string, required | Forces replacement |
+| `key` | string, required | Upper-case letters, digits, `.`, `-`, `_`; forces replacement |
+| `value` | string, required, sensitive | |
+| `path` | string, optional | `/` by default; forces replacement |
+| `type` | string, optional | `secret` or `config` |
+| `comment` | string, optional | |
+| `tags` | string, optional | Comma-separated tags as the API stores them |
+
+`version` is computed. Sealed secrets are not managed: the API never returns
+their value.
+
+Import: `terraform import openwarp_secret.x <env_id>:<KEY>` or
+`<env_id>:<path>:<KEY>` for a non-root path.
+
+### openwarp_service_token
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `app_id` | string, required | Forces replacement |
+| `name` | string, required | Forces replacement |
+| `env_id` | string, optional | Scopes the token; forces replacement |
+| `token` | computed, sensitive | Shown once at creation |
+
+Import: `terraform import openwarp_service_token.x <token_id>`. The plaintext
+token cannot be recovered after creation; an imported token keeps an empty
+value, so generate a new one if you need the secret.
+
+## Data source
+
+`openwarp_secret` reads a secret by `env_id`, `key` and optional `path`, and
+exposes `value` (sensitive), `id`, `type` and `version`.
+
+## Test
+
+```bash
+# Compiles the provider and the acceptance tests.
+go test ./...
+
+# Client round trip against a real server binary.
+cargo build -p openwarp-server
+OPENWARP_BIN="$PWD/../target/debug/openwarp-server" go test ./internal/client -v
+
+# Acceptance tests. They need a running instance, a token and an org id.
+export OPENWARP_HOST=http://127.0.0.1:8080
+export OPENWARP_TOKEN=...
+export OPENWARP_TEST_ORG_ID=...
+TF_ACC=1 go test ./internal/provider -v -timeout 20m
+```
+
+## Publishing
+
+The Registry expects a dedicated `terraform-provider-openwarp` repository with
+signed releases for each platform. The module is self-contained here so it can
+be moved with `git subtree` when that repository is created.

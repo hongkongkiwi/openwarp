@@ -1,10 +1,26 @@
 package main
 
 import (
-	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
-	"terraform-provider-openwarp/internal/provider"
+	"context"
+	"flag"
+	"log"
+
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+
+	"github.com/hongkongkiwi/terraform-provider-openwarp/internal/provider"
 )
 
+var version = "dev"
+
 func main() {
-	plugin.Serve(&plugin.ServeOpts{ProviderFunc: provider.Provider})
+	var debug bool
+	flag.BoolVar(&debug, "debug", false, "run the provider with debugger support")
+	flag.Parse()
+	opts := providerserver.ServeOpts{
+		Address: "registry.terraform.io/hongkongkiwi/openwarp",
+		Debug:   debug,
+	}
+	if err := providerserver.Serve(context.Background(), provider.New(version), opts); err != nil {
+		log.Fatalf("could not serve provider: %s", err)
+	}
 }

@@ -1,5 +1,10 @@
 # Rust build output
 /target
+/sdk/rust/target
+
+# TypeScript SDK build output and installed dependencies
+/sdk/typescript/dist/
+/sdk/typescript/node_modules/
 
 # Git worktrees live inside the repo and are never committed
 /.worktrees/
