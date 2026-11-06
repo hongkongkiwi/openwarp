@@ -493,3 +493,24 @@ in this repository.
 SAML 2.0 SSO, an OCSP responder, provider-specific secret rotation (the generic
 rotation webhook is not shipped), and a fully asynchronous Postgres API. Do not
 treat CRL support as an OCSP replacement.
+
+## Account lifecycle (2026-11-06)
+
+- Ownership transfer is `POST /api/orgs/:id/transfer {user_id}`. The target must
+  already be a member with an active, verified account; the caller becomes an
+  admin. The console's Members table exposes the same transfer, role changes and
+  member removal.
+- `DELETE /api/me` deletes the calling account. It requires a signed-in console
+  session, so an API key, service token or OAuth token cannot delete the account
+  that issued it. A user who owns any workspace gets `409` with the workspace
+  list until ownership is transferred; the instance owner is refused for the
+  same reason.
+- Live credentials turn the request into a `409` warning with
+  `confirmation_required`, `api_keys` and `oauth_sessions` counts; repeat with
+  `DELETE /api/me?confirm=true` to proceed. The delete revokes sessions, OAuth
+  access and refresh tokens, service tokens the user created, environment keys,
+  overrides and identity bindings. Organisation history (audit, proposals,
+  access requests) remains.
+- OAuth consent with email and password now refuses an unverified account,
+  matching the console sign-in gate. Verified accounts continue through the
+  normal authorization-code flow.

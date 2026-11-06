@@ -339,6 +339,61 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h)?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     // A caller can always learn the environment its own credential is confined to.
     let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h)); Ok(j(out)) }
+// Deleting an account is a console action: an API key or OAuth token must not be
+// able to destroy the account that minted it. Workspace ownership blocks the
+// delete until it is transferred, and live credentials need explicit consent
+// because they stop working immediately.
+async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res {
+    let uid = st.token_user(&h)?;
+    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+    let token = if bearer.is_empty() { cookie_val(&h, "ow_session") } else { bearer.to_string() };
+    let session = !token.is_empty() && st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=?", &[json!(oc::hash_token(&token)), json!(&uid)]).map_err(|e| bad(&e))?.is_some();
+    if !session { return Err(err(StatusCode::FORBIDDEN, "sign in to the console to delete your account; API keys and OAuth tokens cannot delete an account")); }
+    let owned = st.db.query("SELECT o.id AS id, o.name AS name FROM org_members m JOIN orgs o ON o.id=m.org_id WHERE m.user_id=? AND m.role='owner' ORDER BY o.name", &[json!(&uid)]).map_err(|e| bad(&e))?;
+    if !owned.is_empty() {
+        let workspaces: Vec<Value> = owned.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name")})).collect();
+        return Err((StatusCode::CONFLICT, Json(json!({
+            "error": "transfer ownership of every workspace you own before deleting your account",
+            "workspaces": workspaces }))));
+    }
+    if meta_get(&st, "instance_owner") == uid {
+        return Err((StatusCode::CONFLICT, Json(json!({"error": "this account owns the instance; point the instance_owner meta key at another account before deleting it"}))));
+    }
+    let api_keys = st.db.one("SELECT COUNT(*) AS n FROM tokens WHERE created_by=?", &[json!(&uid)]).map_err(|e| bad(&e))?.map(|r| db::n(&r,"n")).unwrap_or(0);
+    let oauth_sessions = st.db.one("SELECT COUNT(DISTINCT pair_id) AS n FROM oauth_tokens WHERE user_id=? AND kind='access' AND expires_at>?", &[json!(&uid), json!(now())]).map_err(|e| bad(&e))?.map(|r| db::n(&r,"n")).unwrap_or(0);
+    let confirm = q.get("confirm").map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")).unwrap_or(false);
+    if (api_keys > 0 || oauth_sessions > 0) && !confirm {
+        return Err((StatusCode::CONFLICT, Json(json!({
+            "error": format!("deleting this account revokes {} API key(s) and {} CLI/OAuth session(s) immediately", api_keys, oauth_sessions),
+            "confirmation_required": true, "api_keys": api_keys, "oauth_sessions": oauth_sessions,
+            "hint": "repeat with ?confirm=true to delete anyway" }))));
+    }
+    st.audit("", "", "", &uid, "account.delete", &format!("revoked {} key(s), {} oauth session(s)", api_keys, oauth_sessions));
+    // Credentials, personal keys and grants go first, so an interrupted delete
+    // cannot leave live access. Organisation history (audit, proposals, access
+    // requests) stays; it holds only the opaque user id.
+    for sql in [
+        "DELETE FROM sessions WHERE user_id=?",
+        "DELETE FROM oauth_tokens WHERE user_id=?",
+        "DELETE FROM oauth_codes WHERE user_id=?",
+        "DELETE FROM auth_tokens WHERE user_id=?",
+        "DELETE FROM mfa_challenges WHERE user_id=?",
+        "DELETE FROM tokens WHERE created_by=?",
+        "DELETE FROM env_keys WHERE user_id=?",
+        "DELETE FROM overrides WHERE user_id=?",
+        "DELETE FROM org_members WHERE user_id=?",
+        "DELETE FROM team_members WHERE user_id=?",
+        "DELETE FROM app_members WHERE user_id=?",
+        "DELETE FROM env_members WHERE user_id=?",
+        "DELETE FROM oidc_subjects WHERE user_id=?",
+        "DELETE FROM social_subjects WHERE user_id=?",
+        "DELETE FROM identity_bindings WHERE user_id=?",
+        "DELETE FROM saml_subjects WHERE user_id=?",
+        "DELETE FROM users WHERE id=?",
+    ] { st.db.exec(sql, &[json!(&uid)]).map_err(|e| bad(&e))?; }
+    for key in ["totp_enabled", "totp_secret", "totp_recovery", "totp_last"] { let _ = st.db.exec("DELETE FROM meta WHERE k=?", &[json!(&format!("{}:{}", key, uid))]); }
+    Ok(j(json!({"deleted": true, "revoked_api_keys": api_keys, "revoked_oauth_sessions": oauth_sessions}))) }
 async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h)?;
     let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -363,10 +418,13 @@ async fn transfer_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     if st.require_org(&oid, &uid)? != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can transfer ownership")); }
     let target = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     if target.is_empty() || target == uid { return Err(bad("user_id of another member required")); }
-    if st.org_role(&oid, target).is_none() { return Err(err(StatusCode::NOT_FOUND, "member not found")); }
+    // A deactivated or unverified member would become an owner who cannot sign
+    // in, so ownership can only move to an account that can actually use it.
+    let member = st.db.one("SELECT u.active AS active, u.email_verified AS email_verified FROM org_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=? AND m.user_id=?", &[json!(&oid), json!(target)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
+    if db::n(&member, "active") == 0 || db::n(&member, "email_verified") == 0 { return Err(err(StatusCode::CONFLICT, "the new owner needs an active, verified account")); }
     st.db.exec("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=?", &[json!(&oid), json!(target)]).map_err(|e| bad(&e))?;
     st.db.exec("UPDATE org_members SET role='admin' WHERE org_id=? AND user_id=?", &[json!(&oid), json!(&uid)]).map_err(|e| bad(&e))?;
-    st.audit(&oid, "", "", &uid, "org.transfer", target); Ok(j(json!({"ok": true}))) }
+    st.audit(&oid, "", "", &uid, "org.transfer", target); Ok(j(json!({"ok": true, "owner": target, "previous_owner_role": "admin"}))) }
 async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?;
     st.check_admin(&oid, &uid)?;
     let caller_role = st.require_org(&oid, &uid)?;
@@ -2605,8 +2663,11 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr.ip(), email.to_lowercase());
         if !st.rate_ok(&key, 5, 900) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
-        let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
+        let row = match st.db.one("SELECT id,pass_hash,active,email_verified FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
+        // The console login enforces verification; this second sign-in path
+        // must not hand a verified-looking OAuth grant to an unverified address.
+        if db::n(&row, "email_verified") == 0 { return (StatusCode::FORBIDDEN, "verify your email address before authorizing an application").into_response(); }
         if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
         db::s(&row, "id") };
     if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
@@ -2938,7 +2999,7 @@ async fn main() {
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
-        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
+        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))

@@ -878,3 +878,119 @@ async fn forgot_password_does_not_reveal_accounts() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(s.inbox.lock().unwrap().is_empty(), "no mail may be sent for an unknown address");
 }
+
+#[tokio::test]
+async fn workspace_ownership_blocks_account_deletion_until_transferred() {
+    let s = Server::start().await;
+    let owner = register(&s, "sole-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+
+    let r = s.call(Method::DELETE, "/api/me", Some(ot), None).await;
+    assert_eq!(r.status, 409, "an owner must not delete their account, got {} {}", r.status, r.text);
+    assert_eq!(r.body["workspaces"][0]["id"].as_str().unwrap_or(""), org, "the refusal must name the workspace: {}", r.text);
+    let still = s.call(Method::GET, "/api/me", Some(ot), None).await;
+    assert_eq!(still.status, 200, "a refused delete must leave the account usable: {}", still.text);
+}
+
+#[tokio::test]
+async fn account_deletion_warns_about_issued_keys_and_revokes_them() {
+    let s = Server::start().await;
+    let first = register(&s, "first-owner@test.invalid").await;
+    let ft = first.body["token"].as_str().unwrap();
+    let first_id = first.body["user_id"].as_str().unwrap();
+
+    let second = register(&s, "second-owner@test.invalid").await;
+    let bt = second.body["token"].as_str().unwrap();
+    let org_b = second.body["org_id"].as_str().unwrap();
+
+    // Give the second account no workspace of its own, so only its credentials
+    // stand between it and deletion: first owner joins, then receives ownership.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org_b), Some(bt), Some(json!({"email": "first-owner@test.invalid", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "adding the existing account failed: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/transfer", org_b), Some(bt), Some(json!({"user_id": first_id}))).await;
+    assert_eq!(r.status, 200, "transfer failed: {}", r.text);
+    let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org_b), Some(bt), None).await;
+    assert!(members.text.contains("first-owner@test.invalid"), "{}", members.text);
+    assert!(members.text.contains("\"role\":\"owner\""), "the new owner must hold the role: {}", members.text);
+
+    // The demoted account is an admin, so it can mint a service token.
+    let app = s.call(Method::POST, &format!("/api/orgs/{}/apps", org_b), Some(bt), Some(json!({"name": "svc"}))).await;
+    assert_eq!(app.status, 200, "{}", app.text);
+    let aid = app.body["id"].as_str().unwrap();
+    let token = s.call(Method::POST, &format!("/api/apps/{}/tokens", aid), Some(bt), Some(json!({"name": "ci"}))).await;
+    assert_eq!(token.status, 200, "{}", token.text);
+    let api_key = token.body["token"].as_str().unwrap();
+
+    // A live key turns the delete into a warning, and nothing is revoked yet.
+    let r = s.call(Method::DELETE, "/api/me", Some(bt), None).await;
+    assert_eq!(r.status, 409, "a live API key needs a warning, got {} {}", r.status, r.text);
+    assert_eq!(r.body["confirmation_required"], json!(true), "{}", r.text);
+    assert_eq!(r.body["api_keys"], json!(1), "{}", r.text);
+    let keys = s.call(Method::GET, &format!("/api/apps/{}/tokens", aid), Some(bt), None).await;
+    assert_eq!(keys.status, 200, "a refused delete must leave keys live: {}", keys.text);
+
+    // The key itself cannot destroy the account that issued it, even confirmed.
+    let r = s.call(Method::DELETE, "/api/me?confirm=true", Some(api_key), None).await;
+    assert_eq!(r.status, 403, "an API key must not delete the account, got {} {}", r.status, r.text);
+
+    // The console session can, once it confirms.
+    let r = s.call(Method::DELETE, "/api/me?confirm=true", Some(bt), None).await;
+    assert_eq!(r.status, 200, "confirmed delete failed: {}", r.text);
+    assert_eq!(r.body["revoked_api_keys"], json!(1), "{}", r.text);
+    let r = s.call(Method::GET, "/api/me", Some(bt), None).await;
+    assert_eq!(r.status, 401, "the session must die with the account, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, "/api/me", Some(api_key), None).await;
+    assert_eq!(r.status, 401, "the service token must die with the account, got {} {}", r.status, r.text);
+    let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "second-owner@test.invalid", "password": "correct-horse-battery"}))).await;
+    assert_eq!(login.status, 401, "a deleted account must not sign in, got {} {}", login.status, login.text);
+
+    // The workspace survives with the member who received it.
+    let orgs = s.call(Method::GET, "/api/orgs", Some(ft), None).await;
+    assert_eq!(orgs.status, 200, "{}", orgs.text);
+    assert!(orgs.text.contains(org_b), "the transferred workspace must stay with its owner: {}", orgs.text);
+    assert!(orgs.text.contains("\"role\":\"owner\""), "{}", orgs.text);
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use sha2::{Digest, Sha256};
+    Base64UrlUnpadded::encode_string(&Sha256::digest(verifier.as_bytes()))
+}
+
+#[tokio::test]
+async fn oauth_authorization_requires_a_verified_email() {
+    let s = Server::start().await;
+    let reg = register_raw(&s, "unverified-oauth@test.invalid").await;
+    assert_eq!(reg.status, 200, "{}", reg.text);
+
+    let verifier = "a-very-long-pkce-verifier-for-tests-0123456789";
+    let challenge = pkce_challenge(verifier);
+    let client = s.call(Method::POST, "/oauth/register", None, Some(json!({
+        "client_name": "test-cli",
+        "redirect_uris": ["http://127.0.0.1:49721/callback"],
+        "token_endpoint_auth_method": "none",
+        "scope": "secrets:read"
+    }))).await;
+    assert_eq!(client.status, 201, "client registration failed: {}", client.text);
+    let cid = client.body["client_id"].as_str().unwrap().to_string();
+
+    let form = [
+        ("response_type", "code"), ("client_id", cid.as_str()), ("redirect_uri", "http://127.0.0.1:49721/callback"),
+        ("scope", "secrets:read"), ("state", "st"), ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"), ("approve", "1"),
+        ("email", "unverified-oauth@test.invalid"), ("password", "correct-horse-battery"),
+    ];
+    let r = s.post_form("/oauth/authorize/decision", &form).await;
+    assert_eq!(r.status, 403, "an unverified account must not authorize a client, got {} {}", r.status, r.text);
+    assert!(r.text.contains("verify your email"), "{}", r.text);
+
+    // Once the address is verified the same request hands out a code.
+    let text = wait_for_mail(&s.inbox, "/api/auth/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/verify?token=");
+    let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+    assert_eq!(s.get(&path).await.status, 200, "the verification link must work");
+    let r = s.post_form("/oauth/authorize/decision", &form).await;
+    assert_eq!(r.status, 303, "a verified account must authorize, got {} {}", r.status, r.text);
+    assert!(r.header("location").contains("code="), "expected a code redirect, got {}", r.header("location"));
+}
