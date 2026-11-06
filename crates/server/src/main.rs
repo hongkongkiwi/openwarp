@@ -2562,6 +2562,9 @@ fn load_root(db: &Db) -> Result<([u8;32], Option<kms::Kms>), String> {
         // keep using the same root to read data written before the restart.
         if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]) {
             let raw = kms.unwrap(&db::s(&r, "v"), "openwarp-root")?;
+            // Finish the adoption cleanup if a previous boot crashed between
+            // storing kms_root and deleting the plaintext master.
+            let _ = db.exec("DELETE FROM meta WHERE k='master'", &[]);
             return Ok((raw.try_into().map_err(|_| "kms_root is not 32 bytes".to_string())?, Some(kms)));
         }
         // First KMS boot: adopt the stored master when there is one so old data
