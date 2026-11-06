@@ -33,21 +33,30 @@ impl Db {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
         let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
     }
+    pub fn is_postgres(&self) -> bool { matches!(self, Db::Postgres(_)) }
     pub fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
             Db::Postgres(c) => {
                 let c = c.clone(); let sql = sql.to_string(); let params = params.to_vec();
-                std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql); let pg = PgParams::new(&params); let refs = pg.refs(); client.execute(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())?
+                std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql); let pg = PgParams::new(&params); let refs = pg.refs(); client.execute(sql2.as_str(), &refs[..]).map_err(pg_error) }).join().map_err(|_| "pg thread panicked".to_string())?
             }
         }
     }
+    /// Whether a table has a column, without relying on backend error text.
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
+        let row = if self.is_postgres() {
+            self.one("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?", &[serde_json::json!(table), serde_json::json!(column)])?
+        } else {
+            self.one(&format!("SELECT COUNT(*) AS n FROM pragma_table_info('{}') WHERE name=?", table), &[serde_json::json!(column)])?
+        };
+        Ok(row.map(|r| n(&r, "n") > 0).unwrap_or(false)) }
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
             Db::Postgres(c) => {
                 let c = c.clone(); let sql_owned = sql.to_string(); let params_owned = params.to_vec();
-                let rows = std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql_owned); let pg = PgParams::new(&params_owned); let refs = pg.refs(); client.query(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())??;
+                let rows = std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql_owned); let pg = PgParams::new(&params_owned); let refs = pg.refs(); client.query(sql2.as_str(), &refs[..]).map_err(pg_error) }).join().map_err(|_| "pg thread panicked".to_string())??;
                 let mut out = Vec::new();
                 for r in &rows {
                     let mut m = Row::new();
@@ -66,33 +75,70 @@ impl Db {
         }
     }
     pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
-    fn migrate(&self) -> Result<(), String> {
-        for stmt in SCHEMA { self.exec(stmt, &[])?; }
-        for alter in [
-            "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
-            "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
-            "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1",
-            "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'",
-            "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0",
-            "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''",
-            "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''",
-            "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
-            "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
-            "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
-            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
-        ] { let _ = self.exec(alter, &[]); }
-        for idx in INDEXES { let _ = self.exec(idx, &[]); }
-        // One-time backfill: environments that already had an allowlist keep it.
+    /// Highest applied migration. 0 means the database is empty or predates the
+    /// ledger.
+    pub fn version(&self) -> Result<i64, String> {
+        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[])?.map(|r| n(&r, "version")).unwrap_or(0)) }
+    /// Applies every migration above the recorded version, once. Version 1 is
+    /// the original schema and is written to be idempotent: it tolerates the
+    /// "column already exists" errors produced by databases created before the
+    /// ledger existed. Later versions run as individual statements and must
+    /// also be safe to retry if the process dies mid-way.
+    pub fn migrate(&self) -> Result<(), String> {
+        self.exec("CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)", &[])?;
+        let current = self.version()?;
+        for version in 1..=SCHEMA_VERSION {
+            if version <= current { continue; }
+            self.apply_migration(version)?;
+            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())])
+                .map_err(|e| format!("migration {} applied but could not be recorded: {}", version, e))?;
+        }
+        // Idempotent data backfill, independent of the schema ledger.
         if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
             let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
             let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]);
         }
         Ok(())
     }
+    fn apply_migration(&self, version: i64) -> Result<(), String> {
+        match version {
+            1 => {
+                for stmt in SCHEMA { self.exec(stmt, &[])?; }
+                for (table, column, alter) in LEGACY_COLUMNS {
+                    if !self.column_exists(table, column)? {
+                        self.exec(alter, &[]).map_err(|e| format!("migration 1 failed ({}): {}", alter, e))?;
+                    }
+                }
+                for idx in INDEXES { self.exec(idx, &[]).map_err(|e| format!("migration 1 failed ({}): {}", idx, e))?; }
+                Ok(())
+            }
+            other => Err(format!("no migration registered for version {}", other)),
+        }
+    }
 }
+fn pg_error(e: postgres::Error) -> String {
+    match e.as_db_error() { Some(d) => format!("postgres {}: {}", d.code().code(), d.message()), None => e.to_string() } }
+
+/// The highest migration this binary knows about. Add a step to
+/// `apply_migration` and bump this together.
+pub const SCHEMA_VERSION: i64 = 1;
+
+const LEGACY_COLUMNS: &[(&str, &str, &str)] = &[
+    ("envs", "mode", "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'"),
+    ("envs", "restricted", "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0"),
+    ("envs", "require_approval", "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0"),
+    ("secrets", "e2e", "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0"),
+    ("secrets", "deleted_at", "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0"),
+    ("users", "active", "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1"),
+    ("tokens", "kind", "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'"),
+    ("tokens", "expires_at", "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0"),
+    ("leases", "username", "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''"),
+    ("leases", "config_enc", "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''"),
+    ("oidc_states", "nonce", "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''"),
+    ("pki_cas", "serial", "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''"),
+    ("rotation_schedules", "path", "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'"),
+    ("users", "email_verified", "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1"),
+];
 enum PgOwned { S(String), I(i64), B(bool), N(Option<String>) }
 struct PgParams { owned: Vec<PgOwned> }
 impl PgParams {
@@ -203,5 +249,27 @@ mod tests {
         assert_eq!(s(&rows[0], "name"), "Acme");
         // placeholder translation used by Postgres backend
         assert_eq!(pg_sql("SELECT * FROM t WHERE a=? AND b=?"), "SELECT * FROM t WHERE a=$1 AND b=$2");
+    }
+    #[test] fn migrations_are_recorded_once() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.version().unwrap(), SCHEMA_VERSION, "a fresh database lands on the current version");
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).unwrap().unwrap();
+        assert_eq!(n(&row, "n"), SCHEMA_VERSION, "each migration must be recorded exactly once");
+    }
+    #[test] fn legacy_database_is_upgraded_and_recorded_once() {
+        // A database from before the ledger: no columns added after the first
+        // release, no schema_migrations table.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL,pubkey TEXT NOT NULL,wrapped_privkey TEXT NOT NULL,created_at BIGINT NOT NULL)").unwrap();
+        let db = Db::Sqlite(Mutex::new(conn));
+        db.migrate().unwrap();
+        assert_eq!(db.version().unwrap(), SCHEMA_VERSION);
+        let cols = db.query("PRAGMA table_info(users)", &[]).unwrap();
+        assert!(cols.iter().any(|r| s(r, "name") == "email_verified"), "missing columns are added on upgrade");
+        db.migrate().unwrap();
+        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).unwrap().unwrap();
+        assert_eq!(n(&row, "n"), SCHEMA_VERSION, "a second boot must not re-apply the baseline");
     }
 }

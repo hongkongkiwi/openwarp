@@ -82,6 +82,19 @@ sign in until it is opened. Social and SSO logins arrive with verified
 addresses. The server refuses to start if verification is required but no email
 relay is configured, because nobody could complete it.
 
+## Schema migrations
+
+Migrations are numbered and recorded in `schema_migrations`. The server applies
+them at boot, or a deploy job can run them without starting the listener or
+needing the master key:
+
+```bash
+DATABASE_URL=... openwarp-server --migrate   # prints the current version and exits
+```
+
+Existing databases created before the ledger are baselined at version 1 and
+upgraded in place. Take a backup first; see [BACKUP.md](BACKUP.md).
+
 ## Operational checks
 
 - `GET /health` is unauthenticated and checks the database; it returns 503

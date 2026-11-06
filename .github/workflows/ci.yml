@@ -14,9 +14,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=2
       - run: node --test crates/server/tests/ui.test.cjs
+      - run: python3 scripts/check-openapi.py
+      # The SDK tests spawn the binary cargo test just built.
+      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
+      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdks/python -p 'test_*.py'
 
   docker:
     runs-on: ubuntu-latest

@@ -2009,6 +2009,17 @@ async fn shutdown_signal() {
 async fn main() {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openwarp.db".into());
     let db = Db::open(&db_url).expect("open database (sqlite://file.db or postgres://...)");
+    // Migration-only entry point for job containers: no master key or listener.
+    if std::env::args().any(|a| a == "--migrate") {
+        let outcome = db.version();
+        // The blocking postgres client cannot be dropped from inside a tokio
+        // runtime, so release it on a plain thread before exiting.
+        let _ = std::thread::spawn(move || drop(db)).join();
+        match outcome {
+            Ok(v) => println!("schema version {} (latest {})", v, db::SCHEMA_VERSION),
+            Err(e) => { eprintln!("could not read schema version: {}", e); std::process::exit(1); } }
+        return;
+    }
     let master = load_master(&db).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
     if verification_required() && std::env::var("OPENWARP_EMAIL_WEBHOOK").map(|v| v.trim().is_empty()).unwrap_or(true) {
         eprintln!("OPENWARP_REQUIRE_EMAIL_VERIFICATION is set but OPENWARP_EMAIL_WEBHOOK is not; verification links could not be delivered");

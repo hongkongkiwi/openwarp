@@ -1,0 +1,13 @@
+{
+  "name": "openwarp-sdk",
+  "version": "0.1.0",
+  "description": "OpenWarp secrets API client",
+  "type": "module",
+  "main": "openwarp.ts",
+  "types": "openwarp.ts",
+  "files": ["openwarp.ts", "README.md"],
+  "engines": { "node": ">=22.6" },
+  "scripts": {
+    "test": "node --test sdk.test.ts"
+  }
+}

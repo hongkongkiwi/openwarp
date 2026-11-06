@@ -52,6 +52,36 @@ Access and refresh tokens are stored in the operating system credential store
 that succeeds; `OPENWARP_NO_KEYRING=1` forces the 0600 file, and
 `OPENWARP_CONFIG` overrides its path.
 
+## API, SDKs and schema
+
+The public REST contract is [`openapi.json`](openapi.json): 56 paths and 72
+operations covering authentication, organisations, members, apps,
+environments, secrets, service tokens, integrations, leases, rotations,
+machine identities, sharing and search. Browser and protocol surfaces (OAuth
+authorization, MCP, SCIM, PKI, E2E envelopes) are deliberately outside it.
+
+Clients live under `sdks/`. Both are dependency free, cover the contract, and
+are tested against a real server binary:
+
+```bash
+cargo build -p openwarp-server
+OPENWARP_BIN=target/debug/openwarp-server node --test sdks/typescript/sdk.test.ts
+OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest discover -s sdks/python -p 'test_*.py'
+```
+
+`python3 scripts/check-openapi.py` fails when the spec documents a path or
+method the server does not serve, or when a schema reference or path parameter
+is missing, so the contract cannot drift silently.
+
+Schema changes are numbered migrations in `crates/server/src/db.rs`, recorded in
+`schema_migrations` and applied once. The server applies them at boot;
+`openwarp-server --migrate` reports the version and exits without needing a
+master key or a listener, which is the right hook for a deploy job. Existing
+databases are baselined and upgraded in place.
+
+A Terraform provider built on the same contract is the next step; it will use
+the Go client generated from this spec rather than a second hand-written client.
+
 ## Sign-in and signups
 
 Password sign-in is always available. Google and GitHub sign-in appear on the
