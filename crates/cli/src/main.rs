@@ -269,7 +269,8 @@ fn main() {
             let d: Value = client.post(format!("{}/api/apps/{}/envs/e2e", host, app)).bearer_auth(&token).json(&json!({"name": name, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
         Cmd::E2ePut { env, key, value, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let kname = key.to_uppercase(); let khash = openwarp_crypto::hash_token(&format!("/:{}", kname));
-            let payload = json!({"secrets": [{"key_enc": openwarp_crypto::encrypt_symmetric(&ek, kname.as_bytes()), "value_enc": openwarp_crypto::encrypt_symmetric(&ek, value.as_bytes()), "key_hash": khash, "path": "/"}]});
+            let path_enc = openwarp_crypto::encrypt_symmetric(&ek, b"/");
+            let payload = json!({"secrets": [{"key_enc": openwarp_crypto::encrypt_symmetric(&ek, kname.as_bytes()), "value_enc": openwarp_crypto::encrypt_symmetric(&ek, value.as_bytes()), "key_hash": khash, "path": "/", "path_enc": path_enc}]});
             let d: Value = client.put(format!("{}/api/envs/{}/e2e/secrets", host, env)).bearer_auth(&token).json(&payload).send().expect("req").json().expect("json"); println!("{}", d); }
         Cmd::E2eGet { env, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let d = get(&format!("{}/api/envs/{}/e2e/secrets", host, env));
@@ -287,7 +288,11 @@ fn main() {
             for s in d["secrets"].as_array().cloned().unwrap_or_default() {
                 let key = openwarp_crypto::decrypt_symmetric(&old, s["key_enc"].as_str().unwrap_or("")).expect("decrypt key");
                 let value = openwarp_crypto::decrypt_symmetric(&old, s["value_enc"].as_str().unwrap_or("")).expect("decrypt value");
-                items.push(json!({"key_enc": openwarp_crypto::encrypt_symmetric(&new_key, &key), "value_enc": openwarp_crypto::encrypt_symmetric(&new_key, &value), "key_hash": s["key_hash"].clone(), "path": s["path"].clone()}));
+                let path = match s["path_enc"].as_str().filter(|p| !p.is_empty()) {
+                    Some(pe) => String::from_utf8_lossy(&openwarp_crypto::decrypt_symmetric(&old, pe).expect("decrypt path")).into_owned(),
+                    None => s["path"].as_str().unwrap_or("/").to_string() };
+                let path_enc = openwarp_crypto::encrypt_symmetric(&new_key, path.as_bytes());
+                items.push(json!({"key_enc": openwarp_crypto::encrypt_symmetric(&new_key, &key), "value_enc": openwarp_crypto::encrypt_symmetric(&new_key, &value), "key_hash": s["key_hash"].clone(), "path": "", "path_enc": path_enc}));
             }
             let existing = get(&format!("{}/api/envs/{}/e2e/grants", host, env));
             let mut grants = Vec::new();

@@ -980,20 +980,22 @@ async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Jso
     for s in body.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""); let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
         let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or(""); let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+        let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
+        let path_val = if path_enc.is_empty() { path } else { "" };
         if key_enc.is_empty() || key_hash.is_empty() { continue; }
         if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).map_err(|e| bad(&e))? {
             let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
-            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(key_hash), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
+            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,path=?,path_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(path_val), json!(path_enc), json!(key_hash), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         } else { let sid = id();
-            st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,key_index,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secrets(id,env_id,path,path_enc,key_enc,key_hash,key_index,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path_val), json!(path_enc), json!(key_enc), json!(key_hash), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,1,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         } count += 1;
     }
     st.audit(&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)); Ok(j(json!({"deployed": count}))) }
 async fn e2e_get(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let wrapped = st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::FORBIDDEN, "no wrapped env key for caller; ask a member to grant access"))?;
-    let rows = st.db.query("SELECT id,path,key_hash,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,path,path_enc,key_hash,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).map_err(|e| bad(&e))?;
     Ok(j(json!({"wrapped_key": db::s(&wrapped,"wrapped_key"), "secrets": rows.iter().map(db::obj).collect::<Vec<_>>()}))) }
 async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:write")?;
     if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::FORBIDDEN, "caller has no env key to grant")); }
@@ -1062,14 +1064,16 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or("");
         let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
         let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-        if !valid_path(path) { return Err(bad("invalid secret path in rekey payload")); }
+        let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
+        let path_val = if path_enc.is_empty() { path } else { "" };
+        if path_enc.is_empty() && !valid_path(path) { return Err(bad("invalid secret path in rekey payload")); }
         let existing = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0 AND e2e=1", &[json!(&eid), json!(kh)]).map_err(|e| bad(&e))?;
         let (sid, ver) = match existing {
             Some(r) => (db::s(&r, "id"), db::n(&r, "version") + 1),
             None => { return Err(bad("rekey payload does not match the stored secrets")); }
         };
-        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
-            vec![json!(key_enc), json!(value_enc), json!(path), json!(kh), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
+        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,path_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
+            vec![json!(key_enc), json!(value_enc), json!(path_val), json!(path_enc), json!(kh), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
         // Old history is encrypted under the old key and cannot be read after
         // the rotation; replace it rather than leave undecryptable rows.
         stmts.push(("DELETE FROM secret_versions WHERE secret_id=?".into(), vec![json!(&sid)]));
@@ -1549,7 +1553,9 @@ async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
 async fn encrypt_metadata(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can migrate secret metadata")); }
-    let envs = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>'' AND mode<>'delegated'", &[]).map_err(|e| bad(&e))?;
+    // Only managed environments have a server-side key; never touch E2E or
+    // delegated rows, whose client-owned metadata cannot be rewritten here.
+    let envs = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>'' AND mode='sse'", &[]).map_err(|e| bad(&e))?;
     let mut updated = 0;
     for e in &envs {
         let eid = db::s(e, "id");

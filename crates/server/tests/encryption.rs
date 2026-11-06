@@ -308,6 +308,37 @@ async fn secret_ciphertext_cannot_be_swapped_between_records() {
 }
 
 #[tokio::test]
+async fn e2e_paths_can_be_stored_as_client_ciphertext() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "e2e-path@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&t), None).await;
+    let pubkey = me.body["pubkey"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let env_key = oc::random_key();
+    let wrapped = oc::encrypt_to(&pubkey, &env_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&t), Some(json!({"name": "vault", "wrapped_key": wrapped}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let env = r.body["id"].as_str().unwrap().to_string();
+    let path_enc = oc::encrypt_symmetric(&env_key, b"/prod/billing");
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"secrets": [{
+        "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"),
+        "value_enc": oc::encrypt_symmetric(&env_key, b"secret"),
+        "key_hash": oc::hash_token("/:API_KEY"), "path": "/prod/billing", "path_enc": path_enc
+    }]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let (path, stored_path_enc): (String, String) = conn.query_row("SELECT path,path_enc FROM secrets WHERE env_id=?", [&env], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(path.is_empty(), "the client path must not be stored in the clear: {}", path);
+    assert!(!stored_path_enc.is_empty(), "path_enc was not stored");
+    let d = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), None).await;
+    let decrypted = oc::decrypt_symmetric(&env_key, d.body["secrets"][0]["path_enc"].as_str().unwrap()).unwrap();
+    assert_eq!(decrypted, b"/prod/billing");
+}
+
+#[tokio::test]
 async fn secret_metadata_is_encrypted_and_blind_indexed() {
     let s = Server::start_env(&[]).await;
     let u = register(&s, "metadata@test.invalid").await;

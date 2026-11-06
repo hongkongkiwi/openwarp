@@ -157,8 +157,9 @@ thief without the environment key can neither read the metadata nor test guesses
 against the index. New writes do this automatically; run
 `POST /api/instance/encrypt-metadata` as the instance owner once after upgrading
 to migrate existing rows. In `e2e` and `delegated` modes the server has no key,
-so it stores client-supplied paths and key hashes as opaque metadata; clients
-should treat those fields as public.
+so it stores whatever the client supplies. The CLI encrypts the path and sends
+`path_enc`; a client that sends only `path` is choosing plaintext metadata, and
+the key hash remains a client-supplied lookup value.
 
 ## Runner security
 
