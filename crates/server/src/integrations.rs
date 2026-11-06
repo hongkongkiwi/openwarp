@@ -5,6 +5,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona"];
 
+fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
 async fn req(r: reqwest::RequestBuilder) -> Result<String, String> {
@@ -15,7 +16,7 @@ async fn req(r: reqwest::RequestBuilder) -> Result<String, String> {
 fn map_json(secrets: &[(String, String)]) -> Value { let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!(v)); } Value::Object(m) }
 
 pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     match kind {
         "supabase" => { let items: Vec<Value> = secrets.iter().map(|(k,v)| json!({"name":k,"value":v})).collect();
             req(client.post(format!("{}/v1/projects/{}/secrets", base(config,"https://api.supabase.com"), cfg(config,"project_ref"))).bearer_auth(cfg(config,"token")).json(&items)).await?; Ok(format!("pushed {} secrets to Supabase", secrets.len())) }
@@ -88,7 +89,7 @@ fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String,
     secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (format!("{}{}", prefix, k), v.clone())).collect()
 }
 pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
-    let client = reqwest::Client::new(); let base_url = base(config, "https://api.trigger.dev");
+    let client = http_client(); let base_url = base(config, "https://api.trigger.dev");
     let mode = { let m = cfg(config, "mode"); if m.is_empty() { "upsert" } else { m } };
     let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
     let desired = trigger_desired(config, secrets);
@@ -123,7 +124,7 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
     Ok((format!("Trigger.dev sync{}: {}{}", if dry { " (dry-run)" } else { "" }, reports.join("; "), note), managed))
 }
 pub async fn trigger_test(config: &Value) -> Result<String, String> {
-    let client = reqwest::Client::new(); let base_url = base(config, "https://api.trigger.dev"); let targets = trigger_targets(config);
+    let client = http_client(); let base_url = base(config, "https://api.trigger.dev"); let targets = trigger_targets(config);
     let tg = targets.first().ok_or("no target")?; if tg.project_ref.is_empty() || tg.token.is_empty() { return Err("trigger requires token and project_ref".into()); }
     let text = req(client.get(format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env)).bearer_auth(&tg.token)).await?;
     let count = serde_json::from_str::<Vec<Value>>(&text).map(|v| v.len()).unwrap_or(0);
@@ -175,7 +176,7 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
     if !invalid_values.is_empty() { return Err(format!("Instabox invalid secret values: {}", invalid_values.join(", "))); }
     let values = map_json(&desired);
     let managed: Vec<String> = values.as_object().unwrap().keys().cloned().collect();
-    let client = reqwest::Client::new();
+    let client = http_client();
     let remote = instabox_list(&client, &root, &key).await?;
     let created = managed.iter().filter(|name| !remote.contains(name)).count();
     let replaced = managed.len() - created;
@@ -211,7 +212,7 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
 
 pub async fn instabox_test(config: &Value) -> Result<String, String> {
     let (key, org, root) = instabox_config(config)?;
-    let remote = instabox_list(&reqwest::Client::new(), &root, &key).await?;
+    let remote = instabox_list(&http_client(), &root, &key).await?;
     Ok(format!("Instabox connection OK: org {} currently has {} Secrets", org, remote.len()))
 }
 
@@ -241,7 +242,7 @@ pub async fn boat_sync(config: &Value, secrets: &[(String, String)], previous_ma
     let dry = config.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
     let upgrade = config.get("upgrade").and_then(Value::as_bool).unwrap_or(false);
     let want = { let r = boat_env_ref(config); if r.is_empty() { "base".to_string() } else { r } };
-    let client = reqwest::Client::new();
+    let client = http_client();
     let (eid, ename, env) = boat_find_env(&client, &api, key, &want, cfg(config, "org")).await?;
     let current = dotenv_map(env.get("envContents").and_then(Value::as_str).unwrap_or(""));
     let desired = trigger_desired(config, secrets);
@@ -265,7 +266,7 @@ pub async fn boat_test(config: &Value) -> Result<String, String> {
     let key = cfg(config, "api_key"); if key.is_empty() { return Err("Boat requires api_key (a boat_ key)".into()); }
     let api = base(config, "https://boat.dev/api/v1");
     let want = { let r = boat_env_ref(config); if r.is_empty() { "base".to_string() } else { r } };
-    let (_, ename, env) = boat_find_env(&reqwest::Client::new(), &api, key, &want, cfg(config, "org")).await?;
+    let (_, ename, env) = boat_find_env(&http_client(), &api, key, &want, cfg(config, "org")).await?;
     let vars = dotenv_map(env.get("envContents").and_then(Value::as_str).unwrap_or("")).len();
     Ok(format!("Boat connection OK: environment {} currently has {} variables", ename, vars)) }
 
@@ -283,7 +284,7 @@ pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous
     let hosts: Vec<String> = match config.get("hosts") { None => Vec::new(), Some(Value::Array(items)) => items.iter().map(|v| v.as_str().map(str::to_string).ok_or("Daytona hosts must be an array of strings".to_string())).collect::<Result<_, _>>()?, Some(_) => return Err("Daytona hosts must be an array of strings".into()) };
     let desired = trigger_desired(config, secrets);
     if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("Daytona invalid secret names: {}", bad)); }
-    let client = reqwest::Client::new();
+    let client = http_client();
     let list_text = daytona_send(key, org, client.get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?;
     let list: Vec<Value> = serde_json::from_str(&list_text).map_err(|e| format!("Daytona invalid secret list: {}", e))?;
     let by_name: std::collections::HashMap<String, String> = list.iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("id")?.as_str()?.to_string()))).collect();
@@ -294,7 +295,8 @@ pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous
         for (name, value) in &desired {
             let mut body = json!({"value": value}); if !hosts.is_empty() { body["hosts"] = json!(hosts); }
             if let Some(id) = by_name.get(name) { daytona_send(key, org, client.patch(format!("{}/secret/{}", api, id)).json(&body)).await.map_err(|e| format!("Daytona update {} failed: {}", name, e))?; }
-            else { daytona_send(key, org, client.post(format!("{}/secret", api)).json(&json!({"name": name, "value": value, "hosts": hosts}))).await.map_err(|e| format!("Daytona create {} failed: {}", name, e))?; }
+            else { let mut create = json!({"name": name, "value": value}); if !hosts.is_empty() { create["hosts"] = json!(hosts); }
+                daytona_send(key, org, client.post(format!("{}/secret", api)).json(&create)).await.map_err(|e| format!("Daytona create {} failed: {}", name, e))?; }
         }
         if mode == "mirror" {
             let mut failures = Vec::new();
@@ -312,7 +314,7 @@ pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous
 pub async fn daytona_test(config: &Value) -> Result<String, String> {
     let key = cfg(config, "api_key"); if key.is_empty() { return Err("Daytona requires api_key".into()); }
     let api = base(config, "https://api.daytona.io");
-    let text = daytona_send(key, cfg(config, "organization_id"), reqwest::Client::new().get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?;
+    let text = daytona_send(key, cfg(config, "organization_id"), http_client().get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?;
     let list: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
     Ok(format!("Daytona connection OK: organisation currently has {} vault secrets", list.len())) }
 
@@ -338,7 +340,7 @@ fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).coll
 async fn aws_sync(config: &Value, secrets: &[(String, String)], kind: &str) -> Result<String, String> {
     let region = cfg(config, "region"); let ak = cfg(config, "access_key_id"); let sk = cfg(config, "secret_access_key");
     if region.is_empty() || ak.is_empty() || sk.is_empty() { return Err("AWS integration requires region, access_key_id, secret_access_key".into()); }
-    let client = reqwest::Client::new();
+    let client = http_client();
     if kind == "aws_secrets_manager" {
         let secret_id = cfg(config, "secret_id"); if secret_id.is_empty() { return Err("aws_secrets_manager requires secret_id".into()); }
         let payload = json!({"SecretId": secret_id, "SecretString": map_json(secrets).to_string()}).to_string();
