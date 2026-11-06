@@ -42,7 +42,7 @@ pub struct MailMessage {
 
 impl MailConfig {
     pub fn from_env() -> Self {
-        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        let env = |k: &str| crate::envcfg::var(k).unwrap_or_default();
         let smtp_host = env("OPENWARP_SMTP_HOST");
         let resend_key = env("OPENWARP_RESEND_API_KEY");
         let sendgrid_key = env("OPENWARP_SENDGRID_API_KEY");
@@ -149,6 +149,9 @@ pub fn render(kind: &str, to: &str, vars: &[(&str, &str)]) -> MailMessage {
         }
         out
     };
+    #[cfg(target_arch = "wasm32")]
+    let dir = String::new();
+    #[cfg(not(target_arch = "wasm32"))]
     let dir = std::env::var("OPENWARP_EMAIL_TEMPLATES_DIR").unwrap_or_default();
     let read = |suffix: &str| -> Option<String> {
         if dir.is_empty() { return None; }
@@ -187,6 +190,7 @@ fn builtin(kind: &str) -> (&'static str, &'static str) {
 
 pub async fn send(cfg: &MailConfig, msg: &MailMessage) -> Result<(), String> {
     match cfg.provider.as_str() {
+        #[cfg(not(target_arch = "wasm32"))]
         "smtp" => {
             let cfg = cfg.clone();
             let (to, subject, text, html) = (msg.to.clone(), msg.subject.clone(), msg.text.clone(), msg.html.clone());
@@ -212,17 +216,23 @@ pub async fn send(cfg: &MailConfig, msg: &MailMessage) -> Result<(), String> {
                 ("from", cfg.mailbox()), ("to", msg.to.clone()), ("subject", msg.subject.clone()),
                 ("text", msg.text.clone()), ("html", msg.html.clone()),
             ];
-            let resp = reqwest::Client::new().post(&url).basic_auth("api", Some(&cfg.mailgun_key)).form(&form)
+            let resp = crate::http::Client::new().post(&url).basic_auth("api", Some(&cfg.mailgun_key)).form(&form)
                 .timeout(Duration::from_secs(15)).send().await.map_err(|e| e.to_string())?;
             check(resp).await
         }
+        #[cfg(target_arch = "wasm32")]
+        "smtp" => Err("SMTP is unavailable in a Worker; configure an HTTP email provider with OPENWARP_EMAIL_WEBHOOK".into()),
         other => Err(format!("unknown email provider: {}", other)),
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn smtp_send(cfg: &MailConfig, to: &str, subject: &str, text: &str, html: &str) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
     use lettre::message::MultiPart;
+    #[cfg(not(target_arch = "wasm32"))]
     use lettre::transport::smtp::authentication::Credentials;
+    #[cfg(not(target_arch = "wasm32"))]
     use lettre::{Message, SmtpTransport, Transport};
     let from: lettre::message::Mailbox = cfg.mailbox().parse().map_err(|e| format!("invalid from address: {}", e))?;
     let to: lettre::message::Mailbox = to.parse().map_err(|e| format!("invalid recipient: {}", e))?;
@@ -260,18 +270,18 @@ fn webhook_payload(msg: &MailMessage) -> Value {
 }
 
 async fn post_json(url: &str, bearer: Option<&str>, body: Value) -> Result<(), String> {
-    let mut req = reqwest::Client::new().post(url).json(&body).timeout(Duration::from_secs(15));
+    let mut req = crate::http::Client::new().post(url).json(&body).timeout(Duration::from_secs(15));
     if let Some(token) = bearer { req = req.bearer_auth(token); }
     check(req.send().await.map_err(|e| e.to_string())?).await
 }
 
 async fn post_json_with_headers(url: &str, headers: &[(&str, &str)], body: Value) -> Result<(), String> {
-    let mut req = reqwest::Client::new().post(url).json(&body).timeout(Duration::from_secs(15));
-    for (k, v) in headers { req = req.header(*k, *v); }
+    let mut req = crate::http::Client::new().post(url).json(&body).timeout(Duration::from_secs(15));
+    for (k, v) in headers.iter().copied() { req = req.header(k, v); }
     check(req.send().await.map_err(|e| e.to_string())?).await
 }
 
-async fn check(resp: reqwest::Response) -> Result<(), String> {
+async fn check(resp: crate::http::Response) -> Result<(), String> {
     let status = resp.status();
     if status.is_success() { return Ok(()); }
     let body = resp.text().await.unwrap_or_default();

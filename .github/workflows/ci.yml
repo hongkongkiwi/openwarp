@@ -55,6 +55,28 @@ jobs:
       - run: cd terraform-provider && go build ./... && go vet ./...
       - run: cd terraform-provider && OPENWARP_BIN="$GITHUB_WORKSPACE/target/debug/openwarp-server" go test ./...
 
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Typecheck the Workers target
+        run: cargo check -p openwarp-server --lib --target wasm32-unknown-unknown --no-default-features
+      - name: Build the Worker bundle
+        run: |
+          cargo install worker-build --version 0.8.7
+          cargo install wasm-bindgen-cli --version 0.2.130
+          cd crates/server && worker-build --release --no-default-features
+      - name: Deployment configuration gate
+        run: node --test scripts/tests/portable-runtime/worker-deployment.test.cjs
+      - name: Workerd smoke test
+        run: |
+          npm install --no-save wrangler@4.151.1
+          WRANGLER=node_modules/.bin/wrangler scripts/worker-smoke.sh
+
   docker:
     runs-on: ubuntu-latest
     steps:

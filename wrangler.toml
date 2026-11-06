@@ -1,0 +1,30 @@
+name = "openwarp"
+main = "crates/server/build/worker/shim.mjs"
+# Verified with workerd 125 (Wrangler 4.151.1).
+compatibility_date = "2026-10-01"
+
+# The whole application runs inside one SQLite-backed Durable Object, which is
+# what lets the Workers build share the native server's synchronous storage
+# code. See docs/DEPLOY.md.
+[build]
+command = "cd crates/server && worker-build --release --no-default-features"
+
+[[durable_objects.bindings]]
+name = "APP"
+class_name = "OpenWarp"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OpenWarp"]
+
+# Rotation scheduler: the native server ticks every 30s; the cron floor is one
+# minute and the handler runs the same rotation pass.
+[triggers]
+crons = ["* * * * *"]
+
+[observability]
+enabled = true
+
+[vars]
+OPENWARP_ENV = "production"
+# OPENWARP_PUBLIC_URL = "https://openwarp.example.com"

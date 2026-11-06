@@ -1,0 +1,56 @@
+//! Runtime configuration lookup shared by both deployments.
+//!
+//! Native builds read process environment variables. A Worker has no process
+//! environment: its configuration arrives as bindings, so the entrypoint copies
+//! the known keys into this map before the first request. Call sites are
+//! identical on both targets.
+
+#[cfg(target_arch = "wasm32")]
+use std::collections::HashMap;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn var(key: &str) -> Result<String, String> { std::env::var(key).map_err(|e| e.to_string()) }
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static CONFIG: std::cell::RefCell<HashMap<String, String>> = std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn init(values: HashMap<String, String>) { CONFIG.with(|c| *c.borrow_mut() = values); }
+
+#[cfg(target_arch = "wasm32")]
+pub fn var(key: &str) -> Result<String, String> {
+    CONFIG.with(|c| c.borrow().get(key).cloned()).ok_or_else(|| format!("{} is not configured", key))
+}
+
+/// Every key the shared application reads. The Worker entrypoint copies these
+/// from its bindings; a missing key behaves exactly like an unset native
+/// environment variable.
+pub const KEYS: &[&str] = &[
+    "OPENWARP_ALLOWED_DB_HOSTS", "OPENWARP_ALLOW_PRIVATE_EGRESS", "OPENWARP_APPLE_CLIENT_ID",
+    "OPENWARP_APPLE_CLIENT_SECRET", "OPENWARP_APPLE_ISSUER", "OPENWARP_ATLASSIAN_CLIENT_ID",
+    "OPENWARP_ATLASSIAN_CLIENT_SECRET", "OPENWARP_ATLASSIAN_ISSUER", "OPENWARP_AUTH0_CLIENT_ID",
+    "OPENWARP_AUTH0_CLIENT_SECRET", "OPENWARP_AUTH0_ISSUER", "OPENWARP_CLOUDFLARE_EMAIL_TOKEN",
+    "OPENWARP_CLOUDFLARE_EMAIL_URL", "OPENWARP_EMAIL_FROM", "OPENWARP_EMAIL_FROM_NAME",
+    "OPENWARP_EMAIL_PROVIDER", "OPENWARP_EMAIL_TEMPLATES_DIR", "OPENWARP_EMAIL_TOKEN",
+    "OPENWARP_EMAIL_WEBHOOK", "OPENWARP_ENV", "OPENWARP_GITHUB_API", "OPENWARP_GITHUB_CLIENT_ID",
+    "OPENWARP_GITHUB_CLIENT_SECRET", "OPENWARP_GITHUB_WEB", "OPENWARP_GITLAB_CLIENT_ID",
+    "OPENWARP_GITLAB_CLIENT_SECRET", "OPENWARP_GITLAB_ISSUER", "OPENWARP_GOOGLE_CLIENT_ID",
+    "OPENWARP_GOOGLE_CLIENT_SECRET", "OPENWARP_GOOGLE_ISSUER", "OPENWARP_MAILGUN_API_KEY",
+    "OPENWARP_MAILGUN_DOMAIN", "OPENWARP_MAILGUN_URL", "OPENWARP_MASTER_KEY", "OPENWARP_METRICS_TOKEN",
+    "OPENWARP_MICROSOFT_CLIENT_ID", "OPENWARP_MICROSOFT_CLIENT_SECRET", "OPENWARP_MICROSOFT_ISSUER",
+    "OPENWARP_MICROSOFT_TENANT", "OPENWARP_OIDC_AUTHORIZATION_ENDPOINT", "OPENWARP_OIDC_CLIENT_ID",
+    "OPENWARP_OIDC_CLIENT_SECRET", "OPENWARP_OIDC_ISSUER", "OPENWARP_OIDC_JWKS_URI", "OPENWARP_OIDC_NAME",
+    "OPENWARP_OIDC_SCOPES", "OPENWARP_OIDC_TOKEN_AUTH_METHOD", "OPENWARP_OIDC_TOKEN_ENDPOINT",
+    "OPENWARP_OKTA_CLIENT_ID", "OPENWARP_OKTA_CLIENT_SECRET", "OPENWARP_OKTA_ISSUER",
+    "OPENWARP_OPENAI_CLIENT_ID", "OPENWARP_OPENAI_CLIENT_SECRET", "OPENWARP_OPENAI_ISSUER",
+    "OPENWARP_POSTMARK_TOKEN", "OPENWARP_POSTMARK_URL", "OPENWARP_PUBLIC_URL", "OPENWARP_RESEND_API_KEY",
+    "OPENWARP_RESEND_URL", "OPENWARP_SALESFORCE_CLIENT_ID", "OPENWARP_SALESFORCE_CLIENT_SECRET",
+    "OPENWARP_SALESFORCE_ISSUER", "OPENWARP_SECURE_COOKIES", "OPENWARP_SENDGRID_API_KEY",
+    "OPENWARP_SENDGRID_URL", "OPENWARP_SIGNUPS", "OPENWARP_SLACK_CLIENT_ID",
+    "OPENWARP_SLACK_CLIENT_SECRET", "OPENWARP_SLACK_ISSUER", "OPENWARP_SMTP_HOST",
+    "OPENWARP_SMTP_PASSWORD", "OPENWARP_SMTP_PORT", "OPENWARP_SMTP_TLS", "OPENWARP_SMTP_USERNAME",
+    "OPENWARP_SSH_BIN", "OPENWARP_TRUSTED_PROXIES", "OPENWARP_TRUST_PROXY", "OPENWARP_X_API",
+    "OPENWARP_X_CLIENT_ID", "OPENWARP_X_CLIENT_SECRET", "OPENWARP_X_WEB"
+];

@@ -1,24 +1,44 @@
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 pub type Row = HashMap<String, Value>;
+
+/// Storage backend. Native builds use SQLite or a PostgreSQL pool; the Workers
+/// build uses the synchronous SQLite handle of a Durable Object, which is
+/// wrapped in async methods so call sites stay identical on both targets.
 pub enum Db {
-    Sqlite(Mutex<rusqlite::Connection>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Sqlite(std::sync::Mutex<rusqlite::Connection>),
+    #[cfg(not(target_arch = "wasm32"))]
     Postgres(deadpool_postgres::Pool),
+    #[cfg(target_arch = "wasm32")]
+    DoSqlite(std::rc::Rc<worker::SqlStorage>),
 }
+
+// A Workers isolate has no threads and the Durable Object serialises event
+// delivery, so the JS-backed SQL handle is never used from two threads. axum's
+// state bound still requires Send+Sync, hence these two impls.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for Db {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for Db {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
     out
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn pg_err(error: tokio_postgres::Error) -> String {
     match error.as_db_error() {
         Some(db) => db.message().to_string(),
         None => error.to_string(),
     }
 }
+
 impl Db {
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(url: &str) -> Result<Self, String> {
         if url.starts_with("postgres") {
             let config: tokio_postgres::Config = url.parse().map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
@@ -30,33 +50,45 @@ impl Db {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
             let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
-            let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
+            let db = Db::Sqlite(std::sync::Mutex::new(conn)); db.migrate().await?; Ok(db)
         }
     }
+    /// Wrap the Durable Object SQLite handle used by the Workers deployment.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn from_do_sql(storage: worker::SqlStorage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage)); db.migrate().await?; Ok(db)
+    }
+    /// Cheap clone of the Durable Object SQL handle for deferred work.
+    #[cfg(target_arch = "wasm32")]
+    pub fn clone_handle(&self) -> Db { match self { Db::DoSqlite(s) => Db::DoSqlite(s.clone()) } }
     #[allow(dead_code)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_memory() -> Result<Self, String> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
+        let db = Db::Sqlite(std::sync::Mutex::new(conn)); db.migrate().await?; Ok(db)
     }
     pub async fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::Sqlite(c) => {
-                let result = { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) };
-                result
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
+            #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
                 let client = pool.get().await.map_err(|e| e.to_string())?;
                 let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
                 client.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)
             }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(s) => {
+                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                Ok(cursor.rows_written() as u64)
+            }
         }
     }
     pub async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
-            Db::Sqlite(c) => {
-                let result = { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) };
-                result
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
+            #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
                 let client = pool.get().await.map_err(|e| e.to_string())?;
                 let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
@@ -71,6 +103,21 @@ impl Db {
                             else if let Ok(v) = r.try_get::<_, Option<Value>>(i) { v.unwrap_or(Value::Null) }
                             else { Value::Null };
                         m.insert(col.name().to_string(), v);
+                    }
+                    out.push(m);
+                }
+                Ok(out)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(s) => {
+                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cols = cursor.column_names();
+                let mut out = Vec::new();
+                for row in cursor.raw() {
+                    let values = row.map_err(|e| e.to_string())?;
+                    let mut m = Row::new();
+                    for (i, v) in values.into_iter().enumerate() {
+                        if let Some(name) = cols.get(i) { m.insert(name.clone(), do_value(v)); }
                     }
                     out.push(m);
                 }
@@ -103,7 +150,7 @@ impl Db {
         for idx in INDEXES { let _ = self.exec(idx, &[]).await; }
         // Record the baseline once, then apply numbered additive migrations.
         if self.one("SELECT version FROM schema_migrations WHERE version=1", &[]).await?.is_none() {
-            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(now_secs())]).await;
+            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(crate::clock::now())]).await;
         }
         for (version, statements) in MIGRATIONS {
             if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)]).await?.is_some() { continue; }
@@ -113,31 +160,134 @@ impl Db {
                     if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
                 }
             }
-            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())]).await?;
+            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())]).await?;
         }
         // One-time backfill: environments that already had an allowlist keep it.
         if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
             let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
-            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]).await;
+            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(crate::clock::now())]).await;
         }
         Ok(())
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+impl Db {
+    /// Constructor for the Durable Object. Migrations run synchronously because
+    /// the object constructor cannot await, and the SQL handle never yields.
+    pub fn from_do_sql_now(storage: worker::SqlStorage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage));
+        db.migrate_now()?;
+        Ok(db)
+    }
+    fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+        match self {
+            Db::DoSqlite(s) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
+        }
+    }
+    fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        match self {
+            Db::DoSqlite(s) => {
+                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cols = cursor.column_names();
+                let mut out = Vec::new();
+                for row in cursor.raw() {
+                    let values = row.map_err(|e| e.to_string())?;
+                    let mut m = Row::new();
+                    for (i, v) in values.into_iter().enumerate() { if let Some(name) = cols.get(i) { m.insert(name.clone(), do_value(v)); } }
+                    out.push(m);
+                }
+                Ok(out)
+            }
+        }
+    }
+    fn one_now(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query_now(sql, params)?.into_iter().next()) }
+    fn migrate_now(&self) -> Result<(), String> {
+        for stmt in SCHEMA { self.exec_now(stmt, &[])?; }
+        for alter in [
+            "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
+            "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
+            "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0",
+            "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0",
+            "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1",
+            "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'",
+            "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0",
+            "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''",
+            "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''",
+            "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
+            "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
+            "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
+            "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
+        ] { let _ = self.exec_now(alter, &[]); }
+        for idx in INDEXES { let _ = self.exec_now(idx, &[]); }
+        if self.one_now("SELECT version FROM schema_migrations WHERE version=1", &[])?.is_none() {
+            let _ = self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(crate::clock::now())]);
+        }
+        for (version, statements) in MIGRATIONS {
+            if self.one_now("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)])?.is_some() { continue; }
+            for stmt in *statements {
+                if let Err(e) = self.exec_now(stmt, &[]) {
+                    let duplicate = e.contains("duplicate column") || e.contains("already exists");
+                    if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
+                }
+            }
+            self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())])?;
+        }
+        if self.one_now("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
+            let _ = self.exec_now("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
+            let _ = self.exec_now("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(crate::clock::now())]);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn do_binds(params: &[Value]) -> Option<Vec<worker::SqlStorageValue>> {
+    if params.is_empty() { return None; }
+    Some(params.iter().map(|v| match v {
+        Value::Null => worker::SqlStorageValue::Null,
+        Value::Bool(b) => worker::SqlStorageValue::Integer(if *b { 1 } else { 0 }),
+        Value::Number(n) => match n.as_i64() { Some(i) => worker::SqlStorageValue::Integer(i), None => worker::SqlStorageValue::Float(n.as_f64().unwrap_or(0.0)) },
+        Value::String(s) => worker::SqlStorageValue::String(s.clone()),
+        other => worker::SqlStorageValue::String(other.to_string()),
+    }).collect())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn do_value(v: worker::SqlStorageValue) -> Value {
+    match v {
+        worker::SqlStorageValue::Null => Value::Null,
+        worker::SqlStorageValue::Boolean(b) => Value::Bool(b),
+        worker::SqlStorageValue::Integer(i) => Value::Number(i.into()),
+        worker::SqlStorageValue::Float(f) => serde_json::json!(f),
+        worker::SqlStorageValue::String(s) => Value::String(s),
+        worker::SqlStorageValue::Blob(b) => Value::String(openwarp_crypto::b64(&b)),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 enum PgOwned { S(String), I(i64), B(bool), N(Option<String>) }
+#[cfg(not(target_arch = "wasm32"))]
 struct PgParams { owned: Vec<PgOwned> }
+#[cfg(not(target_arch = "wasm32"))]
 impl PgParams {
     fn new(params: &[Value]) -> Self { Self { owned: params.iter().map(|v| match v { Value::String(s) => PgOwned::S(s.clone()), Value::Number(n) => PgOwned::I(n.as_i64().unwrap_or(0)), Value::Bool(b) => PgOwned::B(*b), _ => PgOwned::N(None) }).collect() } }
     fn refs(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn tokio_postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_val(v: &rusqlite::types::Value) -> Value {
     use rusqlite::types::Value as V;
     match v { V::Null => Value::Null, V::Integer(n) => Value::Number((*n).into()), V::Real(f) => serde_json::json!(*f), V::Text(s) => Value::String(s.clone()), V::Blob(b) => Value::String(openwarp_crypto::b64(b)) }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<u64, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let n = stmt.execute(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     Ok(n as u64)
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -150,8 +300,11 @@ fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Res
     }
     Ok(out)
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_param(v: &Value) -> SqliteParam { SqliteParam(v.clone()) }
+#[cfg(not(target_arch = "wasm32"))]
 struct SqliteParam(Value);
+#[cfg(not(target_arch = "wasm32"))]
 impl rusqlite::ToSql for SqliteParam {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         use rusqlite::types::{ToSqlOutput, Value as V};
@@ -161,7 +314,6 @@ impl rusqlite::ToSql for SqliteParam {
 pub fn s(row: &Row, k: &str) -> String { row.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string() }
 pub fn n(row: &Row, k: &str) -> i64 { row.get(k).and_then(|v| v.as_i64()).unwrap_or(0) }
 pub fn obj(row: &Row) -> Value { let mut m = Map::new(); for (k, v) in row { m.insert(k.clone(), v.clone()); } Value::Object(m) }
-fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL,pubkey TEXT NOT NULL,wrapped_privkey TEXT NOT NULL,created_at BIGINT NOT NULL)",

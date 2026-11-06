@@ -4,8 +4,11 @@
 use serde_json::{json, Value};
 
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
-fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
-async fn req(r: reqwest::RequestBuilder) -> Result<String, String> {
+#[cfg(not(target_arch = "wasm32"))]
+fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::builder().build().expect("http client")) }
+#[cfg(target_arch = "wasm32")]
+fn http_client() -> crate::http::Client { crate::http::Client::new() }
+async fn req(r: crate::http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }
@@ -19,8 +22,8 @@ fn lease_base(config: &Value, default: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid base_url: {}", e))?;
     if url.scheme() != "https" && url.scheme() != "http" { return Err("base_url must be an http(s) URL".into()); }
     let host = url.host_str().ok_or("base_url has no host")?;
-    let production = std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) || config.get("require_public_host").and_then(|v| v.as_bool()).unwrap_or(false);
-    let private_ok = std::env::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
+    let production = crate::envcfg::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) || config.get("require_public_host").and_then(|v| v.as_bool()).unwrap_or(false);
+    let private_ok = crate::envcfg::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
     if production && !private_ok && (host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()) {
         return Err("base_url must name a public host; loopback and IP hosts are refused".into());
     }
@@ -33,7 +36,7 @@ fn stamp_at(secs: i64) -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 fn expires_at(ttl_secs: i64) -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = crate::clock::now();
     stamp_at(now + ttl_secs.clamp(60, 30 * 86400))
 }
 fn civil(z: i64) -> (i64, u32, u32) { let z = z + 719468; let era = z.div_euclid(146097); let doe = z.rem_euclid(146097); let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; let y = yoe + era * 400; let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); let mp = (5 * doy + 2) / 153; let d = (doy - (153 * mp + 2) / 5 + 1) as u32; let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; (if m <= 2 { y + 1 } else { y }, m, d) }

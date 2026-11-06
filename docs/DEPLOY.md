@@ -208,6 +208,48 @@ curl --fail --silent --show-error http://127.0.0.1:8080/health
 
 Do not remove the PostgreSQL volume during an upgrade. Keep old backups until the new version has passed a restore rehearsal.
 
+## Cloudflare Workers
+
+The Workers target runs the same Rust application inside one SQLite-backed
+Durable Object: the object's synchronous SQLite handle sits behind the async
+`Db` API, so handlers, authorization and the console are shared rather than
+reimplemented. Requests are forwarded to that object by `crates/server/src/worker.rs`.
+
+Configure and deploy:
+
+```bash
+cargo install worker-build --version 0.8.7
+cargo install wasm-bindgen-cli --version 0.2.130
+npx wrangler secret put OPENWARP_MASTER_KEY    # 32 random bytes, base64
+(cd crates/server && worker-build --release --no-default-features)
+npx wrangler deploy
+```
+
+The Workers build must use `--no-default-features`: the LDAP feature, ring,
+SAML, SMTP and the native Postgres/Redis clients are excluded there. Runtime
+configuration is read from Worker variables and secrets; the full key list is
+`crates/server/src/envcfg.rs`. `OPENWARP_EMAIL_WEBHOOK` (an HTTP relay) is the
+email provider on Workers; password signup is otherwise unavailable in
+production.
+
+What works on Workers: registration with emailed verification, password and
+GitHub sign-in, OIDC login (pure-Rust JWT verification), TOTP, SCIM, tokens,
+E2E and SSE secrets, approvals, log streams, audit webhooks, integrations,
+PKI CA and certificate issuance, dynamic PostgreSQL leases, and the rotation
+and delivery maintenance cron.
+
+Answers 501 with a clear error on Workers: LDAP sign-in, SAML, SSH file sync,
+SMTP (use the HTTP relay), OCI Vault (RSA request signing), and the WebSocket
+`/api/live` stream. `/api/live` exists only natively; poll the audit endpoint
+instead. OCSP/CRL endpoints and master-key rotation are also native-only.
+
+Operational limits: every request serialises through the single Durable
+Object; `OPENWARP_TRUST_PROXY` is inert (the runtime address is the client);
+`X-Forwarded-For` is ignored; session cookies are always `Secure` and the
+OAuth issuer defaults to `https://`. Metrics counters are per isolate and reset
+on a cold start. Durable Object SQLite point-in-time recovery covers 30 days
+and is not available under `wrangler dev`; see [BACKUP.md](BACKUP.md).
+
 ## Platform limits
 
 OpenWarp is a native service. A Cloudflare Workers or other WASM port, which is

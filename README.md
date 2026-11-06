@@ -92,6 +92,14 @@ databases are baselined and upgraded in place.
 A Terraform provider under [`terraform-provider/`](terraform-provider/) is
 built on the same contract.
 
+### Run on Cloudflare Workers
+
+The same server also runs on Cloudflare Workers: one SQLite-backed Durable
+Object serves the shared handlers, OIDC, PKI issuance, dynamic PostgreSQL
+leases and the console. LDAP, SAML, SMTP, SSH file sync and the WebSocket live
+stream stay native-only and answer 501 there. See
+[docs/DEPLOY.md](docs/DEPLOY.md#cloudflare-workers).
+
 ### Self-host with Compose
 
 The included Compose stack runs OpenWarp with PostgreSQL 17 and Redis 7. It requires a master key and database password:

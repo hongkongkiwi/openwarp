@@ -26,3 +26,8 @@
 /.serena/
 .DS_Store
 *.log
+
+# Worker build output and local Wrangler state
+/crates/server/build/
+/.wrangler/
+.dev.vars
