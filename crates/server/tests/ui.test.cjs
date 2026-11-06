@@ -519,3 +519,22 @@ test('the reset view asks for the kit and an explicit key replacement', async ()
   }
   assert.match(ui.el('authform').textContent, /lose end-to-end access/i, 'replacing the key must state its cost');
 });
+
+test('the E2E editor encrypts in the browser and never uses the managed secrets route', async () => {
+  const start = script.indexOf('function envTabs()');
+  const end = script.indexOf('function matchesFilter');
+  assert.ok(start > 0 && end > start, 'the E2E console block must be extractable');
+  const block = script.slice(start, end);
+  assert.match(block, /\/api\/envs\/\$\{id\}\/e2e\/secrets/, 'E2E deploy uses the ciphertext endpoint');
+  assert.match(block, /OW\.encryptSymmetric\(key,enc\(k\)\)/, 'keys are encrypted client-side');
+  assert.match(block, /OW\.encryptSymmetric\(key,enc\(d\.value\?\?''\)\)/, 'values are encrypted client-side');
+  assert.match(block, /OW\.encryptSymmetric\(key,enc\(path\)\)/, 'paths are encrypted client-side');
+  assert.ok(!/\/api\/envs\/\$\{[^}]+\}\/secrets/.test(block.replace(/\/e2e\/secrets/g, '')), 'the E2E block must not call the managed secrets route');
+  assert.ok(!/localStorage|sessionStorage/.test(block), 'E2E keys and drafts must stay in memory');
+  assert.match(block, /wrapped_key:wrapped/, 'E2E creation sends a client-generated wrapped key');
+  assert.match(block, /server_generated/, 'E2E creation rejects the server-generated compatibility path');
+  assert.match(block, /every value|read-back/i, 'deploy verifies the ciphertext it stored');
+  const deploy = block.slice(block.indexOf('async function deployE2E'), block.indexOf('async function e2eGrantsModal'));
+  assert.ok(deploy.indexOf("api('PUT'") < deploy.indexOf("api('DELETE'"), 'puts must be stored before a staged delete is issued');
+  assert.ok(!/id="e2e-out"|id="e2e-env"|function loadE2E/.test(script), 'the settings plaintext dump must be gone');
+});

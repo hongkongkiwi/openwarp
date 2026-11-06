@@ -52,10 +52,27 @@ key. It stores only ciphertext it cannot decrypt. Clients that omit
 *wrapped key is produced by the grantor's client*, never by the server.
 
 - CLI: `openwarp e2e-create|e2e-put|e2e-get|e2e-grant` (keys from `OPENWARP_PRIVKEY`, your recovery kit).
-- Browser: the console's E2E panel decrypts in-page with the pure-JS
-  X25519 + XChaCha20-Poly1305 implementation in `crates/server/src/e2e.js`;
-  the recovery kit never leaves the page. JS and Rust implementations are
-  cross-tested both directions, including tamper rejection.
+- Console: the environment editor decrypts in the browser with the vendored
+  libsodium X25519 + XChaCha20-Poly1305 build in `crates/server/src/e2e.js`.
+  Creating an E2E environment generates the env key in the page and posts only
+  the wrapped form, so the server never sees it. The editor stages new, edited
+  and deleted rows until deploy, encrypts them on deploy, re-reads the
+  ciphertext to confirm every value round-trips, and offers no server-readable
+  history, import, export, personal overrides or dynamic leases for these
+  environments. The environment key lives in the tab's memory; a reload locks
+  the environment and the recovery kit (or a fresh client-derived sign-in)
+  unlocks it again. Environments created through the `server_generated: true`
+  compatibility branch look identical after creation, because the response flag
+  is not persisted; recreate them if the server must never have held the key.
+- Access: the console lists key grantees, wraps the env key to a teammate's
+  account public key for a grant, and removes grants. Removing a grant marks
+  the environment as needing rotation; `Rotate key now` re-encrypts every
+  secret under a new environment key and wraps it to the current grantees. A
+  member who already copied ciphertext keeps that copy; rotation only protects
+  what the server stores afterwards.
+- Provider sync needs plaintext, so the integrations page refuses to configure
+  sync for an E2E environment. Use a delegated environment with a customer-run
+  runner when an integration must receive the secrets.
 
 ## Storage
 

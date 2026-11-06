@@ -128,12 +128,16 @@ guarantee:
    modified client can capture the password or keys regardless of the protocol.
    For high assurance, use the CLI or a signed native/desktop client, and verify
    the client build. The CLI already keeps its tokens in the OS credential store
-   and decrypts E2E values locally.
+   and decrypts E2E values locally. The console editor follows the same rule:
+   the recovery kit and unwrapped environment key stay in page memory, a reload
+   locks the environment, and staged plaintext is lost rather than cached.
 
 For version 2 accounts, `delegated` and `e2e` protect the data from a stolen
 database, backup, disk or server that only sees protocol traffic. They do not
 protect against an operator who can replace the client code. Version 1 accounts
-retain the old exposure until migrated.
+retain the old exposure until migrated. The console writes E2E ciphertext only
+through `PUT /api/envs/:id/e2e/secrets`; `GET /api/envs/:id/secrets` returns
+409 for these environments, which is what the browser acceptance test asserts.
 
 ## Recovery and revocation
 
