@@ -193,4 +193,22 @@ curl --fail --silent --show-error http://127.0.0.1:8080/health
 
 Do not remove the PostgreSQL volume during an upgrade. Keep old backups until the new version has passed a restore rehearsal.
 
+## Platform limits
+
+OpenWarp is a native service. A Cloudflare Workers or other WASM port, which is
+not part of this repository, cannot open raw TCP/TLS sockets and cannot offer
+LDAP. The `ldap` cargo feature carries the directory client, its routes and its
+console entry: building with `--no-default-features` produces a binary with no
+LDAP code at all, `/api/auth/providers` reports `ldap: false`, and the console
+hides the directory card and sign-in button. The rest of the server still needs
+its database driver and OS networking, so that build is not a Workers
+deployment by itself. Directories that publish OIDC (Entra ID, Keycloak,
+Authentik, Dex) remain reachable through the OIDC flow on any target.
+
+On a native deployment the directory is usually on a private network. Add its
+CA to the host trust store, or paste the CA PEM into the directory settings.
+`OPENWARP_ENV=production` treats loopback and private targets as blocked
+egress; set `OPENWARP_ALLOW_PRIVATE_EGRESS=1` to allow the internal directory,
+exactly as for a self-hosted OIDC issuer.
+
 [Configuration](CONFIGURATION.md) · [Backup and restore](BACKUP.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)

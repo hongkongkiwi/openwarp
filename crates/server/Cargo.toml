@@ -32,7 +32,15 @@ sha1 = "0.10"
 ipnet = "2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 time = "0.3"
+ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
+native-tls = { version = "0.2", optional = true }
 
 [features]
-default = ["redis-cache"]
+default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
+# LDAP opens a raw TCP/TLS socket to a directory. Native builds enable it; a
+# Workers/WASM port must build with --no-default-features and cannot offer it.
+ldap = ["dep:ldap3", "dep:native-tls"]
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

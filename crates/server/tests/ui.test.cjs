@@ -218,6 +218,8 @@ async function consoleUI(secrets = [saved]) {
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
+      else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
+      else if (options.method === 'POST' && url === '/api/auth/mfa') body = { token: 'session-token' };
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -526,4 +528,31 @@ test('the reset view asks for the kit and an explicit key replacement', async ()
     assert.ok(label && label.textContent.trim(), `#${id} needs a programmatic label`);
   }
   assert.match(ui.el('authform').textContent, /lose end-to-end access/i, 'replacing the key must state its cost');
+});
+
+test('directory sign-in carries the workspace and completes the second factor', async () => {
+  const ui = await consoleUI();
+  await ui.invoke('ldapPrompt()');
+  for (const id of ['ld-org', 'ld-user', 'ld-pw']) assert.ok(ui.document.getElementById(id), `missing ${id}`);
+  ui.el('ld-org').value = 'org-a';
+  ui.el('ld-user').value = 'bob';
+  ui.el('ld-pw').value = 'user-secret';
+  await ui.invoke('ldapSignIn()');
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['POST', '/api/auth/ldap']]);
+  assert.deepEqual(ui.calls[0].body, { org_id: 'org-a', username: 'bob', password: 'user-secret' },
+    'the directory request must carry the workspace id, username and password only');
+  assert.ok(ui.document.getElementById('ld-mfa'), 'an MFA challenge must render the code field');
+  ui.el('ld-mfa').value = '123456';
+  ui.calls.length = 0;
+  await ui.invoke('ldapMfa()');
+  assert.deepEqual(ui.calls[0].body, { mfa_token: 'mfa-1', code: '123456' });
+});
+
+test('the LDAP settings card is absent when the server does not advertise the provider', async () => {
+  const ui = await consoleUI();
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.document.getElementById('ld-url'), null,
+    'a build without the ldap feature must not render directory settings');
+  assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
 });
