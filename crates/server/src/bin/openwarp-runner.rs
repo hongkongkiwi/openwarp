@@ -32,16 +32,13 @@ fn prepare(job: &Value, kp: &oc::Keypair) -> Result<Prepared, String> {
     let (_runner, sealed) = rest.split_once(':').ok_or("malformed runner config")?;
     let envelope: Value = serde_json::from_slice(&kp.decrypt(sealed)?).map_err(|e| e.to_string())?;
     // The sealed box has no AAD; the context inside the plaintext proves this
-    // config belongs to the integration named by the job.
-    let config = match envelope.get("context").and_then(|v| v.as_str()) {
-        Some(ctx) => {
-            let eid = job.get("env_id").and_then(|v| v.as_str()).unwrap_or("");
-            let iid = job.get("integration_id").and_then(|v| v.as_str()).unwrap_or("");
-            if ctx != format!("ow-integration|{}|{}", eid, iid) { return Err("integration config context does not match this job".into()); }
-            envelope.get("config").cloned().unwrap_or(json!({}))
-        }
-        None => envelope,
-    };
+    // config belongs to the integration named by the job. A blob without one is
+    // not accepted, so a legacy or copied config cannot be redirected silently.
+    let ctx = envelope.get("context").and_then(|v| v.as_str()).ok_or("sealed integration config has no context")?;
+    let eid = job.get("env_id").and_then(|v| v.as_str()).unwrap_or("");
+    let iid = job.get("integration_id").and_then(|v| v.as_str()).unwrap_or("");
+    if ctx != format!("ow-integration|{}|{}", eid, iid) { return Err("integration config context does not match this job".into()); }
+    let config = envelope.get("config").cloned().ok_or("sealed integration config has no config body")?;
     let mut pairs = Vec::new();
     for s in job.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let key = decrypt_secret(&env_key, s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""))?;

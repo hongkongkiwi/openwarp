@@ -76,7 +76,8 @@ impl Db {
                 for (sql, params) in statements {
                     if let Err(e) = exec_sqlite(&conn, sql, params) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
                 }
-                conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+                if let Err(e) = conn.execute_batch("COMMIT") { let _ = conn.execute_batch("ROLLBACK"); return Err(e.to_string()); }
+                Ok(())
             }
             Db::Postgres(c) => {
                 let c = c.clone(); let statements = statements.to_vec();
@@ -87,7 +88,8 @@ impl Db {
                         let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
                         if let Err(e) = client.execute(sql2.as_str(), &refs[..]) { let _ = client.batch_execute("ROLLBACK"); return Err(e.to_string()); }
                     }
-                    client.batch_execute("COMMIT").map_err(|e| e.to_string())
+                    if let Err(e) = client.batch_execute("COMMIT") { let _ = client.batch_execute("ROLLBACK"); return Err(e.to_string()); }
+                    Ok(())
                 }).join().map_err(|_| "pg thread panicked".to_string())?
             }
         }
