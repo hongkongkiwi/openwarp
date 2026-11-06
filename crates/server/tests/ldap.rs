@@ -350,6 +350,7 @@ struct Server {
     base: String,
     dir: std::path::PathBuf,
     client: reqwest::Client,
+    inbox: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Drop for Server {
@@ -381,9 +382,11 @@ impl Server {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
+        let (inbox_url, inbox) = start_inbox();
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
+            .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -397,7 +400,7 @@ impl Server {
             .expect("spawn openwarp-server");
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15)).build().expect("http client");
-        let server = Server { child, base, dir, client };
+        let server = Server { child, base, dir, client, inbox };
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -428,7 +431,20 @@ impl Server {
     async fn register(&self, email: &str, password: &str) -> (String, String) {
         let r = self.call(reqwest::Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": password}))).await;
         assert_eq!(r.status, 200, "register {} failed: {}", email, r.text);
-        (r.body["token"].as_str().expect("token").to_string(), r.body["org_id"].as_str().expect("org").to_string())
+        let org = r.body["org_id"].as_str().expect("org").to_string();
+        // Password signup now needs the verification link, so finish the flow the
+        // way an operator with a mail relay would before signing in.
+        if r.body["verification_required"] == json!(true) {
+            let text = wait_for_mail(&self.inbox, "/api/auth/verify?token=").await;
+            let link = extract_link(&text, "/api/auth/verify?token=");
+            let path = link.strip_prefix(&self.base).unwrap_or(&link).to_string();
+            let verified = self.call(reqwest::Method::GET, &path, None, None).await;
+            assert_eq!(verified.status, 200, "verification failed for {}: {}", email, verified.text);
+            let login = self.call(reqwest::Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": password}))).await;
+            assert_eq!(login.status, 200, "verified sign-in failed for {}: {}", email, login.text);
+            return (login.body["token"].as_str().expect("token").to_string(), org);
+        }
+        (r.body["token"].as_str().expect("token").to_string(), org)
     }
 
     async fn put_ldap(&self, token: &str, org: &str, dir: &Stub, extra: Value) -> Reply {
@@ -469,6 +485,51 @@ async fn finish(result: Result<reqwest::Response, reqwest::Error>) -> Reply {
     let text = response.text().await.unwrap_or_default();
     let body = serde_json::from_str(&text).unwrap_or(Value::Null);
     Reply { status, text, body }
+}
+
+/// Minimal email relay: records each JSON body and answers 200.
+fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
+    let addr = listener.local_addr().expect("inbox addr");
+    let inbox = Arc::new(Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+    (format!("http://{}/mail", addr), inbox)
+}
+
+async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no email containing {:?} arrived", needle);
+}
+
+fn extract_link(text: &str, needle: &str) -> String {
+    for word in text.split_whitespace() {
+        if let Some(i) = word.find(needle) { return word[i..].to_string(); }
+    }
+    panic!("no link containing {:?} in {:?}", needle, text);
 }
 
 fn user(username: &str, email: &str) -> DirectoryUser {
