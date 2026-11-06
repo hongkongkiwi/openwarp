@@ -33,9 +33,11 @@ Config is stored encrypted under the env key. Secrets are pushed decrypted
 `github` (sealed-box via libsodium-compatible XSalsa20-Poly1305), `gitlab`,
 `vercel`, `netlify`, `cloudflare` (Workers secrets), `heroku`, `render`,
 `flyio`, `railway`, `digitalocean` (App Platform spec update),
-`aws_secrets_manager` + `aws_parameter_store` (SigV4 signed),
-`gcp_secret_manager`, `azure_key_vault`, `kubernetes` (Opaque Secret),
-`hashicorp_vault`, `webhook` (generic JSON POST).
+`aws_secrets_manager` + `aws_parameter_store` (SigV4 signed, per-key or
+one-JSON-secret modes), `gcp_secret_manager`, `azure_key_vault`, `kubernetes`
+(Opaque Secret), `hashicorp_vault`, `webhook` (generic JSON POST), `instabox`,
+`boat`, `daytona`, `onepassword` (Connect), `dokploy`, `caprover`, `portainer`
+(stack environment variables), and `docker_swarm` (Docker Engine secrets).
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -94,6 +96,32 @@ Kept from OpenWarp where it already exceeds both: point-in-time recovery,
 secret-change proposals, and Postgres dynamic roles are not Phase features.
 Deferred by design: CLI parity (separate effort), Kubernetes operator,
 SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).
+
+## Additional sync adapters (2026-11-06)
+
+The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`,
+`include_keys` and `exclude_keys` options, and expose a connection test:
+
+- `onepassword` uses a 1Password Connect server (`connect_url`, `token`,
+  `vault_id`, optional `value_label`). Each key becomes an item whose title is
+  the key and whose value sits in a concealed field.
+- `aws_secrets_manager` defaults to one secret per key. Setting `secret_id`
+  switches to one JSON `SecretString`; `mapping` makes the choice explicit.
+  `session_token`, `kms_key_id`, `endpoint` and `force_delete` are supported.
+- `aws_parameter_store` writes one parameter per key under `path_prefix`, with
+  `type`, `tier`, `kms_key_id` and `session_token` options.
+- `dokploy` merges values into an application or compose env string and can
+  redeploy after saving.
+- `caprover` logs in with `password` (or accepts `token`) and updates an app's
+  environment variables through API v2.
+- `portainer` merges values into a Compose or Swarm stack's `Env` array without
+  changing the stack file.
+- `docker_swarm` writes Docker Swarm secrets through the Docker Engine API.
+  Values are delete-and-recreate because Docker secrets are immutable.
+
+Kamal has no server API or central secret store, so there is no `kamal` adapter.
+Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
+`.kamal/secrets` at deploy time.
 
 ## Trigger.dev sync
 

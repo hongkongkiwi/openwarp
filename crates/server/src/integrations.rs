@@ -1,9 +1,10 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use hmac::{Hmac, Mac};
+use std::collections::{BTreeMap, HashMap};
 type HmacSha256 = Hmac<Sha256>;
 
-pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona"];
+pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","onepassword","dokploy","caprover","portainer","docker_swarm"];
 
 fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
@@ -77,7 +78,6 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
         "instabox" => instabox_sync(config, secrets, &[]).await.map(|(report, _)| report),
         "boat" => boat_sync(config, secrets, &[]).await.map(|(report, _)| report),
         "daytona" => daytona_sync(config, secrets, &[]).await.map(|(report, _)| report),
-        "aws_secrets_manager" | "aws_parameter_store" => aws_sync(config, secrets, kind).await,
         _ => Err(format!("unknown integration kind: {}", kind)),
     }
 }
@@ -370,37 +370,543 @@ async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(Strin
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> { let mut m = HmacSha256::new_from_slice(key).unwrap(); m.update(data); m.finalize().into_bytes().to_vec() }
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).collect() }
-async fn aws_sync(config: &Value, secrets: &[(String, String)], kind: &str) -> Result<String, String> {
-    let region = cfg(config, "region"); let ak = cfg(config, "access_key_id"); let sk = cfg(config, "secret_access_key");
+// ---------- Shared sync options ----------
+fn sync_mode<'a>(config: &'a Value, provider: &str) -> Result<&'a str, String> {
+    match cfg(config, "mode") { "" | "upsert" => Ok("upsert"), "mirror" => Ok("mirror"), other => Err(format!("{} mode must be upsert or mirror (got {:?})", provider, other)) }
+}
+fn is_dry(config: &Value) -> bool { config.get("dry_run").and_then(Value::as_bool).unwrap_or(false) }
+
+/// Merge desired values into an existing env map. In mirror mode only names this
+/// integration previously managed are removed, so unrelated remote values survive.
+fn merge_pairs(current: &HashMap<String, String>, desired: &[(String, String)], previous: &[String], mirror: bool) -> (BTreeMap<String, String>, usize, usize, usize, usize) {
+    let mut out: BTreeMap<String, String> = current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    for (k, v) in desired {
+        match current.get(k) {
+            None => { created += 1; out.insert(k.clone(), v.clone()); }
+            Some(old) if old == v => unchanged += 1,
+            Some(_) => { updated += 1; out.insert(k.clone(), v.clone()); }
+        }
+    }
+    let mut deleted = 0;
+    if mirror {
+        for name in previous { if !desired.iter().any(|(k, _)| k == name) && out.remove(name).is_some() { deleted += 1; } }
+    }
+    (out, created, updated, unchanged, deleted)
+}
+
+fn dotenv_quote(value: &str) -> String {
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:/@+=,%~".contains(&b)) { value.to_string() }
+    else { format!("'{}'", value.replace('\'', "'\\''")) }
+}
+fn dotenv_render(map: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (k, v) in map { out.push_str(k); out.push('='); out.push_str(&dotenv_quote(v)); out.push('\n'); }
+    out
+}
+fn config_i64(config: &Value, key: &str) -> Option<i64> {
+    config.get(key).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+}
+
+// ---------- AWS SigV4 ----------
+struct AwsReq<'a> { service: &'a str, region: &'a str, ak: &'a str, sk: &'a str, session_token: &'a str, target: &'a str, payload: &'a str, endpoint: &'a str }
+async fn aws_signed(client: &reqwest::Client, r: AwsReq<'_>) -> Result<String, String> {
+    let host_default = format!("{}.{}.amazonaws.com", r.service, r.region); let url_default = format!("https://{}", host_default);
+    let (host, url, uri) = if r.endpoint.is_empty() { (host_default, url_default, "/".to_string()) } else {
+        let parsed = reqwest::Url::parse(r.endpoint).map_err(|e| format!("invalid AWS endpoint: {}", e))?;
+        let host = match parsed.port() { Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(""), port), None => parsed.host_str().unwrap_or("").to_string() };
+        let uri = if parsed.path().is_empty() { "/".to_string() } else { parsed.path().to_string() };
+        (host, r.endpoint.trim_end_matches('/').to_string(), uri)
+    };
+    let now = chrono_now(); let (date, amzdate) = (now[..8].to_string(), now.clone());
+    let payload_hash = hex(&Sha256::digest(r.payload.as_bytes()));
+    let mut headers = vec![("content-type", "application/x-amz-json-1.1".to_string()), ("host", host), ("x-amz-date", amzdate.clone())];
+    if !r.session_token.is_empty() { headers.push(("x-amz-security-token", r.session_token.to_string())); }
+    headers.push(("x-amz-target", r.target.to_string()));
+    headers.sort_by(|a, b| a.0.cmp(b.0));
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{}:{}\n", k, v)).collect();
+    let signed_headers: String = headers.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
+    let canonical = format!("POST\n{}\n\n{}\n{}\n{}", uri, canonical_headers, signed_headers, payload_hash);
+    let scope = format!("{}/{}/{}/aws4_request", date, r.region, r.service);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amzdate, scope, hex(&Sha256::digest(canonical.as_bytes())));
+    let k_date = hmac(format!("AWS4{}", r.sk).as_bytes(), date.as_bytes()); let k_region = hmac(&k_date, r.region.as_bytes()); let k_svc = hmac(&k_region, r.service.as_bytes()); let k_sign = hmac(&k_svc, b"aws4_request");
+    let sig = hex(&hmac(&k_sign, to_sign.as_bytes()));
+    let auth = format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", r.ak, scope, signed_headers, sig);
+    let mut request = client.post(&url).header("Content-Type", "application/x-amz-json-1.1").header("X-Amz-Date", &amzdate).header("X-Amz-Target", r.target).header("Authorization", auth);
+    if !r.session_token.is_empty() { request = request.header("X-Amz-Security-Token", r.session_token); }
+    req(request.body(r.payload.to_string())).await
+}
+#[allow(clippy::too_many_arguments)]
+async fn aws_call(client: &reqwest::Client, config: &Value, service: &str, region: &str, ak: &str, sk: &str, target: &str, payload: &Value) -> Result<Value, String> {
+    let body = payload.to_string();
+    let text = aws_signed(client, AwsReq { service, region, ak, sk, session_token: cfg(config, "session_token"), target, payload: &body, endpoint: cfg(config, "endpoint") }).await?;
+    if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("AWS {} returned invalid JSON: {}", target, e)) }
+}
+fn aws_creds(config: &Value) -> Result<(&str, &str, &str), String> {
+    let (region, ak, sk) = (cfg(config, "region"), cfg(config, "access_key_id"), cfg(config, "secret_access_key"));
     if region.is_empty() || ak.is_empty() || sk.is_empty() { return Err("AWS integration requires region, access_key_id, secret_access_key".into()); }
+    Ok((region, ak, sk))
+}
+fn aws_secret_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 512 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+=.@-".contains(&b))
+}
+fn ssm_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 1011 && !name.contains(' ') && !name.contains("//") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
+}
+
+async fn aws_sm_list(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new(); let mut token = String::new();
+    loop {
+        let mut payload = json!({"MaxResults": 100});
+        if !token.is_empty() { payload["NextToken"] = json!(token); }
+        let value = aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.ListSecrets", &payload).await?;
+        if let Some(items) = value.get("SecretList").and_then(Value::as_array) {
+            for item in items { if let Some(name) = item.get("Name").and_then(Value::as_str) { out.push(name.to_string()); } }
+        }
+        token = value.get("NextToken").and_then(Value::as_str).unwrap_or("").to_string();
+        if token.is_empty() { break; }
+    }
+    Ok(out)
+}
+
+pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (region, ak, sk) = aws_creds(config)?;
+    let mode = sync_mode(config, "aws_secrets_manager")?;
+    let dry = is_dry(config);
+    let mapping = { let m = cfg(config, "mapping"); if !m.is_empty() { m } else if !cfg(config, "secret_id").is_empty() { "many_to_one" } else { "one_to_one" } };
     let client = http_client();
-    if kind == "aws_secrets_manager" {
-        let secret_id = cfg(config, "secret_id"); if secret_id.is_empty() { return Err("aws_secrets_manager requires secret_id".into()); }
-        let payload = json!({"SecretId": secret_id, "SecretString": map_json(secrets).to_string()}).to_string();
-        aws_signed(&client, AwsReq{service:"secretsmanager", region, ak, sk, target:"secretsmanager.UpdateSecret", payload:&payload, endpoint:cfg(config,"endpoint")}).await?;
-        Ok("pushed to AWS Secrets Manager".into())
-    } else {
-        for (k, v) in secrets { let name = format!("{}/{}", cfg(config, "path_prefix").trim_end_matches('/'), k);
-            let payload = json!({"Name": name, "Value": v, "Type": "SecureString", "Overwrite": true}).to_string();
-            aws_signed(&client, AwsReq{service:"ssm", region, ak, sk, target:"AmazonSSM.PutParameter", payload:&payload, endpoint:cfg(config,"endpoint")}).await?; }
-        Ok(format!("pushed {} parameters to AWS SSM", secrets.len()))
+    if mapping == "many_to_one" {
+        let secret_id = cfg(config, "secret_id");
+        if secret_id.is_empty() { return Err("aws_secrets_manager many_to_one requires secret_id".into()); }
+        if mode == "mirror" { return Err("aws_secrets_manager many_to_one cannot mirror keys; use mapping one_to_one".into()); }
+        let json_body = map_json(secrets).to_string();
+        if !dry {
+            let body = json!({"SecretId": secret_id, "SecretString": json_body});
+            match aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.UpdateSecret", &body).await {
+                Ok(_) => {}
+                Err(e) if e.to_lowercase().contains("resourcenotfound") => {
+                    let mut create = json!({"Name": secret_id, "SecretString": json_body});
+                    if !cfg(config, "kms_key_id").is_empty() { create["KmsKeyId"] = json!(cfg(config, "kms_key_id")); }
+                    aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.CreateSecret", &create).await.map_err(|e| format!("create {} failed: {}", secret_id, e))?;
+                }
+                Err(e) => return Err(format!("update {} failed: {}", secret_id, e)),
+            }
+        }
+        return Ok((format!("AWS Secrets Manager sync{}: wrote {} keys into {}", if dry { " (dry-run)" } else { "" }, secrets.len(), secret_id), Vec::new()));
+    }
+    if mapping != "one_to_one" { return Err("aws_secrets_manager mapping must be one_to_one or many_to_one".into()); }
+    let desired = trigger_desired(config, secrets);
+    if let Some(bad) = desired.iter().find(|(name, _)| !aws_secret_name_ok(name)).map(|(name, _)| name.as_str()) { return Err(format!("invalid AWS Secrets Manager name: {:?}", bad)); }
+    let remote = aws_sm_list(&client, config, region, ak, sk).await?;
+    let created = desired.iter().filter(|(name, _)| !remote.contains(name)).count();
+    let updated = desired.len() - created;
+    let deleted = previous_managed.iter().filter(|name| !desired.iter().any(|(n, _)| n == *name) && remote.contains(name)).count();
+    if !dry {
+        for (name, value) in &desired {
+            let body = json!({"SecretId": name, "SecretString": value});
+            match aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.PutSecretValue", &body).await {
+                Ok(_) => {}
+                Err(e) if e.to_lowercase().contains("resourcenotfound") => {
+                    let mut create = json!({"Name": name, "SecretString": value});
+                    if !cfg(config, "kms_key_id").is_empty() { create["KmsKeyId"] = json!(cfg(config, "kms_key_id")); }
+                    aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.CreateSecret", &create).await.map_err(|e| format!("create {} failed: {}", name, e))?;
+                }
+                Err(e) => return Err(format!("update {} failed: {}", name, e)),
+            }
+        }
+        if mode == "mirror" {
+            for name in previous_managed {
+                if desired.iter().any(|(n, _)| n == name) || !remote.contains(name) { continue; }
+                let mut body = json!({"SecretId": name});
+                if config.get("force_delete").and_then(Value::as_bool).unwrap_or(false) { body["ForceDeleteWithoutRecovery"] = json!(true); } else { body["RecoveryWindowInDays"] = json!(7); }
+                aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.DeleteSecret", &body).await.map_err(|e| format!("delete {} failed: {}", name, e))?;
+            }
+        }
+    }
+    let names = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("AWS Secrets Manager sync{}: created={} updated={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, deleted), names))
+}
+
+pub async fn aws_secrets_manager_test(config: &Value) -> Result<String, String> {
+    let (region, ak, sk) = aws_creds(config)?;
+    let value = aws_call(&http_client(), config, "secretsmanager", region, ak, sk, "secretsmanager.ListSecrets", &json!({"MaxResults": 1})).await?;
+    let count = value.get("SecretList").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    Ok(format!("AWS Secrets Manager connection OK: region {} returned a secret list ({} item(s))", region, count))
+}
+
+fn ssm_path(config: &Value) -> String {
+    let path = cfg(config, "path_prefix").trim_end_matches('/');
+    if path.is_empty() { String::new() } else if path.starts_with('/') { path.to_string() } else { format!("/{}", path) }
+}
+async fn ssm_list(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+    let path = ssm_path(config);
+    let mut out = Vec::new(); let mut token = String::new();
+    loop {
+        let mut payload = if path.is_empty() { json!({"MaxResults": 50}) } else { json!({"Path": path, "Recursive": true, "MaxResults": 10}) };
+        if !token.is_empty() { payload["NextToken"] = json!(token); }
+        let target = if path.is_empty() { "AmazonSSM.DescribeParameters" } else { "AmazonSSM.GetParametersByPath" };
+        let value = aws_call(client, config, "ssm", region, ak, sk, target, &payload).await?;
+        if let Some(items) = value.get("Parameters").and_then(Value::as_array) {
+            for item in items { if let Some(name) = item.get("Name").and_then(Value::as_str) { out.push(name.to_string()); } }
+        }
+        token = value.get("NextToken").and_then(Value::as_str).unwrap_or("").to_string();
+        if token.is_empty() { break; }
+    }
+    Ok(out)
+}
+fn ssm_full_name(config: &Value, name: &str) -> String {
+    let path = ssm_path(config);
+    if path.is_empty() { name.to_string() } else { format!("{}/{}", path, name) }
+}
+
+pub async fn aws_parameter_store_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (region, ak, sk) = aws_creds(config)?;
+    let mode = sync_mode(config, "aws_parameter_store")?;
+    let dry = is_dry(config);
+    let kind = match cfg(config, "type") { "" => "SecureString", "String" | "StringList" | "SecureString" => cfg(config, "type"), other => return Err(format!("aws_parameter_store type must be String, StringList or SecureString (got {:?})", other)) };
+    let tier = cfg(config, "tier");
+    if !tier.is_empty() && tier != "Standard" && tier != "Advanced" && tier != "Intelligent-Tiering" { return Err("aws_parameter_store tier must be Standard, Advanced or Intelligent-Tiering".into()); }
+    if tier != "Advanced" && tier != "Intelligent-Tiering" {
+        if let Some((name, _)) = secrets.iter().find(|(_, v)| v.len() > 4096) { return Err(format!("AWS Parameter Store Standard tier values are limited to 4096 bytes; set tier Advanced for {:?}", name)); }
+    }
+    let desired: Vec<(String, String)> = trigger_desired(config, secrets).into_iter().map(|(name, value)| (ssm_full_name(config, &name), value)).collect();
+    if let Some(bad) = desired.iter().find(|(name, _)| !ssm_name_ok(name)).map(|(name, _)| name.as_str()) { return Err(format!("invalid AWS Parameter Store name: {:?}", bad)); }
+    let client = http_client();
+    let remote = ssm_list(&client, config, region, ak, sk).await?;
+    let created = desired.iter().filter(|(name, _)| !remote.contains(name)).count();
+    let updated = desired.len() - created;
+    let deleted = previous_managed.iter().filter(|name| !desired.iter().any(|(n, _)| n == *name) && remote.contains(name)).count();
+    if !dry {
+        for (name, value) in &desired {
+            let mut body = json!({"Name": name, "Value": value, "Type": kind, "Overwrite": true});
+            if !cfg(config, "kms_key_id").is_empty() { body["KeyId"] = json!(cfg(config, "kms_key_id")); }
+            if !tier.is_empty() { body["Tier"] = json!(tier); }
+            aws_call(&client, config, "ssm", region, ak, sk, "AmazonSSM.PutParameter", &body).await.map_err(|e| format!("put {} failed: {}", name, e))?;
+        }
+        if mode == "mirror" {
+            for name in previous_managed {
+                if desired.iter().any(|(n, _)| n == name) || !remote.contains(name) { continue; }
+                aws_call(&client, config, "ssm", region, ak, sk, "AmazonSSM.DeleteParameter", &json!({"Name": name})).await.map_err(|e| format!("delete {} failed: {}", name, e))?;
+            }
+        }
+    }
+    let names = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("AWS Parameter Store sync{}: created={} updated={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, deleted), names))
+}
+
+pub async fn aws_parameter_store_test(config: &Value) -> Result<String, String> {
+    let (region, ak, sk) = aws_creds(config)?;
+    let value = aws_call(&http_client(), config, "ssm", region, ak, sk, "AmazonSSM.DescribeParameters", &json!({"MaxResults": 1})).await?;
+    let count = value.get("Parameters").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    Ok(format!("AWS Parameter Store connection OK: region {} returned a parameter list ({} item(s))", region, count))
+}
+
+// ---------- 1Password Connect ----------
+fn onepassword_config(config: &Value) -> Result<(String, String, String, String, String), String> {
+    let raw = { let v = cfg(config, "connect_url"); if v.is_empty() { cfg(config, "base_url") } else { v } };
+    let base = raw.trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/').to_string();
+    if base.is_empty() { return Err("1Password requires connect_url (the Connect server URL)".into()); }
+    let token = { let t = cfg(config, "token"); if t.is_empty() { cfg(config, "access_token") } else { t } };
+    let vault = { let v = cfg(config, "vault_id"); if v.is_empty() { cfg(config, "vault") } else { v } };
+    if token.is_empty() || vault.is_empty() { return Err("1Password requires token and vault_id".into()); }
+    let label = { let v = cfg(config, "value_label"); if v.is_empty() { "value" } else { v } };
+    let category = { let v = cfg(config, "category"); if v.is_empty() { "API_CREDENTIAL" } else { v } };
+    Ok((base, token.to_string(), vault.to_string(), label.to_string(), category.to_string()))
+}
+async fn onepassword_items(client: &reqwest::Client, base: &str, token: &str, vault: &str) -> Result<Vec<Value>, String> {
+    let text = req(client.get(format!("{}/v1/vaults/{}/items", base, vault)).bearer_auth(token)).await.map_err(|e| format!("1Password list items failed: {}", e))?;
+    if let Ok(items) = serde_json::from_str::<Vec<Value>>(&text) { return Ok(items); }
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("1Password invalid item list: {}", e))?;
+    value.get("items").and_then(Value::as_array).cloned().ok_or("1Password invalid item list: missing items".into())
+}
+fn onepassword_field<'a>(item: &'a Value, label: &str) -> Option<&'a str> {
+    item.get("fields").and_then(Value::as_array)?.iter().find(|f| f.get("label").and_then(Value::as_str) == Some(label) || f.get("id").and_then(Value::as_str) == Some(label)).and_then(|f| f.get("value")).and_then(Value::as_str)
+}
+fn onepassword_set_field(item: &mut Value, label: &str, value: &str) {
+    let fields = item.get_mut("fields").and_then(Value::as_array_mut);
+    match fields {
+        Some(fields) => {
+            if let Some(field) = fields.iter_mut().find(|f| f.get("label").and_then(Value::as_str) == Some(label) || f.get("id").and_then(Value::as_str) == Some(label)) { field["value"] = json!(value); }
+            else { fields.push(json!({"label": label, "value": value, "type": "CONCEALED"})); }
+        }
+        None => { item["fields"] = json!([{"label": label, "value": value, "type": "CONCEALED"}]); }
     }
 }
-struct AwsReq<'a> { service: &'a str, region: &'a str, ak: &'a str, sk: &'a str, target: &'a str, payload: &'a str, endpoint: &'a str }
-async fn aws_signed(client: &reqwest::Client, r: AwsReq<'_>) -> Result<String, String> {
-    let (service, region, ak, sk, target, payload, endpoint_cfg) = (r.service, r.region, r.ak, r.sk, r.target, r.payload, r.endpoint);
-    let host = format!("{}.{}.amazonaws.com", service, region); let url = format!("https://{}", host);
-    let endpoint = endpoint_cfg.to_string();
-    let (host, url) = if endpoint.is_empty() { (host, url) } else { (endpoint.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(), endpoint.trim_end_matches('/').to_string()) };
-    let now = chrono_now(); let (date, amzdate) = (now[..8].to_string(), now.clone());
-    let payload_hash = hex(&Sha256::digest(payload.as_bytes()));
-    let canonical = format!("POST\n/\n\ncontent-type:application/x-amz-json-1.1\nhost:{}\nx-amz-date:{}\nx-amz-target:{}\n\ncontent-type;host;x-amz-date;x-amz-target\n{}", host, amzdate, target, payload_hash);
-    let scope = format!("{}/{}/{}/aws4_request", date, region, service);
-    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amzdate, scope, hex(&Sha256::digest(canonical.as_bytes())));
-    let k_date = hmac(format!("AWS4{}", sk).as_bytes(), date.as_bytes()); let k_region = hmac(&k_date, region.as_bytes()); let k_svc = hmac(&k_region, service.as_bytes()); let k_sign = hmac(&k_svc, b"aws4_request");
-    let sig = hex(&hmac(&k_sign, to_sign.as_bytes()));
-    let auth = format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature={}", ak, scope, sig);
-    req(client.post(&url).header("Content-Type","application/x-amz-json-1.1").header("X-Amz-Date",&amzdate).header("X-Amz-Target",target).header("Authorization",auth).body(payload.to_string())).await
+pub async fn onepassword_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (base, token, vault, label, category) = onepassword_config(config)?;
+    let mode = sync_mode(config, "onepassword")?;
+    let dry = is_dry(config);
+    let desired = trigger_desired(config, secrets);
+    if let Some((name, _)) = desired.iter().find(|(name, _)| name.is_empty() || name.len() > 256) { return Err(format!("invalid 1Password item title: {:?}", name)); }
+    let client = http_client();
+    let items = onepassword_items(&client, &base, &token, &vault).await?;
+    let by_title: HashMap<String, String> = items.iter().filter_map(|i| Some((i.get("title")?.as_str()?.to_string(), i.get("id")?.as_str()?.to_string()))).collect();
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    let mut managed = Vec::new();
+    for (name, value) in &desired {
+        match by_title.get(name) {
+            Some(id) => {
+                let text = req(client.get(format!("{}/v1/vaults/{}/items/{}", base, vault, id)).bearer_auth(&token)).await.map_err(|e| format!("1Password read {} failed: {}", name, e))?;
+                let item: Value = serde_json::from_str(&text).map_err(|e| format!("1Password invalid item {}: {}", name, e))?;
+                if onepassword_field(&item, &label) == Some(value.as_str()) { unchanged += 1; }
+                else {
+                    if !dry {
+                        let mut body = json!({"id": id, "title": name, "vault": {"id": vault}, "category": item.get("category").and_then(Value::as_str).unwrap_or(category.as_str())});
+                        let fields = item.get("fields").cloned().unwrap_or(json!([]));
+                        let mut wrapper = json!({"fields": fields});
+                        onepassword_set_field(&mut wrapper, &label, value);
+                        body["fields"] = wrapper["fields"].clone();
+                        if let Some(sections) = item.get("sections") { body["sections"] = sections.clone(); }
+                        if let Some(tags) = item.get("tags") { body["tags"] = tags.clone(); }
+                        if let Some(urls) = item.get("urls") { body["urls"] = urls.clone(); }
+                        req(client.put(format!("{}/v1/vaults/{}/items/{}", base, vault, id)).bearer_auth(&token).json(&body)).await.map_err(|e| format!("1Password update {} failed: {}", name, e))?;
+                    }
+                    updated += 1;
+                }
+            }
+            None => {
+                if !dry { req(client.post(format!("{}/v1/vaults/{}/items", base, vault)).bearer_auth(&token).json(&json!({"title": name, "vault": {"id": vault}, "category": category, "fields": [{"label": label, "value": value, "type": "CONCEALED"}]}))).await.map_err(|e| format!("1Password create {} failed: {}", name, e))?; }
+                created += 1;
+            }
+        }
+        managed.push(name.clone());
+    }
+    let mut deleted = 0;
+    if mode == "mirror" {
+        for name in previous_managed {
+            if desired.iter().any(|(n, _)| n == name) { continue; }
+            if let Some(id) = by_title.get(name) {
+                if !dry { req(client.delete(format!("{}/v1/vaults/{}/items/{}", base, vault, id)).bearer_auth(&token)).await.map_err(|e| format!("1Password delete {} failed: {}", name, e))?; }
+                deleted += 1;
+            }
+        }
+    }
+    Ok((format!("1Password sync{}: vault={} created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, vault, created, updated, unchanged, deleted), managed))
+}
+pub async fn onepassword_test(config: &Value) -> Result<String, String> {
+    let (base, token, vault, _, _) = onepassword_config(config)?;
+    let text = req(http_client().get(format!("{}/v1/vaults/{}", base, vault)).bearer_auth(&token)).await?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("1Password invalid vault response: {}", e))?;
+    let name = value.get("name").and_then(Value::as_str).unwrap_or(&vault);
+    Ok(format!("1Password Connect OK: vault {} is reachable", name))
+}
+
+// ---------- Dokploy ----------
+fn dokploy_config(config: &Value) -> Result<(String, String, String, bool), String> {
+    let base = cfg(config, "base_url").trim_end_matches('/').to_string();
+    let key = cfg(config, "api_key").trim();
+    let app = cfg(config, "application_id").trim();
+    let compose = cfg(config, "compose_id").trim();
+    if base.is_empty() || key.is_empty() { return Err("Dokploy requires base_url and api_key".into()); }
+    if app.is_empty() == compose.is_empty() { return Err("Dokploy requires exactly one of application_id or compose_id".into()); }
+    let id = if app.is_empty() { compose.to_string() } else { app.to_string() };
+    Ok((base, key.to_string(), id, !app.is_empty()))
+}
+pub async fn dokploy_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (base, key, id, is_app) = dokploy_config(config)?;
+    let mode = sync_mode(config, "dokploy")?;
+    let dry = is_dry(config);
+    let client = http_client();
+    let read_url = if is_app { format!("{}/api/application.one?applicationId={}", base, form_encode(&id)) } else { format!("{}/api/compose.one?composeId={}", base, form_encode(&id)) };
+    let text = req(client.get(read_url).header("x-api-key", &key)).await.map_err(|e| format!("Dokploy read failed: {}", e))?;
+    let current: Value = serde_json::from_str(&text).map_err(|e| format!("Dokploy invalid read response: {}", e))?;
+    let current_map = dotenv_map(current.get("env").and_then(Value::as_str).unwrap_or(""));
+    let desired = trigger_desired(config, secrets);
+    if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("Dokploy invalid environment variable names: {}", bad)); }
+    if let Some((name, _)) = desired.iter().find(|(_, v)| v.contains('\n') || v.contains('\r')) { return Err(format!("Dokploy env values cannot contain line breaks: {:?}", name)); }
+    let (merged, created, updated, unchanged, deleted) = merge_pairs(&current_map, &desired, previous_managed, mode == "mirror");
+    if !dry {
+        if is_app {
+            let body = json!({"applicationId": id, "env": dotenv_render(&merged), "buildArgs": current.get("buildArgs").cloned().unwrap_or(json!("")), "buildSecrets": current.get("buildSecrets").cloned().unwrap_or(json!("")), "createEnvFile": current.get("createEnvFile").and_then(Value::as_bool).unwrap_or(true)});
+            req(client.post(format!("{}/api/application.saveEnvironment", base)).header("x-api-key", &key).json(&body)).await.map_err(|e| format!("Dokploy saveEnvironment failed: {}", e))?;
+            if config.get("redeploy").and_then(Value::as_bool).unwrap_or(false) { req(client.post(format!("{}/api/application.redeploy", base)).header("x-api-key", &key).json(&json!({"applicationId": id}))).await.map_err(|e| format!("Dokploy redeploy failed: {}", e))?; }
+        } else {
+            req(client.post(format!("{}/api/compose.saveEnvironment", base)).header("x-api-key", &key).json(&json!({"composeId": id, "env": dotenv_render(&merged)}))).await.map_err(|e| format!("Dokploy compose saveEnvironment failed: {}", e))?;
+            if config.get("redeploy").and_then(Value::as_bool).unwrap_or(false) { req(client.post(format!("{}/api/compose.redeploy", base)).header("x-api-key", &key).json(&json!({"composeId": id}))).await.map_err(|e| format!("Dokploy compose redeploy failed: {}", e))?; }
+        }
+    }
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Dokploy sync{}: {} created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, id, created, updated, unchanged, deleted), managed))
+}
+pub async fn dokploy_test(config: &Value) -> Result<String, String> {
+    let (base, key, id, is_app) = dokploy_config(config)?;
+    let url = if is_app { format!("{}/api/application.one?applicationId={}", base, form_encode(&id)) } else { format!("{}/api/compose.one?composeId={}", base, form_encode(&id)) };
+    let text = req(http_client().get(url).header("x-api-key", &key)).await?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Dokploy invalid response: {}", e))?;
+    let count = dotenv_map(value.get("env").and_then(Value::as_str).unwrap_or("")).len();
+    Ok(format!("Dokploy connection OK: {} currently has {} environment variables", id, count))
+}
+
+// ---------- CapRover ----------
+async fn caprover_auth(client: &reqwest::Client, config: &Value) -> Result<(String, String), String> {
+    let base = cfg(config, "base_url").trim_end_matches('/').to_string();
+    if base.is_empty() { return Err("CapRover requires base_url".into()); }
+    let api = format!("{}/api/v2", base);
+    let token = { let t = cfg(config, "token"); if !t.is_empty() { t.to_string() } else {
+        let password = cfg(config, "password"); if password.is_empty() { return Err("CapRover requires token or password".into()); }
+        let text = req(client.post(format!("{}/login", api)).json(&json!({"password": password}))).await.map_err(|e| format!("CapRover login failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("CapRover invalid login response: {}", e))?;
+        value.get("data").and_then(|d| d.get("token")).and_then(Value::as_str).ok_or("CapRover login response is missing data.token")?.to_string()
+    } };
+    Ok((api, token))
+}
+async fn caprover_apps(client: &reqwest::Client, api: &str, token: &str) -> Result<Vec<Value>, String> {
+    let text = req(client.get(format!("{}/user/apps/appDefinitions", api)).header("x-captain-auth", token)).await.map_err(|e| format!("CapRover list apps failed: {}", e))?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("CapRover invalid app list: {}", e))?;
+    value.get("data").and_then(|d| d.get("appDefinitions")).and_then(Value::as_array).cloned().ok_or("CapRover invalid app list: missing data.appDefinitions".into())
+}
+pub async fn caprover_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let client = http_client();
+    let (api, token) = caprover_auth(&client, config).await?;
+    let mode = sync_mode(config, "caprover")?;
+    let dry = is_dry(config);
+    let app_name = cfg(config, "app_name").trim();
+    if app_name.is_empty() { return Err("CapRover requires app_name".into()); }
+    let apps = caprover_apps(&client, &api, &token).await?;
+    let app = apps.iter().find(|a| a.get("appName").and_then(Value::as_str) == Some(app_name)).ok_or_else(|| format!("CapRover app {:?} not found", app_name))?;
+    let current: HashMap<String, String> = app.get("envVars").and_then(Value::as_array).map(|items| items.iter().filter_map(|v| Some((v.get("key")?.as_str()?.to_string(), v.get("value").and_then(Value::as_str).unwrap_or("").to_string()))).collect()).unwrap_or_default();
+    let notes: HashMap<String, String> = app.get("envVars").and_then(Value::as_array).map(|items| items.iter().filter_map(|v| Some((v.get("key")?.as_str()?.to_string(), v.get("notes").and_then(Value::as_str).unwrap_or("").to_string()))).collect()).unwrap_or_default();
+    let desired = trigger_desired(config, secrets);
+    if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("CapRover invalid environment variable names: {}", bad)); }
+    let (merged, created, updated, unchanged, deleted) = merge_pairs(&current, &desired, previous_managed, mode == "mirror");
+    if !dry {
+        let env_vars: Vec<Value> = merged.iter().map(|(k, v)| json!({"key": k, "value": v, "notes": notes.get(k).cloned().unwrap_or_default()})).collect();
+        let mut body = app.clone(); body["envVars"] = json!(env_vars);
+        req(client.post(format!("{}/user/apps/appDefinitions/update/", api)).header("x-captain-auth", &token).json(&body)).await.map_err(|e| format!("CapRover update failed: {}", e))?;
+    }
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("CapRover sync{}: app {} created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, app_name, created, updated, unchanged, deleted), managed))
+}
+pub async fn caprover_test(config: &Value) -> Result<String, String> {
+    let client = http_client(); let (api, token) = caprover_auth(&client, config).await?;
+    let apps = caprover_apps(&client, &api, &token).await?;
+    Ok(format!("CapRover connection OK: {} app(s) visible", apps.len()))
+}
+
+// ---------- Portainer ----------
+fn portainer_auth(config: &Value) -> Result<(String, String), String> {
+    let base = cfg(config, "base_url").trim_end_matches('/').to_string();
+    let key = cfg(config, "api_key").trim();
+    if base.is_empty() || key.is_empty() { return Err("Portainer requires base_url and api_key".into()); }
+    Ok((base, key.to_string()))
+}
+async fn portainer_stacks(client: &reqwest::Client, base: &str, key: &str) -> Result<Vec<Value>, String> {
+    let text = req(client.get(format!("{}/api/stacks", base)).header("X-API-Key", key)).await.map_err(|e| format!("Portainer list stacks failed: {}", e))?;
+    serde_json::from_str(&text).map_err(|e| format!("Portainer invalid stack list: {}", e))
+}
+pub async fn portainer_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (base, key) = portainer_auth(config)?;
+    let mode = sync_mode(config, "portainer")?;
+    let dry = is_dry(config);
+    let client = http_client();
+    let stacks = portainer_stacks(&client, &base, &key).await?;
+    let wanted_id = config_i64(config, "stack_id");
+    let wanted_name = cfg(config, "stack_name");
+    let stack = stacks.iter().find(|s| (wanted_id.is_some() && s.get("Id").and_then(Value::as_i64) == wanted_id) || (!wanted_name.is_empty() && s.get("Name").and_then(Value::as_str) == Some(wanted_name))).ok_or("Portainer stack not found")?;
+    let id = stack.get("Id").and_then(Value::as_i64).ok_or("Portainer stack has no Id")?;
+    let endpoint_id = config_i64(config, "endpoint_id").or_else(|| stack.get("EndpointId").and_then(Value::as_i64)).ok_or("Portainer requires endpoint_id (or a stack with EndpointId)")?;
+    // The list response is not guaranteed to include Env; read the stack detail
+    // so unrelated variables are preserved rather than wiped.
+    let detail_text = req(client.get(format!("{}/api/stacks/{}", base, id)).header("X-API-Key", &key)).await.map_err(|e| format!("Portainer read stack failed: {}", e))?;
+    let detail: Value = serde_json::from_str(&detail_text).map_err(|e| format!("Portainer invalid stack response: {}", e))?;
+    let current: HashMap<String, String> = detail.get("Env").and_then(Value::as_array).map(|items| items.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v.get("value").and_then(Value::as_str).unwrap_or("").to_string()))).collect()).unwrap_or_default();
+    let desired = trigger_desired(config, secrets);
+    if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("Portainer invalid environment variable names: {}", bad)); }
+    let (merged, created, updated, unchanged, deleted) = merge_pairs(&current, &desired, previous_managed, mode == "mirror");
+    if !dry {
+        let file_text = req(client.get(format!("{}/api/stacks/{}/file", base, id)).header("X-API-Key", &key)).await.map_err(|e| format!("Portainer read stack file failed: {}", e))?;
+        let file: Value = serde_json::from_str(&file_text).map_err(|e| format!("Portainer invalid stack file response: {}", e))?;
+        let env_json: Vec<Value> = merged.iter().map(|(k, v)| json!({"name": k, "value": v})).collect();
+        let body = json!({"StackFileContent": file.get("StackFileContent").and_then(Value::as_str).unwrap_or(""), "Env": env_json, "Prune": false, "PullImage": false});
+        req(client.put(format!("{}/api/stacks/{}?endpointId={}", base, id, endpoint_id)).header("X-API-Key", &key).json(&body)).await.map_err(|e| format!("Portainer update stack failed: {}", e))?;
+    }
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Portainer sync{}: stack {} created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, id, created, updated, unchanged, deleted), managed))
+}
+pub async fn portainer_test(config: &Value) -> Result<String, String> {
+    let (base, key) = portainer_auth(config)?;
+    let stacks = portainer_stacks(&http_client(), &base, &key).await?;
+    Ok(format!("Portainer connection OK: {} stack(s) visible", stacks.len()))
+}
+
+// ---------- Docker Swarm ----------
+fn docker_client(config: &Value) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+    let cert = cfg(config, "client_cert"); let key = cfg(config, "client_key"); let ca = cfg(config, "ca_cert");
+    if !cert.is_empty() || !key.is_empty() {
+        if cert.is_empty() || key.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
+        let identity = reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("Docker client certificate is invalid: {}", e))?;
+        builder = builder.identity(identity);
+    }
+    if !ca.is_empty() { builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).map_err(|e| format!("Docker CA certificate is invalid: {}", e))?); }
+    if config.get("insecure").and_then(Value::as_bool).unwrap_or(false) { builder = builder.danger_accept_invalid_certs(true); }
+    builder.build().map_err(|e| e.to_string())
+}
+fn docker_base(config: &Value) -> Result<String, String> {
+    let raw = cfg(config, "api_url").trim_end_matches('/');
+    if raw.is_empty() { return Err("Docker requires api_url (the Docker Engine endpoint, for example https://host:2376)".into()); }
+    let version = { let v = cfg(config, "api_version"); if v.is_empty() { "v1.47" } else { v } };
+    let last = raw.rsplit('/').next().unwrap_or("");
+    let versioned = last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit() || c == '.');
+    Ok(if versioned { raw.to_string() } else { format!("{}/{}", raw, version) })
+}
+pub async fn docker_swarm_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let base = docker_base(config)?;
+    let client = docker_client(config)?;
+    let mode = sync_mode(config, "docker_swarm")?;
+    let dry = is_dry(config);
+    let desired = trigger_desired(config, secrets);
+    if let Some((name, _)) = desired.iter().find(|(name, _)| name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))) { return Err(format!("Docker secret names must be 1-64 characters of letters, digits, underscore, dot or dash: {:?}", name)); }
+    let text = req(client.get(format!("{}/secrets", base))).await.map_err(|e| format!("Docker list secrets failed: {}", e))?;
+    let list: Vec<Value> = serde_json::from_str(&text).map_err(|e| format!("Docker invalid secret list: {}", e))?;
+    let by_name: HashMap<String, String> = list.iter().filter_map(|s| Some((s.get("Spec")?.get("Name")?.as_str()?.to_string(), s.get("ID")?.as_str()?.to_string()))).collect();
+    let created = desired.iter().filter(|(name, _)| !by_name.contains_key(name)).count();
+    let replaced = desired.len() - created;
+    let mut deleted = 0;
+    if !dry {
+        for (name, value) in &desired {
+            if let Some(id) = by_name.get(name) {
+                req(client.delete(format!("{}/secrets/{}", base, id))).await.map_err(|e| format!("Docker delete {} before recreate failed: {}", name, e))?;
+            }
+            req(client.post(format!("{}/secrets/create", base)).json(&json!({"Name": name, "Labels": {"com.openwarp.managed": "true"}, "Data": openwarp_crypto::b64(value.as_bytes())}))).await.map_err(|e| format!("Docker create {} failed: {}", name, e))?;
+        }
+        if mode == "mirror" {
+            for name in previous_managed {
+                if desired.iter().any(|(n, _)| n == name) { continue; }
+                if let Some(id) = by_name.get(name) {
+                    req(client.delete(format!("{}/secrets/{}", base, id))).await.map_err(|e| format!("Docker delete {} failed: {}", name, e))?;
+                    deleted += 1;
+                }
+            }
+        }
+    } else { deleted = previous_managed.iter().filter(|name| !desired.iter().any(|(n, _)| n == *name) && by_name.contains_key(*name)).count(); }
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Docker Swarm sync{}: created={} replaced={} deleted={} (Docker secrets are immutable, so existing values are deleted and recreated)", if dry { " (dry-run)" } else { "" }, created, replaced, deleted), managed))
+}
+pub async fn docker_swarm_test(config: &Value) -> Result<String, String> {
+    let base = docker_base(config)?; let client = docker_client(config)?;
+    let text = req(client.get(format!("{}/_ping", base))).await.map_err(|e| format!("Docker Engine ping failed: {}", e))?;
+    Ok(format!("Docker Engine connection OK: {}", text.trim()))
+}
+
+pub fn has_test(kind: &str) -> bool {
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm")
+}
+pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
+    match kind {
+        "trigger" => trigger_test(config).await,
+        "instabox" => instabox_test(config).await,
+        "boat" => boat_test(config).await,
+        "daytona" => daytona_test(config).await,
+        "aws_secrets_manager" => aws_secrets_manager_test(config).await,
+        "aws_parameter_store" => aws_parameter_store_test(config).await,
+        "onepassword" => onepassword_test(config).await,
+        "dokploy" => dokploy_test(config).await,
+        "caprover" => caprover_test(config).await,
+        "portainer" => portainer_test(config).await,
+        "docker_swarm" => docker_swarm_test(config).await,
+        _ => Err(format!("connection test is not implemented for kind {}", kind)),
+    }
 }
 fn form_encode(s: &str) -> String {
     s.bytes().map(|b| match b {
@@ -481,9 +987,49 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
+    type FullCalls = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
     fn header_end(buf: &[u8]) -> Option<usize> { buf.windows(4).position(|w| w == b"\r\n\r\n") }
     fn content_length(head: &str) -> usize { head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse().ok() } else { None } }).unwrap_or(0) }
+
+    fn mock_routes(items: &[(&str, u16, &str)]) -> Vec<(String, u16, String)> { items.iter().map(|(pattern, status, body)| (pattern.to_string(), *status, body.to_string())).collect() }
+
+    /// Mock server that matches a pattern against "METHOD PATH HEADERS" and records
+    /// the method, path, raw headers and body of every request.
+    fn start_mock_routes(routes: Vec<(String, u16, String)>) -> (String, FullCalls) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
+        let addr = listener.local_addr().expect("mock addr");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+                let mut buf = Vec::new(); let mut chunk = [0u8; 4096];
+                loop {
+                    let read = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                    buf.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = header_end(&buf) {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        if buf.len() >= end + 4 + content_length(&head) { break; }
+                    }
+                }
+                let end = header_end(&buf).unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let len = content_length(&head);
+                let body = String::from_utf8_lossy(&buf[end + 4..(end + 4 + len).min(buf.len())]).to_string();
+                sink.lock().unwrap().push((method.clone(), path.clone(), head.clone(), body));
+                let key = format!("{} {} {}", method, path, head);
+                let (status, payload) = match routes.iter().find(|(pattern, _, _)| key.contains(pattern)) { Some((_, status, body)) => (*status, body.clone()), None => (200, "{}".to_string()) };
+                let status_line = match status { 201 => "201 Created", 204 => "204 No Content", 400 => "400 Bad Request", 404 => "404 Not Found", _ => "200 OK" };
+                let _ = stream.write_all(format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status_line, payload.len(), payload).as_bytes());
+            }
+        });
+        (format!("http://{}", addr), calls)
+    }
 
     fn start_mock() -> (String, Calls) { start_mock_with(None) }
 
@@ -688,5 +1234,200 @@ mod tests {
         daytona_sync(&config, &secrets, &[]).await.expect("sync");
         let posts = calls.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p.ends_with("/secret")).count();
         assert_eq!(posts, 1, "the same remote name must be created once");
+    }
+
+    #[test]
+    fn merge_pairs_preserves_unmanaged_values_and_counts() {
+        let current = HashMap::from([("KEEP".to_string(), "1".to_string()), ("OLD".to_string(), "2".to_string())]);
+        let desired = vec![("KEEP".to_string(), "1".to_string()), ("NEW".to_string(), "3".to_string())];
+        let (merged, created, updated, unchanged, deleted) = merge_pairs(&current, &desired, &["OLD".to_string()], true);
+        assert_eq!((created, updated, unchanged, deleted), (1, 0, 1, 1));
+        assert_eq!(merged.get("KEEP").map(String::as_str), Some("1"));
+        assert_eq!(merged.get("NEW").map(String::as_str), Some("3"));
+        assert!(!merged.contains_key("OLD"));
+    }
+
+    #[test]
+    fn dotenv_render_quotes_values_that_need_it() {
+        let map = BTreeMap::from([("PLAIN".to_string(), "abc-123".to_string()), ("SPACED".to_string(), "a b".to_string())]);
+        let text = dotenv_render(&map);
+        assert!(text.contains("PLAIN=abc-123\n"));
+        assert!(text.contains("SPACED='a b'\n"));
+    }
+
+    #[tokio::test]
+    async fn aws_secrets_manager_one_to_one_creates_and_prunes() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("secretsmanager.ListSecrets", 200, "{\"SecretList\":[{\"Name\":\"OLD\"}]}"),
+            ("secretsmanager.PutSecretValue", 200, "{}"),
+            ("secretsmanager.DeleteSecret", 200, "{}"),
+        ]));
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","session_token":"session-token","endpoint":base,"mapping":"one_to_one","mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, managed) = aws_secrets_manager_sync(&config, &secrets, &["OLD".to_string()]).await.expect("aws sm sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert_eq!(managed, vec!["API_KEY".to_string()]);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.PutSecretValue")).expect("put call");
+        assert!(put.2.to_lowercase().contains("x-amz-security-token: session-token"), "{}", put.2);
+        assert!(put.3.contains("\"SecretId\":\"API_KEY\""), "{}", put.3);
+        let del = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.DeleteSecret")).expect("delete call");
+        assert!(del.3.contains("\"SecretId\":\"OLD\""), "{}", del.3);
+    }
+
+    #[tokio::test]
+    async fn aws_secrets_manager_many_to_one_creates_a_missing_secret() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("secretsmanager.UpdateSecret", 400, "{\"__type\":\"ResourceNotFoundException\",\"message\":\"not found\"}"),
+            ("secretsmanager.CreateSecret", 200, "{}"),
+        ]));
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (_report, managed) = aws_secrets_manager_sync(&config, &secrets, &[]).await.expect("aws sm sync");
+        assert!(managed.is_empty());
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.CreateSecret")).expect("create call");
+        assert!(create.3.contains("\"Name\":\"app/prod\""), "{}", create.3);
+        let body: Value = serde_json::from_str(&create.3).expect("json body");
+        let nested: Value = serde_json::from_str(body["SecretString"].as_str().expect("secret string")).expect("nested json");
+        assert_eq!(nested["API_KEY"], "v1");
+    }
+
+    #[tokio::test]
+    async fn aws_parameter_store_writes_secure_strings_under_the_path() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("AmazonSSM.GetParametersByPath", 200, "{\"Parameters\":[]}"),
+            ("AmazonSSM.PutParameter", 200, "{}"),
+        ]));
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"path_prefix":"/app/prod"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, managed) = aws_parameter_store_sync(&config, &secrets, &[]).await.expect("ssm sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert_eq!(managed, vec!["/app/prod/API_KEY".to_string()]);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(_, _, head, _)| head.contains("AmazonSSM.PutParameter")).expect("put call");
+        let body: Value = serde_json::from_str(&put.3).expect("json body");
+        assert_eq!(body["Name"], "/app/prod/API_KEY");
+        assert_eq!(body["Type"], "SecureString");
+        assert_eq!(body["Overwrite"], true);
+    }
+
+    #[tokio::test]
+    async fn onepassword_creates_items_and_prunes_only_managed_titles() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /v1/vaults/vault1/items HTTP", 200, "[{\"id\":\"old-id\",\"title\":\"OLD\"}]"),
+            ("POST /v1/vaults/vault1/items", 200, "{}"),
+            ("DELETE /v1/vaults/vault1/items/old-id", 204, ""),
+        ]));
+        let config = json!({"connect_url":base,"token":"op_token","vault_id":"vault1","mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, managed) = onepassword_sync(&config, &secrets, &["OLD".to_string()]).await.expect("1password sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert_eq!(managed, vec!["API_KEY".to_string()]);
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/items")).expect("create item");
+        let body: Value = serde_json::from_str(&create.3).expect("json body");
+        assert_eq!(body["title"], "API_KEY");
+        assert_eq!(body["fields"][0]["label"], "value");
+        assert_eq!(body["fields"][0]["value"], "v1");
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p.ends_with("/items/old-id")), "mirror should delete the previously managed item");
+    }
+
+    #[tokio::test]
+    async fn onepassword_updates_the_configured_field_on_an_existing_item() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /v1/vaults/vault1/items HTTP", 200, "[{\"id\":\"item-1\",\"title\":\"API_KEY\"}]"),
+            ("GET /v1/vaults/vault1/items/item-1", 200, "{\"id\":\"item-1\",\"title\":\"API_KEY\",\"category\":\"API_CREDENTIAL\",\"fields\":[{\"label\":\"value\",\"value\":\"old\",\"type\":\"CONCEALED\"}]}"),
+            ("PUT /v1/vaults/vault1/items/item-1", 200, "{}"),
+        ]));
+        let config = json!({"connect_url":base,"token":"op_token","vault_id":"vault1"});
+        let secrets = vec![("API_KEY".to_string(), "new".to_string())];
+        let (report, _) = onepassword_sync(&config, &secrets, &[]).await.expect("1password sync");
+        assert!(report.contains("updated=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(m, _, _, _)| m == "PUT").expect("put item");
+        let body: Value = serde_json::from_str(&put.3).expect("json body");
+        assert_eq!(body["fields"][0]["value"], "new");
+    }
+
+    #[tokio::test]
+    async fn dokploy_merges_the_application_env_and_mirrors_managed_keys() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("application.one", 200, "{\"env\":\"OLD=1\\nKEEP=2\\n\",\"buildArgs\":\"\",\"buildSecrets\":\"\",\"createEnvFile\":true}"),
+            ("saveEnvironment", 200, "{}"),
+        ]));
+        let config = json!({"base_url":base,"api_key":"dok_key","application_id":"app1","mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = dokploy_sync(&config, &secrets, &["OLD".to_string()]).await.expect("dokploy sync");
+        assert!(report.contains("created=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let save = calls.iter().find(|(_, p, _, _)| p.ends_with("/api/application.saveEnvironment")).expect("save call");
+        let body: Value = serde_json::from_str(&save.3).expect("json body");
+        let env = body["env"].as_str().expect("env string");
+        assert!(env.contains("API_KEY=v1"), "{}", env);
+        assert!(env.contains("KEEP=2"), "{}", env);
+        assert!(!env.contains("OLD=1"), "{}", env);
+    }
+
+    #[tokio::test]
+    async fn caprover_logs_in_and_updates_app_env_vars() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /api/v2/login", 200, "{\"status\":100,\"data\":{\"token\":\"cap_token\"}}"),
+            ("GET /api/v2/user/apps/appDefinitions HTTP", 200, "{\"status\":100,\"data\":{\"appDefinitions\":[{\"appName\":\"app\",\"envVars\":[{\"key\":\"OLD\",\"value\":\"1\"}]}]}}"),
+            ("POST /api/v2/user/apps/appDefinitions/update/", 200, "{}"),
+        ]));
+        let config = json!({"base_url":base,"password":"captain42","app_name":"app","mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = caprover_sync(&config, &secrets, &["OLD".to_string()]).await.expect("caprover sync");
+        assert!(report.contains("created=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let update = calls.iter().find(|(_, p, _, _)| p.ends_with("/appDefinitions/update/")).expect("update call");
+        let body: Value = serde_json::from_str(&update.3).expect("json body");
+        let envs = body["envVars"].as_array().expect("envVars");
+        assert!(envs.iter().any(|v| v["key"] == "API_KEY" && v["value"] == "v1"));
+        assert!(!envs.iter().any(|v| v["key"] == "OLD"));
+    }
+
+    #[tokio::test]
+    async fn portainer_updates_stack_env_and_keeps_the_stack_file() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /api/stacks HTTP", 200, "[{\"Id\":1,\"Name\":\"web\",\"EndpointId\":2}]"),
+            ("GET /api/stacks/1 HTTP", 200, "{\"Id\":1,\"Name\":\"web\",\"EndpointId\":2,\"Env\":[{\"name\":\"OLD\",\"value\":\"1\"},{\"name\":\"KEEP\",\"value\":\"2\"}]}"),
+            ("GET /api/stacks/1/file", 200, "{\"StackFileContent\":\"services: {}\"}"),
+            ("PUT /api/stacks/1", 200, "{}"),
+        ]));
+        let config = json!({"base_url":base,"api_key":"pt_key","stack_id":1,"mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = portainer_sync(&config, &secrets, &["OLD".to_string()]).await.expect("portainer sync");
+        assert!(report.contains("created=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(m, p, _, _)| m == "PUT" && p.starts_with("/api/stacks/1?")).expect("update call");
+        assert!(put.1.contains("endpointId=2"), "{}", put.1);
+        let body: Value = serde_json::from_str(&put.3).expect("json body");
+        assert_eq!(body["StackFileContent"], "services: {}");
+        let envs = body["Env"].as_array().expect("env");
+        assert!(envs.iter().any(|v| v["name"] == "API_KEY" && v["value"] == "v1"));
+        assert!(envs.iter().any(|v| v["name"] == "KEEP"));
+        assert!(!envs.iter().any(|v| v["name"] == "OLD"));
+    }
+
+    #[tokio::test]
+    async fn docker_swarm_recreates_immutable_secrets_and_prunes() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /v1.47/secrets HTTP", 200, "[{\"ID\":\"old-id\",\"Spec\":{\"Name\":\"OLD\"}}]"),
+            ("POST /v1.47/secrets/create", 201, "{\"ID\":\"new-id\"}"),
+            ("DELETE /v1.47/secrets/old-id", 204, ""),
+        ]));
+        let config = json!({"api_url":base,"mode":"mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, managed) = docker_swarm_sync(&config, &secrets, &["OLD".to_string()]).await.expect("docker sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert_eq!(managed, vec!["API_KEY".to_string()]);
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/secrets/create")).expect("create call");
+        let body: Value = serde_json::from_str(&create.3).expect("json body");
+        assert_eq!(body["Name"], "API_KEY");
+        assert_eq!(openwarp_crypto::unb64(body["Data"].as_str().expect("data")).expect("base64"), b"v1");
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p.ends_with("/secrets/old-id")), "mirror should delete the previously managed secret");
     }
 }
