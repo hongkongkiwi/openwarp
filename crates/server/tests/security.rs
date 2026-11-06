@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
-static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Resp {
     status: u16,
@@ -60,7 +60,7 @@ impl Server {
     }
 
     async fn start_with_public(public_url: Option<&str>) -> Server {
-        let _start = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _start = START_LOCK.lock().await;
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-it-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).expect("temp dir");
