@@ -105,6 +105,14 @@ can be enabled; OIDC counts once an organisation has an issuer. Turning
 password off also blocks password registration, password reset and the OAuth
 consent password form.
 
+New accounts, invites, password resets and the OAuth consent page use
+client-derived authentication. The browser derives an authentication key and a
+separate wrapping key with PBKDF2-HMAC-SHA256, sends only the authentication key
+and an AES-GCM-wrapped private key, and proves login with a single-use HMAC
+challenge. The server never receives the password or the wrapping key. Version 1
+password accounts keep working and are upgraded by a password reset. The full
+wire protocol is in [AUTH-PROTOCOL.md](AUTH-PROTOCOL.md).
+
 Each account can add any combination of second factors:
 
 - TOTP authenticator app with recovery codes (`/api/me/totp/setup`, verify,

@@ -96,6 +96,7 @@ const OW = (() => {
   }
   function decryptSymmetric(keyBytes, payloadB64) { const raw = b64dec(payloadB64); return xchachaDecrypt(keyBytes, raw.slice(0, 24), raw.slice(24)); }
   function encryptSymmetric(keyBytes, plaintext) { const nonce = crypto.getRandomValues(new Uint8Array(24)); const ct = xchachaEncrypt(keyBytes, nonce, plaintext); const out = new Uint8Array(24 + ct.length); out.set(nonce); out.set(ct, 24); return b64enc(out); }
-  return { b64dec, b64enc, x25519, x25519Pub, decryptAsymmetric, encryptAsymmetric, decryptSymmetric, encryptSymmetric, _xchachaEncrypt: xchachaEncrypt, _xchachaDecrypt: xchachaDecrypt };
+  function generateKeypair() { const secret = crypto.getRandomValues(new Uint8Array(32)); return { secret, public: b64enc(x25519Pub(secret)) }; }
+  return { b64dec, b64enc, x25519, x25519Pub, generateKeypair, decryptAsymmetric, encryptAsymmetric, decryptSymmetric, encryptSymmetric, _xchachaEncrypt: xchachaEncrypt, _xchachaDecrypt: xchachaDecrypt };
 })();
 if (typeof module !== 'undefined') module.exports = OW;

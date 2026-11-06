@@ -115,21 +115,25 @@ unless `OPENWARP_MASTER_KEY` still holds the same key. Back up the KMS key.
 Two gaps remain between the current implementation and a malicious-operator
 guarantee:
 
-1. **The password still reaches the server.** Registration and login send the
-   password over TLS; the server wraps the user's private key with it. A
-   malicious operator can capture the password and unwrap the key. Replacing
-   this with OPAQUE or a client-derived verifier plus a separate wrapping key is
-   required before claiming operator-blindness against the server.
-2. **The browser client is served by the server.** `/e2e.js` and the console are
-   delivered by the same process that could be compromised. For high assurance,
-   use the CLI or a signed native/desktop client, and verify the client build.
-   The CLI already keeps its tokens in the OS credential store and decrypts E2E
-   values locally.
+1. **Version 1 accounts still send the password.** New accounts, invites,
+   password resets and the OAuth consent page use the client-derived protocol in
+   [AUTH-PROTOCOL.md](AUTH-PROTOCOL.md): the password and wrapping key stay in
+   the browser, and the server stores only an authentication key it cannot use
+   to decrypt end-to-end data. Version 1 accounts keep the old password login
+   until they reset their password (which upgrades them). A malicious operator
+   can still impersonate a version 2 account because it holds the authentication
+   key, but it cannot derive the wrapping key.
+2. **The browser client is served by the server.** `/e2e.js`, `/auth-v2.js` and
+   the console are delivered by the same process that could be compromised. A
+   modified client can capture the password or keys regardless of the protocol.
+   For high assurance, use the CLI or a signed native/desktop client, and verify
+   the client build. The CLI already keeps its tokens in the OS credential store
+   and decrypts E2E values locally.
 
-Until both are addressed, `delegated` and `e2e` protect against a stolen
-database, backup or disk, and against the server accidentally logging or
-serving plaintext. They do not prove that a determined operator who controls the
-server cannot obtain a user's key.
+For version 2 accounts, `delegated` and `e2e` protect the data from a stolen
+database, backup, disk or server that only sees protocol traffic. They do not
+protect against an operator who can replace the client code. Version 1 accounts
+retain the old exposure until migrated.
 
 ## Recovery and revocation
 

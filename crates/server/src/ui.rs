@@ -92,7 +92,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, MFAMETHODS=[], MFA_INFO=null, LASTFOCUS=null, PENDING_ORG=null;
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, MFAMETHODS=[], MFA_INFO=null, LASTFOCUS=null, PENDING_ORG=null, AUTH_KEY=null, WRAP_KEY=null, WRAPPED_PRIV='', E2E_KIT='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
@@ -170,9 +170,17 @@ function showInvite(token){
     <div class="field"><label for="inv-pw">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters"></div>
     <button class="primary" style="width:100%;padding:11px" onclick="acceptInvite()">Create account</button>`;
   $('authform').dataset.invite=token;}
+function showKit(title,text,kit,cont){modal(`<h3>${esc(title)}</h3><p class="mut">${esc(text)}</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${jsq(kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();${cont?'enterApp()':''}">${cont?'I saved it, continue':'I saved it'}</button></div>`)}
+async function unlockE2E(){if(!(WRAP_KEY&&WRAPPED_PRIV))return;try{let secret=await AuthV2.unwrapPrivate(WRAP_KEY,WRAPPED_PRIV);E2E_KIT=OW.b64enc(secret)}catch(e){E2E_KIT=''}}
 async function acceptInvite(){try{
-  let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
-  T='';history.replaceState(null,'',location.pathname);enterApp();
+  let password=$('inv-pw').value;if(password.length<8){toast('Password must be at least 8 characters',true);return}
+  let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);let kp=OW.generateKeypair();
+  let wrapped=await AuthV2.wrapPrivate(keys.wrap,kp.secret);
+  let d=await api('POST','/api/auth/accept-invite-v2',{token:$('authform').dataset.invite,salt,iterations:600000,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:wrapped});
+  AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(kp.secret);
+  T='';history.replaceState(null,'',location.pathname);
+  if(d.mfa_required){showMfa(d.mfa_token,d.methods,d.email_available);return}
+  showKit('Save your recovery kit','This X25519 private key decrypts end-to-end environments and is shown once.',E2E_KIT,true);
 }catch(e){toast(e.message,true)}}
 function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
@@ -187,33 +195,57 @@ function showReset(token){
     <button class="primary" style="width:100%;padding:11px;margin-top:10px" onclick="resetPassword()">Set new password</button>`;
   $('authform').dataset.reset=token}
 async function resetPassword(){try{
-  let d=await api('POST','/api/auth/reset',{token:$('authform').dataset.reset,password:$('rp-pw').value,recovery_kit:$('rp-kit').value,discard_e2e_key:!!$('rp-discard').checked});
+  let password=$('rp-pw').value,kit=$('rp-kit').value.trim(),token=$('authform').dataset.reset;
+  if(password.length<8){toast('Password must be at least 8 characters',true);return}
+  let info=await api('POST','/api/auth/reset-info',{token});
+  let secret,pubkey;
+  if(kit){secret=AuthV2.b64dec(kit);pubkey=OW.b64enc(OW.x25519Pub(secret));if(info.public_key&&pubkey!==info.public_key){toast('The recovery kit does not match this account',true);return}}
+  else if($('rp-discard').checked){let kp=OW.generateKeypair();secret=kp.secret;pubkey=kp.public}
+  else{toast('Recovery kit required; tick the replacement box only if you accept losing end-to-end access',true);return}
+  let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);
+  let wrapped=await AuthV2.wrapPrivate(keys.wrap,secret);
+  let d=await api('POST','/api/auth/reset-v2',{token,salt,iterations:600000,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:pubkey,wrapped_privkey:wrapped});
+  AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(secret);
   T='';history.replaceState(null,'',location.pathname);
-  if(d.mfa_required){toast(d.e2e_key_replaced?'Password set and key replaced; verify your second factor':'Password set; verify your second factor');showMfa(d.mfa_token,d.methods,d.email_available);return}
-  toast(d.e2e_key_replaced?'Password set; your key was replaced':'Password set');enterApp();
+  if(d.mfa_required){toast('Password set; verify your second factor');showMfa(d.mfa_token,d.methods,d.email_available);return}
+  toast('Password set');enterApp();
 }catch(e){toast(e.message,true)}}
 let MODE='login';
 function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');$('authtitle').textContent=m==='login'?'Welcome back':'Create your account';$('authbtn').textContent=m==='login'?'Sign in':'Create account'}
-async function doAuth(){try{
-  if(MODE==='register'){let d=await api('POST','/api/auth/register',{email:$('email').value,password:$('pw').value});
-    if(d.verification_required){
-      modal(`<h3>Check your email</h3><p class="mut">We sent a verification link to ${esc($('email').value)}. Save your recovery kit now; it is shown once.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal()">I saved it</button></div>`,'Check your email');
-      return}
-    T='';
-    modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`,'Save your recovery kit');return}
-  let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
-  if(d.mfa_required){showMfa(d.mfa_token,d.methods,d.email_available);return}
-  T='';enterApp();
-}catch(e){toast(e.message,true)}}
-async function doMfa(){try{await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
+async function doAuth(){let email=$('email').value.trim(),password=$('pw').value;AUTH_KEY=null;WRAP_KEY=null;WRAPPED_PRIV='';E2E_KIT='';
+  try{
+    let kdf=await AuthV2.kdf(email);
+    if(MODE==='register'){
+      if(kdf.version!==2){toast('This instance still uses password registration',true);return}
+      if(password.length<8){toast('Password must be at least 8 characters',true);return}
+      let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations);let kp=OW.generateKeypair();
+      let wrapped=await AuthV2.wrapPrivate(keys.wrap,kp.secret);
+      let d=await api('POST','/api/auth/register-v2',{email,salt:kdf.salt,iterations:kdf.iterations,algo:kdf.algo,auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:wrapped});
+      AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(kp.secret);
+      if(d.verification_required){showKit('Check your email',`We sent a verification link to ${email}. Save your recovery kit now; it is shown once.`,E2E_KIT,false);return}
+      T='';showKit('Save your recovery kit','This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.',E2E_KIT,true);return;
+    }
+    if(kdf.version===1){
+      let d=await api('POST','/api/auth/login',{email,password});
+      if(d.mfa_required){showMfa(d.mfa_token,d.methods,d.email_available);return}
+      T='';enterApp();return;
+    }
+    let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations);
+    let ch=await AuthV2.challenge(email);let proof=await AuthV2.proof(keys.auth,ch.challenge,ch.challenge_id);
+    let d=await api('POST','/api/auth/login-v2',{email,challenge_id:ch.challenge_id,proof});
+    AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=d.wrapped_privkey||'';
+    if(d.mfa_required){showMfa(d.mfa_token,d.methods,d.email_available);return}
+    T='';await unlockE2E();enterApp();
+  }catch(e){toast(e.message,true)}}
+async function doMfa(){try{await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';await unlockE2E();enterApp()}catch(e){toast(e.message,true)}}
 async function sendEmailCode(){try{await api('POST','/api/auth/mfa/email/send',{mfa_token:MFA});toast('A code is on its way to your email')}catch(e){toast(e.message,true)}}
 async function usePasskey(){try{
   let s=await api('POST','/api/auth/mfa/passkey/start',{mfa_token:MFA});
   let cred=await navigator.credentials.get({publicKey:requestOptions(s.options.publicKey)});
   await api('POST','/api/auth/mfa/passkey/finish',{mfa_token:MFA,credential:assertionJson(cred)});
-  T='';enterApp();
+  T='';await unlockE2E();enterApp();
 }catch(e){toast(e.message||String(e),true)}}
-async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
+async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';AUTH_KEY=null;WRAP_KEY=null;WRAPPED_PRIV='';E2E_KIT='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
@@ -497,7 +529,7 @@ async function verifyEmailMfa(){try{let d=await api('POST','/api/me/mfa/email/ve
   toast('Email codes enabled');renderSettings()}catch(e){toast(e.message,true)}}
 async function disableEmailMfa(){let pw=reauthPrompt('Current password to disable email codes');if(pw===null)return;
   try{await api('DELETE','/api/me/mfa/email',{password:pw});toast('Email codes disabled');renderSettings()}catch(e){toast(e.message,true)}}
-async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
+async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let kit=$('e2e-kit')?.value||E2E_KIT;if(!kit)throw new Error('Recovery kit required');let k=await OW.decryptAsymmetric(kit,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
@@ -532,5 +564,6 @@ if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener(
 $('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
 </script>
 <script src="/e2e.js"></script>
+<script src="/auth-v2.js"></script>
 </body></html>
 "##;

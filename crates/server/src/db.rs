@@ -116,6 +116,11 @@ impl Db {
             "ALTER TABLE secrets ADD COLUMN path_enc TEXT DEFAULT ''",
             "ALTER TABLE secrets ADD COLUMN tags_enc TEXT DEFAULT ''",
             "ALTER TABLE secrets ADD COLUMN key_index TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN auth_version BIGINT DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN kdf_salt TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN kdf_iterations BIGINT DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN kdf_algo TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN auth_key_enc TEXT DEFAULT ''",
         ] { let _ = self.exec(alter, &[]); }
         for idx in INDEXES { let _ = self.exec(idx, &[]); }
         // One-time backfill: environments that already had an allowlist keep it.
@@ -216,6 +221,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS runners(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,pubkey TEXT NOT NULL,token_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS runner_env_keys(runner_id TEXT NOT NULL,env_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(runner_id,env_id))",
     "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0,claim_id TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS auth_challenges(id_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,challenge TEXT NOT NULL,created_at BIGINT NOT NULL)",
 ];
 
 const INDEXES: &[&str] = &[
@@ -237,6 +243,7 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_runners_token ON runners(token_hash)",
     "CREATE INDEX IF NOT EXISTS idx_sync_jobs_pending ON sync_jobs(status,created_at)",
     "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
 ];
 
 #[cfg(test)]

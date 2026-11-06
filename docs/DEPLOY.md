@@ -129,7 +129,25 @@ Settings, or set `OPENWARP_SIGNUPS=closed` to pin the policy. With signups
 closed, an admin invites an address from Members: existing accounts are added
 directly, new addresses get a single-use link valid for seven days. The invitee
 sets a password from that link, or signs in with a configured social provider,
-which redeems the invite and applies its role.
+which redeems the invite and applies its role. The console now derives the
+account keys in the browser, so the invite password never reaches the server.
+
+## Client-derived authentication
+
+New accounts, invites, password resets and the OAuth consent page use the
+protocol in [AUTH-PROTOCOL.md](AUTH-PROTOCOL.md). The browser derives an
+authentication key and a separate wrapping key with PBKDF2-HMAC-SHA256
+(600,000 iterations), sends only the authentication key and an AES-GCM-wrapped
+private key, and proves login with a single-use HMAC challenge. The server never
+receives the password or the wrapping key, so an operator with full server
+access cannot decrypt end-to-end data for these accounts.
+
+Version 1 password accounts keep working. A password reset upgrades them to the
+client-derived protocol; an explicit upgrade would require the recovery kit in
+the browser and is not exposed as a separate action yet. The server still holds
+the authentication key, so it can authenticate as a user, and it still serves
+the client JavaScript. See the security model for what that does and does not
+cover.
 
 ## Sign-in methods and two-factor authentication
 
