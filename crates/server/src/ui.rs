@@ -35,7 +35,7 @@ td{padding:9px 14px;border-bottom:1px solid var(--line);vertical-align:middle}tr
 .iconbtn{background:transparent;border:0;padding:7px 9px;min-width:30px;min-height:30px;border-radius:6px;color:var(--muted);font-size:14px}.iconbtn:hover{color:var(--text);background:var(--panel2)}
 td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(--mono);font-size:12.5px}td input:focus{box-shadow:none;border-bottom:1px dashed var(--acc);border-radius:0}
 .stagedot{display:inline-block;width:7px;height:7px;border-radius:99px;background:var(--warn);margin-right:6px}
-#deploybar{position:fixed;left:50%;transform:translateX(-50%) translateY(90px);bottom:26px;background:#1b1b2c;border:1px solid var(--line2);border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:center;box-shadow:0 18px 50px rgba(0,0,0,.55);transition:.25s;z-index:40}#deploybar.show{transform:translateX(-50%) translateY(0)}
+#deploybar{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;background:#1b1b2c;border:1px solid var(--line2);border-radius:12px;padding:12px 16px;display:none;gap:12px;align-items:center;box-shadow:0 18px 50px rgba(0,0,0,.55);z-index:40}#deploybar.show{display:flex}
 .modalwrap{position:fixed;inset:0;background:rgba(4,4,8,.7);display:none;place-items:center;z-index:60;backdrop-filter:blur(3px)}.modalwrap.show{display:grid}
 .modal{width:560px;max-width:94vw;max-height:88vh;overflow:auto;background:var(--panel);border:1px solid var(--line2);border-radius:16px;padding:24px}.modal h3{margin:0 0 14px;font-size:16px}
 #palette{position:fixed;inset:0;background:rgba(4,4,8,.65);display:none;z-index:70;padding:12vh 16px 16px}.palettecard{max-width:620px;margin:0 auto;background:var(--panel);border:1px solid var(--line2);border-radius:14px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6)}.palettecard input{width:100%;border:0;background:transparent;font-size:16px;padding:16px}.pitem{padding:10px 16px;cursor:pointer;display:flex;gap:10px;align-items:center}.pitem:hover,.pitem.sel{background:rgba(124,108,255,.12)}
@@ -89,7 +89,9 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], STAGED={}, VIEW='apps', MFA=null;
+let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null;
+function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
+function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
 const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
 async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
@@ -100,10 +102,24 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 // escaping alone is not enough: the parser turns &#39; back into a quote before
 // the JS is parsed, which would let a secret key break out of the string.
 function jsq(s){return String(s??'').replace(/&/g,'&amp;').replace(/\\/g,'\\\\').replace(/'/g,"\\u0027").replace(/"/g,'\\u0022').replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
-function modal(html){$('modal').innerHTML=html;$('modalwrap').classList.add('show')}
-function closeModal(){$('modalwrap').classList.remove('show')}
+function modal(html,label){let m=$('modal');m.innerHTML=html;m.setAttribute('role','dialog');m.setAttribute('aria-modal','true');
+  if(label)m.setAttribute('aria-label',label);else m.removeAttribute('aria-label');
+  $('modalwrap').classList.add('show');LASTFOCUS=document.activeElement;
+  requestAnimationFrame(()=>{let f=m.querySelector('input,textarea,select,button');if(f)f.focus()})}
+function closeModal(){let w=$('modalwrap');if(!w.classList.contains('show'))return;w.classList.remove('show');
+  if(LASTFOCUS&&LASTFOCUS.focus){try{LASTFOCUS.focus()}catch(e){}}LASTFOCUS=null}
+function modalOpen(){return $('modalwrap').classList.contains('show')}
 $('modalwrap').addEventListener('click',e=>{if(e.target.id==='modalwrap')closeModal()});
-document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()} if(e.key==='Escape'){closeModal();$('palette').style.display='none'}});
+document.addEventListener('keydown',e=>{
+  if((e.metaKey||e.ctrlKey)&&String(e.key).toLowerCase()==='k'){e.preventDefault();openPalette();return}
+  if(e.key==='Escape'){closeModal();$('palette').style.display='none';return}
+  if(e.key==='Tab'&&modalOpen()){
+    let c=Array.from($('modal').querySelectorAll('input,textarea,select,button')).filter(el=>!el.disabled);
+    if(!c.length)return;
+    let first=c[0],last=c[c.length-1];
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+  }});
 
 // ---------- auth ----------
 async function loadProviders(){try{
@@ -122,7 +138,7 @@ function showInvite(token){
   $('auth').style.display='grid';$('shell').style.display='none';
   $('authtitle').textContent='Accept invitation';
   $('authform').innerHTML=`<p class="mut">Choose a password for your new account.</p>
-    <div class="field"><label>Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters"></div>
+    <div class="field"><label for="inv-pw">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters"></div>
     <button class="primary" style="width:100%;padding:11px" onclick="acceptInvite()">Create account</button>`;
   $('authform').dataset.invite=token;}
 async function acceptInvite(){try{
@@ -143,13 +159,14 @@ async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;
   let orgs=await api('GET','/api/orgs');ORG=orgs[0]?.id||'';$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
-  nav('apps')}
-async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;nav('apps')}
+  await nav('apps')}
+async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
 
 // ---------- navigation ----------
-function nav(v){VIEW=v;document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
+async function nav(v){VIEW=v;document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
   $('topaction').style.display=(v==='apps')?'':'none';
-  ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)()}
+  await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
+  updateDeployBar()}
 
 // ---------- apps ----------
 async function renderApps(){$('topaction').style.display='';$('pagetitle').textContent='Apps';$('crumb').textContent='';
@@ -164,10 +181,11 @@ function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.s
 async function newApp(){modal(`<h3>New app</h3><div class="field"><label>App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label>Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
   <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
 async function createApp(){try{await api('POST',`/api/orgs/${ORG}/apps`,{name:$('na-name').value,readme:$('na-readme').value});closeModal();toast('App created');renderApps()}catch(e){toast(e.message,true)}}
-async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET',`/api/apps/${id}/envs`);ENV=ENVS[0]||null;STAGED={};renderEnv()}
+async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET',`/api/apps/${id}/envs`);
+  ENV=ENVS.find(e=>e.id===ENV?.id)||ENVS[0]||null;await renderEnv()}
 
 // ---------- environments and secrets ----------
-async function renderEnv(){$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
+async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
   if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
   if(!ENV)ENV=ENVS[0];
   let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
@@ -181,49 +199,80 @@ async function renderEnv(){$('topaction').style.display='none';$('pagetitle').te
   <div id="stable"></div>
   ${APP?.readme?`<div class="card" style="margin-top:14px"><h3>Readme</h3><pre class="val" style="white-space:pre-wrap">${esc(APP.readme)}</pre></div>`:''}`;
   drawSecrets();updateDeployBar()}
-async function switchEnv(id){if(Object.keys(STAGED).length&&!confirm('Discard staged changes?'))return;ENV=ENVS.find(e=>e.id===id);STAGED={};renderEnv()}
+async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
+  if(cur&&Object.keys(drafts()).length&&!confirm('Discard staged changes?'))return;
+  if(cur)delete DRAFTS[cur];
+  ENV=ENVS.find(e=>e.id===id);await renderEnv()}
 function envMode(e){return 'sse'}
 async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label>Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
 async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label>Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createE2eEnv(){try{let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name:$('ne2-name').value});closeModal();toast('E2E environment created: '+d.id);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);renderEnv()}catch(e){toast(e.message,true)}}
-async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{await api('DELETE',`/api/envs/${ENV.id}`);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');renderEnv()}catch(e){toast(e.message,true)}}
-function drawSecrets(){let q=($('sfilter')?.value||'').toLowerCase();
-  let rows=SECRETS.filter(s=>!q||s.key.toLowerCase().includes(q)||(s.path||'').toLowerCase().includes(q));
-  let stagedRows=Object.values(STAGED);
-  let all=[...rows.map(s=>({s})),...stagedRows.filter(x=>x.isNew).map(x=>({s:x,isNew:true}))];
-  if(!all.length){$('stable').innerHTML='<div class="empty"><div class="big">No secrets here yet</div>Click “+ New secret”, or import a .env file.</div>';return}
+async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
+function matchesFilter(key,path){let q=($('sfilter')?.value||'').toLowerCase();return !q||String(key||'').toLowerCase().includes(q)||String(path||'').toLowerCase().includes(q)}
+function drawSecrets(){
+  let all=SECRETS.map(s=>({s,isNew:false,d:drafts()[s.id]})).filter(x=>matchesFilter(x.d?x.d.key:x.s.key,x.d?x.d.path:x.s.path));
+  all=all.concat(draftList().filter(d=>d.isNew&&matchesFilter(d.key,d.path)).map(d=>({s:d,isNew:true,d})));
+  if(!all.length){
+    let any=SECRETS.length||draftList().length;
+    $('stable').innerHTML=any
+      ?'<div class="empty"><div class="big">No matching secrets</div>Nothing here matches that filter. Clear it to see every secret in this environment.</div>'
+      :'<div class="empty"><div class="big">No secrets here yet</div>Click “+ New secret”, or import a .env file.</div>';
+    return}
   $('stable').innerHTML=`<table><thead><tr><th style="width:26%">Key</th><th>Value</th><th style="width:13%">Path</th><th style="width:9%">Version</th><th style="width:15%"></th></tr></thead><tbody>
-  ${all.map(({s,isNew})=>{let st=STAGED[s.id]||(isNew?s:null);let shown=st?st.value:s.value;let dirty=!!st;
-    return `<tr><td>${dirty?'<span class="stagedot"></span>':''}<span class="mono">${esc(st?st.key:s.key)}</span> <span class="badge b-${esc(s.type||'secret')}">${esc(s.type||'secret')}</span></td>
-    <td>${s.type==='sealed'?'<span class="mut mono">🔒 sealed, never shown</span>':`<span class="val" data-val="${esc(shown??'')}" data-show="0">••••••••••</span>`}</td>
-    <td class="mono mut">${esc(s.path||'/')}</td><td class="mut">${isNew?'new':'v'+(s.version||1)}</td>
+  ${all.map(({s,isNew,d})=>{let staged=d;let key=staged?staged.key:s.key;let value=staged?staged.value:s.value;let path=(staged?staged.path:s.path)||'/';
+    let type=(staged?staged.type:s.type)||'secret';let sealed=!isNew&&type==='sealed';let dirty=!!staged;
+    return `<tr><td>${dirty&&!isNew?'<span class="stagedot"></span>':''}<span class="mono">${esc(key)}</span> <span class="badge b-${esc(type)}">${esc(type)}</span>${isNew?' <span class="chip">new</span>':''}</td>
+    <td>${sealed?'<span class="mut mono">🔒 sealed, never shown</span>':`<span class="val" data-val="${esc(value??'')}" data-show="0">••••••••••</span>`}</td>
+    <td class="mono mut">${esc(path)}</td><td class="mut">${isNew?'new':'v'+(s.version||1)}</td>
     <td style="white-space:nowrap;text-align:right">
-      ${s.type!=='sealed'?`<button class="iconbtn" title="Reveal" onclick="revealVal(this)">◉</button><button class="iconbtn" title="Copy value" onclick="copyVal(this)">⧉</button>`:''}
-      <button class="iconbtn" title="Edit" onclick="editRow('${s.id}')">✎</button>
-      <button class="iconbtn" title="History" onclick="showHistory('${s.id}')">↺</button>
-      <button class="iconbtn" title="Personal override" onclick="overrideRow('${s.id}','${jsq(s.key)}')">♟</button>
-      <button class="iconbtn" title="Delete" onclick="delSecret('${s.id}','${jsq(s.key)}')">🗑</button></td></tr>`}).join('')}
+      ${sealed?'':`<button class="iconbtn" title="Reveal" aria-label="Reveal" onclick="revealVal(this)">◉</button><button class="iconbtn" title="Copy value" aria-label="Copy value" onclick="copyVal(this)">⧉</button>`}
+      <button class="iconbtn" title="Edit" aria-label="Edit" onclick="editRow('${jsq(s.id)}')">✎</button>
+      ${isNew?'':`<button class="iconbtn" title="History" aria-label="History" onclick="showHistory('${jsq(s.id)}')">↺</button>
+      <button class="iconbtn" title="Personal override" aria-label="Personal override" onclick="overrideRow('${jsq(s.id)}','${jsq(key)}')">♟</button>`}
+      <button class="iconbtn" title="Delete" aria-label="Delete" onclick="delSecret('${jsq(s.id)}','${jsq(key)}')">🗑</button></td></tr>`}).join('')}
   </tbody></table>`}
 function findValEl(btn){return btn.closest('tr').querySelector('.val')}
 function revealVal(btn){let el=findValEl(btn);let show=el.dataset.show==='1';el.dataset.show=show?'0':'1';el.textContent=show?'••••••••••':el.dataset.val}
 function copyVal(btn){navigator.clipboard.writeText(findValEl(btn).dataset.val);toast('Value copied')}
-function stage(id,key,value,path,type,isNew){STAGED[id]={id,key,value,path:path||'/',type:type||'secret',isNew:!!isNew};updateDeployBar();drawSecrets()}
-function addRow(){let id='new-'+Date.now();STAGED[id]={id,key:'',value:'',path:'/',type:'secret',isNew:true};
-  modal(`<h3>New secret</h3><div class="field"><label>Key</label><input id="ns-key" placeholder="DATABASE_URL"></div><div class="field"><label>Value</label><textarea id="ns-val" rows="3"></textarea></div><div class="row"><div class="field" style="flex:1"><label>Path</label><input id="ns-path" value="/"></div><div class="field"><label>Type</label><select id="ns-type"><option>secret</option><option>sealed</option><option>config</option></select></div></div><div class="row"><button class="primary" onclick="stageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div><p class="small mut">Staged changes deploy together, like a commit. Sealed values can never be read back.</p>`)}
-function stageNew(id){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return}STAGED[id].key=k.toUpperCase();STAGED[id].value=$('ns-val').value;STAGED[id].path=$('ns-path').value||'/';STAGED[id].type=$('ns-type').value;closeModal();updateDeployBar();drawSecrets()}
-function editRow(id){let s=SECRETS.find(x=>x.id===id);if(!s)return;
-  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label>Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div><div class="field"><label>Comment</label><input id="ed-comment" value="${esc(s.comment||'')}"></div><div class="row"><button class="primary" onclick="stageEdit('${id}')">Stage change</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
-function stageEdit(id){let s=SECRETS.find(x=>x.id===id);STAGED[id]={id,key:s.key,value:$('ed-val').value,path:s.path,type:s.type,comment:$('ed-comment').value};closeModal();updateDeployBar();drawSecrets();toast('Change staged, deploy when ready')}
-async function overrideRow(id,key){modal(`<h3>Personal override: ${esc(key)}</h3><p class="mut">Only you see this value. Teammates keep the shared one.</p><div class="field"><label>Your value</label><textarea id="ov-val" rows="3"></textarea></div><div class="row"><button class="primary" onclick="saveOverride('${id}')">Save override</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+function addRow(){if(!ENV){toast('Open an environment first',true);return}let id='new-'+Date.now();
+  modal(`<h3>New secret</h3>
+    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL"></div>
+    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3"></textarea></div>
+    <div class="row"><div class="field" style="flex:1"><label for="ns-path">Path</label><input id="ns-path" value="/"></div>
+    <div class="field"><label for="ns-type">Type</label><select id="ns-type"><option>secret</option><option>sealed</option><option>config</option></select></div></div>
+    <div class="row"><button class="primary" onclick="stageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+    <p class="small mut">Staged changes deploy together, like a commit. Sealed values can never be read back.</p>`,'New secret')}
+function stageNew(id){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return}
+  if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};
+  DRAFTS[ENV.id][id]={id,key:k.toUpperCase(),value:$('ns-val').value,path:$('ns-path').value||'/',type:$('ns-type').value,comment:'',isNew:true};
+  closeModal();drawSecrets();updateDeployBar()}
+function editRow(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;let isNew=!!d;
+  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div>
+    <div class="field"><label for="ed-comment">Comment</label><input id="ed-comment" value="${esc(s.comment||'')}"></div>
+    <div class="row"><button class="primary" onclick="stageEdit('${jsq(id)}')">${isNew?'Stage secret':'Stage change'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Edit secret')}
+function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;
+  if(d){d.value=$('ed-val').value;d.comment=$('ed-comment').value}
+  else{if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]={id,key:s.key,value:$('ed-val').value,path:s.path,type:s.type,comment:$('ed-comment').value}}
+  closeModal();drawSecrets();updateDeployBar();toast('Change staged, deploy when ready')}
+async function overrideRow(id,key){modal(`<h3>Personal override: ${esc(key)}</h3><p class="mut">Only you see this value. Teammates keep the shared one.</p><div class="field"><label for="ov-val">Your value</label><textarea id="ov-val" rows="3"></textarea></div><div class="row"><button class="primary" onclick="saveOverride('${jsq(id)}')">Save override</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Personal override')}
 async function saveOverride(id){try{await api('POST',`/api/secrets/${id}/override`,{secrets:[{key:'x',value:$('ov-val').value}]});closeModal();toast('Override saved');renderEnv()}catch(e){toast(e.message,true)}}
-async function delSecret(id,key){let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
-  if(!confirm('Delete '+key+'? You can restore it from history.'))return;try{await api('DELETE',`/api/secrets/${id}`);toast('Secret deleted');renderEnv()}catch(e){toast(e.message,true)}}
-function updateDeployBar(){let n=Object.keys(STAGED).length;$('deploybar').classList.toggle('show',n>0&&VIEW==='apps'&&!!ENV);$('deploytext').innerHTML=n?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
-function discardStage(){STAGED={};updateDeployBar();drawSecrets()}
-async function deployStage(){try{let items=Object.values(STAGED).map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));let d=await api('PUT',`/api/envs/${ENV.id}/secrets`,{secrets:items});STAGED={};toast(`Deployed ${d.deployed} secret${d.deployed!==1?'s':''}`);renderEnv()}catch(e){toast(e.message,true)}}
+async function delSecret(id,key){let d=drafts()[id];
+  if(d&&d.isNew){delete drafts()[id];drawSecrets();updateDeployBar();return}
+  let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
+  if(!confirm('Delete '+key+'? You can restore it from history.'))return;
+  try{await api('DELETE',`/api/secrets/${id}`);delete drafts()[id];toast('Secret deleted');await renderEnv()}catch(e){toast(e.message,true)}}
+function updateDeployBar(){let n=draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
+  $('deploybar').classList.toggle('show',active);
+  $('deploytext').innerHTML=active?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
+function discardStage(){if(ENV)delete DRAFTS[ENV.id];drawSecrets();updateDeployBar()}
+async function deployStage(){try{let items=draftList().map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));
+  if(!items.length)return;let envId=ENV.id;
+  let d=await api('PUT',`/api/envs/${envId}/secrets`,{secrets:items});
+  if(ENV&&ENV.id===envId)delete DRAFTS[envId];
+  toast(`Deployed ${d.deployed} secret${d.deployed!==1?'s':''}`);await renderEnv()}catch(e){toast(e.message,true)}}
 async function showHistory(id){try{let h=await api('GET',`/api/secrets/${id}/history`);
-  modal(`<h3>History</h3>${h.length?h.map(v=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>v${v.version}</b> <span class="mut small">${new Date(v.created_at*1000).toLocaleString()}</span><br><span class="val">${esc(v.value)}</span></span><button onclick="restoreVer('${id}',${v.version})">Restore</button></div>`).join(''):'<p class="mut">No history.</p>'}<div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message,true)}}
+  modal(`<h3>History</h3>${h.length?h.map(v=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>v${v.version}</b> <span class="mut small">${new Date(v.created_at*1000).toLocaleString()}</span><br><span class="val">${esc(v.value)}</span></span><button onclick="restoreVer('${jsq(id)}',${v.version})">Restore</button></div>`).join(''):'<p class="mut">No history.</p>'}<div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">Close</button></div>`,'Secret history')}catch(e){toast(e.message,true)}}
 async function restoreVer(id,ver){try{await api('POST',`/api/secrets/${id}/restore/${ver}`,{});closeModal();toast('Restored version '+ver);renderEnv()}catch(e){toast(e.message,true)}}
 function importModal(){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…"></textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function doImport(){try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text:$('imp-text').value});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
