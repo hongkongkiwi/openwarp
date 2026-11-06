@@ -44,7 +44,8 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:14px}.card h3{margin:0 0 6px;font-size:15px}.card p{color:var(--muted);margin:0 0 12px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.empty{padding:48px 20px;text-align:center;color:var(--faint);border:1px dashed var(--line2);border-radius:14px}.empty .big{font-size:22px;margin-bottom:6px}
 .mut{color:var(--muted)}.small{font-size:12.5px}.val{font-family:var(--mono);font-size:12.5px;word-break:break-all}
-@media(max-width:820px){#shell{grid-template-columns:1fr}aside{display:none}.content{padding:16px 14px 100px}}
+#navtoggle{display:none}
+@media(max-width:820px){#shell{grid-template-columns:1fr}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:0 0 60px rgba(0,0,0,.7)}aside.open{display:flex}.content{padding:16px 14px 100px}}
 </style></head>
 <body>
 <div id="auth">
@@ -76,7 +77,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
     <div class="sidefoot"><div id="whoami" class="mono"></div><button class="ghost" style="padding:4px 0" onclick="logout()">Sign out</button></div>
   </aside>
   <main>
-    <div class="topbar"><h2 id="pagetitle">Apps</h2><span class="crumb" id="crumb"></span><div class="grow"></div>
+    <div class="topbar"><button class="iconbtn" id="navtoggle" aria-label="Open navigation" onclick="toggleNav()">☰</button><h2 id="pagetitle">Apps</h2><span class="crumb" id="crumb"></span><div class="grow"></div>
       <div class="searchbox" onclick="openPalette()"><span>⌕</span><span style="flex:1">Search secrets…</span><kbd>⌘K</kbd></div>
       <button class="primary" id="topaction" onclick="newApp()">+ New app</button>
     </div>
@@ -187,7 +188,8 @@ async function enterApp(){$('auth').style.display='none';$('shell').style.displa
 async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
 
 // ---------- navigation ----------
-async function nav(v){VIEW=v;document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
+function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
+async function nav(v){VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
   $('topaction').style.display=(v==='apps')?'':'none';
   await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
   updateDeployBar()}
