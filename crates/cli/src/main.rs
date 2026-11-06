@@ -293,8 +293,11 @@ fn main() {
             let mut grants = Vec::new();
             for g in existing.as_array().cloned().unwrap_or_default() {
                 let uid = g["user_id"].as_str().unwrap_or(""); let email = g["email"].as_str().unwrap_or("");
-                let u = get(&format!("{}/api/users/lookup?email={}", host, urlq(email)));
-                let wrapped = openwarp_crypto::encrypt_to(u["pubkey"].as_str().expect("grantee pubkey"), &new_key).expect("wrap grant");
+                let pubkey = g["pubkey"].as_str().map(str::to_string).filter(|p| !p.is_empty()).unwrap_or_else(|| {
+                    let u = get(&format!("{}/api/users/lookup?email={}", host, urlq(email)));
+                    u["pubkey"].as_str().unwrap_or("").to_string()
+                });
+                let wrapped = openwarp_crypto::encrypt_to(&pubkey, &new_key).expect("wrap grant");
                 grants.push(json!({"user_id": uid, "wrapped_key": wrapped}));
             }
             let meta = get(&format!("{}/api/envs/{}/e2e/meta", host, env));

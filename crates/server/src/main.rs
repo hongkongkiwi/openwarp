@@ -960,7 +960,7 @@ async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     Ok(j(json!({"ok": true}))) }
 async fn e2e_grants(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
-    let rows = st.db.query("SELECT k.user_id AS user_id, u.email AS email FROM env_keys k JOIN users u ON u.id=k.user_id WHERE k.env_id=?", &[json!(&eid)]).map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT k.user_id AS user_id, u.email AS email, u.pubkey AS pubkey FROM env_keys k JOIN users u ON u.id=k.user_id WHERE k.env_id=?", &[json!(&eid)]).map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn e2e_meta(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res {
     let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
@@ -2461,7 +2461,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal()).await.unwrap();
 }
 fn load_root(db: &Db) -> Result<([u8;32], Option<kms::Kms>), String> {
-    if let Some(kms) = kms::Kms::from_env() {
+    if let Some(kms) = kms::Kms::from_env()? {
         // The KMS-wrapped root in the database wins: a restarted instance must
         // keep using the same root to read data written before the restart.
         if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]) {
