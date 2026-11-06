@@ -2385,7 +2385,7 @@ fn ssh_files(config: &Value) -> Result<Vec<SshFile>, String> {
     if let Some(items) = config.get("files").and_then(Value::as_array) {
         for item in items {
             let path = item.get("path").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            let format = { let f = item.get("format").and_then(Value::as_str).unwrap_or(""); if f.is_empty() { "dotenv".to_string() } else { f.to_string() } };
+            let format = ssh_format(item.get("format").and_then(Value::as_str).unwrap_or(""));
             let folders = item.get("folders").or_else(|| item.get("paths")).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
             let owner = item.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
             let mode = item.get("file_mode").and_then(Value::as_str).unwrap_or("").to_string();
@@ -2394,12 +2394,12 @@ fn ssh_files(config: &Value) -> Result<Vec<SshFile>, String> {
     }
     if out.is_empty() {
         let path = cfg(config, "path").trim().to_string();
-        let format = { let f = cfg(config, "format"); if f.is_empty() { "dotenv".to_string() } else { f.to_string() } };
+        let format = ssh_format(cfg(config, "format"));
         out.push(SshFile { path, format, folders: Vec::new(), owner: cfg(config, "owner").to_string(), mode: cfg(config, "file_mode").to_string() });
     }
     for file in &out {
         if !ssh_remote_path_ok(&file.path) { return Err(format!("ssh file path must be absolute and contain no whitespace or quotes: {:?}", file.path)); }
-        if !matches!(file.format.as_str(), "dotenv" | "json" | "yaml" | "export") { return Err(format!("ssh format must be dotenv, json, yaml or export (got {:?})", file.format)); }
+        if !matches!(file.format.as_str(), "dotenv" | "json" | "yaml" | "csv" | "export") { return Err(format!("ssh format must be dotenv (or env), json, yaml, csv or export (got {:?})", file.format)); }
         if !file.owner.is_empty() && !file.owner.bytes().all(|b| b.is_ascii_alphanumeric() || b":_-".contains(&b)) { return Err(format!("ssh owner must be user or user:group: {:?}", file.owner)); }
         if !file.mode.is_empty() && (file.mode.len() > 4 || !file.mode.bytes().all(|b| (b'0'..=b'7').contains(&b))) { return Err(format!("ssh mode must be octal, for example 600: {:?}", file.mode)); }
     }
@@ -2413,17 +2413,37 @@ fn ssh_folder_matches(folders: &[String], path: &str) -> bool {
     let path = if path.is_empty() { "/" } else { path };
     folders.iter().any(|f| { let f = if f.is_empty() { "/" } else { f.as_str() }; path == f || path.starts_with(&format!("{}/", f.trim_end_matches('/'))) })
 }
-fn ssh_render(format: &str, pairs: &BTreeMap<String, String>) -> String {
+/// `.env` and `env` are the dotenv format under the name the file usually has.
+fn ssh_format(raw: &str) -> String { match raw.trim() { "" | "dotenv" | "env" | ".env" => "dotenv".to_string(), other => other.to_string() } }
+fn ssh_synced_at() -> String { chrono_now() }
+fn ssh_csv_cell(value: &str) -> String { if value.contains([',', '"', '\n', '\r']) { format!("\"{}\"", value.replace('"', "\"\"")) } else { value.to_string() } }
+fn ssh_render(format: &str, pairs: &BTreeMap<String, String>, comment: &str) -> String {
+    let note = if comment.is_empty() { String::new() } else { format!("# Synced by OpenWarp at {}\n", comment) };
     match format {
         "json" => { let mut m = serde_json::Map::new(); for (k, v) in pairs { m.insert(k.clone(), json!(v)); } Value::Object(m).to_string() + "\n" }
-        "yaml" => { let mut out = String::new(); for (k, v) in pairs { out.push_str(k); out.push_str(": "); out.push_str(&dotenv_quote(v)); out.push('\n'); } out }
-        "export" => pairs.iter().map(|(k, v)| format!("export {}={}\n", k, dotenv_quote(v))).collect(),
-        _ => dotenv_render(pairs),
+        "yaml" => { let mut out = note; for (k, v) in pairs { out.push_str(k); out.push_str(": "); out.push_str(&dotenv_quote(v)); out.push('\n'); } out }
+        "csv" => { let mut out = String::from("key,value\n"); for (k, v) in pairs { out.push_str(&ssh_csv_cell(k)); out.push(','); out.push_str(&ssh_csv_cell(v)); out.push('\n'); } out }
+        "export" => { let mut out = note; for (k, v) in pairs { out.push_str("export "); out.push_str(k); out.push('='); out.push_str(&dotenv_quote(v)); out.push('\n'); } out }
+        _ => { let mut out = note; out.push_str(&dotenv_render(pairs)); out }
     }
+}
+fn ssh_csv_row(line: &str) -> Option<(String, String)> {
+    let mut cells = Vec::new(); let mut cur = String::new(); let mut quoted = false; let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => { cur.push('"'); chars.next(); }
+            '"' => quoted = !quoted,
+            ',' if !quoted => { cells.push(std::mem::take(&mut cur)); }
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur);
+    if cells.len() < 2 { None } else { Some((cells[0].trim().to_string(), cells[1].to_string())) }
 }
 fn ssh_parse(format: &str, text: &str) -> Result<BTreeMap<String, String>, String> {
     match format {
         "json" => { if text.trim().is_empty() { return Ok(BTreeMap::new()); } let value: Value = serde_json::from_str(text).map_err(|e| format!("remote file is not JSON: {}", e))?; let object = value.as_object().ok_or("remote file is not a JSON object")?; Ok(object.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect()) }
+        "csv" => Ok(text.lines().skip(1).filter_map(ssh_csv_row).filter(|(k, _)| !k.is_empty()).collect()),
         _ => Ok(dotenv_map(text).into_iter().collect()),
     }
 }
@@ -2555,7 +2575,9 @@ fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, St
         let owned: Vec<String> = previous_managed.iter().filter_map(|n| n.strip_prefix(&stamp).map(str::to_string)).collect();
         let (merged, created, updated, unchanged, deleted) = merge_pairs(&current_map, &desired_pairs, &owned, mode == "mirror");
         if !dry && (created + updated + deleted > 0 || missing) {
-            let rendered = ssh_render(&file.format, &merged);
+            // JSON and CSV have no comment syntax, so a stamp would corrupt them.
+            let comment = if matches!(file.format.as_str(), "json" | "csv") || config.get("comment").and_then(Value::as_bool) == Some(false) { String::new() } else { ssh_synced_at() };
+            let rendered = ssh_render(&file.format, &merged, &comment);
             // Write beside the target and rename, so a dropped connection cannot
             // leave the previous file emptied by a truncate.
             let staged = format!("{}.openwarp-{}", file.path, std::process::id());
@@ -4525,14 +4547,25 @@ mod tests {
         assert!(managed.is_empty(), "a dry run must not record ownership");
         assert!(!yaml.exists(), "a dry run must not create the file");
         let mut live = base.clone();
-        live["files"] = json!([{"path":yaml,"format":"yaml","folders":["/app"]},{"path":exported,"format":"export","folders":["/ops"]}]);
-        let secrets = vec![("/app".into(),"API_KEY".into(),"a b".into(),"secret".into()),("/ops".into(),"TOKEN".into(),"x".into(),"secret".into())];
+        let csv = server.dir.join("app.csv");
+        live["files"] = json!([{"path":yaml,"format":"yaml","folders":["/app"]},{"path":exported,"format":"export","folders":["/ops"]},{"path":csv,"format":"csv","folders":["/sheet"]}]);
+        let secrets = vec![("/app".into(),"API_KEY".into(),"a b".into(),"secret".into()),("/ops".into(),"TOKEN".into(),"x".into(),"secret".into()),("/sheet".into(),"ROW".into(),"1".into(),"secret".into())];
         ssh_file_sync(&live, &secrets, &[]).await.expect("sync");
         let yaml_text = std::fs::read_to_string(&yaml).unwrap();
+        assert!(yaml_text.starts_with("# Synced by OpenWarp at "), "yaml records when it was written: {}", yaml_text);
         assert!(yaml_text.contains("API_KEY: 'a b'"), "yaml quotes a value with spaces: {}", yaml_text);
         assert!(!yaml_text.contains("TOKEN"), "yaml only carries its folder: {}", yaml_text);
         let export_text = std::fs::read_to_string(&exported).unwrap();
-        assert!(export_text.starts_with("export TOKEN=x\n"), "{}", export_text);
+        assert!(export_text.contains("export TOKEN=x\n"), "{}", export_text);
+        let csv_text = std::fs::read_to_string(&csv).unwrap();
+        assert_eq!(csv_text, "key,value\nROW,1\n", "csv has no comment syntax: {}", csv_text);
+        let quoted = ssh_render("csv", &std::iter::once(("NOTE".into(), "a, \"b\"".into())).collect(), "");
+        let parsed = ssh_parse("csv", &quoted).unwrap();
+        assert_eq!(parsed.get("NOTE").map(String::as_str), Some("a, \"b\""), "csv quoting round-trips: {}", quoted);
+        let mut quiet = base.clone(); quiet["comment"] = json!(false); quiet["path"] = json!(server.dir.join("quiet.env")); quiet["format"] = json!(".env");
+        ssh_file_sync(&quiet, &[("/".into(),"API_KEY".into(),"v".into(),"secret".into())], &[]).await.expect("quiet");
+        let quiet_text = std::fs::read_to_string(server.dir.join("quiet.env")).unwrap();
+        assert_eq!(quiet_text, "API_KEY=v\n", ".env is dotenv, and comment:false omits the stamp: {}", quiet_text);
         let mut overlap = base.clone();
         overlap["files"] = json!([{"path":"/tmp/a","folders":["/"]},{"path":"/tmp/b","folders":["/"]}]);
         let err = ssh_file_sync(&overlap, &secrets, &[]).await.unwrap_err();
