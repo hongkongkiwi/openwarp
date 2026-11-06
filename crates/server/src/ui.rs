@@ -504,8 +504,9 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
-  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
+  <div class="card"><h3>PKI</h3><p>Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre>
+  <div class="row" style="margin-top:10px"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()">Create SSH CA</button></div><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>
+  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`;loadSshCAs()}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
@@ -525,6 +526,35 @@ async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
+async function mkSshCA(){try{let d=await api('POST',`/api/orgs/${ORG}/ssh/cas`,{name:$('ssh-ca-name').value||'ssh-ca'});
+  $('ssh-ca-name').value='';$('ca-out').textContent='SSH CA id: '+d.id+'\nFingerprint '+d.fingerprint;
+  loadSshCAs();openSshCA(d.id)}catch(e){toast(e.message,true)}}
+async function loadSshCAs(){let host=$('ssh-ca-list');if(!host)return;try{let d=await api('GET',`/api/orgs/${ORG}/ssh/cas`);
+  host.innerHTML=d.length?`<table><thead><tr><th>SSH CA</th><th>Fingerprint</th><th></th></tr></thead><tbody>`+d.map(c=>`<tr><td>${esc(c.name)}</td><td class="mono small">${esc(c.fingerprint)}</td><td><button onclick="openSshCA('${jsq(c.id)}')">Manage</button></td></tr>`).join('')+'</tbody></table>':'<p class="mut small">No SSH CA yet. A host accepts these certificates only after TrustedUserCAKeys names this CA.</p>'}catch(e){host.textContent=e.message}}
+async function openSshCA(id){let detail=$('ssh-ca-detail');if(!detail)return;try{let d=await api('GET',`/api/ssh/cas/${id}`);
+  let grants=d.grants.map(g=>g.role+': '+g.principals.join(', ')+(g.max_ttl?' ('+Math.round(g.max_ttl/60)+'m)':'')).join('\n');
+  detail.innerHTML=`<h4 style="margin:16px 0 6px">${esc(d.name)}</h4>
+    <p class="small mut">Fingerprint <span class="mono">${esc(d.fingerprint)}</span>. Install the CA key on every host that should accept these certificates.</p>
+    <pre class="val">${esc(d.sshd)}</pre>
+    <div class="field"><label>Principal grants, one role per line as role: pattern, pattern (15m)</label><textarea id="ssh-grants" rows="4" placeholder="developer: web-*, db-*&#10;admin: *">${esc(grants)}</textarea></div>
+    <p class="small mut" style="margin:0 0 8px">A certificate can only name a principal its role is granted. A bare * means any local account, root included, so only an owner can grant it.</p>
+    <div class="row"><button class="primary" onclick="saveSshGrants('${jsq(id)}')">Save grants</button><a class="mono small" style="align-self:center" href="/api/ssh/cas/${id}/revoked-keys" download="openwarp_revoked_keys">revoked keys file</a></div>
+    <div id="ssh-certs"></div>`;
+  loadSshCerts(id)}catch(e){toast(e.message,true)}}
+async function saveSshGrants(id){let box=$('ssh-grants');if(!box)return;try{
+  let grants=box.value.split('\n').map(l=>l.trim()).filter(Boolean).map(l=>{
+    let i=l.indexOf(':'); let role=(i<0?l:l.slice(0,i)).trim(); let rest=i<0?'':l.slice(i+1);
+    let minutes=null; rest=rest.replace(/\((\d+)\s*m\)\s*$/i,(m,n)=>{minutes=n;return ''});
+    let patterns=rest.split(',').map(p=>p.trim()).filter(Boolean);
+    return {role:role,principals:patterns,max_ttl:minutes?parseInt(minutes)*60:undefined};
+  }).filter(g=>g.role&&g.principals.length);
+  if(!grants.length)return toast('Format each line as role: pattern, pattern',true);
+  await api('PUT',`/api/ssh/cas/${id}/grants`,{grants:grants});toast('Grants saved');openSshCA(id)}catch(e){toast(e.message,true)}}
+async function loadSshCerts(id){let host=$('ssh-certs');if(!host)return;try{let d=await api('GET',`/api/ssh/cas/${id}/certs`);
+  host.innerHTML=`<h4 style="margin:16px 0 6px">Issued certificates</h4><table><thead><tr><th>Principal</th><th>Key id</th><th>Expires</th><th>State</th><th></th></tr></thead><tbody>`+
+    (d.map(c=>`<tr><td class="mono">${esc(c.principal)}</td><td class="mut small">${esc(c.key_id)}</td><td class="mut small">${new Date((c.valid_before||0)*1000).toLocaleString()}</td><td>${c.revoked?'<span style="color:var(--bad)">revoked</span>':'active'}</td><td>${c.revoked?'':`<button class="danger" onclick="revokeSshCert('${jsq(c.id)}','${jsq(id)}')">Revoke</button>`}</td></tr>`).join('')||'<tr><td colspan="5" class="mut">No certificates issued yet</td></tr>')+'</tbody></table>'}catch(e){host.textContent=e.message}}
+async function revokeSshCert(cid,ca){if(!confirm('Revoke this certificate? A host only enforces it once its RevokedKeys file is refreshed.'))return;
+  try{await api('POST',`/api/ssh/certs/${cid}/revoke`,{});toast('Revoked');openSshCA(ca)}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
 
 // ---------- command palette ----------

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)] #[command(name = "openwarp", about = "OpenWarp secrets CLI")]
@@ -24,12 +25,41 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
     Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
+    /// SSH certificates: sign a public key, or mint one and run ssh with it
+    Ssh { #[command(subcommand)] cmd: SshCmd },
     E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
     E2ePut { #[arg(long, default_value = "")] env: String, #[arg(long)] key: String, #[arg(long)] value: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     E2eGet { #[arg(long, default_value = "")] env: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     E2eGrant { #[arg(long, default_value = "")] env: String, #[arg(long)] email: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     /// Print shell completions: openwarp completion bash|zsh|fish
     Completion { shell: String },
+}
+
+#[derive(Subcommand)] enum SshCmd {
+    /// Sign your OpenSSH public key and write <key>-cert.pub
+    Cert {
+        #[arg(long, env = "OPENWARP_SSH_CA")] ca: String,
+        #[arg(long)] principal: String,
+        #[arg(long)] key: Option<String>,
+        #[arg(long, default_value = "15m")] ttl: String,
+        #[arg(long)] out: Option<String>,
+        #[arg(long)] print: bool,
+        #[arg(long)] quiet: bool,
+    },
+    /// Mint a certificate, write it beside the key, then exec ssh
+    Login {
+        #[arg(long, env = "OPENWARP_SSH_CA")] ca: String,
+        #[arg(long)] principal: String,
+        #[arg(long)] key: Option<String>,
+        #[arg(long, default_value = "15m")] ttl: String,
+        #[arg(last = true)] args: Vec<String>,
+    },
+    /// Print the ssh_config block that mints a certificate per connection
+    Config {
+        #[arg(long, env = "OPENWARP_SSH_CA")] ca: String,
+        #[arg(long)] principal: String,
+        #[arg(long)] key: Option<String>,
+    },
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -158,6 +188,68 @@ fn e2e_env_key(client: &reqwest::blocking::Client, host: &str, token: &str, env:
     (raw.try_into().expect("env key len"), kp)
 }
 
+fn parse_ttl(raw: &str) -> i64 {
+    let text = raw.trim();
+    let (number, seconds) = if let Some(v) = text.strip_suffix('d') { (v, 86_400) }
+        else if let Some(v) = text.strip_suffix('h') { (v, 3_600) }
+        else if let Some(v) = text.strip_suffix('m') { (v, 60) }
+        else if let Some(v) = text.strip_suffix('s') { (v, 1) }
+        else { (text, 1) };
+    match number.trim().parse::<i64>() { Ok(n) if n > 0 => n * seconds, _ => {
+        eprintln!("invalid --ttl {:?}: use 90s, 15m, 2h or a number of seconds", raw); std::process::exit(2) } } }
+
+/// The private key and the certificate path OpenSSH loads automatically
+/// (`<key>-cert.pub`), derived from `--key` or from ~/.ssh/id_ed25519.
+fn ssh_key_paths(explicit: &Option<String>) -> (PathBuf, PathBuf) {
+    let raw = explicit.clone().unwrap_or_else(|| "~/.ssh/id_ed25519".into());
+    let key = match raw.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(rest),
+        None => PathBuf::from(raw),
+    };
+    let key = if key.extension().and_then(|e| e.to_str()) == Some("pub") { key.with_extension("") } else { key };
+    let mut cert = key.clone().into_os_string();
+    cert.push("-cert.pub");
+    (key, PathBuf::from(cert))
+}
+
+fn read_public_key(key: &Path) -> String {
+    let public = key.with_extension("pub");
+    match std::fs::read_to_string(&public) {
+        Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+        _ => { eprintln!("no public key at {}: generate one with `ssh-keygen -t ed25519 -f {}`", public.display(), key.display()); std::process::exit(2) } } }
+
+/// Certificates expire within hours, so one backup slot is enough to keep a
+/// foreign certificate from being clobbered without accumulating files.
+fn write_cert(path: &Path, certificate: &str) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing.trim() != certificate.trim() {
+            let backup = path.with_extension("pub.bak");
+            let _ = std::fs::rename(path, &backup);
+            eprintln!("previous certificate moved to {}", backup.display());
+        } }
+    std::fs::write(path, format!("{}\n", certificate.trim())) }
+
+fn ssh_sign(client: &reqwest::blocking::Client, host: &str, token: &str, ca: &str, principal: &str, ttl: i64, public_key: &str) -> Value {
+    let resp = match client.post(format!("{}/api/ssh/cas/{}/sign", host, ca)).bearer_auth(token)
+        .json(&json!({"principal": principal, "ttl": ttl, "public_key": public_key})).send() {
+        Ok(r) => r,
+        Err(e) => { eprintln!("could not reach {}: {}", host, e); std::process::exit(1) } };
+    let status = resp.status();
+    let body: Value = resp.json().unwrap_or_else(|_| json!({"error": "the server did not return JSON"}));
+    if !status.is_success() {
+        eprintln!("signing failed ({}): {}", status.as_u16(), body.get("error").and_then(|e| e.as_str()).unwrap_or("no message"));
+        std::process::exit(1); }
+    body }
+
+fn ssh_summary(signed: &Value, path: Option<&Path>) {
+    if let Some(p) = path { println!("certificate: {}", p.display()); }
+    println!("principal:   {}", signed["principal"].as_str().unwrap_or(""));
+    println!("key id:      {}", signed["key_id"].as_str().unwrap_or(""));
+    println!("serial:      {}", signed["serial"]);
+    let expires = signed["valid_before"].as_i64().unwrap_or(0) - now_secs();
+    println!("expires in:  {}m{}s", expires / 60, expires % 60);
+    println!("ca:          {}", signed["ca_public_key"].as_str().unwrap_or("")); }
+
 fn main() {
     let cli = Cli::parse();
     let local = load_local_config();
@@ -248,6 +340,40 @@ fn main() {
                 if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
             }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
+        Cmd::Ssh { cmd } => match cmd {
+            SshCmd::Cert { ca, principal, key, ttl, out, print, quiet } => {
+                let (key_path, default_cert) = ssh_key_paths(key);
+                let public = read_public_key(&key_path);
+                let signed = ssh_sign(&client, &host, &token, ca, principal, parse_ttl(ttl), &public);
+                let certificate = signed["certificate"].as_str().unwrap_or_else(|| { eprintln!("the server returned no certificate: {}", signed); std::process::exit(1) }).to_string();
+                if *print {
+                    println!("{}", certificate);
+                    if !*quiet { ssh_summary(&signed, None); }
+                } else {
+                    let path = out.clone().map(PathBuf::from).unwrap_or(default_cert);
+                    if let Err(e) = write_cert(&path, &certificate) { eprintln!("could not write {}: {}", path.display(), e); std::process::exit(1); }
+                    if !*quiet { ssh_summary(&signed, Some(&path)); }
+                } }
+            SshCmd::Login { ca, principal, key, ttl, args } => {
+                if args.is_empty() { eprintln!("usage: openwarp ssh login --ca <ID> --principal <name> -- <user@host> [ssh args]"); std::process::exit(2); }
+                let (key_path, cert_path) = ssh_key_paths(key);
+                let public = read_public_key(&key_path);
+                let signed = ssh_sign(&client, &host, &token, ca, principal, parse_ttl(ttl), &public);
+                let certificate = signed["certificate"].as_str().unwrap_or_else(|| { eprintln!("the server returned no certificate: {}", signed); std::process::exit(1) }).to_string();
+                if let Err(e) = write_cert(&cert_path, &certificate) { eprintln!("could not write {}: {}", cert_path.display(), e); std::process::exit(1); }
+                ssh_summary(&signed, Some(&cert_path));
+                // The certificate is beside the key, so ssh picks it up from
+                // -i; IdentitiesOnly keeps an agent from offering something else.
+                let status = Command::new("ssh").arg("-i").arg(&key_path).args(["-o", "IdentitiesOnly=yes"]).args(args).status();
+                match status { Ok(s) => std::process::exit(s.code().unwrap_or(1)), Err(e) => { eprintln!("could not run ssh: {}", e); std::process::exit(1) } } }
+            SshCmd::Config { ca, principal, key } => {
+                let (key_path, cert_path) = ssh_key_paths(key);
+                println!("# ~/.ssh/config: mint a fresh certificate before each connection to matching hosts.\n\
+                         # Replace the host pattern; Match exec requires OpenSSH 7.6 or newer.\n\
+                         Match host *.internal exec \"openwarp ssh cert --ca {ca} --principal {principal} --quiet\"\n\
+                         \x20 IdentityFile {key}\n\
+                         \x20 CertificateFile {cert}",
+                    ca = ca, principal = principal, key = key_path.display(), cert = cert_path.display()); } },
         Cmd::E2eCreate { app, name } => { let app = pick(app, &local, "app_id", "--app");
             let me = get(&format!("{}/api/me", host));
             let env_key = openwarp_crypto::random_key();

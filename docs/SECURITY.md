@@ -79,6 +79,18 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## SSH certificate authority
+
+An SSH CA moves part of the trust decision onto the target host: sshd accepts any certificate its `TrustedUserCAKeys` CA signed while the certificate is inside its validity window. OpenWarp therefore does not mediate the login itself, and a host enforces expiry rather than asking the server whether a session is still allowed.
+
+The private key of the subject never reaches the server. The server holds only the CA private key, sealed with the master key in the same column as an X.509 CA, so master-key rotation re-wraps it. Losing the master key without a backup means reissuing the CA and reinstalling it on every host.
+
+The principal, not the signature, is the authorisation boundary. A certificate granted for `root` authenticates as root on every host that trusts the CA, so issuance requires a per-CA role grant that matches the requested principal. Patterns are an exact name, one trailing `*`, or a bare `*`; a bare `*` is owner-only and should be treated as root-equivalent. A CA with no grant issues nothing. Adding a grant for a role you do not intend is equivalent to granting that role shell access to the matching accounts.
+
+Revocation is bounded by design. There is no KRL writer: revoked certificates appear in the `RevokedKeys` file, which each host must refresh, and otherwise a certificate simply expires. Keep lifetimes short. There is no way to withdraw a delegated certificate from a host that is offline, and a compromised CA key cannot be contained by revocation, only by replacing the CA on every host.
+
+Machine certificates use the same path: a workspace identity signs with its own role, so a token minted for a developer identity cannot request a principal outside that role's grant.
+
 ## Network and operational controls
 
 Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They are not a replacement for a firewall: authentication/bootstrap routes have different handling. Keep the server and database on trusted networks and expose only the intended HTTPS entry point.

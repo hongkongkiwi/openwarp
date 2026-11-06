@@ -1744,3 +1744,127 @@ async fn pitr_restores_creates_deletes_and_tags() {
     let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
     assert!(list.body["secrets"].as_array().expect("secrets").iter().any(|x| x["key"] == "BRAVO"), "a manually restored secret must survive a point-in-time restore: {}", list.text);
 }
+
+// An SSH certificate's principal decides which local account it authenticates
+// as, so the grant table, not the signature, is the boundary under test here.
+const SSH_PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYQJZ7VR/OW5fqVOvmn+BRt5SLWDPx2UVO3ALmn21ZE openwarp-test";
+
+async fn ssh_sign(s: &Server, ca: &str, token: &str, body: Value) -> Resp {
+    s.call(Method::POST, &format!("/api/ssh/cas/{}/sign", ca), Some(token), Some(body)).await
+}
+
+async fn ssh_grants(s: &Server, ca: &str, token: &str, body: Value) -> Resp {
+    s.call(Method::PUT, &format!("/api/ssh/cas/{}/grants", ca), Some(token), Some(body)).await
+}
+
+#[tokio::test]
+async fn ssh_ca_principals_are_gated_by_role_grants() {
+    let s = Server::start().await;
+    let owner = register(&s, "sshowner@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
+    assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
+    let ca = r.body["id"].as_str().expect("ca id").to_string();
+    assert!(r.body["public_key"].as_str().unwrap().starts_with("ssh-ed25519 "), "the CA must be an OpenSSH key, not PEM: {}", r.text);
+    assert!(r.body["sshd"].as_str().unwrap().contains("TrustedUserCAKeys"), "the create response carries the sshd block: {}", r.text);
+
+    // Fail closed: a CA with no grant issues nothing, not even to its owner.
+    let r = ssh_sign(&s, &ca, &ot, json!({"principal": "web-1", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 403, "signing before any grant must fail: {}", r.text);
+
+    // A pattern that could mean more than it says is refused, and a refused
+    // request must not have deleted the grants that already exist.
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "developer", "principals": ["web*prod"]}]})).await;
+    assert_eq!(r.status, 400, "a mid-string star must be refused: {}", r.text);
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "nonesuch", "principals": ["web-*"]}]})).await;
+    assert_eq!(r.status, 400, "a grant for a role that does not exist must be refused: {}", r.text);
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "developer", "principals": ["web-*"]}, {"role": "developer", "principals": ["db-1"]}]})).await;
+    assert_eq!(r.status, 400, "a duplicated role must be refused: {}", r.text);
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "owner", "principals": ["*"]}, {"role": "developer", "principals": ["web-*"], "max_ttl": 600}]})).await;
+    assert_eq!(r.status, 200, "set grants: {}", r.text);
+
+    // A developer gets exactly the granted principals and the granted lifetime.
+    let member = register(&s, "sshdev@test.invalid").await;
+    let mt = member["token"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "sshdev@test.invalid", "developer").await;
+    let r = ssh_sign(&s, &ca, &mt, json!({"principal": "web-1", "public_key": SSH_PUBKEY, "ttl": 3600})).await;
+    assert_eq!(r.status, 200, "a granted principal must sign: {}", r.text);
+    let cert = r.body["certificate"].as_str().expect("certificate").to_string();
+    assert!(cert.starts_with("ssh-ed25519-cert-v01@openssh.com "), "a user certificate, not a bare key: {}", cert);
+    assert_eq!(r.body["verified"]["principals"], json!(["web-1"]), "the certificate carries only the requested principal: {}", r.text);
+    assert_eq!(r.body["verified"]["valid_before"].as_i64().unwrap() - r.body["verified"]["valid_after"].as_i64().unwrap(), 660, "the grant's max_ttl must cap a longer request: {}", r.text);
+    assert_eq!(r.body["verified"]["key_id"].as_str().unwrap(), r.body["key_id"].as_str().unwrap());
+    let cert_id = r.body["id"].as_str().unwrap().to_string();
+
+    let r = ssh_sign(&s, &ca, &mt, json!({"principal": "root", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 403, "a principal outside the grant must be refused: {}", r.text);
+    let r = ssh_sign(&s, &ca, &mt, json!({"principal": "web-1,root", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 400, "a comma would split into two principals and must be refused: {}", r.text);
+    let r = ssh_sign(&s, &ca, &mt, json!({"principal": "web-1", "public_key": "not a key"})).await;
+    assert_eq!(r.status, 400, "an unparseable public key must be refused: {}", r.text);
+
+    // Only an owner writes grants, and only an owner may grant the bare star.
+    let r = ssh_grants(&s, &ca, &mt, json!({"grants": [{"role": "developer", "principals": ["*"]}]})).await;
+    assert_eq!(r.status, 403, "a developer cannot rewrite the grant table: {}", r.text);
+    let admin_user = register(&s, "sshadmin@test.invalid").await;
+    let at = admin_user["token"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "sshadmin@test.invalid", "admin").await;
+    let r = ssh_grants(&s, &ca, &at, json!({"grants": [{"role": "admin", "principals": ["*"]}]})).await;
+    assert_eq!(r.status, 403, "an admin who is not the owner cannot grant the star pattern: {}", r.text);
+    let r = ssh_grants(&s, &ca, &at, json!({"grants": [{"role": "admin", "principals": ["dba-*"]}]})).await;
+    assert_eq!(r.status, 200, "an admin may grant named patterns: {}", r.text);
+
+    // Setting grants replaces the whole table: the admin's write above dropped
+    // the developer grant, so restore all three before the machine test.
+    let r = ssh_grants(&s, &ca, &ot, json!({"grants": [
+        {"role": "owner", "principals": ["*"]},
+        {"role": "developer", "principals": ["web-*"], "max_ttl": 600},
+        {"role": "admin", "principals": ["dba-*"]}
+    ]})).await;
+    assert_eq!(r.status, 200, "restore grants: {}", r.text);
+    let r = ssh_sign(&s, &ca, &at, json!({"principal": "dba-1", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 200, "the admin role signs for its own granted pattern: {}", r.text);
+
+    // A machine identity signs with its own role, not the role of its creator.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&ot), Some(json!({"name": "deploy-bot", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "create identity: {}", r.text);
+    let client_id = r.body["client_id"].as_str().unwrap().to_string();
+    let client_secret = r.body["client_secret"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/v1/machine/auth/universal/login", None, Some(json!({"client_id": client_id, "client_secret": client_secret}))).await;
+    assert_eq!(r.status, 200, "machine login: {}", r.text);
+    let machine = r.body["accessToken"].as_str().unwrap().to_string();
+    let r = ssh_sign(&s, &ca, &machine, json!({"principal": "web-2", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 200, "a machine identity signs for a granted principal: {}", r.text);
+
+    // Another workspace cannot use this CA at all.
+    let outside = register(&s, "sshoutside@test.invalid").await;
+    let xt = outside["token"].as_str().unwrap().to_string();
+    let r = ssh_sign(&s, &ca, &xt, json!({"principal": "web-1", "public_key": SSH_PUBKEY})).await;
+    assert_eq!(r.status, 403, "another workspace cannot sign with this CA: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/ssh/cas/{}", ca), Some(&xt), None).await;
+    assert_eq!(r.status, 403, "another workspace cannot read the CA detail: {}", r.text);
+
+    // Revocation is admin-only, and the file sshd reads stays authenticated.
+    let r = s.call(Method::POST, &format!("/api/ssh/certs/{}/revoke", cert_id), Some(&mt), None).await;
+    assert_eq!(r.status, 403, "a developer cannot revoke a certificate: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/ssh/cas/{}/revoked-keys", ca), None, None).await;
+    assert_eq!(r.status, 401, "the revoked keys file must not be public: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/ssh/certs/{}/revoke", cert_id), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "revoke: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/ssh/cas/{}/revoked-keys", ca), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "revoked keys: {}", r.text);
+    assert!(r.text.contains("ssh-ed25519-cert-v01@openssh.com "), "the revoked file lists the whole certificate, which is what sshd matches on: {}", r.text);
+    let list = s.call(Method::GET, &format!("/api/ssh/cas/{}/certs", ca), Some(&ot), None).await;
+    assert_eq!(list.status, 200, "list certificates: {}", list.text);
+    assert!(list.body.as_array().unwrap().iter().any(|c| c["id"] == cert_id && c["revoked"] == 1), "the revoked certificate is recorded: {}", list.text);
+
+    // An SSH CA is not an X.509 CA and must not be fed to those handlers.
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(&ot), Some(json!({"cn": "svc"}))).await;
+    assert_eq!(r.status, 400, "an SSH CA must not issue X.509 certificates: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/crl", ca), Some(&ot), None).await;
+    assert_eq!(r.status, 400, "an SSH CA has no X.509 CRL: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/certs", ca), Some(&ot), None).await;
+    assert_eq!(r.status, 400, "an SSH CA's certificates are not X.509 rows: {}", r.text);
+}

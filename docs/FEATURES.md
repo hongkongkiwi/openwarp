@@ -446,6 +446,37 @@ integration test.
 
 `GET /api/pki/cas/:id/crl` returns a signed PEM CRL containing every revoked
 certificate, with the issuer reconstructed from the stored serial.
+
+#### SSH certificate authority
+
+A separate CA type mints OpenSSH *user* certificates, which is not the same
+thing as syncing an `ssh_key` secret. A synced key is a permanent public key; a
+certificate is minted per session, names the principal it may log in as, and
+expires in minutes. The host trusts the CA once through `TrustedUserCAKeys` and
+then decides every login itself, so the certificate keeps working when OpenWarp
+is unreachable and stops working when it expires.
+
+The subject's private key never leaves the client. `POST /api/ssh/cas/:id/sign`
+takes an OpenSSH public key and returns a certificate; the server keeps the CA
+key sealed with the master key in the same column as an X.509 CA, so master-key
+rotation covers it without a second code path.
+
+Principals are the security boundary. Each CA carries a role-to-pattern grant
+(`ssh_principal_grants`); a certificate request is refused unless the caller's
+role is granted a matching principal. Patterns are an exact name, a prefix
+ending in one `*`, or a bare `*`. A bare `*` means any local account including
+`root`, so only a workspace owner can write one. A CA with no grant issues
+nothing, including to its owner.
+
+Certificates default to least privilege: `permit-pty` and nothing else, with a
+per-CA `allow_forwarding` switch for agent and port forwarding. Lifetime
+defaults to 15 minutes, is capped per grant, and can never exceed 8 hours.
+
+Revocation is deliberately limited: OpenSSH's KRL format has no writer here.
+`GET /api/ssh/cas/:id/revoked-keys` returns the plain list of revoked
+certificate lines for sshd's `RevokedKeys`, and short lifetimes do the rest.
+Host certificates and a KRL writer are not implemented.
+
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores
 the admin secret. Postgres lease host allowlisting remains in force.

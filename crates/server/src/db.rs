@@ -270,6 +270,16 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'",
         "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''",
     ]),
+    // SSH certificate authorities reuse pki_cas so the sealed CA key and the
+    // master-key rotation that re-wraps it stay in one place.
+    (14, &[
+        "ALTER TABLE pki_cas ADD COLUMN kind TEXT DEFAULT 'x509'",
+        "ALTER TABLE pki_cas ADD COLUMN allow_forwarding BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS ssh_principal_grants(ca_id TEXT NOT NULL,role TEXT NOT NULL,principals TEXT NOT NULL,max_ttl BIGINT DEFAULT 900,PRIMARY KEY(ca_id,role))",
+        "CREATE TABLE IF NOT EXISTS ssh_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,key_id TEXT NOT NULL,principal TEXT NOT NULL,public_key TEXT NOT NULL,cert TEXT NOT NULL,serial BIGINT NOT NULL,actor TEXT NOT NULL,revoked BIGINT DEFAULT 0,valid_after BIGINT NOT NULL,valid_before BIGINT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_ssh_certs_ca ON ssh_certs(ca_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ssh_grants_ca ON ssh_principal_grants(ca_id)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -303,9 +313,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 13, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 14, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 13, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 14, "each migration must be recorded exactly once");
     }
 }

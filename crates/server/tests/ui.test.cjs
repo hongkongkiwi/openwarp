@@ -199,6 +199,9 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-c/secrets': { secrets: [] },
     '/api/envs/env-d/secrets': { secrets: [] },
     '/api/secrets/saved-secret/history': [],
+    '/api/orgs/org-a/ssh/cas': [],
+    '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
+    '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000 }],
   };
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
@@ -226,6 +229,9 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
       else if (options.method === 'POST' && url === '/api/auth/mfa') body = { token: 'session-token' };
+      else if (options.method === 'POST' && url === '/api/orgs/org-a/ssh/cas') body = { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub' };
+      else if (options.method === 'PUT' && url === '/api/ssh/cas/ca-ssh-1/grants') body = { ca_id: 'ca-ssh-1', roles: call.body.grants.map(g => g.role) };
+      else if (options.method === 'POST' && url === '/api/ssh/certs/ssh-cert-1/revoke') body = { revoked: 'ssh-cert-1' };
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -619,6 +625,35 @@ test('workspace and app settings expose the reuse switch', async () => {
   const appPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/apps/app-a/settings');
   assert.ok(appPut, 'saving app settings must reach the app endpoint');
   assert.equal(appPut.body.reuse_check, false, 'the app switch must be saved');
+});
+
+test('SSH CA settings create a CA, edit grants and revoke a certificate', async () => {
+  const ui = await consoleUI();
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('ssh-ca-list').textContent.includes('No SSH CA yet'), 'an empty workspace explains what is missing');
+  ui.el('ssh-ca-name').value = 'ssh-ca';
+  await ui.click(ui.button(ui.el('view'), /^Create SSH CA$/));
+  const create = ui.calls.find(c => c.method === 'POST' && c.url === '/api/orgs/org-a/ssh/cas');
+  assert.ok(create, 'creating a CA must reach the workspace');
+  assert.equal(create.body.name, 'ssh-ca');
+  assert.ok(ui.el('ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
+  assert.ok(ui.el('ssh-ca-detail').textContent.includes('TrustedUserCAKeys'), 'the new CA opens straight to the sshd block');
+  await ui.invoke("openSshCA('ca-ssh-1')");
+  assert.ok(ui.el('ssh-grants').value.includes('developer: web-*'), 'existing grants load into the editor');
+  ui.el('ssh-grants').value = 'developer: web-*, db-1 (30m)\nadmin: *';
+  await ui.invoke("saveSshGrants('ca-ssh-1')");
+  const put = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/ssh/cas/ca-ssh-1/grants');
+  assert.ok(put, 'saving grants must reach the CA');
+  assert.deepEqual(put.body.grants[0].principals, ['web-*', 'db-1'], 'comma-separated patterns are split');
+  assert.equal(put.body.grants[0].max_ttl, 1800, 'a trailing (30m) sets the maximum lifetime');
+  assert.deepEqual(put.body.grants[1].principals, ['*'], 'the owner pattern survives the editor');
+  ui.confirm = false;
+  await ui.invoke("revokeSshCert('ssh-cert-1','ca-ssh-1')");
+  assert.ok(!ui.calls.some(c => c.url === '/api/ssh/certs/ssh-cert-1/revoke'), 'a dismissed confirm must not revoke');
+  ui.confirm = true;
+  await ui.invoke("revokeSshCert('ssh-cert-1','ca-ssh-1')");
+  assert.ok(ui.calls.some(c => c.method === 'POST' && c.url === '/api/ssh/certs/ssh-cert-1/revoke'), 'confirming revokes');
 });
 
 test('re-editing a draft back to its stored value does not match itself', async () => {

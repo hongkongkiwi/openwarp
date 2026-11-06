@@ -13,6 +13,7 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 | `crates/server/src/ui.rs` | The entire browser console: HTML, CSS and JS in Rust string constants |
 | `crates/server/src/e2e.js` | Browser-side end-to-end cryptography, served at `/e2e.js` |
 | `crates/server/src/integrations.rs` | Provider sync (Instabox, Boat, Daytona, Trigger, …) |
+| `crates/server/src/ssh_ca.rs` | OpenSSH user certificates: CA generation, principal patterns, signing, RevokedKeys |
 | `crates/server/src/mailer.rs` | Transactional email providers and templates |
 | `crates/server/tests/` | HTTP suites `security`, `authorization`, `accounts`; `ui.test.cjs` for console source |
 | `crates/cli/src/main.rs` | The `openwarp` binary: login, inject, export, sync |

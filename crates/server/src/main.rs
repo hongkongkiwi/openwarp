@@ -1,4 +1,4 @@
-mod db; mod inference_leases; mod integrations; mod mailer; mod ssh_keys; mod ui;
+mod db; mod inference_leases; mod integrations; mod mailer; mod ssh_ca; mod ssh_keys; mod ui;
 #[cfg(feature = "ldap")] mod ldap;
 use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
@@ -2656,6 +2656,7 @@ fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair),
 async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     st.check_admin(&db::s(&ca,"org_id"), &uid).await?;
+    if db::s(&ca,"kind") == "ssh" { return Err(bad("this is an SSH certificate authority; sign with POST /api/ssh/cas/{id}/sign")); }
     let cn = body.get("cn").and_then(|v| v.as_str()).unwrap_or("service"); let days = body.get("days").and_then(|v| v.as_i64()).unwrap_or(365).clamp(1, 3650);
     let (issuer_cert, issuer_kp) = load_issuer(&st, &ca)?;
     let leaf_kp = rcgen::KeyPair::generate().map_err(|e| bad(&e.to_string()))?;
@@ -2675,6 +2676,8 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     Ok(j(json!({"id": cert_id, "certificate": leaf.pem(), "private_key": leaf_kp.serialize_pem(), "ca_certificate": db::s(&ca,"cert_pem")}))) }
 async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
+    // Unauthenticated, so an SSH CA answers as if it did not exist.
+    if db::s(&ca, "kind") == "ssh" { return err(StatusCode::NOT_FOUND, "CA not found").into_response(); }
     let cert_der = match keystore_ocsp::pem::decode("CERTIFICATE", &db::s(&ca,"cert_pem")) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
     let key_pem = match oc::decrypt_symmetric(&st.master(), &db::s(&ca,"key_enc")) { Ok(k) => k, Err(e) => return bad(&e).into_response() };
     let key_text = String::from_utf8_lossy(&key_pem);
@@ -2699,7 +2702,8 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/ocsp-response"));
     resp }
 async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.require_org(&db::s(&ca,"org_id"),&uid).await?;
+    let ca = st.db.one("SELECT org_id,kind FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.require_org(&db::s(&ca,"org_id"),&uid).await?;
+    if db::s(&ca,"kind") == "ssh" { return Err(bad("this is an SSH certificate authority; its certificates are listed at /api/ssh/cas/{id}/certs")); }
     let rows = st.db.query("SELECT id,ca_id,cn,serial,revoked,expires_at,created_at FROM pki_certs WHERE ca_id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT ca_id FROM pki_certs WHERE id=?", &[json!(cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"cert not found"))?;
@@ -2708,6 +2712,7 @@ async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>)
 async fn ca_crl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response { let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     if let Err(e) = st.check_admin(&db::s(&ca,"org_id"), &uid).await { return e.into_response(); }
+    if db::s(&ca,"kind") == "ssh" { return bad("an SSH certificate authority has no X.509 CRL; revoke certificates and serve /api/ssh/cas/{id}/revoked-keys").into_response(); }
     let (issuer_cert, issuer_kp) = match load_issuer(&st, &ca) { Ok(x) => x, Err(e) => return e.into_response() };
     let rows = match st.db.query("SELECT serial,revoked FROM pki_certs WHERE ca_id=?", &[json!(&caid)]).await { Ok(r) => r, Err(e) => return bad(&e).into_response() };
     let mut revoked = Vec::new();
@@ -2730,6 +2735,156 @@ async fn ca_crl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> 
     } }
 
 
+// ---------- SSH certificate authority ----------
+// An SSH CA lives in pki_cas with kind='ssh' so its private key shares the
+// sealed key column, and master-key rotation, with X.509 CAs. Everything below
+// only ever sees an SSH CA; the X.509 handlers reject kind='ssh'.
+
+fn ssh_grants(raw: &str) -> Vec<String> { serde_json::from_str::<Vec<String>>(raw).unwrap_or_default() }
+
+async fn ssh_ca_row(st: &S, caid: &str) -> Result<Row, (StatusCode, Json<Value>)> {
+    st.db.one("SELECT * FROM pki_cas WHERE id=? AND kind='ssh'", &[json!(caid)]).await
+        .map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "SSH CA not found")) }
+
+async fn create_ssh_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    st.check_admin(&oid, &uid).await?;
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let name = if name.is_empty() { "ssh-ca".to_string() } else { name };
+    let forwarding = body.get("allow_forwarding").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (secret, public) = ssh_ca::generate_ca().map_err(|e| bad(&e))?;
+    let cid = id();
+    st.db.exec("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,serial,kind,allow_forwarding,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        &[json!(&cid), json!(oid), json!(&name), json!(&public), json!(oc::encrypt_symmetric(&st.master(), secret.as_bytes())), json!(""), json!("ssh"), json!(if forwarding { 1 } else { 0 }), json!(now())])
+        .await.map_err(|e| bad(&e))?;
+    st.audit(&oid, "", "", &uid, "ssh.ca.create", &name).await;
+    Ok(j(json!({"id": cid, "name": name, "public_key": public, "fingerprint": ssh_ca::ca_fingerprint(&public).unwrap_or_default(),
+        "sshd": ssh_ca::sshd_snippet(&public), "note": "no certificate can be issued until a role grant names the principals it may request"}))) }
+
+async fn list_ssh_cas(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
+    let rows = st.db.query("SELECT id,name,cert_pem,allow_forwarding,created_at FROM pki_cas WHERE org_id=? AND kind='ssh' ORDER BY created_at DESC", &[json!(oid)]).await.map_err(|e| bad(&e))?;
+    let out: Vec<Value> = rows.iter().map(|r| { let public = db::s(r, "cert_pem");
+        json!({"id": db::s(r, "id"), "name": db::s(r, "name"), "public_key": public,
+            "fingerprint": ssh_ca::ca_fingerprint(&public).unwrap_or_default(),
+            "allow_forwarding": db::n(r, "allow_forwarding") == 1, "created_at": r.get("created_at").cloned().unwrap_or(Value::Null)}) }).collect();
+    Ok(j(json!(out))) }
+
+async fn get_ssh_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    st.check_admin(&db::s(&ca, "org_id"), &uid).await?;
+    let public = db::s(&ca, "cert_pem");
+    let grants = st.db.query("SELECT role,principals,max_ttl FROM ssh_principal_grants WHERE ca_id=? ORDER BY role", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!({"id": caid, "name": db::s(&ca, "name"), "public_key": public, "fingerprint": ssh_ca::ca_fingerprint(&public).unwrap_or_default(),
+        "allow_forwarding": db::n(&ca, "allow_forwarding") == 1, "sshd": ssh_ca::sshd_snippet(&public),
+        "grants": grants.iter().map(|r| json!({"role": db::s(r,"role"), "principals": ssh_grants(&db::s(r,"principals")), "max_ttl": db::n(r,"max_ttl")})).collect::<Vec<_>>()}))) }
+
+// Replace-all: a role left out of the new list loses its grant, so nobody keeps
+// an old permission by accident.
+async fn put_ssh_grants(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    let org = db::s(&ca, "org_id");
+    st.check_admin(&org, &uid).await?;
+    let caller_role = st.require_org(&org, &uid).await?;
+    let items = body.get("grants").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if items.is_empty() { return Err(bad("grants must be a non-empty array of {role, principals, max_ttl}")); }
+    let mut stmts: Vec<(String, Vec<Value>)> = vec![("DELETE FROM ssh_principal_grants WHERE ca_id=?".into(), vec![json!(&caid)])];
+    let mut granted = Vec::new();
+    for it in &items {
+        let role = it.get("role").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let patterns: Vec<String> = it.get("principals").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect()).unwrap_or_default();
+        if role.is_empty() || patterns.is_empty() { return Err(bad("each grant needs a role and at least one principal pattern")); }
+        // A duplicate role would fail its second insert after the delete has
+        // already run, which would leave the CA with no grants at all.
+        if granted.contains(&role) { return Err(bad(&format!("role {:?} is listed twice", role))); }
+        let builtin = matches!(role.as_str(), "owner" | "admin" | "developer");
+        if !builtin && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(&org), json!(&role)]).await.map_err(|e| bad(&e))?.is_none() {
+            return Err(bad(&format!("unknown role {:?}: create it first, grants are per existing role", role)));
+        }
+        for p in &patterns {
+            if !ssh_ca::valid_pattern(p) { return Err(bad(&format!("{:?} is not a principal pattern (an exact name, a prefix ending in *, or *)", p))); }
+        }
+        // A bare "*" lets that role authenticate as any local account, root
+        // included, so it takes the same owner-only bar as an admin role.
+        if patterns.iter().any(|p| p == "*") && caller_role != "owner" {
+            return Err(err(StatusCode::FORBIDDEN, "only an owner can grant the * (any principal) pattern"));
+        }
+        let ttl = it.get("max_ttl").and_then(|v| v.as_i64()).unwrap_or(ssh_ca::DEFAULT_TTL).clamp(60, ssh_ca::MAX_TTL);
+        stmts.push(("INSERT INTO ssh_principal_grants(ca_id,role,principals,max_ttl) VALUES(?,?,?,?)".into(),
+            vec![json!(&caid), json!(&role), json!(serde_json::to_string(&patterns).unwrap_or_default()), json!(ttl)]));
+        granted.push(role);
+    }
+    for (sql, params) in &stmts { st.db.exec(sql, params).await.map_err(|e| bad(&e))?; }
+    st.audit(&org, "", "", &uid, "ssh.ca.grants", &format!("{} role(s): {}", granted.len(), granted.join(","))).await;
+    Ok(j(json!({"ca_id": caid, "roles": granted}))) }
+
+async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    let org = db::s(&ca, "org_id");
+    // Works for a person and for a machine identity: require_org resolves both.
+    let role = st.require_org(&org, &uid).await?;
+    let principal = body.get("principal").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !ssh_ca::valid_principal(&principal) { return Err(bad("principal must be one account name (letters, digits, . _ - @)")); }
+    let public_key = body.get("public_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if public_key.is_empty() { return Err(bad("public_key is required: send the OpenSSH public key to certify, never a private key")); }
+    let grant = st.db.one("SELECT principals,max_ttl FROM ssh_principal_grants WHERE ca_id=? AND role=?", &[json!(&caid), json!(&role)]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| err(StatusCode::FORBIDDEN, &format!("role {} has no SSH principal grant on this CA; an admin must grant one", role)))?;
+    let patterns = ssh_grants(&db::s(&grant, "principals"));
+    if !ssh_ca::principal_allowed(&patterns, &principal) {
+        return Err(err(StatusCode::FORBIDDEN, &format!("role {} may not request principal {:?}", role, principal))); }
+    let ttl = ssh_ca::clamp_ttl(body.get("ttl").and_then(|v| v.as_i64()), db::n(&grant, "max_ttl"));
+    let key = oc::decrypt_symmetric(&st.master(), &db::s(&ca, "key_enc")).map_err(|e| bad(&e))?;
+    let cert_id = id();
+    let key_id = format!("{}{}", ssh_ca::KEY_ID_PREFIX, cert_id);
+    let signed = ssh_ca::sign_user_cert(&String::from_utf8_lossy(&key),
+        &ssh_ca::SignInput { public_key: &public_key, principal: &principal, key_id: &key_id, ttl },
+        db::n(&ca, "allow_forwarding") == 1, now()).map_err(|e| bad(&e))?;
+    // Read the certificate back before storing it: if what we minted does not
+    // parse, the caller gets an error rather than an unusable credential.
+    let verified = ssh_ca::describe(&signed.certificate).map_err(|e| bad(&format!("the minted certificate did not parse back: {}", e)))?;
+    st.db.exec("INSERT INTO ssh_certs(id,ca_id,key_id,principal,public_key,cert,serial,actor,revoked,valid_after,valid_before,created_at) VALUES(?,?,?,?,?,?,?,?,0,?,?,?)",
+        &[json!(&cert_id), json!(&caid), json!(&key_id), json!(&principal), json!(&public_key), json!(&signed.certificate),
+          json!(signed.serial as i64), json!(&uid), json!(signed.valid_after), json!(signed.valid_before), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, "", "", &uid, "ssh.sign", &format!("{} principal={} serial={} ttl={}s", key_id, principal, signed.serial, ttl)).await;
+    Ok(j(json!({"id": cert_id, "certificate": signed.certificate, "key_id": key_id, "serial": signed.serial,
+        "principal": principal, "valid_after": signed.valid_after, "valid_before": signed.valid_before,
+        "verified": verified, "ca_public_key": db::s(&ca, "cert_pem")}))) }
+
+async fn list_ssh_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let ca = ssh_ca_row(&st, &caid).await?;
+    st.check_admin(&db::s(&ca, "org_id"), &uid).await?;
+    let rows = st.db.query("SELECT id,key_id,principal,serial,actor,revoked,valid_after,valid_before,created_at FROM ssh_certs WHERE ca_id=? ORDER BY created_at DESC LIMIT 200", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+
+async fn revoke_ssh_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT ca_id FROM ssh_certs WHERE id=?", &[json!(&cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "certificate not found"))?;
+    let ca = ssh_ca_row(&st, &db::s(&row, "ca_id")).await?;
+    let org = db::s(&ca, "org_id");
+    st.check_admin(&org, &uid).await?;
+    st.db.exec("UPDATE ssh_certs SET revoked=1 WHERE id=?", &[json!(&cid)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, "", "", &uid, "ssh.revoke", &cid).await;
+    Ok(j(json!({"revoked": cid}))) }
+
+// sshd's RevokedKeys file. There is no KRL writer, so this plus the short
+// certificate lifetime is the whole revocation story.
+async fn ssh_revoked_keys(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response {
+    let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
+    let ca = match ssh_ca_row(&st, &caid).await { Ok(c) => c, Err(e) => return e.into_response() };
+    if let Err(e) = st.check_admin(&db::s(&ca, "org_id"), &uid).await { return e.into_response(); }
+    let rows = match st.db.query("SELECT cert FROM ssh_certs WHERE ca_id=? AND revoked=1 ORDER BY created_at", &[json!(&caid)]).await {
+        Ok(r) => r, Err(e) => return bad(&e).into_response() };
+    let certs: Vec<String> = rows.iter().map(|r| db::s(r, "cert")).collect();
+    let mut resp = ssh_ca::revoked_keys_file(&certs).into_response();
+    resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("text/plain; charset=utf-8"));
+    resp }
+
+
 // ---------- IP allowlist enforcement (T01) ----------
 fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
     let ip = ip.trim(); let cidr = cidr.trim(); if cidr.is_empty() { return false; }
@@ -2749,6 +2904,12 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
         }
     }
     if let Some(caid) = seg("/api/pki/cas/") { return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
+    if let Some(caid) = seg("/api/ssh/cas/") { return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
+    if let Some(cid) = seg("/api/ssh/certs/") {
+        if let Ok(Some(r)) = st.db.one("SELECT ca_id FROM ssh_certs WHERE id=?", &[json!(cid)]).await {
+            return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(db::s(&r, "ca_id"))]).await.ok().flatten().map(|r| db::s(&r, "org_id"));
+        }
+    }
     if let Some(cid) = seg("/api/pki/certs/") {
         if let Ok(Some(r)) = st.db.one("SELECT ca_id FROM pki_certs WHERE id=?", &[json!(cid)]).await {
             return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(db::s(&r, "ca_id"))]).await.ok().flatten().map(|r| db::s(&r, "org_id"));
@@ -3459,7 +3620,7 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/api/orgs/{oid}/ssh/cas", get(list_ssh_cas).post(create_ssh_ca)).route("/api/ssh/cas/{caid}", get(get_ssh_ca)).route("/api/ssh/cas/{caid}/grants", put(put_ssh_grants)).route("/api/ssh/cas/{caid}/sign", post(ssh_sign)).route("/api/ssh/cas/{caid}/certs", get(list_ssh_certs)).route("/api/ssh/cas/{caid}/revoked-keys", get(ssh_revoked_keys)).route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));

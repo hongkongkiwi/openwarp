@@ -89,6 +89,10 @@ Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, r
 
 Workspace settings include IP allowlists and OIDC configuration. Test policy changes with a second authorised session before ending your working session. Only trust forwarded client IPs when the instance operator has configured the actual reverse proxies.
 
+The PKI card creates two kinds of authority. An X.509 CA issues service certificates with a CRL. An SSH CA mints short-lived OpenSSH user certificates: create it once, copy the printed `TrustedUserCAKeys` block to every host that should accept those certificates, then grant each workspace role the principals it may request. Save grants as one role per line, `role: pattern, pattern`, with an optional trailing `(30m)` to cap that role's lifetime.
+
+Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certificates and a revoke action. A certificate can only name a principal its role is granted; a bare `*` means any local account including `root`, so only a workspace owner can save one. Revoking records the certificate here, but a host enforces it only after its `RevokedKeys` file is refreshed from the download link.
+
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 
 [Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)

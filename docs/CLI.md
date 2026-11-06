@@ -34,6 +34,7 @@ The top-level token option supplies a token for the current invocation. The sepa
 | Machine identity | `openwarp login --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET"` | Universal Auth |
 | Current identity | `openwarp whoami` | Inspect the authenticated account |
 | Sign out | `openwarp logout` | Sign out and clear saved credentials |
+| SSH certificates | `openwarp ssh cert --ca CA_ID --principal NAME` | Sign a public key for a granted principal |
 
 Browser login uses PKCE and a temporary loopback callback port. Browser OAuth credentials can refresh automatically when saved refresh metadata is available. Service tokens and machine credentials do not become renewable OAuth sessions simply because you saved them; respect their expiry and reauthenticate as needed. Machine-issued tokens last one hour.
 
@@ -126,6 +127,23 @@ openwarp e2e-grant --env E2E_ENV_ID --email colleague@example.invalid
 ```
 
 These commands also accept `--privkey`, but that exposes the key as an argument. The recipient must be an eligible account whose public key can be resolved and must have the relevant environment access. Granting a wrapped key and granting workspace access are distinct operations. Protect your original recovery kit; changing the private key does not decrypt old grants.
+
+## SSH certificates
+
+These commands sign your existing OpenSSH public key with a workspace SSH CA. Only the public key is sent; the private key stays on your machine. The certificate is valid for one principal, which must be granted to your role on that CA.
+
+```bash
+openwarp ssh cert --ca CA_ID --principal deploy --print
+openwarp ssh cert --ca CA_ID --principal deploy --key ~/.ssh/id_ed25519 --ttl 30m
+openwarp ssh login --ca CA_ID --principal deploy -- deploy@host.internal
+openwarp ssh config --ca CA_ID --principal deploy
+```
+
+`cert` signs and writes the certificate beside your key as `<key>-cert.pub`, which OpenSSH loads automatically, or prints it with `--print`. `login` mints a certificate and then runs `ssh -i <key> -o IdentitiesOnly=yes`, so the host sees the certificate rather than an agent key. `config` prints an `~/.ssh/config` block that mints a certificate before each matching connection.
+
+The CA is selected with `--ca` or `OPENWARP_SSH_CA`. `--key` defaults to `~/.ssh/id_ed25519`. `--ttl` accepts `90s`, `15m`, `2h`, `1d` or a number of seconds, and the workspace's grant can cap it lower. `--quiet` suppresses the summary, which is what the `Match exec` snippet uses.
+
+A certificate is a short-lived credential, not a stored key. Revoking one takes effect on a host only after that host refreshes its `RevokedKeys` file; otherwise it stops working when it expires.
 
 ## Completion
 
