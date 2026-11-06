@@ -36,6 +36,7 @@ docker compose up -d --build
 | `OPENWARP_SECURE_COOKIES` | `1` forces the `Secure` cookie flag |
 | `OPENWARP_TRUST_PROXY` | `1` enables `X-Forwarded-For` from trusted proxies |
 | `OPENWARP_TRUSTED_PROXIES` | Peer addresses allowed to send `X-Forwarded-For` |
+| `OPENWARP_ALLOW_PRIVATE_EGRESS` | `1` allows OIDC issuers, log streams and audit webhooks on loopback/private addresses in production |
 | `OPENWARP_SIGNUPS` | `open` or `closed`; when set it overrides the console toggle |
 | `OPENWARP_GOOGLE_CLIENT_ID` / `OPENWARP_GOOGLE_CLIENT_SECRET` | Google sign-in |
 | `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |

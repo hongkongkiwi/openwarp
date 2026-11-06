@@ -765,7 +765,7 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     if let Some(v)=body.get("ip_allowlist").and_then(|x|x.as_str()) {
         if !valid_cidr_list(v) { return Err(bad("ip_allowlist must be comma-separated IP addresses or CIDR ranges")); }
         st.db.exec("UPDATE orgs SET ip_allowlist=? WHERE id=?", &[json!(v), json!(oid)]).map_err(|e| bad(&e))?; }
-    if let Some(v)=body.get("audit_webhook").and_then(|x|x.as_str()) { if !v.is_empty() && !url_ok(v) { return Err(bad("audit_webhook must be an http(s) URL")); } meta_set(&st, &format!("audit_webhook:{}",oid), v); }
+    if let Some(v)=body.get("audit_webhook").and_then(|x|x.as_str()) { if !v.is_empty() && (!url_ok(v) || !egress_allowed(v)) { return Err(bad("audit_webhook must be an http(s) URL outside private networks; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow one")); } meta_set(&st, &format!("audit_webhook:{}",oid), v); }
     if let Some(v)=body.get("oidc_redirect_uri").and_then(|x|x.as_str()) { if !v.is_empty() && !url_ok(v) { return Err(bad("oidc_redirect_uri must be an http(s) URL")); } }
     if let Some(v)=body.get("oidc_allowed_domains").and_then(|x|x.as_str()) { if !valid_domain_list(v) { return Err(bad("oidc_allowed_domains must be comma-separated DNS domains")); } }
     // A stored client secret belongs to the issuer that was configured with it.
@@ -918,6 +918,21 @@ async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<
 
 fn meta_get(st: &S, k: &str) -> String { st.db.one("SELECT v FROM meta WHERE k=?", &[json!(k)]).ok().flatten().map(|r| db::s(&r,"v")).unwrap_or_default() }
 fn url_ok(u: &str) -> bool { let u = u.trim().to_ascii_lowercase(); (u.starts_with("https://") || u.starts_with("http://")) && !u.contains(' ') && !u.contains('\n') }
+// Admin-configured URLs are trusted, but production should not be usable as a
+// probe into loopback or private networks. Self-hosted services can opt out.
+fn egress_allowed(u: &str) -> bool {
+    if std::env::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false) { return true; }
+    if !std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) { return true; }
+    let Ok(url) = reqwest::Url::parse(u) else { return false };
+    let Some(host) = url.host_str() else { return false };
+    if host.eq_ignore_ascii_case("localhost") { return false; }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
+            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local()),
+        };
+    }
+    true }
 // Outbound OIDC/SAML metadata may only use TLS, except for a loopback IdP used in
 // development or tests. Link-local metadata addresses are always refused.
 fn issuer_url_ok(issuer: &str) -> bool {
@@ -959,9 +974,9 @@ async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum
     let client_secret = oc::decrypt_symmetric(&st.master, &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     if issuer.is_empty() || client_id.is_empty() || redirect_uri.is_empty() { return Err(bad("OIDC not configured for this org (set oidc_issuer, oidc_client_id, oidc_client_secret, oidc_redirect_uri via org settings)")); }
     if client_secret.is_empty() { return Err(bad("OIDC client secret is not configured or was cleared by an issuer change; re-enter the client secret in org settings")); }
-    if !issuer_url_ok(&issuer) { return Err(bad("OIDC issuer must be https, or http on a loopback address")); }
+    if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("OIDC issuer must be https, or http on a loopback address; private addresses need OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let disc = oidc_discovery(&issuer).await?; let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
-    if !url_ok(auth_ep) { return Err(bad("OIDC discovery returned no usable authorization_endpoint")); }
+    if !url_ok(auth_ep) || !egress_allowed(auth_ep) { return Err(bad("OIDC discovery returned no usable authorization_endpoint")); }
     let state = oc::random_token("st"); let nonce = oc::random_token("n");
     st.db.exec("INSERT INTO oidc_states(state,org_id,created_at,nonce) VALUES(?,?,?,?)", &[json!(state), json!(oid), json!(now()), json!(nonce)]).map_err(|e| bad(&e))?;
     let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
@@ -976,9 +991,10 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     if db::n(&srow, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)); let client_secret = oc::decrypt_symmetric(&st.master, &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    if !egress_allowed(&issuer) { return Err(bad("OIDC issuer is a private address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted IdP")); }
     let disc = oidc_discovery(&issuer).await?;
     let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or(""); let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
-    if !url_ok(token_ep) || !url_ok(jwks_uri) { return Err(bad("OIDC discovery returned no usable token_endpoint or jwks_uri")); }
+    if !url_ok(token_ep) || !url_ok(jwks_uri) || !egress_allowed(token_ep) || !egress_allowed(jwks_uri) { return Err(bad("OIDC discovery returned no usable token_endpoint or jwks_uri")); }
     let client = http_client();
     let tok: Value = client.post(token_ep).form(&[("grant_type","authorization_code"),("code",&code),("redirect_uri",&redirect_uri),("client_id",&client_id),("client_secret",&client_secret)]).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string()))?;
     let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or_else(|| bad("token response has no id_token"))?;
@@ -1653,7 +1669,7 @@ async fn mfa_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::
 async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
     st.check_admin(&oid,&uid)?;
     let url = body.get("url").and_then(|v|v.as_str()).unwrap_or("");
-    if !url_ok(url) { return Err(bad("log stream url must be http(s)")); }
+    if !url_ok(url) || !egress_allowed(url) { return Err(bad("log stream url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let secret = body.get("secret").and_then(|v|v.as_str()).unwrap_or("");
     let secret_enc = if secret.is_empty() { String::new() } else { oc::encrypt_symmetric(&st.master, secret.as_bytes()) };
     let sid = id(); st.db.exec("INSERT INTO log_streams(id,org_id,name,url,secret,created_at) VALUES(?,?,?,?,?,?)", &[json!(sid), json!(oid), json!(body.get("name").and_then(|v|v.as_str()).unwrap_or("stream")), json!(url), json!(secret_enc), json!(now())]).map_err(|e| bad(&e))?;
