@@ -2121,6 +2121,7 @@ pub(crate) fn egress_allowed(u: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(u) else { return false };
     let Some(host) = url.host_str() else { return false };
     if host.eq_ignore_ascii_case("localhost") { return false; }
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
@@ -5273,6 +5274,62 @@ mod tests {
     fn test_state(db: Db) -> S {
         let (live, _) = broadcast::channel(16);
         new_state(db, String::new(), "test".into(), String::new(), [7u8; 32], live, #[cfg(feature = "redis-cache")] None)
+    }
+    // Run environment-sensitive assertions in an isolated copy of this test binary.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn egress_test_child(name: &str, environment: &str, private_egress: Option<&str>) -> bool {
+        const CHILD: &str = "OPENWARP_EGRESS_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) { return true; }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &format!("app::tests::{}", name), "--nocapture"])
+            .env(CHILD, name).env("OPENWARP_ENV", environment)
+            .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS");
+        if let Some(value) = private_egress { command.env("OPENWARP_ALLOW_PRIVATE_EGRESS", value); }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{} child failed: {}\n{}\n{}", name, output.status,
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "{} child did not run its assertion: {}", name, String::from_utf8_lossy(&output.stdout));
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn egress_production_rejects_private_ipv6_literals() {
+        if !egress_test_child("egress_production_rejects_private_ipv6_literals", "production", None) { return; }
+        let mut allowed = Vec::new();
+        for host in ["::1", "0:0:0:0:0:0:0:1", "fc00::1", "fd00::1", "fe80::1", "febf::1", "::"] {
+            for scheme in ["http", "https"] {
+                let url = format!("{}://[{}]:8443/metadata", scheme, host);
+                if egress_allowed(&url) { allowed.push(url); }
+            }
+        }
+        assert!(allowed.is_empty(), "production allowed private IPv6 destinations: {:?}", allowed);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn egress_production_preserves_public_and_ipv4_boundaries() {
+        if !egress_test_child("egress_production_preserves_public_and_ipv4_boundaries", "PrOdUcTiOn", None) { return; }
+        for url in ["https://[2606:4700:4700::1111]/", "http://[2001:4860:4860::8888]:8080/", "https://8.8.8.8/", "https://example.com/"] {
+            assert!(egress_allowed(url), "production rejected public destination {}", url);
+        }
+        for url in ["http://127.0.0.1/", "http://10.0.0.1/", "http://172.16.0.1/", "http://192.168.0.1/", "http://169.254.169.254/", "http://0.0.0.0/", "http://LOCALHOST/", "not a URL", "file:///tmp/egress-test"] {
+            assert!(!egress_allowed(url), "production allowed blocked destination {}", url);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn egress_production_preserves_operator_override() {
+        if !egress_test_child("egress_production_preserves_operator_override", "production", Some("1")) { return; }
+        for url in ["https://[::1]/", "https://[fc00::1]/", "https://[fd00::1]/", "https://[fe80::1]/", "https://[::]/", "http://127.0.0.1/", "http://10.0.0.1/", "http://localhost/"] {
+            assert!(egress_allowed(url), "operator override rejected {}", url);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn egress_development_preserves_private_destinations() {
+        if !egress_test_child("egress_development_preserves_private_destinations", "development", None) { return; }
+        for url in ["https://[::1]/", "https://[fc00::1]/", "https://[fd00::1]/", "https://[fe80::1]/", "https://[::]/", "http://127.0.0.1/", "http://10.0.0.1/", "http://localhost/"] {
+            assert!(egress_allowed(url), "development rejected {}", url);
+        }
     }
     #[test]
     fn administrative_scope_includes_destructive_and_policy_routes() {
