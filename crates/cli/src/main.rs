@@ -66,7 +66,8 @@ fn main() {
     let mut cfg = load_config();
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
-    if token_expired(&cfg) { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } }
+    let saved_host = cfg["host"].as_str().map(|s| s.to_string());
+    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } }
     let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };

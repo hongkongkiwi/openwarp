@@ -160,6 +160,10 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
         Some(_) => return Err("Instabox hosts must be an array of strings".into()),
     };
     if delivery == "env" && !hosts.is_empty() { return Err("Instabox env delivery requires empty hosts".into()); }
+    if delivery == "proxy" {
+        if hosts.len() > 32 { return Err("Instabox hosts allows at most 32 entries".into()); }
+        if let Some(bad) = hosts.iter().find(|h| h.as_str() != "*" && (h.contains("://") || h.contains('/') || h.contains(':') || h.contains('*'))) { return Err(format!("Instabox host {:?} must be a bare DNS hostname or *", bad)); }
+    }
     let mode = match cfg(config, "mode") { "" => "upsert", value => value };
     if mode != "upsert" && mode != "mirror" { return Err("Instabox mode must be upsert or mirror".into()); }
     let dry = config.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
@@ -170,6 +174,9 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
             bytes.iter().skip(1).any(|b| !b.is_ascii_alphanumeric() && *b != b'_') { Some(name.as_str()) } else { None }
     }).collect();
     if !invalid.is_empty() { return Err(format!("Instabox invalid secret names: {}", invalid.join(", "))); }
+    let reserved = ["PATH", "HOME", "BASH_ENV", "ENV", "IFS"];
+    let blocked: Vec<&str> = desired.iter().filter_map(|(n, _)| { if reserved.contains(&n.as_str()) || n.starts_with("INSTABOX_") || n.starts_with("SSH_") { Some(n.as_str()) } else { None } }).collect();
+    if !blocked.is_empty() { return Err(format!("Instabox reserves these environment variable names: {}", blocked.join(", "))); }
     let invalid_values: Vec<&str> = desired.iter().filter_map(|(name, value)| {
         if value.len() > 65536 || value.contains('\0') || (delivery == "proxy" && (value.contains('\r') || value.contains('\n'))) { Some(name.as_str()) } else { None }
     }).collect();
@@ -182,10 +189,12 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
     let replaced = managed.len() - created;
     let mut deleted = 0;
     if !dry {
-        let mut import = root.clone();
-        import.path_segments_mut().map_err(|_| "Instabox invalid secrets URL".to_string())?.push("import");
-        req(client.post(import).header("X-API-Key", &key).json(&json!({"values": values, "delivery": delivery, "hosts": hosts}))).await
-            .map_err(|e| format!("Instabox import failed: {}", e))?;
+        if !desired.is_empty() {
+            let mut import = root.clone();
+            import.path_segments_mut().map_err(|_| "Instabox invalid secrets URL".to_string())?.push("import");
+            req(client.post(import).header("X-API-Key", &key).json(&json!({"values": values, "delivery": delivery, "hosts": hosts}))).await
+                .map_err(|e| format!("Instabox import failed: {}", e))?;
+        }
         if mode == "mirror" {
             let mut failures = Vec::new();
             let mut attempted = std::collections::HashSet::new();
@@ -249,16 +258,17 @@ pub async fn boat_sync(config: &Value, secrets: &[(String, String)], previous_ma
     if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("Boat invalid environment variable names: {}", bad)); }
     let created = desired.iter().filter(|(n, _)| !current.contains_key(n)).count();
     let updated = desired.iter().filter(|(n, v)| current.get(n.as_str()).map(|c| c.as_str() != v.as_str()).unwrap_or(false)).count();
+    let suffix = { let org = cfg(config, "org"); if org.is_empty() { String::new() } else { format!("?org={}", enc(org)) } };
     let mut deleted = 0;
     if !dry {
-        for (name, value) in &desired { req(client.put(format!("{}/environments/{}/vars/{}", api, eid, name)).bearer_auth(key).json(&json!({"value": value}))).await.map_err(|e| format!("Boat set {} failed: {}", name, e))?; }
+        for (name, value) in &desired { req(client.put(format!("{}/environments/{}/vars/{}{}", api, eid, name, suffix)).bearer_auth(key).json(&json!({"value": value}))).await.map_err(|e| format!("Boat set {} failed: {}", name, e))?; }
         if mode == "mirror" {
             let mut failures = Vec::new();
             for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && current.contains_key(name) {
-                match req(client.delete(format!("{}/environments/{}/vars/{}", api, eid, name)).bearer_auth(key)).await { Ok(_) => deleted += 1, Err(e) => failures.push(format!("{}: {}", name, e)) } } }
+                match req(client.delete(format!("{}/environments/{}/vars/{}{}", api, eid, name, suffix)).bearer_auth(key)).await { Ok(_) => deleted += 1, Err(e) => failures.push(format!("{}: {}", name, e)) } } }
             if !failures.is_empty() { return Err(format!("Boat delete failed after updating {}: {}", desired.len(), failures.join("; "))); }
         }
-        if upgrade { let _ = req(client.post(format!("{}/environments/{}/upgrade", api, eid)).bearer_auth(key)).await; }
+        if upgrade { let _ = req(client.post(format!("{}/environments/{}/upgrade{}", api, eid, suffix)).bearer_auth(key)).await; }
     }
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
     Ok((format!("Boat sync{}: environment {} created={} updated={} unchanged={} deleted={}{}", if dry { " (dry-run)" } else { "" }, ename, created, updated, desired.len() - created - updated, deleted, if upgrade && !dry { " (sandboxes upgraded)" } else { "" }), managed)) }
@@ -274,10 +284,20 @@ pub async fn boat_test(config: &Value) -> Result<String, String> {
 async fn daytona_send(key: &str, org: &str, r: reqwest::RequestBuilder) -> Result<String, String> {
     let r = if org.is_empty() { r.bearer_auth(key) } else { r.bearer_auth(key).header("X-Daytona-Organization-ID", org) };
     req(r).await }
+async fn daytona_secret_list(client: &reqwest::Client, key: &str, org: &str, api: &str) -> Result<Vec<Value>, String> {
+    let text = match daytona_send(key, org, client.get(format!("{}/secret/paginated?limit=200", api))).await {
+        Ok(t) => t,
+        Err(_) => daytona_send(key, org, client.get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?,
+    };
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Daytona invalid secret list: {}", e))?;
+    if let Some(items) = value.get("items").and_then(Value::as_array) { return Ok(items.clone()); }
+    if let Some(items) = value.as_array() { return Ok(items.clone()); }
+    Err("Daytona invalid secret list: missing items".into()) }
 pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let key = cfg(config, "api_key"); if key.is_empty() { return Err("Daytona requires api_key".into()); }
-    let api = base(config, "https://api.daytona.io");
+    let api = base(config, "https://app.daytona.io/api");
     let org = cfg(config, "organization_id");
+    if key.starts_with("eyJ") && org.is_empty() { return Err("Daytona JWT authentication requires organization_id".into()); }
     let mode = match cfg(config, "mode") { "" => "upsert", m => m };
     if mode != "upsert" && mode != "mirror" { return Err("daytona mode must be upsert or mirror".into()); }
     let dry = config.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
@@ -285,8 +305,7 @@ pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous
     let desired = trigger_desired(config, secrets);
     if let Some(bad) = env_names_ok(&desired.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) { return Err(format!("Daytona invalid secret names: {}", bad)); }
     let client = http_client();
-    let list_text = daytona_send(key, org, client.get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?;
-    let list: Vec<Value> = serde_json::from_str(&list_text).map_err(|e| format!("Daytona invalid secret list: {}", e))?;
+    let list = daytona_secret_list(&client, key, org, &api).await?;
     let by_name: std::collections::HashMap<String, String> = list.iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("id")?.as_str()?.to_string()))).collect();
     let created = desired.iter().filter(|(n, _)| !by_name.contains_key(n)).count();
     let updated = desired.len() - created;
@@ -313,9 +332,10 @@ pub async fn daytona_sync(config: &Value, secrets: &[(String, String)], previous
     Ok((format!("Daytona sync{}: created={} updated={} deleted={}{}", if dry { " (dry-run)" } else { "" }, created, updated, deleted, mount), managed)) }
 pub async fn daytona_test(config: &Value) -> Result<String, String> {
     let key = cfg(config, "api_key"); if key.is_empty() { return Err("Daytona requires api_key".into()); }
-    let api = base(config, "https://api.daytona.io");
-    let text = daytona_send(key, cfg(config, "organization_id"), http_client().get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?;
-    let list: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
+    let api = base(config, "https://app.daytona.io/api");
+    let org = cfg(config, "organization_id");
+    if key.starts_with("eyJ") && org.is_empty() { return Err("Daytona JWT authentication requires organization_id".into()); }
+    let list = daytona_secret_list(&http_client(), key, org, &api).await?;
     Ok(format!("Daytona connection OK: organisation currently has {} vault secrets", list.len())) }
 
 async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
@@ -419,8 +439,8 @@ mod tests {
                 sink.lock().unwrap().push((method.clone(), path.clone(), body));
                 let (status, payload) = if method == "GET" && path.contains("/environments") {
                         ("200 OK", json!({"environments": [{"id": "env-1", "name": "base", "envContents": "OLD=1\n"}]}).to_string())
-                    } else if method == "GET" && path.ends_with("/secret") {
-                        ("200 OK", json!([{"id": "sec-1", "name": "OLD"}]).to_string())
+                    } else if method == "GET" && path.contains("/secret") {
+                        ("200 OK", json!({"items": [{"id": "sec-1", "name": "OLD"}]}).to_string())
                     } else if method == "GET" { ("200 OK", json!({"items": [{"name": "OLD"}]}).to_string()) }
                     else if method == "DELETE" { ("204 No Content", String::new()) }
                     else if method == "POST" && path.ends_with("/secret") { ("201 Created", json!({"id": "sec-2", "name": "API_KEY"}).to_string()) }
@@ -462,16 +482,17 @@ mod tests {
     #[tokio::test]
     async fn boat_sync_sets_vars_and_prunes_only_managed_names() {
         let (base, calls) = start_mock();
-        let config = json!({"api_key": "boat_test", "environment": "base", "base_url": base, "mode": "mirror"});
+        let config = json!({"api_key": "boat_test", "environment": "base", "org": "team", "base_url": base, "mode": "mirror"});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
         let (report, managed) = boat_sync(&config, &secrets, &["OLD".to_string()]).await.expect("boat sync");
         assert!(report.contains("created=1"), "{}", report);
         assert_eq!(managed, vec!["API_KEY".to_string()]);
         let calls = calls.lock().unwrap();
-        let put = calls.iter().find(|(m, p, _)| m == "PUT" && p.ends_with("/vars/API_KEY")).expect("var put");
+        let put = calls.iter().find(|(m, p, _)| m == "PUT" && (p.ends_with("/vars/API_KEY") || p.contains("/vars/API_KEY?"))).expect("var put");
+        assert!(put.1.contains("org=team"), "organisation scope must be sent on mutations: {}", put.1);
         let body: Value = serde_json::from_str(&put.2).expect("json body");
         assert_eq!(body["value"], "v1");
-        assert!(calls.iter().any(|(m, p, _)| m == "DELETE" && p.ends_with("/vars/OLD")), "mirror should remove the previously managed variable");
+        assert!(calls.iter().any(|(m, p, _)| m == "DELETE" && (p.ends_with("/vars/OLD") || p.contains("/vars/OLD?"))), "mirror should remove the previously managed variable");
     }
 
     #[tokio::test]
@@ -510,6 +531,24 @@ mod tests {
         assert!(report.contains("dry-run"), "{}", report);
         let calls = calls.lock().unwrap();
         assert!(calls.iter().all(|(m, _, _)| m == "GET"), "dry run must only read: {:?}", *calls);
+    }
+
+    #[tokio::test]
+    async fn instabox_rejects_reserved_names() {
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1"});
+        let secrets = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let error = instabox_sync(&config, &secrets, &[]).await.expect_err("reserved name");
+        assert!(error.contains("reserves"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn instabox_empty_environment_makes_no_import() {
+        let (base, calls) = start_mock();
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base});
+        let (report, managed) = instabox_sync(&config, &[], &[]).await.expect("empty sync");
+        assert!(managed.is_empty());
+        assert!(report.contains("imported=0"), "{}", report);
+        assert!(!calls.lock().unwrap().iter().any(|(m, _, _)| m == "POST"), "an empty environment must not call import");
     }
 
     #[tokio::test]

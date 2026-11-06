@@ -165,24 +165,27 @@ environments), `mode` (`upsert` or `mirror`), `prefix`, `include_keys`,
 syncing so existing sandboxes pick up the new version), `base_url`, and
 `dry_run`. Sync reads `envContents` from `GET /environments`, sets each
 variable with `PUT /environments/{id}/vars/{KEY}`, and in mirror mode deletes
-only previously managed names. Names must match `^[A-Za-z_][A-Za-z0-9_]*$`.
+only previously managed names. The `org` selector is sent on mutations too,
+as Boat requires for shared environments. Names must match
+`^[A-Za-z_][A-Za-z0-9_]*$`.
 Boat only delivers variables to sandboxes created or upgraded after the
 change, so set `upgrade` when existing sandboxes must see the new values.
 
 ## Daytona vault secrets
 
 Kind `daytona` writes to Daytona's organisation vault
-(`https://api.daytona.io`). Config: `api_key`, `organization_id` (sent as
-`X-Daytona-Organization-ID`, required with JWT auth), `hosts` (allowed
+(`https://app.daytona.io/api`). Config: `api_key`, `organization_id` (sent as
+`X-Daytona-Organization-ID`; required when the key is a JWT), `hosts` (allowed
 outbound hosts stored on each secret), `sandbox` (optional id or name; when
 set, sync mounts every managed secret into that sandbox with
 `PUT /sandbox/{id}/secrets`), `mode`, `prefix`, `include_keys`,
-`exclude_keys`, `base_url`, and `dry_run`. Daytona never returns values, so
-sync creates missing names with `POST /secret` and patches existing ones with
-`PATCH /secret/{id}`. Mirror deletes only previously managed names. Daytona
-has no API to change environment variables on an existing sandbox after
-creation; use vault secrets plus the mount, or create the sandbox with `env`
-and replace it.
+`exclude_keys`, `base_url`, and `dry_run`. Listing uses
+`GET /secret/paginated` and falls back to the legacy `GET /secret`. Daytona
+never returns values, so sync creates missing names with `POST /secret` and
+patches existing ones with `PATCH /secret/{id}`. Mirror deletes only
+previously managed names. Daytona has no API to change environment variables
+on an existing sandbox after creation; use vault secrets plus the mount, or
+create the sandbox with `env` and replace it.
 
 ## Hardening pass (2026-11-06)
 

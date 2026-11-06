@@ -427,6 +427,7 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     upsert_secret(&st,&eid,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:"/".into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()})?;
     st.audit(&org,&app,&eid,&uid,"secret.rotate",key_name); Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id")}))) }
 fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
+    if oauth_access(st, h).is_some() { return Err(err(StatusCode::FORBIDDEN, "OAuth access tokens cannot call SCIM; use a session or a service token")); }
     let uid = st.token_user(h)?;
     let oid = q.get("org_id").cloned().unwrap_or_default();
     if oid.is_empty() { return Err(bad("org_id query parameter required")); }
