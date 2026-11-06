@@ -25,6 +25,20 @@ jobs:
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdks/python -p 'test_*.py'
 
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: terraform-provider/go.mod
+          cache-dependency-path: terraform-provider/go.sum
+      - run: cargo build -p openwarp-server
+      - run: cd terraform-provider && go build ./... && go vet ./...
+      - run: cd terraform-provider && OPENWARP_BIN="$GITHUB_WORKSPACE/target/debug/openwarp-server" go test ./...
+
   docker:
     runs-on: ubuntu-latest
     steps:

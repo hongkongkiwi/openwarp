@@ -161,7 +161,7 @@ export class OpenWarp {
   }
   deleteSecret(secret: string) { return this.request<{ ok: boolean }>("DELETE", `/api/secrets/${encode(secret)}`); }
   secretHistory(secret: string) {
-    return this.request<Array<{ version: number; value: string; created_at: number; created_by: string }>>("GET", `/api/secrets/${encode(secret)}/history`);
+    return this.request<Array<{ version: number; value: string; path: string; tags: string; created_at: number; created_by: string }>>("GET", `/api/secrets/${encode(secret)}/history`);
   }
   restoreSecret(secret: string, version: number) {
     return this.request<{ ok: boolean; version: number }>("POST", `/api/secrets/${encode(secret)}/restore/${version}`);

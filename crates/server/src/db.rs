@@ -112,6 +112,20 @@ impl Db {
                 for idx in INDEXES { self.exec(idx, &[]).map_err(|e| format!("migration 1 failed ({}): {}", idx, e))?; }
                 Ok(())
             }
+            2 => {
+                // Secret versions now carry the path and tags they were written
+                // with, so a point-in-time restore can put tags back. Rows from
+                // before this version default to '/' and ''.
+                for (table, column, alter) in [
+                    ("secret_versions", "path", "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'"),
+                    ("secret_versions", "tags", "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''"),
+                ] {
+                    if !self.column_exists(table, column)? {
+                        self.exec(alter, &[]).map_err(|e| format!("migration 2 failed ({}): {}", alter, e))?;
+                    }
+                }
+                Ok(())
+            }
             other => Err(format!("no migration registered for version {}", other)),
         }
     }
@@ -121,7 +135,7 @@ fn pg_error(e: postgres::Error) -> String {
 
 /// The highest migration this binary knows about. Add a step to
 /// `apply_migration` and bump this together.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const LEGACY_COLUMNS: &[(&str, &str, &str)] = &[
     ("envs", "mode", "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'"),
@@ -192,7 +206,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS envs(id TEXT PRIMARY KEY,app_id TEXT NOT NULL,name TEXT NOT NULL,env_key_wrapped TEXT NOT NULL,restricted BIGINT DEFAULT 0,require_approval BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS env_members(env_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
     "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,deleted_at BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',path TEXT DEFAULT '/',tags TEXT DEFAULT '',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
     "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",

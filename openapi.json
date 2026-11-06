@@ -732,6 +732,12 @@
           "value": {
             "type": "string"
           },
+          "path": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "string"
+          },
           "created_at": {
             "type": "integer"
           },
