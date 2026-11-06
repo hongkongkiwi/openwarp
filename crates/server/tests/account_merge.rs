@@ -63,7 +63,7 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_PUBLIC_URL", &base)
-            .env("OPENWARP_EMAIL_WEBHOOK", relay).env("TOKIO_WORKER_THREADS", "2")
+            .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", relay).env("TOKIO_WORKER_THREADS", "2")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_SIGNUPS").stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().expect("spawn server");

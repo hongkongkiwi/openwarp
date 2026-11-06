@@ -64,19 +64,19 @@ pub async fn identity(provider: &str, client_id: &str, secret: &str, redirect: &
         "discord" => {
             let token_ep = endpoint(provider, "/api/oauth2/token")?;
             let user_ep = endpoint(provider, "/api/users/@me")?;
-            let response = crate::app::http_client().post(&token_ep)
-                .form(&[("client_id", client_id), ("client_secret", secret), ("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)])
-                .send().await.map_err(|_| "provider token request failed")?;
-            let token = response_json(response).await?;
+            let request = crate::app::http_client().post(&token_ep)
+                .form(&[("client_id", client_id), ("client_secret", secret), ("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)]);
+            let bytes = crate::http::provider_post_bounded(request, 1024 * 1024).await?;
+            let token: Value = serde_json::from_slice(&bytes).map_err(|_| "provider response is invalid JSON")?;
             let access_token = token.get("access_token").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("provider response has no access token")?;
             let response = crate::app::http_client().get(&user_ep).bearer_auth(access_token).send().await.map_err(|_| "provider profile request failed")?;
             Ok(Some(profile(&response_json(response).await?, "verified")?)) }
         "workos" => {
             let endpoint = endpoint(provider, "/user_management/authenticate")?;
-            let response = crate::app::http_client().post(&endpoint)
-                .json(&json!({"client_id": client_id, "client_secret": secret, "grant_type": "authorization_code", "code": code}))
-                .send().await.map_err(|_| "provider authentication request failed")?;
-            let token = response_json(response).await?;
+            let request = crate::app::http_client().post(&endpoint)
+                .json(&json!({"client_id": client_id, "client_secret": secret, "grant_type": "authorization_code", "code": code}));
+            let bytes = crate::http::provider_post_bounded(request, 1024 * 1024).await?;
+            let token: Value = serde_json::from_slice(&bytes).map_err(|_| "provider response is invalid JSON")?;
             let user = token.get("user").ok_or("provider response has no user")?;
             Ok(Some(profile(user, "email_verified")?)) }
         _ => Ok(None) } }
