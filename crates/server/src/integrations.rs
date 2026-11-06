@@ -268,7 +268,7 @@ pub async fn boat_sync(config: &Value, secrets: &[(String, String)], previous_ma
                 match req(client.delete(format!("{}/environments/{}/vars/{}{}", api, eid, name, suffix)).bearer_auth(key)).await { Ok(_) => deleted += 1, Err(e) => failures.push(format!("{}: {}", name, e)) } } }
             if !failures.is_empty() { return Err(format!("Boat delete failed after updating {}: {}", desired.len(), failures.join("; "))); }
         }
-        if upgrade { let _ = req(client.post(format!("{}/environments/{}/upgrade{}", api, eid, suffix)).bearer_auth(key)).await; }
+        if upgrade { req(client.post(format!("{}/environments/{}/upgrade{}", api, eid, suffix)).bearer_auth(key)).await.map_err(|e| format!("Boat upgrade failed after updating {} variables: {}", desired.len(), e))?; }
     }
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
     Ok((format!("Boat sync{}: environment {} created={} updated={} unchanged={} deleted={}{}", if dry { " (dry-run)" } else { "" }, ename, created, updated, desired.len() - created - updated, deleted, if upgrade && !dry { " (sandboxes upgraded)" } else { "" }), managed)) }

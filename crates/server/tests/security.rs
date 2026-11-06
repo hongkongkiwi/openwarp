@@ -715,6 +715,115 @@ async fn oauth_consent_limits_otp_guessing() {
     assert_eq!(last, 429, "repeated wrong OTP codes were not rate limited");
 }
 
+const OIDC_TEST_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC5O340cebdkWsx
+FiSVOA0xClu5jkVdfk/T1h6fsEHqHJDRLtxRiJevaMBr7mKlbp4d6PQWQ6ydFzsh
+6gb4IqE7/UONKNhq+ZK/SpKaY0DiorFpX7ULfoc9RvZb/0zwBuFi4j4km2BDaf09
+WvEId/QbiizE9o0Ev1YQkyqck7dz1t52JnE4tI0aOz6jAvwceV5QflPsGmKa+PiJ
+nXEfZin7VRTi/IQRXvntQtIDk4CMl2qT5V/cGNKNtpHi+19za96qt0hIphsD/PwM
+YN9Az1BZ8/lygTTnjZIfcrMnZEbVNSfZTtAa2tzgueAlUx+CJmEE6J1MfVW6AGHG
+v7SR6XVjAgMBAAECggEAEsF/afgOlGjhHbtMQP/H9itCVmudgnYDx0NrHmhOhFIY
+J9ZC4M6f7VcCBOvCeVXWFNk9vfNkSxPLHQgBZKa9BMIEUQrNvyc+QLhgV9ms/EXV
+CQJz5pINR5sj3vTe6X8I22ZlPHevK6RTzB6lQWJECXXYSqlcZhqpsEv2iJw8ezIe
+eY7nRe27tquhj2ZC8FrA86yWEe1eq5H7t4bFqHm8OUosklw5uIy3PLmIiUk89oML
+NdsPJ5sHNEFUGbIQYMjTQIUShEKKp6k3Hx9GvFo7g0DdM7OIN5d1otVXIlJKqQJA
+9LPrvfGVU/fZqDqPauVfen/ws8Q8p5dKrlZKs0OFIQKBgQDi2T1OwOuTm2vLlY4y
+H3CG4fjPmAwgrIHIU0/NT+w9hi8BRdHxH7jnzz7uYqLV8T6hg8onrwMTkXMybGWE
+ZWue4BTW/stqBH8s00/In8HKS1OjzJSEq1rNiH0Qq8tt/1STTO3ARK4jr6gk2fo6
+ue+TnwB2Mjl4o3gmLOl3ktuUpQKBgQDRCS7ZwYGevt/MIHF1U2H7clHo/uX1qotG
+ruCmxXgzA8r2RkJVpy1ooSYY6T4ykDx68ousHULZtWoXSKv/DaVb+nVEVTt8Sxu3
+IzdwmybV7qttY9oFI6zvFzr/i2+bwXkd7KJ42YS1RioMxFFYnNKQS9nVLOZ9bC0a
+NQj3V7JbZwKBgH7rImT8hRE5xM7LpxoeAvxEU8v5+tcRDS/ChQSO8dLeT1A7+yEY
+KYDwr/n6D7b5WZxOOv2G6oa5OyV8BjRT9imWn7JGLhLr3yd6Nso9r9P53xrm7DVq
+Fcymz6pTI+cwEuazBNYs1u06ay3rExhmTUdfj4eRxBveAewB9sGi1d3NAoGAZoq/
+rdiMEmiF9mev4KMfvK5u2gI4opOfsPPWhlj2RuhEZx0+KzBQSTRMMQoyFbHFyXYz
+6CGOiqfAvF1M6lgyVvV9EyFQhf9+QA+JgbbKjUWAWLAT4lOG4N6fdX5cKKb3GCPd
+67SgsiASPqMLWJHNhTWATV+yTbKESYfctyERAF8CgYBo/wn6tKon7NsVzPxv8KrL
+OF8MHpy7ObWoOf5KfrHRRwqkYrAapKkT9R5+4rm10oNt9nMitwUOng9IsDyIm1l2
+1EuIUbif869vmzHMvy5SEpXTl+BfKUc3rOKIHw1SKvExnT9VPdOguVcYggAPovC/
+zx/UpPmCIb8/3cJ8IR+QpA==
+-----END PRIVATE KEY-----"#;
+const OIDC_TEST_N: &str = "uTt-NHHm3ZFrMRYklTgNMQpbuY5FXX5P09Yen7BB6hyQ0S7cUYiXr2jAa-5ipW6eHej0FkOsnRc7IeoG-CKhO_1DjSjYavmSv0qSmmNA4qKxaV-1C36HPUb2W_9M8AbhYuI-JJtgQ2n9PVrxCHf0G4osxPaNBL9WEJMqnJO3c9bediZxOLSNGjs-owL8HHleUH5T7Bpimvj4iZ1xH2Yp-1UU4vyEEV757ULSA5OAjJdqk-Vf3BjSjbaR4vtfc2veqrdISKYbA_z8DGDfQM9QWfP5coE0542SH3KzJ2RG1TUn2U7QGtrc4LngJVMfgiZhBOidTH1VugBhxr-0kel1Yw";
+
+fn start_idp(email: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("idp bind");
+    let addr = listener.local_addr().expect("idp addr");
+    let issuer = format!("http://{}", addr);
+    let thread_issuer = issuer.clone();
+    let email = email.to_string();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            use std::io::{Read, Write};
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let path = head.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
+            let body = if path.starts_with("/.well-known/openid-configuration") {
+                json!({"issuer": thread_issuer, "authorization_endpoint": format!("{}/authorize", thread_issuer), "token_endpoint": format!("{}/token", thread_issuer), "jwks_uri": format!("{}/jwks", thread_issuer)}).to_string()
+            } else if path.starts_with("/jwks") {
+                json!({"keys": [{"kty": "RSA", "kid": "t1", "use": "sig", "alg": "RS256", "n": OIDC_TEST_N, "e": "AQAB"}]}).to_string()
+            } else {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let header = jsonwebtoken::Header { alg: jsonwebtoken::Algorithm::RS256, kid: Some("t1".into()), ..Default::default() };
+                let claims = json!({"iss": thread_issuer, "aud": "test-client", "sub": "subject-1", "email": email, "iat": now, "exp": now + 300});
+                let key = jsonwebtoken::EncodingKey::from_rsa_pem(OIDC_TEST_PEM.as_bytes()).expect("rsa pem");
+                let token = jsonwebtoken::encode(&header, &claims, &key).expect("sign id token");
+                json!({"access_token": "x", "id_token": token, "token_type": "Bearer"}).to_string()
+            };
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+        }
+    });
+    issuer
+}
+
+async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &str) -> String {
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(session), Some(json!({
+        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)}))).await;
+    assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
+    assert_eq!(r.status, 307, "oidc start failed: {}", r.text);
+    parse_query(&r.header("location")).get("state").cloned().expect("state")
+}
+
+#[tokio::test]
+async fn oidc_does_not_link_an_existing_account_by_email() {
+    let s = Server::start().await;
+    let victim = register(&s, "oidc-victim@test.invalid").await;
+    let attacker = register(&s, "oidc-attacker@test.invalid").await;
+    let at = attacker["token"].as_str().unwrap();
+    let ao = attacker["org_id"].as_str().unwrap();
+    let idp = start_idp("oidc-victim@test.invalid");
+    let state = begin_oidc(&s, at, ao, &idp).await;
+    let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
+    assert_eq!(r.status, 409, "an existing email must be refused, got {} {}", r.status, r.header("location"));
+    assert!(!r.header("location").contains("token="), "no session may be issued for the victim: {}", r.header("location"));
+    let _ = victim;
+}
+
+#[tokio::test]
+async fn oidc_provisions_a_new_user() {
+    let s = Server::start().await;
+    let attacker = register(&s, "oidc-new@test.invalid").await;
+    let at = attacker["token"].as_str().unwrap();
+    let ao = attacker["org_id"].as_str().unwrap();
+    let idp = start_idp("oidc-newcomer@test.invalid");
+    let state = begin_oidc(&s, at, ao, &idp).await;
+    let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
+    assert_eq!(r.status, 307, "new users should be provisioned, got {} {}", r.status, r.text);
+    let location = r.header("location");
+    let token = location.rsplit("token=").next().unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!token.is_empty(), "expected a session token in {}", location);
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.status, 200, "provisioned session failed: {}", me.text);
+    assert_eq!(me.body["email"].as_str().unwrap_or(""), "oidc-newcomer@test.invalid");
+}
+
 #[tokio::test]
 async fn secure_cookie_flag_follows_the_public_url() {
     let plain = Server::start().await;
