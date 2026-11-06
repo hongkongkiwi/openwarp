@@ -129,7 +129,7 @@ async fn a_delegated_environment_syncs_through_the_customer_runner() {
     let key_enc = oc::encrypt_symmetric(&env_key, b"API_KEY");
     let value_enc = oc::encrypt_symmetric(&env_key, b"secret-value");
     let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), Some(json!({
-        "secrets": [{"key_enc": key_enc, "value_enc": value_enc, "key_hash": oc::hash_token("API_KEY"), "path": "/"}]
+        "secrets": [{"key_enc": key_enc, "value_enc": value_enc, "key_hash": oc::hash_token("API_KEY"), "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")}]
     }))).await;
     assert_eq!(r.status, 200, "client-side deploy failed: {} {}", r.status, r.text);
 

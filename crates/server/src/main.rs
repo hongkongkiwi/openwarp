@@ -979,10 +979,11 @@ async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Jso
     let mut count = 0;
     for s in body.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""); let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
-        let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or(""); let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+        let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
         let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
-        let path_val = if path_enc.is_empty() { path } else { "" };
         if key_enc.is_empty() || key_hash.is_empty() { continue; }
+        if path_enc.is_empty() { return Err(bad("path_enc is required: encrypt the path with the environment key")); }
+        let path_val = "";
         if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).map_err(|e| bad(&e))? {
             let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
             st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,path=?,path_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(path_val), json!(path_enc), json!(key_hash), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
@@ -1063,10 +1064,9 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         let kh = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or("");
         let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
-        let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
         let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
-        let path_val = if path_enc.is_empty() { path } else { "" };
-        if path_enc.is_empty() && !valid_path(path) { return Err(bad("invalid secret path in rekey payload")); }
+        if path_enc.is_empty() { return Err(bad("path_enc is required in the rekey payload")); }
+        let path_val = "";
         let existing = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0 AND e2e=1", &[json!(&eid), json!(kh)]).map_err(|e| bad(&e))?;
         let (sid, ver) = match existing {
             Some(r) => (db::s(&r, "id"), db::n(&r, "version") + 1),

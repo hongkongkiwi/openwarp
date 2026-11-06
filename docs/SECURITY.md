@@ -139,9 +139,10 @@ server cannot obtain a user's key.
   organisation that needs escrow should hold a recovery key split between
   administrators, not store it in OpenWarp.
 - Removing a member deletes their wrapped key and sets `rekey_required`. Run
-  `openwarp e2e rekey --env <ENV_ID>` with a current grant. It generates a new
-  environment key, re-encrypts every secret, and rewraps the new key to every
-  remaining grantee and the runner. Old history rows are replaced because they
+  `openwarp e2e revoke --env <ENV_ID> --email <ADDRESS>` to revoke and rotate in
+  one step, or `openwarp e2e rekey --env <ENV_ID>` if the grant was already
+  removed. Rotation generates a new environment key, re-encrypts every secret,
+  and rewraps the new key to every remaining grantee and the runner. Old history rows are replaced because they
   are encrypted under the old key. The rewrite runs in one database transaction;
   a failed grant write rolls the whole rotation back. A rekey may remove
   grantees but cannot add one: grant access first, then rotate.
@@ -158,8 +159,8 @@ against the index. New writes do this automatically; run
 `POST /api/instance/encrypt-metadata` as the instance owner once after upgrading
 to migrate existing rows. In `e2e` and `delegated` modes the server has no key,
 so it stores whatever the client supplies. The CLI encrypts the path and sends
-`path_enc`; a client that sends only `path` is choosing plaintext metadata, and
-the key hash remains a client-supplied lookup value.
+`path_enc` and the endpoint rejects a put or rekey without it; the key hash
+remains a client-supplied lookup value.
 
 ## Runner security
 

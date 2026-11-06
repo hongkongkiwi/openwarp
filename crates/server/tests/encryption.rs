@@ -205,14 +205,14 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
     let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"secrets": [{
         "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"),
         "value_enc": oc::encrypt_symmetric(&env_key, b"old-value"),
-        "key_hash": key_hash, "path": "/"
+        "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")
     }]}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
 
     let new_key = oc::random_key();
     let new_wrapped = oc::encrypt_to(&pubkey, &new_key).unwrap();
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
-        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new-value"), "key_hash": key_hash, "path": "/"}],
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
         "grants": [{"user_id": uid, "wrapped_key": new_wrapped}]
     }))).await;
     assert_eq!(r.status, 200, "rekey failed: {} {}", r.status, r.text);
@@ -232,7 +232,7 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
     let bad_key = oc::random_key();
     let bad_wrapped = oc::encrypt_to(&pubkey, &bad_key).unwrap();
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
-        "secrets": [{"key_enc": oc::encrypt_symmetric(&bad_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&bad_key, b"bad-value"), "key_hash": key_hash, "path": "/"}],
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&bad_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&bad_key, b"bad-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&bad_key, b"/")}],
         "grants": [{"user_id": uid, "wrapped_key": bad_wrapped}, {"user_id": uid, "wrapped_key": bad_wrapped}]
     }))).await;
     assert!(r.status >= 400, "a broken rekey must fail: {} {}", r.status, r.text);

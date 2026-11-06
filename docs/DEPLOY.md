@@ -115,9 +115,11 @@ the provider, and reports the result. The server never holds the plaintext or
 the provider credentials. A claimed job is reclaimable after ten minutes if the
 runner crashes.
 
-Removing a member from an `e2e` or delegated environment sets a rekey flag; run
-`openwarp e2e rekey --env ENV_ID` with a current grant to rotate the environment
-key and rewrap it to the remaining grantees and the runner.
+Removing a member from an `e2e` or delegated environment sets a rekey flag. Run
+`openwarp e2e revoke --env ENV_ID --email ADDRESS` to remove the grant and
+rotate in one command, or `openwarp e2e rekey --env ENV_ID` if the grant was
+already removed. Rotation rewraps the new key to the remaining grantees and the
+runner.
 
 ## Signups and invitations
 
