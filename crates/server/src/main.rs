@@ -615,8 +615,11 @@ async fn scan_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) ->
     }
     st.audit(&org,&app,&eid,&uid,"secret.scan",&format!("{} findings", findings.len()));
     Ok(j(json!({"findings": findings}))) }
-async fn export_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; st.check_scope(&h, &eid)?; let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org,&uid,"secrets:read")?;
-    let items = st.list_secrets_decrypted(&eid,&uid)?; let text = items.iter().map(|(k,v,_)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n"); Ok(j(json!({"text": text, "secrets": items.iter().map(|x| x.2.clone()).collect::<Vec<_>>()}))) }
+async fn export_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h)?; st.check_scope(&h, &eid)?; let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org,&uid,"secrets:read")?;
+    // base=1 skips the caller's personal overrides. Deployments must not pick up
+    // whichever stand-in values the token owner happens to keep locally.
+    let items = if q.get("base").map(|v| v == "1" || v == "true").unwrap_or(false) { st.list_secrets_base(&eid)? } else { st.list_secrets_decrypted(&eid,&uid)? };
+    let text = items.iter().map(|(k,v,_)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n"); Ok(j(json!({"text": text, "secrets": items.iter().map(|x| x.2.clone()).collect::<Vec<_>>()}))) }
 async fn search(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h)?; let needle = q.get("q").cloned().unwrap_or_default().to_uppercase();
     let orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?;
     let mut results = Vec::new();

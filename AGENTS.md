@@ -16,6 +16,7 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 | `crates/server/src/mailer.rs` | Transactional email providers and templates |
 | `crates/server/tests/` | HTTP suites `security`, `authorization`, `accounts`; `ui.test.cjs` for console source |
 | `crates/cli/src/main.rs` | The `openwarp` binary: login, inject, export, sync |
+| `crates/eso/src/main.rs` | `openwarp-eso`, the External Secrets Operator webhook bridge |
 | `crates/crypto/src/lib.rs` | Encryption, key wrapping, primitives |
 | `sdk/`, `action/`, `terraform-provider-openwarp/` | Clients outside the Cargo workspace |
 
@@ -86,4 +87,4 @@ Worktrees created before this rule may still live in `/Volumes/Storage/Developme
 
 ## Documentation
 
-[docs/README.md](docs/README.md) is the index: [GETTING_STARTED](docs/GETTING_STARTED.md), [CONFIGURATION](docs/CONFIGURATION.md), [CLI](docs/CLI.md), [CONSOLE](docs/CONSOLE.md), [DEPLOY](docs/DEPLOY.md), [INTEGRATIONS](docs/INTEGRATIONS.md), [BACKUP](docs/BACKUP.md), [FEATURES](docs/FEATURES.md).
+[docs/README.md](docs/README.md) is the index: [GETTING_STARTED](docs/GETTING_STARTED.md), [CONFIGURATION](docs/CONFIGURATION.md), [CLI](docs/CLI.md), [CONSOLE](docs/CONSOLE.md), [DEPLOY](docs/DEPLOY.md), [INTEGRATIONS](docs/INTEGRATIONS.md), [KUBERNETES](docs/KUBERNETES.md), [BACKUP](docs/BACKUP.md), [FEATURES](docs/FEATURES.md).

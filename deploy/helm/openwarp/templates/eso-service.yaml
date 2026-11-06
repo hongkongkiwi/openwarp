@@ -1,0 +1,16 @@
+{{- if .Values.eso.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openwarp.eso.fullname" . }}
+  labels:
+    {{- include "openwarp.eso.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.eso.port }}
+      targetPort: http
+  selector:
+    {{- include "openwarp.eso.selectorLabels" . | nindent 4 }}
+{{- end }}

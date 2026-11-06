@@ -81,3 +81,25 @@ embedded in the chart.
 helm lint deploy/helm/openwarp
 helm template openwarp deploy/helm/openwarp
 ```
+
+## External Secrets Operator bridge
+
+`eso.enabled` adds a second Deployment and ClusterIP Service running
+`openwarp-eso`. It serves one environment as the JSON object an ESO `webhook`
+SecretStore reads. The option installs no CRDs and does not depend on ESO being
+installed; the `SecretStore` and `ExternalSecret` objects are yours to create.
+
+The bridge has no credentials of its own. A request must carry an OpenWarp
+service token as `Authorization: Bearer`, and the bridge forwards that token, so
+the caller's own environment scope and role decide what comes back. Store the
+token in a Kubernetes Secret labelled `external-secrets.io/type: webhook` and
+reference it from the SecretStore `headers`, as shown in
+[docs/KUBERNETES.md](../../../docs/KUBERNETES.md).
+
+Defaults: one replica on port 8090, image `image.repository` with the same tag
+as the server, upstream URL `http://<release>:<service.port>`. Override
+`eso.replicas`, `eso.port`, `eso.image.*`, `eso.openwarpUrl`, and
+`eso.resources` as needed. The bridge is stateless, so more replicas are safe.
+Restrict it with a NetworkPolicy: anything that can reach port 8090 can present
+a token, though it still needs a valid one.
+
