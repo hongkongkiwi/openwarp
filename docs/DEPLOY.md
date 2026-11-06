@@ -1,93 +1,196 @@
-# Deploying OpenWarp
+# Deployment
 
-Docker compose is the supported path. `docker compose up --build` starts the
-server, Postgres 17 and Redis 7. The compose file refuses to start until
-`OPENWARP_MASTER_KEY` and `POSTGRES_PASSWORD` are set.
+The repository includes a Compose stack with OpenWarp, PostgreSQL 17, and Redis 7. You can also run the native server against SQLite or PostgreSQL. Start with [getting started](GETTING_STARTED.md) for local evaluation; this guide covers a deployed instance.
+
+## Deployment checklist
+
+- An external, backed-up master key and persistent database storage.
+- HTTPS at a reverse proxy and the correct public URL.
+- A private bootstrap window for the first account.
+- Explicit signup, proxy-trust, and outbound-network policies.
+- A mail relay if password reset or email verification is needed.
+- A tested backup and restore procedure.
+
+Read the [security model](SECURITY.md) before storing production secrets. The PostgreSQL driver currently uses `NoTls`; browser HTTPS does not encrypt database connections. Keep database traffic on an isolated network or provide an encrypted transport separately.
+
+## Compose setup
+
+From the repository root, generate credentials for a new instance:
 
 ```bash
-# 32 random bytes, base64
-export OPENWARP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
-export POSTGRES_PASSWORD="$(head -c 24 /dev/urandom | base64)"
-docker compose up -d --build
+export OPENWARP_MASTER_KEY="$(openssl rand -base64 32)"
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 ```
 
-## Before going live
+Save these values securely before continuing. Do not regenerate the master key when restarting an existing instance. The password uses hexadecimal characters so it can be inserted into the Compose database URL without URL-escaping issues.
 
-1. Terminate TLS in front of the server and set `OPENWARP_PUBLIC_URL` to the
-   public HTTPS origin. It fixes the OAuth issuer and marks the session cookie
-   `Secure`; without it the issuer is derived from the `Host` header.
-2. If you run behind a reverse proxy, set `OPENWARP_TRUST_PROXY=1` and list the
-   proxy addresses in `OPENWARP_TRUSTED_PROXIES` (comma-separated IPs or CIDRs).
-   `X-Forwarded-For` is only honoured when the peer connection comes from one of
-   those addresses, so an exposed port cannot spoof the client IP.
-3. Register the first account immediately. The first account is the instance
-   owner and is the only one that can change the signup policy.
-4. Create the recovery kit backup for every user. It is shown once.
+[`docker-compose.yml`](../docker-compose.yml) requires both variables and sets `OPENWARP_ENV=production`. It publishes port 8080 through a Caddy edge and persists PostgreSQL in the `pgdata` volume. Redis is included in this stack, but the native server does not require it.
 
-## Environment
+### More than one server
 
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | `sqlite://file.db` or `postgres://...` |
-| `ADDR` | Listen address, default `0.0.0.0:8080` |
-| `OPENWARP_ENV` | `production` refuses to start without an external master key |
-| `OPENWARP_MASTER_KEY` | 32 bytes base64; wraps every environment data key |
-| `OPENWARP_PUBLIC_URL` | Public origin used for OAuth issuers and redirects |
-| `OPENWARP_SECURE_COOKIES` | `1` forces the `Secure` cookie flag |
-| `OPENWARP_TRUST_PROXY` | `1` enables `X-Forwarded-For` from trusted proxies |
-| `OPENWARP_TRUSTED_PROXIES` | Peer addresses allowed to send `X-Forwarded-For` |
-| `OPENWARP_ALLOW_PRIVATE_EGRESS` | `1` allows OIDC issuers, log streams and audit webhooks on loopback/private addresses in production |
-| `OPENWARP_SIGNUPS` | `open` or `closed`; when set it overrides the console toggle |
-| `OPENWARP_GOOGLE_CLIENT_ID` / `OPENWARP_GOOGLE_CLIENT_SECRET` | Google sign-in |
-| `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
-| `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
-| `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
-| `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
-| `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
-| `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider |
-| `OPENWARP_EMAIL_TOKEN` | Optional bearer sent to the email relay |
-| `OPENWARP_REQUIRE_EMAIL_VERIFICATION` | `1` blocks password sign-in until the emailed link is opened; requires the webhook |
-| `REDIS_URL` | Optional session cache |
+Every `server` container uses the same Postgres database and the same `OPENWARP_MASTER_KEY`. That pair is the whole join secret: a process that starts with both is a replica, and stopping it removes it. There is no membership list to edit.
 
-Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
-GitHub callback URL: `{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback`.
-GitHub needs the `read:user` and `user:email` scopes; only a verified address
-can create or match an account.
+```bash
+docker compose up -d --scale server=3
+```
 
-## Signups and invitations
+The edge container is the only published port. It re-resolves the `server` name, checks `/health`, and drops a replica that stops answering. WebSocket connections to `/api/live` stay on the replica that accepted them and receive events written by any replica. Do not point a second server at the SQLite file; only Postgres is shared across processes.
 
-Signups are open on a fresh instance. The instance owner can close them under
-Settings, or set `OPENWARP_SIGNUPS=closed` to pin the policy. With signups
-closed, an admin invites an address from Members: existing accounts are added
-directly, new addresses get a single-use link valid for seven days. The invitee
-sets a password from that link, or signs in with a configured social provider,
-which redeems the invite and applies its role.
+### Pass deployment settings into the container
 
-## Password reset and email verification
+A variable exported in your host shell or present in Compose's `.env` file is not automatically part of the server container's environment. Add each server setting to the Compose service, or use an override such as `compose.override.yaml`:
 
-Password reset needs an email relay: `OPENWARP_EMAIL_WEBHOOK` receives a JSON
-body with `to`, `subject` and `text`, and the link inside it points back at
-`OPENWARP_PUBLIC_URL`. `POST /api/auth/forgot` always answers the same way, so
-it cannot be used to discover accounts.
+```yaml
+services:
+  server:
+    environment:
+      OPENWARP_PUBLIC_URL: ${OPENWARP_PUBLIC_URL:?set the public HTTPS origin}
+      OPENWARP_SECURE_COOKIES: "1"
+      OPENWARP_SIGNUPS: ${OPENWARP_SIGNUPS:-closed}
+      OPENWARP_TRUST_PROXY: ${OPENWARP_TRUST_PROXY:-0}
+      OPENWARP_TRUSTED_PROXIES: ${OPENWARP_TRUSTED_PROXIES:-127.0.0.1/32,::1}
+```
 
-A reset link does not decrypt anything on its own. The user supplies their
-recovery kit and a new password, which re-wraps the same private key and keeps
-end-to-end environments readable. A user who has lost the kit can pass
-`discard_e2e_key: true`, which generates a new key pair and makes existing
-end-to-end environments unreadable. Either path revokes every session, OAuth
-token and pending refresh pair for the account.
+Set the public URL to your actual HTTPS origin. Explicitly select signup policy for the private bootstrap described below; do not accidentally prevent creation of the initial account. Add mail, social login, and metrics variables the same way if you use them. See the [configuration reference](CONFIGURATION.md).
 
-Email verification is opt-in with `OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`. New
-password registrations then start unverified, receive a 24-hour link, and cannot
-sign in until it is opened. Social and SSO logins arrive with verified
-addresses. The server refuses to start if verification is required but no email
-relay is configured, because nobody could complete it.
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 server
+```
 
-## Operational checks
+Treat rendered Compose configuration and logs as sensitive: they can include credentials or connection strings. The source Compose file binds port 8080 on host interfaces. Restrict it with firewall or binding configuration before exposing the host. If a reverse proxy runs in another container, its address is not necessarily loopback.
 
-- `GET /health` is unauthenticated and checks the database; it returns 503
-  when the database cannot be queried.
-- `GET /metrics` is disabled unless `OPENWARP_METRICS_TOKEN` is set. Scrape with
-  `Authorization: Bearer $OPENWARP_METRICS_TOKEN`.
-- The server drains connections on `SIGTERM` and `SIGINT`.
-- Backups: see [BACKUP.md](BACKUP.md).
+## HTTPS and reverse proxies
+
+Terminate TLS at your reverse proxy and forward requests to OpenWarp. Set `OPENWARP_PUBLIC_URL` to the externally reachable HTTPS origin so OAuth metadata, redirects, and account links use the correct address.
+
+For client-IP policies behind a proxy:
+
+1. Set `OPENWARP_TRUST_PROXY=1`.
+2. Set `OPENWARP_TRUSTED_PROXIES` to the actual proxy peer IPs or CIDRs.
+3. Have the proxy replace untrusted inbound forwarding headers.
+4. Verify the direct application port is not an unintended public entry point.
+
+The server honours `X-Forwarded-For` only when the connection peer is trusted. Do not use broad trusted ranges merely to make an allowlist pass.
+
+## Bootstrap and signup policy
+
+Keep the service private while bootstrapping. Allow registration, create the first account, and save its recovery kit. The first account is the instance owner, which is distinct from being an owner of an individual workspace.
+
+Then close signups in instance Settings or pin `OPENWARP_SIGNUPS=closed` in the deployment. When that variable is set, it overrides the console policy. If using the override example above, temporarily choose `OPENWARP_SIGNUPS=open` for the private bootstrap, then change it and recreate the server container.
+
+Workspace administrators can invite people. Existing accounts can be added directly; new addresses receive a single-use invitation link with a seven-day lifetime. Follow the invite flow rather than reopening public registration for each person.
+
+## Email delivery
+
+`OPENWARP_EMAIL_WEBHOOK` points to a relay that accepts an HTTP JSON body:
+
+```json
+{
+  "to": "recipient@example.invalid",
+  "subject": "Account message",
+  "text": "Plain-text message containing the account link"
+}
+```
+
+The relay is responsible for sending the email through your provider. `OPENWARP_EMAIL_TOKEN` optionally adds bearer authentication to the relay request. Protect relay access and logs because message bodies contain sensitive account links.
+
+Password reset requires the relay. The forgot-password endpoint returns a generic response, so a successful response does not prove that a message was delivered. Test actual delivery and link origins before opening registration.
+
+Password signups always require email verification. Registration issues no session until the link is opened, and the first verified account claims instance ownership. Verification links last 24 hours. Configure the relay before opening password registration: without one the server still starts, but a production server refuses new password signups while SSO sign-in remains available; outside production it writes verification and reset links to its log. Emails asserted by a configured provider are treated as verified. Password reset with the recovery kit preserves the user's private key; deliberately replacing a lost key loses access to old E2E grants. See [security](SECURITY.md).
+
+## Social login and workspace SSO
+
+Google login needs `OPENWARP_GOOGLE_CLIENT_ID` and `OPENWARP_GOOGLE_CLIENT_SECRET`. Register this callback with the provider:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback
+```
+
+GitHub login needs `OPENWARP_GITHUB_CLIENT_ID` and `OPENWARP_GITHUB_CLIENT_SECRET`, with callback:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback
+```
+
+Apple login needs `OPENWARP_APPLE_CLIENT_ID` (the Services ID) and `OPENWARP_APPLE_CLIENT_SECRET` (the ES256 client-secret JWT generated with your Sign in with Apple key; Apple limits its lifetime to six months, so rotate it before it expires). Register this callback:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/apple/callback
+```
+
+Apple requires an HTTPS redirect URI with a domain, and it posts the authorization response, so the server accepts both GET and POST on that path. Apple returns a private relay address when the user hides their email; treat it as a verified address for that Apple subject.
+
+OpenAI login needs `OPENWARP_OPENAI_CLIENT_ID` (`oaiapp_...`) and `OPENWARP_OPENAI_CLIENT_SECRET` from the Sign in with ChatGPT client registration, with callback:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/openai/callback
+```
+
+OpenAI sign-in uses the authorization code flow with PKCE (S256). GitHub login requests `read:user` and `user:email`. Provider buttons appear only when configured. Provider login requires verified email information and does not silently attach an identity to an existing password account based only on email.
+
+Microsoft Entra ID, Okta, Auth0, GitLab, Slack, Salesforce and Atlassian use OIDC with the same callback pattern:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/<provider>/callback
+```
+
+Microsoft needs `OPENWARP_MICROSOFT_CLIENT_ID` and `OPENWARP_MICROSOFT_CLIENT_SECRET`; `OPENWARP_MICROSOFT_TENANT` defaults to `common`, and a single-tenant deployment can set its tenant ID. Entra work accounts often omit the `email` claim, so the server falls back to `preferred_username` or `upn`.
+
+Okta and Auth0 also need their issuer: `OPENWARP_OKTA_ISSUER` and `OPENWARP_AUTH0_ISSUER`. GitLab, Slack, Salesforce and Atlassian default to their public issuers; override `OPENWARP_GITLAB_ISSUER`, `OPENWARP_SLACK_ISSUER`, `OPENWARP_SALESFORCE_ISSUER` or `OPENWARP_ATLASSIAN_ISSUER` for self-managed, sandbox or My Domain deployments.
+
+X uses OAuth 2.0 with PKCE rather than OIDC:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/x/callback
+```
+
+Set `OPENWARP_X_CLIENT_ID` and, for a confidential client, `OPENWARP_X_CLIENT_SECRET`. The X app must request `users.read` and `users.email`, and the account needs a confirmed email; sign-in fails rather than inventing one when X returns no address.
+
+Workspace OIDC is configured separately in workspace settings through `oidc_issuer`, `oidc_client_id`, `oidc_client_secret`, and `oidc_redirect_uri`. Set provisioning and allowed-domain policy deliberately. Changing the issuer without supplying a replacement secret clears the old secret. SCIM provisioning requires workspace context and administrative credentials; see the [API reference](API.md).
+
+## Run the native server
+
+Build the server:
+
+```bash
+cargo build --release -p openwarp-server
+```
+
+Run it under your service manager with an existing data directory and securely provisioned environment:
+
+```bash
+OPENWARP_ENV=production \
+DATABASE_URL=sqlite:///var/lib/openwarp/openwarp.db \
+ADDR=127.0.0.1:8080 \
+  ./target/release/openwarp-server
+```
+
+This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL, set `DATABASE_URL` to your database connection string instead. Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
+
+OpenWarp is a native service. Cloudflare Workers cannot run this binary as-is; the storage and networking layers would need a separate port.
+
+Cloudflare as a proxy in front of the native server is supported. Orange-cloud the hostname, set `OPENWARP_TRUST_PROXY=1`, and set `OPENWARP_TRUSTED_PROXIES` to the addresses your origin actually sees, which are Cloudflare's egress ranges rather than the visitor's address. The server reads `X-Forwarded-For` only from a peer in that list, so an IP allowlist still sees the visitor. WebSockets pass through Cloudflare, and `/api/live` sends a ping every 30 seconds so the edge's idle timeout does not close a quiet console. A dropped socket reconnects with `?since=<id>`. This does not make the server run on Workers.
+
+## Health, metrics, and limits
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8080/health
+```
+
+`/health` checks database connectivity and returns 503 when it cannot query the database. It does not prove mail delivery, provider sync, or recovery readiness.
+
+`/metrics` is disabled unless `OPENWARP_METRICS_TOKEN` is set. Use bearer authentication to scrape it and keep the endpoint restricted. The server caps request bodies at 8 MiB and applies a five-minute handler timeout. Provider requests have their own timeouts. The server drains connections on SIGTERM or SIGINT.
+
+## Upgrades and rollback
+
+1. Record the deployed source revision and configuration.
+2. Back up the database and preserve the matching master key.
+3. Rehearse the new version against an isolated restore, with outbound automation blocked.
+4. Deploy during a controlled maintenance window and check health, login, secret access, and any integrations you depend on.
+5. If rollback is necessary, use a compatible database snapshot as well as the old binary. Do not assume startup schema changes are reversible.
+
+Do not remove the PostgreSQL volume during an upgrade. Keep old backups until the new version has passed a restore rehearsal.
+
+[Configuration](CONFIGURATION.md) · [Backup and restore](BACKUP.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)

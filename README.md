@@ -1,150 +1,115 @@
+<div align="center">
+
 # OpenWarp
 
-Clean-room Rust clone of the Phase secrets platform (behaviour modelled on the
-public [Phase Console docs](https://docs.phase.dev/console)). **No tiers, no
-licence checks, no seat/env limits, no telemetry.** All Pro/Enterprise-tier
-features are included for everyone.
+### Your secrets. Your infrastructure.
 
-This is an independent reimplementation. No Phase enterprise (`ee/`) code,
-assets or branding are used.
+A self-hosted secrets manager written in Rust.<br>
+Manage secrets in the browser, inject them with the CLI, and sync them to the services that run your code.
 
-## Run
+[Quick start](#quick-start) · [Documentation](docs/README.md) · [CLI](docs/CLI.md) · [Self-hosting](docs/DEPLOY.md) · [Security](docs/SECURITY.md)
+
+</div>
+
+---
+
+## One place for application secrets
+
+OpenWarp groups secrets into workspaces, applications, and environments. Teams can collaborate in the console while applications and automation use scoped tokens, the CLI, or the API.
+
+| Work | What OpenWarp provides |
+| --- | --- |
+| Organise | Workspaces, invitations, teams, custom roles, applications, environments, and secret paths |
+| Develop | Secret references, personal overrides, version history, `.env` import/export, and process injection |
+| Control access | Scoped service tokens, machine identities, MFA, OIDC sign-in, approval requests, and IP allowlists |
+| Deliver | Provider integrations, deployment-triggered sync, manual sync, and audit events |
+| Choose encryption | Server-side encryption for automation, or client-managed end-to-end environments |
+| Automate | REST API, OAuth with PKCE, MCP tools, rotation schedules, and dynamic credentials |
+
+There are no licence checks, paid feature gates, or configured seat and environment tiers. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
+
+> [!IMPORTANT]
+> OpenWarp handles sensitive data. Obtain an independent security and cryptography review before relying on it in production. Server-side encryption trusts the server with plaintext. End-to-end environments require client-managed keys and do not support the same automation paths. Read the [security model](docs/SECURITY.md).
+
+## Quick start
+
+### Run locally
+
+You need Rust and Cargo. Run this from a checkout of the repository:
 
 ```bash
-# SQLite (zero config, great for testing)
-DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo run -p openwarp-server
-# Postgres + optional Redis session cache
-DATABASE_URL=postgres://user:pass@host:5432/openwarp REDIS_URL=redis://127.0.0.1:6379 cargo run -p openwarp-server
-# or
-docker compose up --build   # server + Postgres 17 + Redis 7
+git clone https://github.com/hongkongkiwi/openwarp.git
+cd openwarp
+DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 \
+  cargo run -p openwarp-server
 ```
 
-Open http://127.0.0.1:8080 and register. Save the **recovery kit** returned at
-registration offline: it is your X25519 private key.
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080), register an account, and save the recovery kit offline. The first account is the instance owner. Use the console to create an application, choose an environment, and add a secret.
 
-## Hosting
+This is a local development setup. The server generates a development master key and stores it in the database. For a real deployment, supply an external key and enable production mode.
 
-Docker is the supported self-host path (`docker compose up --build`:
-server + Postgres + Redis). Set `OPENWARP_MASTER_KEY` (32 random bytes,
-base64) and `OPENWARP_ENV=production` for anything real: production refuses
-to start without an external master key, while development generates one and
-stores it in the database with a warning. Cloudflare Workers cannot run this server
-as-is (it needs OS sockets, threads and a local DB driver; Workers is a
-wasm isolate runtime), so a Worker port would be a separate rewrite of
-the storage and HTTP layers around the portable `openwarp-crypto` crate.
+### Install the CLI
 
-## CLI
+In another terminal, from the repository root:
 
 ```bash
-openwarp login            # browser OAuth (PKCE, ephemeral loopback port), or: login --token <TOKEN>, or machine login with --client-id/--client-secret
-openwarp init --app <APP_ID> --env <ENV_ID>   # writes .openwarp.json; later commands read it
-openwarp secrets --env <ENV_ID>          # redacted list
-openwarp secrets --env <ENV_ID> --show
-openwarp export  --env <ENV_ID>
-openwarp import  --env <ENV_ID> .env
-openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
+cargo install --path crates/cli
+openwarp login
+openwarp init --app APP_ID --env ENV_ID
+openwarp secrets
+openwarp run -- ./your-app
 ```
 
-Access tokens are refreshed automatically from the saved refresh token when
-one exists; `init` defaults remove the need to pass `--env` on every call.
-Access and refresh tokens are stored in the operating system credential store
-(macOS Keychain, Linux Secret Service) and removed from the config file when
-that succeeds; `OPENWARP_NO_KEYRING=1` forces the 0600 file, and
-`OPENWARP_CONFIG` overrides its path.
+Replace `APP_ID` and `ENV_ID` with IDs from your instance. `init` saves project defaults in `.openwarp.json`; `run` supplies secrets as environment variables to the child process. See [getting started](docs/GETTING_STARTED.md) for a complete walkthrough and the [CLI reference](docs/CLI.md) for authentication and command options.
 
-## Sign-in and signups
+### Self-host with Compose
 
-Password sign-in is always available. Google and GitHub sign-in appear on the
-login screen when `OPENWARP_GOOGLE_CLIENT_ID`/`_SECRET` or
-`OPENWARP_GITHUB_CLIENT_ID`/`_SECRET` are set; an unconfigured provider returns
-404 and is not advertised. Verified email addresses are required, and an account
-that already has a password is never linked to a social identity silently.
+The included Compose stack runs OpenWarp with PostgreSQL 17 and Redis 7. It requires a master key and database password:
 
-Signups are open on a new instance. The instance owner (the first account) can
-close them under Settings, or pin the policy with `OPENWARP_SIGNUPS=closed`.
-With signups closed, new users join only through an invitation: an admin invites
-an address, an existing account is added directly, a new address receives a
-single-use link valid for seven days, and the invitee either sets a password or
-signs in with a configured provider. See [docs/DEPLOY.md](docs/DEPLOY.md).
+```bash
+export OPENWARP_MASTER_KEY="$(openssl rand -base64 32)"
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+docker compose up -d --build
+```
 
-## Security model
+Save both values in your deployment secret store before restarting or recreating the stack. Configure HTTPS, the public URL, persistent storage, and backups before exposing it. The [deployment guide](docs/DEPLOY.md) explains the full setup.
 
-- Crypto mirrors Phase's documented construction: ephemeral X25519 key
-  exchange + XChaCha20-Poly1305 AEAD (`Keph || nonce || ct`), Argon2id
-  password wrapping of user private keys, SHA-256 token hashing.
-- Secrets are stored only as ciphertext (`key_enc`, `value_enc`, `comment_enc`)
-  under a per-environment data key; that key is wrapped by the server master
-  key (`OPENWARP_MASTER_KEY`, or a generated key persisted in the `meta`
-  table). This is Phase's *SSE* mode. The `openwarp-crypto` crate provides the
-  full E2E primitives (encrypt-to-public-key, sealed box) used for Lockbox and
-  GitHub sync; browser-side E2E decryption is future work, so treat the server
-  as trusted for plaintext in transit, exactly like an SSE-enabled Phase app.
-- `sealed` secrets are never returned by the API after deploy.
-- True E2E environments are available alongside SSE: in E2E envs the server
-  stores only ciphertext and wrapped env keys it cannot decrypt; the CLI and
-  the browser console (pure-JS X25519/XChaCha20-Poly1305) decrypt locally.
-- OIDC SSO (authorization-code flow, JWKS-verified) identifies users by
-  issuer plus subject, never by email: a first-time SSO login that matches an
-  existing account is refused instead of linked, so an organisation cannot
-  take over an account by configuring its own issuer. SCIM users and groups
-  require `org_id` and admin rights in that organisation, and deactivation
-  removes that organisation's membership only.
-- TOTP MFA with recovery codes (also enforced on the OAuth consent flow, with
-  per-address guess limits; changing an active enrolment requires the
-  password), enforced IP allowlists covering `/api`, `/mcp` and `/scim`, login
-  and registration rate limiting, and custom RBAC roles that are deny by
-  default: a role only receives the permissions in its list, managed roles keep
-  their documented breadth, and every read, write, delete, integration, lease,
-  rotation, token and org-admin route checks one of them. Environment and
-  application grant lists narrow the default, and an environment marked
-  restricted admits only its members (or holders of an approved access
-  request). Env-scoped service tokens cannot escape their environment over REST
-  or MCP, cannot call SCIM, and cannot mint wider tokens. Machine identities
-  (Universal Auth) issue 1-hour tokens and cannot mint longer-lived ones.
-  Approval workflows, log streams, a rotation scheduler, allowlisted dynamic
-  Postgres leases and a basic PKI round out the Phase + Infisical takeaways.
-- OIDC issuer changes drop the stored client secret unless a new secret is
-  supplied in the same request, so a secret is never sent to a different
-  identity provider. OIDC states expire after ten minutes and the nonce is
-  checked when the provider returns one.
-- OAuth clients only receive scopes they registered; PKCE verifiers must be
-  non-empty; MCP rejects any `Origin` that is not an exact match for the
-  request host or the configured public URL.
-- Password reset re-wraps the existing private key only when the recovery kit
-  is supplied; replacing the key is a separate, explicit choice that makes
-  existing end-to-end environments unreadable. Either path revokes every
-  session and OAuth token for the account, and reset links are single use.
-- Optional email verification (`OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`) keeps
-  new password accounts unverified until they open a 24-hour link. Mail is
-  delivered through `OPENWARP_EMAIL_WEBHOOK`; the server refuses to start with
-  verification required and no relay configured.
-- Rate limits live in the database, so they survive a restart and apply across
-  replicas.
-- OAuth access tokens are scope-checked on every REST call (`secrets:read`
-  for reads, `secrets:write` for mutations) and `/mcp` validates the token
-  audience. The authorize page escapes all parameters and sets a
-  restrictive Content-Security-Policy.
-- `OPENWARP_ENV=production` refuses to start without `OPENWARP_MASTER_KEY`;
-  development still generates one and stores it in the database, with a
-  warning.
-- Get an external crypto review before production use.
+## How it fits together
 
-## Features (all unlocked)
+```mermaid
+flowchart LR
+    Console[Browser console] --> Server[OpenWarp server]
+    CLI[CLI and applications] --> Server
+    MCP[MCP clients] --> Server
+    Server --> DB[(SQLite or PostgreSQL)]
+    Server -. optional session cache .-> Redis[(Redis)]
+    Server --> Providers[Sync destinations]
+```
 
-See [docs/FEATURES.md](docs/FEATURES.md) for the full matrix and API reference.
+The server hosts the console and API. SQLite keeps local setup small; PostgreSQL is available for deployed instances. Redis is optional. Secrets in standard environments are encrypted under per-environment keys wrapped by the instance master key. End-to-end environments keep decryption in the client.
+
+## Documentation
+
+| For | Read |
+| --- | --- |
+| First-time users | [Getting started](docs/GETTING_STARTED.md), [console guide](docs/CONSOLE.md) |
+| Developers and automation | [CLI reference](docs/CLI.md), [API reference](docs/API.md), [integrations](docs/INTEGRATIONS.md) |
+| Instance operators | [Deployment](docs/DEPLOY.md), [configuration](docs/CONFIGURATION.md), [backup and restore](docs/BACKUP.md) |
+| Security reviewers | [Security model](docs/SECURITY.md), [feature boundaries](docs/FEATURES.md) |
+| Contributors | [Architecture](docs/ARCHITECTURE.md), [development](docs/DEVELOPMENT.md) |
+| When something fails | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 
 ## Development
 
 ```bash
-cargo test --workspace     # crypto, DB and HTTP integration tests
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The integration suites spawn the real server on a private SQLite file:
-`tests/security.rs` covers tenant isolation, SCIM scoping, OAuth scope and
-audience, MFA on consent, token scoping, IP allowlists, HTML escaping, member
-management and rate limiting; `tests/authorization.rs` covers custom-role
-enforcement, admin gates, OIDC secret handling, the Postgres lease boundary,
-scope escapes and account deactivation; `tests/accounts.rs` covers the signup
-policy, invite provisioning and Google/GitHub sign-in against mock providers.
-CI runs them on every push and pull request.
+The repository includes crypto tests, database tests, HTTP integration suites, and browser-console checks. The [development guide](docs/DEVELOPMENT.md) lists prerequisites and commands, including the JavaScript checks that are separate from Cargo tests.
+
+## Project boundaries
+
+OpenWarp is a native Rust service, not a Cloudflare Worker. Its server needs operating-system networking and a database driver. Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
+
+The [documentation index](docs/README.md) links every guide. Start with [security](docs/SECURITY.md) and [backup and restore](docs/BACKUP.md) before storing secrets you cannot afford to lose.
