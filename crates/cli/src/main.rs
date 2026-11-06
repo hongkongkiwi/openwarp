@@ -332,12 +332,13 @@ fn main() {
             let port = listener.local_addr().expect("loopback address").port();
             let redirect = format!("http://127.0.0.1:{}/callback", port);
             let encoded = redirect.replace(':', "%3A").replace('/', "%2F");
-            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":"secrets:read secrets:write mcp"})).send().expect("req").json().expect("json");
+            let resource = host.replace(':', "%3A").replace('/', "%2F");
+            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":"secrets:read secrets:write"})).send().expect("req").json().expect("json");
             let cid = reg["client_id"].as_str().expect("client_id").to_string();
             let verifier = openwarp_crypto::random_token("verifier");
             let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
             let state = openwarp_crypto::random_token("state");
-            let url = format!("{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope=secrets%3Aread%20secrets%3Awrite%20mcp&state={}&code_challenge={}&code_challenge_method=S256&resource={}%2Fmcp", host, cid, encoded, state, challenge, host);
+            let url = format!("{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&scope=secrets%3Aread%20secrets%3Awrite&state={}&code_challenge={}&code_challenge_method=S256&resource={}", host, cid, encoded, state, challenge, resource);
             println!("Open this URL to sign in and approve:\n{}", url);
             let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(&url).status();
             let (mut stream, _) = listener.accept().expect("callback");
