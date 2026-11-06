@@ -155,6 +155,35 @@ values are checked for size and, in proxy mode, for CR or LF. Deploying an
 environment triggers the same path as other integrations.
 `POST /api/integrations/:id/test` verifies the key and org.
 
+## Boat sandbox environments
+
+Kind `boat` writes environment variables into a Boat sandbox environment
+(`https://boat.dev/api/v1`). Config: `api_key` (a `boat_` key), `environment`
+(name or UUID, default `base`), `org` (the shared wallet for team
+environments), `mode` (`upsert` or `mirror`), `prefix`, `include_keys`,
+`exclude_keys`, `upgrade` (calls `POST /environments/{id}/upgrade` after
+syncing so existing sandboxes pick up the new version), `base_url`, and
+`dry_run`. Sync reads `envContents` from `GET /environments`, sets each
+variable with `PUT /environments/{id}/vars/{KEY}`, and in mirror mode deletes
+only previously managed names. Names must match `^[A-Za-z_][A-Za-z0-9_]*$`.
+Boat only delivers variables to sandboxes created or upgraded after the
+change, so set `upgrade` when existing sandboxes must see the new values.
+
+## Daytona vault secrets
+
+Kind `daytona` writes to Daytona's organisation vault
+(`https://api.daytona.io`). Config: `api_key`, `organization_id` (sent as
+`X-Daytona-Organization-ID`, required with JWT auth), `hosts` (allowed
+outbound hosts stored on each secret), `sandbox` (optional id or name; when
+set, sync mounts every managed secret into that sandbox with
+`PUT /sandbox/{id}/secrets`), `mode`, `prefix`, `include_keys`,
+`exclude_keys`, `base_url`, and `dry_run`. Daytona never returns values, so
+sync creates missing names with `POST /secret` and patches existing ones with
+`PATCH /secret/{id}`. Mirror deletes only previously managed names. Daytona
+has no API to change environment variables on an existing sandbox after
+creation; use vault secrets plus the mount, or create the sandbox with `env`
+and replace it.
+
 ## Hardening pass (2026-11-06)
 
 - SCIM requires `?org_id=<org>` and owner or admin rights in that org. User

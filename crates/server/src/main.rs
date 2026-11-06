@@ -367,6 +367,8 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     if db::s(&row, "kind") == "trigger" { let msg = integrations::trigger_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     if db::s(&row, "kind") == "instabox" { let msg = integrations::instabox_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
+    if db::s(&row, "kind") == "boat" { let msg = integrations::boat_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
+    if db::s(&row, "kind") == "daytona" { let msg = integrations::daytona_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Ok(j(json!({"ok": true, "detail": format!("kind {} is configured; use Sync to verify against the live service", db::s(&row, "kind"))}))) }
 async fn trigger_sync(st: &S, eid: &str, uid: &str) {
     if let Ok(rows) = st.db.query("SELECT id FROM integrations WHERE env_id=?", &[json!(eid)]) {
@@ -379,23 +381,21 @@ async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, J
     let key = st.env_key(&eid)?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let items = st.list_secrets_decrypted(&eid, uid)?; let pairs: Vec<(String, String)> = items.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
-    if db::s(&row, "kind") == "trigger" {
+    let kind = db::s(&row, "kind");
+    if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona") {
         let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
         let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
-        let (msg, managed) = integrations::trigger_sync(&config, &pairs, &prev).await.map_err(|e| bad(&e))?;
+        let (msg, managed) = match kind.as_str() {
+            "trigger" => integrations::trigger_sync(&config, &pairs, &prev).await,
+            "instabox" => integrations::instabox_sync(&config, &pairs, &prev).await,
+            "boat" => integrations::boat_sync(&config, &pairs, &prev).await,
+            _ => integrations::daytona_sync(&config, &pairs, &prev).await,
+        }.map_err(|e| bad(&e))?;
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         if !dry { let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
             for n in &managed { let hv = pairs.iter().find(|(k, _)| n.ends_with(k)).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); } }
         st.audit(&org, &app, &eid, uid, "integration.sync", &msg); return Ok(msg); }
-    if db::s(&row, "kind") == "instabox" {
-        let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
-        let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
-        let (msg, managed) = integrations::instabox_sync(&config, &pairs, &prev).await.map_err(|e| bad(&e))?;
-        let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !dry { let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
-            for n in &managed { let hv = pairs.iter().find(|(k, _)| n.ends_with(k)).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); } }
-        st.audit(&org, &app, &eid, uid, "integration.sync", &msg); return Ok(msg); }
-    let msg = integrations::sync(&db::s(&row, "kind"), &config, &pairs).await.map_err(|e| bad(&e))?;
+    let msg = integrations::sync(&kind, &config, &pairs).await.map_err(|e| bad(&e))?;
     st.audit(&org, &app, &eid, uid, "integration.sync", &msg); Ok(msg)
 }
 
