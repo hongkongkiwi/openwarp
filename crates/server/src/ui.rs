@@ -321,7 +321,12 @@ async function createE2eEnv(){try{
 async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];delete E2E_KEYS[removed];delete E2E_DATA[removed];delete E2E_DRAFTS[removed];delete E2E_META[removed];delete E2E_GRANTS[removed];delete E2E_LOCKED[removed];delete E2E_ERR[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
 function enc(s){return new TextEncoder().encode(s)}
 function dec(b){return new TextDecoder().decode(b)}
-async function e2eHash(path,key){let d=await crypto.subtle.digest('SHA-256',enc(String(path||'/')+':'+String(key||'').toUpperCase()));return OW.b64enc(new Uint8Array(d))}
+async function e2eHash(path,key,envKey){
+  // Match the server's blind index: HMAC under the environment key, not a bare
+  // SHA-256 a database thief could test guesses against offline.
+  let k=await crypto.subtle.importKey('raw',envKey,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  let sig=await crypto.subtle.sign('HMAC',k,enc('ow-key-index:v1|'+String(path||'/')+'|'+String(key||'').toUpperCase()));
+  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('')}
 async function e2eLoad(id,kit){E2E_LOADING[id]=true;delete E2E_ERR[id];
   try{
     let d=await api('GET',`/api/envs/${id}/e2e/secrets`);
@@ -408,7 +413,7 @@ async function deployE2E(){
     let items=[],expected=new Map();
     for(const d of puts){
       let k=(d.key||'').trim().toUpperCase(),path=d.path||'/';
-      let kh=d.key_hash||await e2eHash(path,k);
+      let kh=d.key_hash||await e2eHash(path,k,key);
       items.push({key_enc:await OW.encryptSymmetric(key,enc(k)),value_enc:await OW.encryptSymmetric(key,enc(d.value??'')),key_hash:kh,path_enc:await OW.encryptSymmetric(key,enc(path))});
       expected.set(kh,[k,d.value??'']);
     }

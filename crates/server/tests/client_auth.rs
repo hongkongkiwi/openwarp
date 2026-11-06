@@ -64,7 +64,7 @@ impl Server {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if let Ok(text) = std::fs::read_to_string(&self.log) {
-                if let Some(i) = text.find(&pattern) {
+                if let Some(i) = text.rfind(&pattern) {
                     let rest = &text[i..];
                     let end = rest.find(|c: char| c.is_whitespace() || c == '"' || c == '<').unwrap_or(rest.len());
                     return rest[..end].to_string();
@@ -294,6 +294,26 @@ async fn a_v2_login_still_requires_the_second_factor() {
     let mfa = r.body["mfa_token"].as_str().unwrap();
     let r = s.call(Method::POST, "/api/auth/mfa", None, Some(json!({"mfa_token": mfa, "code": totp(&secret)}))).await;
     assert_eq!(r.status, 200, "MFA after v2 login failed: {} {}", r.status, r.text);
+
+    // A v2 account never knows a server-readable password, so factor changes
+    // must rely on the session rather than asking for one.
+    let session = r.body["token"].as_str().unwrap();
+    let r = s.call(Method::DELETE, "/api/me/totp", Some(session), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "a v2 account must be able to disable TOTP: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn a_v1_reset_cannot_downgrade_a_v2_account() {
+    let s = Server::start().await;
+    let reg = register_v2_verified(&s, "downgrade@test.invalid").await;
+    let uid = reg.body["user_id"].as_str().unwrap().to_string();
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    conn.execute("INSERT INTO auth_tokens(token_hash,user_id,kind,created_at,expires_at,used) VALUES(?,?,?,?,?,0)",
+        rusqlite::params![oc::hash_token("v1-reset"), uid, "reset", 0i64, 4_000_000_000i64]).unwrap();
+    let r = s.call(Method::POST, "/api/auth/reset", None, Some(json!({"token": "v1-reset", "password": "new-correct-horse", "discard_e2e_key": true}))).await;
+    assert_eq!(r.status, 400, "a version 1 reset must not overwrite a v2 account: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "downgrade@test.invalid", "password": "new-correct-horse"}))).await;
+    assert_eq!(r.status, 401, "the password endpoint must stay closed for v2 accounts: {} {}", r.status, r.text);
 }
 
 #[tokio::test]

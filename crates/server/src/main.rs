@@ -405,6 +405,9 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
     let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).await.map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+    // A version 2 account has no server-usable password, even if an old reset
+    // path left a hash behind; it must use the challenge login.
+    if db::n(&row, "auth_version") == 2 { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key).await;
@@ -461,6 +464,7 @@ async fn register_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum
     if !st.rate_ok(&rl, 5, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
     st.rate_fail(&rl, 3600).await;
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password registration is disabled on this instance; sign in with a configured provider")); }
+    if production() && !mailer::MailConfig::from_env().enabled() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "password signup is unavailable: no email provider is configured; use a configured sign-in provider or ask an administrator")); }
     let email = r.email.trim().to_lowercase();
     if email.is_empty() || !valid_email(&email) { return Err(bad("email required")); }
     if !signups_open(&st).await { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
@@ -478,7 +482,8 @@ async fn register_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(&oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
     claim_instance_owner(&st, &uid).await;
-    mfa::note_password_login(&st, &uid).await;
+    // A v2 account never proves a password, so factor management must not ask
+    // for one; the session or auth-key proof is the credential.
     st.audit("", "", "", &uid, "auth.register_v2", &email).await;
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
@@ -521,7 +526,6 @@ async fn login_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     st.rate_clear(&key).await;
     if db::n(&row, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
     if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
-    mfa::note_password_login(&st, &uid).await;
     st.audit("", "", "", &uid, "auth.login_v2", "").await;
     login_outcome(&st, &uid, &db::s(&row, "pubkey"), Some(&db::s(&row, "wrapped_privkey"))).await }
 #[derive(Deserialize, Default)] struct ResetV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String, #[serde(default)] discard_e2e_key: bool }
@@ -551,7 +555,6 @@ async fn reset_password_v2(State(st): State<S>, axum::extract::ConnectInfo(addr)
     let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]).await;
     let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await;
     let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]).await;
-    mfa::note_password_login(&st, &uid).await;
     st.audit("", "", "", &uid, "auth.password_reset_v2", if replaced { "key replaced" } else { "kit supplied" }).await;
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
 #[derive(Deserialize, Default)] struct ResetInfoReq { token: String }
@@ -2277,7 +2280,10 @@ async fn reset_password(State(st): State<S>, axum::extract::ConnectInfo(addr): a
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT user_id FROM auth_tokens WHERE token_hash=? AND kind='reset' AND used=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
     let uid = db::s(&row, "user_id");
-    let user = st.db.one("SELECT email,pubkey,email_verified FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    let user = st.db.one("SELECT email,pubkey,email_verified,auth_version FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    // A version 1 reset would install a real password hash on a version 2
+    // account and reopen the password endpoint; keep the account on v2.
+    if db::n(&user, "auth_version") == 2 { return Err(bad("this account uses client-derived sign-in; use the v2 reset endpoint")); }
     st.rate_fail(&key, 900).await;
     let kit = r.recovery_kit.trim().to_string();
     let (pubkey, wrapped, replaced) = if !kit.is_empty() {
@@ -3706,9 +3712,8 @@ async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<Hash
     let hidden = hidden_fields(&q);
     let client = esc(q.get("client_id").map(|s| s.as_str()).unwrap_or(""));
     let scope = esc(q.get("scope").map(|s| s.as_str()).unwrap_or(""));
-    if let Some(uid) = oauth_user(&st, &h).await {
-        let otp = if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" { "<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code><br>".to_string() } else { String::new() };
-        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden, otp));
+    if oauth_user(&st, &h).await.is_some() {
+        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden));
     }
     html_csp_with(OAUTH_AUTH_CSP, format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form id=\"oauthlogin\" method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form>{}</body></html>", hidden, OAUTH_AUTH_JS))
 }
@@ -3718,8 +3723,7 @@ fn consent_mfa_page(form: &HashMap<String, String>, token: &str) -> String {
 async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
     let (client_id, redirect, scope) = match authorize_params_ok(&st, &form).await { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
     let form_token = form.get("mfa_token").cloned().unwrap_or_default();
-    let uid = if let Some(u) = oauth_user(&st, &h).await { u }
-    else if !form_token.is_empty() {
+    let uid = if !form_token.is_empty() {
         let uid = match mfa::challenge_user(&st, &form_token).await { Some(u) => u, None => return (StatusCode::UNAUTHORIZED, "this two-factor challenge expired; sign in again").into_response() };
         let key = format!("otp:{}:{}", addr.ip(), uid);
         if !st.rate_ok(&key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
@@ -3729,6 +3733,13 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         st.rate_clear(&key).await;
         mfa::consume_challenge(&st, &form_token).await;
         uid }
+    else if let Some(u) = oauth_user(&st, &h).await {
+        // A session already passed the sign-in checks, but consent is a
+        // privileged action; require the second factor again.
+        if mfa::required(&st, &u).await {
+            let token = match mfa::new_challenge(&st, &u).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
+            return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
+        u }
     else if !form.get("proof").cloned().unwrap_or_default().is_empty() {
         let email = form.get("email").cloned().unwrap_or_default().trim().to_lowercase();
         let cid = form.get("challenge_id").cloned().unwrap_or_default();
@@ -3750,7 +3761,6 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         st.rate_clear(&key).await;
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
         if db::n(&row, "email_verified") == 0 { return (StatusCode::FORBIDDEN, "verify your email address before signing in").into_response(); }
-        mfa::note_password_login(&st, &uid).await;
         if mfa::required(&st, &uid).await {
             let token = match mfa::new_challenge(&st, &uid).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
             return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
@@ -4196,8 +4206,12 @@ async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String>
             let raw = kms.unwrap(&db::s(&r, "v"), "master").map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
             return raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string());
         }
-        let local = if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
-            oc::unb64(&db::s(&r, "v")).ok().and_then(|b| b.try_into().ok())
+        // A present-but-unreadable master row must stop the boot. Minting a new
+        // root here would make every record under the old key undecryptable and
+        // delete the only copy of the old root.
+        let local: Option<[u8; 32]> = if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
+            let raw = oc::unb64(&db::s(&r, "v")).map_err(|_| "the stored master root is not valid base64; refusing to generate a replacement".to_string())?;
+            Some(raw.try_into().map_err(|_| "the stored master root is not 32 bytes; refusing to generate a replacement".to_string())?)
         } else { None };
         let k = local.unwrap_or_else(oc::random_key);
         let wrapped = kms.wrap(&k, "master")?;
