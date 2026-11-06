@@ -63,15 +63,20 @@ async fn resolve(cfg: &Config, token: &str, target: &Target) -> Result<String, A
     let (workspace, app, env) = match target {
         Target::EnvId(id) => return Ok(id.clone()),
         Target::Names { workspace, app, env } => (workspace, app, env) };
-    // OpenWarp only lets an environment-scoped token call /api/envs/{its own id}.
-    // Listing workspaces and apps is refused, so names need an unscoped token.
-    let orgs = get_json(cfg, token, "/api/orgs").await.map_err(|(status, Json(body))| {
-        if status != StatusCode::FORBIDDEN { return (status, Json(body)) }
-        let upstream = body.get("error").and_then(Value::as_str).unwrap_or("forbidden");
-        (StatusCode::FORBIDDEN, Json(json!({
-            "error": format!("this token cannot resolve names ({upstream}); use the environment id as the ref"),
-            "code": "name_resolution_forbidden" })))
-    })?;
+    let me = get_json(cfg, token, "/api/me").await?;
+    let scope = me["env_scope"].as_str().unwrap_or("");
+    if !scope.is_empty() {
+        // The token is confined to one environment, so the API refuses to list
+        // workspaces for it. Compare the reference against that one environment.
+        let meta = get_json(cfg, token, &format!("/api/envs/{scope}/meta")).await?;
+        let same = meta["app"].as_str() == Some(app.as_str())
+            && meta["name"].as_str() == Some(env.as_str())
+            && workspace.as_ref().is_none_or(|w| meta["workspace"].as_str() == Some(w.as_str()));
+        if same { return Ok(scope.to_string()) }
+        return Err(fail(StatusCode::FORBIDDEN, &format!("this token is scoped to {}/{}/{}; reference that environment or use its id",
+            meta["workspace"].as_str().unwrap_or(""), meta["app"].as_str().unwrap_or(""), meta["name"].as_str().unwrap_or(""))));
+    }
+    let orgs = get_json(cfg, token, "/api/orgs").await?;
     let mut matches = Vec::new();
     for org in orgs.as_array().cloned().unwrap_or_default() {
         if let Some(wanted) = workspace {
@@ -185,6 +190,7 @@ mod tests {
     // Stands in for OpenWarp: one env id, one name path, and a 404 for anything else.
     async fn stub_upstream() -> String {
         serve(Router::new()
+            .route("/api/me", get(|| async { Json(v!({"id": "u1", "env_scope": ""})) }))
             .route("/api/orgs", get(|| async { Json(v!([{"id": "o1", "name": "Acme"}])) }))
             .route("/api/orgs/{oid}/apps", get(|| async { Json(v!([{"id": "a1", "name": "api"}])) }))
             .route("/api/apps/{aid}/envs", get(|| async { Json(v!([
@@ -271,18 +277,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
-    // An environment-scoped token cannot list workspaces, so a name reference has
-    // to say what to do instead of surfacing the upstream message alone.
+    // A token confined to one environment cannot list workspaces, so the bridge
+    // checks the reference against the environment the token names in /api/me.
+    async fn scoped_upstream(meta_status: StatusCode) -> String {
+        serve(Router::new()
+            .route("/api/me", get(|| async { Json(v!({"id": "u1", "env_scope": "e1"})) }))
+            .route("/api/envs/{eid}/meta", get(move || async move {
+                if meta_status != StatusCode::OK { return (meta_status, Json(v!({"error": "env not found"}))) }
+                (StatusCode::OK, Json(v!({"id": "e1", "name": "Production", "app": "api", "workspace": "Acme"})))
+            }))
+            .route("/api/envs/{eid}/export", get(|| async {
+                Json(v!({"text": "", "secrets": [{"key": "K", "value": "v", "decrypt_error": false}]})) }))).await
+    }
+
     #[tokio::test]
-    async fn scoped_token_gets_a_clear_name_resolution_error() {
-        let upstream = serve(Router::new().route("/api/orgs", get(|| async {
-            (StatusCode::FORBIDDEN, Json(v!({"error": "this token is scoped to a different environment"}))) }))).await;
-        let bridge = serve(router(config(&upstream))).await;
-        let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=api/Production"))
+    async fn scoped_token_resolves_the_environment_it_is_confined_to() {
+        let bridge = serve(router(config(&scoped_upstream(StatusCode::OK).await))).await;
+        let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=Acme/api/Production"))
+            .bearer_auth("t").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["data"]["K"], "v");
+    }
+
+    #[tokio::test]
+    async fn scoped_token_refuses_a_name_outside_its_scope() {
+        let bridge = serve(router(config(&scoped_upstream(StatusCode::OK).await))).await;
+        let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=Acme/api/Staging"))
             .bearer_auth("t").send().await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["code"], "name_resolution_forbidden");
-        assert!(body["error"].as_str().unwrap().contains("environment id"));
+        assert!(body["error"].as_str().unwrap().contains("Acme/api/Production"));
+    }
+
+    // A deleted environment must stay 404 so ESO applies its deletionPolicy.
+    #[tokio::test]
+    async fn scoped_token_sees_404_when_its_environment_is_gone() {
+        let bridge = serve(router(config(&scoped_upstream(StatusCode::NOT_FOUND).await))).await;
+        let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=Acme/api/Production"))
+            .bearer_auth("t").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
