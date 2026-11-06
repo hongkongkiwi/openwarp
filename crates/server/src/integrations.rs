@@ -100,13 +100,15 @@ pub async fn sync_with_tags(kind: &str, config: &Value, secrets: &[(String, Stri
             let project = cfg(config,"project"); let token = gcp_access_token(config).await?;
             let root = base(config,"https://secretmanager.googleapis.com"); let static_tags = config_tags(config)?;
             let mut label_failures = 0;
-            for (k, v) in secrets {
+            let mut seen = std::collections::HashSet::new();
+            let secrets: Vec<_> = secrets.iter().filter(|(name, _)| seen.insert(name.clone())).cloned().collect();
+            for (k, v) in &secrets {
                 let name = k.to_lowercase().replace('_',"-");
                 let labels = gcp_labels(&merge_tags(tags_by_name.get(k).map(String::as_str).unwrap_or(""), &static_tags));
                 let mut create = json!({"replication":{"automatic":{}}});
                 if !labels.is_empty() { create["labels"] = Value::Object(labels.clone()); }
                 let existing = matches!(client.post(format!("{}/v1/projects/{}/secrets?secretId={}", root, project, name)).bearer_auth(&token).json(&create).send().await, Ok(response) if response.status().as_u16() == 409);
-                if existing && !labels.is_empty() && req(client.patch(format!("{}/v1/projects/{}/secrets/{}?updateMask=labels", root, project, name)).bearer_auth(&token).json(&json!({"labels": labels}))).await.is_err() { label_failures += 1; }
+                if existing && req(client.patch(format!("{}/v1/projects/{}/secrets/{}?updateMask=labels", root, project, name)).bearer_auth(&token).json(&json!({"labels": labels}))).await.is_err() { label_failures += 1; }
                 req(client.post(format!("{}/v1/projects/{}/secrets/{}:addVersion", root, project, name)).bearer_auth(&token).json(&json!({"payload":{"data": openwarp_crypto::b64(v.as_bytes())}}))).await?;
             }
             let note = if label_failures > 0 { format!("; labels could not be updated on {} secret(s)", label_failures) } else { String::new() };
@@ -972,8 +974,49 @@ pub async fn aws_parameter_store_test(config: &Value) -> Result<String, String> 
 
 // ---------- Azure Key Vault ----------
 fn azure_secret_name(name: &str) -> String { name.to_lowercase().replace('_', "-") }
+async fn azure_disable_versions(client: &crate::http::Client, root: &str, target: &str, token: &str) -> Result<bool, String> {
+    let list = reqwest::Url::parse(&format!("{}/secrets/{}/versions?api-version=7.4", root, target)).map_err(|_| "invalid Azure versions URL")?;
+    let version_prefix = format!("{}/", list.path().strip_suffix("/versions").ok_or("invalid Azure versions path")?);
+    let mut page = list.clone();
+    let mut pages = std::collections::HashSet::new();
+    let mut versions = std::collections::BTreeSet::new();
+    loop {
+        if pages.len() >= 100 || !pages.insert(page.to_string()) { return Err("Azure versions pagination limit or cycle".into()); }
+        let response = client.get(page.as_str()).bearer_auth(token).send().await.map_err(|e| e.to_string())?;
+        if response.status().as_u16() == 404 && pages.len() == 1 { return Ok(false); }
+        if !response.status().is_success() { return Err(format!("Azure list versions failed: HTTP {}", response.status())); }
+        let value: Value = response.json().await.map_err(|e| e.to_string())?;
+        let items = value.get("value").and_then(Value::as_array).ok_or("Azure versions response missing value array")?;
+        for item in items {
+            let id = item.get("id").and_then(Value::as_str).ok_or("Azure version missing id")?;
+            let id = reqwest::Url::parse(id).map_err(|_| "invalid Azure version id")?;
+            if id.origin() != list.origin() || !id.username().is_empty() || id.password().is_some() || id.query().is_some() || id.fragment().is_some() {
+                return Err("Azure version id must belong to the configured vault and secret".into());
+            }
+            let version = id.path().strip_prefix(&version_prefix).ok_or("Azure version id must belong to the configured secret")?;
+            if version.is_empty() || !version.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return Err("invalid Azure secret version".into()); }
+            versions.insert(version.to_string());
+        }
+        match value.get("nextLink") {
+            None | Some(Value::Null) => break,
+            Some(Value::String(next)) if next.is_empty() => break,
+            Some(Value::String(next)) => {
+                let next = page.join(next).map_err(|_| "invalid Azure versions nextLink")?;
+                if next.origin() != list.origin() || next.path() != list.path() || !next.username().is_empty() || next.password().is_some() || next.fragment().is_some() {
+                    return Err("Azure versions nextLink must stay on the configured secret versions path".into());
+                }
+                page = next;
+            }
+            _ => return Err("invalid Azure versions nextLink".into()),
+        }
+    }
+    for version in &versions {
+        req(client.patch(format!("{}/secrets/{}/{}?api-version=7.4", root, target, version)).bearer_auth(token).json(&json!({"attributes":{"enabled":false}}))).await?;
+    }
+    Ok(!versions.is_empty())
+}
 async fn azure_key_vault_sync(config: &Value, secrets: &[(String, String)], tags_by_name: &HashMap<String, String>, previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
-    let token = azure_access_token(config).await?;
+    let token = if is_dry(config) { String::new() } else { azure_access_token(config).await? };
     let root = if cfg(config,"base_url").is_empty() { format!("https://{}.vault.azure.net", cfg(config,"vault")) } else { base(config,"") };
     let mode = sync_mode(config, "azure_key_vault")?;
     let absent = { let a = cfg(config,"absent"); if a.is_empty() { "keep" } else { a } };
@@ -988,7 +1031,7 @@ async fn azure_key_vault_sync(config: &Value, secrets: &[(String, String)], tags
         if name.is_empty() { return Err("azure_key_vault many_to_one requires secret_name".into()); }
         if mode == "mirror" || absent == "disable" { return Err("azure_key_vault many_to_one cannot track individual keys; use mapping one_to_one".into()); }
         if !dry {
-            let mut body = json!({"value": map_json(&desired).to_string()});
+            let mut body = json!({"value": map_json(&desired).to_string(), "attributes":{"enabled":true}});
             if !static_tags.is_empty() { body["tags"] = tags_object(&static_tags); }
             req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&body)).await?;
         }
@@ -1001,10 +1044,9 @@ async fn azure_key_vault_sync(config: &Value, secrets: &[(String, String)], tags
         let target = azure_secret_name(name);
         let tag_list = merge_tags(tags_by_name.get(name).map(String::as_str).unwrap_or(""), &static_tags);
         if !dry {
-            let mut body = json!({"value": value});
+            let mut body = json!({"value": value, "attributes":{"enabled":true}});
             if !tag_list.is_empty() { body["tags"] = tags_object(&tag_list); }
             req(client.put(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&body)).await?;
-            if absent == "disable" { req(client.patch(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&json!({"attributes":{"enabled":true}}))).await?; }
         }
         managed.push(name.clone());
     }
@@ -1013,9 +1055,9 @@ async fn azure_key_vault_sync(config: &Value, secrets: &[(String, String)], tags
             let target = azure_secret_name(name);
             if desired.iter().any(|(n, _)| azure_secret_name(n) == target) { continue; }
             if absent == "disable" {
-                match req(client.patch(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&json!({"attributes":{"enabled":false}}))).await {
-                    Ok(_) => { disabled += 1; managed.push(name.clone()); }
-                    Err(e) if e.contains("404") => {}
+                match azure_disable_versions(&client, &root, &target, &token).await {
+                    Ok(true) => { disabled += 1; managed.push(name.clone()); }
+                    Ok(false) => {}
                     Err(e) => return Err(format!("disable {} failed: {}", name, e)),
                 }
             } else if mode == "mirror" {
@@ -4257,23 +4299,45 @@ mod tests {
 
     #[tokio::test]
     async fn azure_key_vault_disables_absent_names_and_restores_metadata_tags() {
-        let (base, calls) = start_mock_routes(mock_routes(&[
-            ("PUT /secrets/app-api-key", 200, "{}"),
-            ("PATCH /secrets/app-api-key", 200, "{}"),
-            ("PATCH /secrets/app-old-key", 200, "{}"),
-        ]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("mock bind");
+        let base = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let calls: FullCalls = Arc::new(Mutex::new(Vec::new()));
+        let router = axum::Router::new().fallback(axum::routing::any(
+            |axum::extract::State((base, calls)): axum::extract::State<(String, FullCalls)>, request: axum::http::Request<axum::body::Body>| async move {
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.expect("mock body");
+                let method = parts.method.to_string(); let path = parts.uri.to_string();
+                calls.lock().unwrap().push((method.clone(), path.clone(), format!("{:?}", parts.headers), String::from_utf8(bytes.to_vec()).expect("UTF-8 JSON")));
+                let response = match (method.as_str(), path.as_str()) {
+                    ("PUT", "/secrets/app-api-key?api-version=7.4") => json!({"id": format!("{}/secrets/app-api-key/1234567890abcdef1234567890abcdef", base)}),
+                    ("GET", "/secrets/app-old-key/versions?api-version=7.4") => json!({"value": [{"id": format!("{}/secrets/app-old-key/abcdef1234567890abcdef1234567890", base), "attributes": {"enabled": true}}], "nextLink": null}),
+                    ("PATCH", "/secrets/app-old-key/abcdef1234567890abcdef1234567890?api-version=7.4") => json!({"attributes": {"enabled": false}}),
+                    _ => return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "unexpected Key Vault 7.4 request; PATCH requires a version"}))),
+                };
+                (axum::http::StatusCode::OK, axum::Json(response))
+            }
+        )).with_state((base.clone(), calls.clone()));
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.expect("mock serve"); });
         let config = json!({"base_url": base, "token": "azure-token", "absent": "disable", "prefix": "APP_"});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
         let tags = HashMap::from([("APP_API_KEY".to_string(), "owner=platform".to_string())]);
-        let (report, managed) = azure_key_vault_sync(&config, &secrets, &tags, &["APP_OLD_KEY".to_string()]).await.expect("azure sync");
-        assert!(report.contains("disabled=1"), "{}", report);
+        let result = azure_key_vault_sync(&config, &secrets, &tags, &["APP_OLD_KEY".to_string()]).await;
+        task.abort(); let (report, managed) = result.expect("azure sync");
+        assert!(report.contains("pushed=1") && report.contains("disabled=1"), "{}", report);
         assert_eq!(managed, vec!["APP_API_KEY".to_string(), "APP_OLD_KEY".to_string()]);
         let calls = calls.lock().unwrap();
-        let put = calls.iter().find(|(m, p, _, _)| m == "PUT" && p.contains("/secrets/app-api-key")).expect("put");
+        assert_eq!(calls.len(), 3, "one current write, version discovery and absent-version disable: {:?}", calls);
+        let put = calls.iter().find(|(m, p, _, _)| m == "PUT" && p == "/secrets/app-api-key?api-version=7.4").expect("put");
         let body: Value = serde_json::from_str(&put.3).expect("json");
-        assert_eq!(body["tags"]["owner"], "platform");
-        assert!(calls.iter().any(|(m, p, _, body)| m == "PATCH" && p.contains("/secrets/app-api-key") && body.contains("\"enabled\":true")));
-        assert!(calls.iter().any(|(m, p, _, body)| m == "PATCH" && p.contains("/secrets/app-old-key") && body.contains("\"enabled\":false")));
+        assert_eq!(body["value"], "v1");
+        assert_eq!(body["tags"], json!({"owner": "platform"}));
+        assert_eq!(body["attributes"]["enabled"], true, "the new current version is enabled by its PUT");
+        assert!(calls.iter().any(|(m, p, _, _)| m == "GET" && p == "/secrets/app-old-key/versions?api-version=7.4"));
+        let patches: Vec<_> = calls.iter().filter(|(m, _, _, _)| m == "PATCH").collect();
+        assert_eq!(patches.len(), 1, "only the absent version needs a PATCH");
+        assert_eq!(patches[0].1, "/secrets/app-old-key/abcdef1234567890abcdef1234567890?api-version=7.4");
+        assert_eq!(serde_json::from_str::<Value>(&patches[0].3).expect("disable JSON"), json!({"attributes": {"enabled": false}}));
+        assert!(!calls.iter().any(|(m, _, _, _)| m == "DELETE"), "disable preserves the remote secret and ownership");
     }
 
     #[test]

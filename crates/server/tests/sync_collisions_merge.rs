@@ -18,16 +18,20 @@ impl Mock {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(Mutex::new(Vec::new()));
-        async fn capture(State(calls): State<Arc<Mutex<Vec<Call>>>>, request: Request<Body>) -> Json<Value> {
+        async fn capture(State((base, calls)): State<(String, Arc<Mutex<Vec<Call>>>)>, request: Request<Body>) -> Json<Value> {
             let (parts, body) = request.into_parts();
             let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
             let target = parts.headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-            let response = if target == "secretsmanager.ListSecrets" { json!({"SecretList": []}) } else { json!({}) };
+            let response = if target == "secretsmanager.ListSecrets" { json!({"SecretList": []}) }
+                else if parts.method == "GET" && parts.uri.path().starts_with("/secrets/") && parts.uri.path().ends_with("/versions") {
+                    let secret = parts.uri.path().trim_end_matches("/versions");
+                    json!({"value": [{"id": format!("{}{}/1234567890abcdef1234567890abcdef", base, secret), "attributes": {"enabled": true}}], "nextLink": null})
+                } else { json!({}) };
             calls.lock().unwrap().push(Call { method: parts.method.to_string(), path: parts.uri.path().to_string(), target,
                 body: if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).expect("mock request JSON") } });
             Json(response)
         }
-        let router = Router::new().fallback(any(capture)).with_state(calls.clone());
+        let router = Router::new().fallback(any(capture)).with_state((base.clone(), calls.clone()));
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
         Self { base, calls, task }
     }
@@ -47,13 +51,17 @@ async fn azure_retains_canonical_target(disable: bool) {
         let writes: Vec<_> = calls.iter().filter(|c| c.method == "PUT").collect();
         assert_eq!(writes.len(), 1, "one current target: {:?}", calls);
         assert_eq!(writes[0].path, "/secrets/api-key"); assert_eq!(writes[0].body["value"], "shared-value");
-        let pruned: Vec<_> = calls.iter().filter(|c| c.path == "/secrets/old-key").collect();
+        let pruned: Vec<_> = calls.iter().filter(|c| (c.path == "/secrets/old-key" || c.path.starts_with("/secrets/old-key/")) && (c.method == "PATCH" || c.method == "DELETE")).collect();
         assert_eq!(pruned.len(), 1, "a genuinely absent owned target must still be pruned: {:?}", calls);
+        assert_eq!(writes[0].body["attributes"]["enabled"], true, "current target must be enabled by its new-version PUT");
         if disable {
-            assert_eq!(pruned[0].method, "PATCH"); assert_eq!(pruned[0].body["attributes"]["enabled"], false);
-            assert!(calls.iter().any(|c| c.method == "PATCH" && c.path == "/secrets/api-key" && c.body["attributes"]["enabled"] == true), "current target must be enabled");
-        } else { assert_eq!(pruned[0].method, "DELETE"); }
-        unsafe_calls.extend(calls.into_iter().filter(|c| c.path == "/secrets/api-key" &&
+            assert!(calls.iter().any(|c| c.method == "GET" && c.path == "/secrets/old-key/versions"), "discover the absent target's version");
+            assert_eq!(pruned[0].method, "PATCH");
+            assert_eq!(pruned[0].path, "/secrets/old-key/1234567890abcdef1234567890abcdef");
+            assert_eq!(pruned[0].body["attributes"]["enabled"], false);
+            assert!(calls.iter().filter(|c| c.method == "PATCH").all(|c| c.path.trim_matches('/').split('/').count() == 3), "Key Vault PATCH must target a version");
+        } else { assert_eq!(pruned[0].method, "DELETE"); assert_eq!(pruned[0].path, "/secrets/old-key"); }
+        unsafe_calls.extend(calls.into_iter().filter(|c| (c.path == "/secrets/api-key" || c.path.starts_with("/secrets/api-key/")) &&
             (c.method == "DELETE" || (c.method == "PATCH" && c.body["attributes"]["enabled"] == false))));
     }
     assert!(unsafe_calls.is_empty(), "renaming an owned logical key must not prune its still-desired canonical Azure target: {:?}", unsafe_calls);

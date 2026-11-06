@@ -143,7 +143,7 @@ Naming is off by default and applies to every adapter. It renames a key on the w
 
 For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. For Terraform-style names, `"prefix": "TF_VAR_", "case": "upper"` writes `db_host` as `TF_VAR_DB_HOST`; `case` applies to the key only, so the prefix keeps its spelling. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
 
-AWS Secrets Manager, Azure Key Vault, and GCP Secret Manager accept a `tags` object of static string values and copy per-secret metadata tags. Comma-separated `key=value` entries become tags; bare entries have empty values. Static tags take precedence. AWS and Azure many-to-one mappings use static tags only. GCP converts tags to lowercase labels, replaces unsupported characters with underscores, and prefixes names that do not start with a letter with `tag_`. GCP label updates on existing secrets replace their label set; AWS tags are merged. Azure writes tags on the new secret version.
+AWS Secrets Manager, Azure Key Vault, and GCP Secret Manager accept a `tags` object of static string values and copy per-secret metadata tags. Comma-separated `key=value` entries become tags; bare entries have empty values. Static tags take precedence. AWS and Azure many-to-one mappings use static tags only. GCP converts tags to lowercase labels, replaces unsupported characters with underscores, and prefixes names that do not start with a letter with `tag_`. GCP label updates on existing secrets replace their label set, including clearing all labels when no tags remain. For duplicate selected names, GCP writes the first shared value and its metadata once. AWS tags are merged. Azure writes tags on the new secret version.
 
 The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Azure Key Vault, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) also share these options:
 
@@ -154,7 +154,7 @@ The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS
 | `include_keys` | Array of source keys to include; empty means all |
 | `exclude_keys` | Array of source keys to omit |
 | `base_url` | Override the adapter's API base for a compatible service |
-| `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore; manual Sync still runs |
+| `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore before sync-option validation; manual Sync still validates and runs |
 | `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync |
 | `disable_secret_deletion` | Boolean; suppresses pruning and retains ownership of previously managed names |
 
@@ -191,7 +191,9 @@ Two mappings are available:
 
 `mapping: one_to_one` writes each selected key as a secret. `mapping: many_to_one` writes the selected keys as one JSON value in `secret_name` and accepts static tags only. Many-to-one cannot use mirror or `absent: disable`.
 
-`absent: disable` disables previously managed names missing from the source and keeps them in managed state so returning names are enabled. It cannot be combined with `mode: mirror`; mirror deletes previously managed missing names. `disable_secret_deletion` suppresses both operations and retains ownership. Initial import is not implemented for Azure Key Vault.
+Both mappings explicitly enable each newly written version in the PUT request. `absent: disable` lists version metadata for previously managed names missing from the source, then disables every returned version with a versioned PATCH, including versions already disabled. It does not read secret values or assume version ordering. Pagination stays on the same vault and secret versions path and fails on cycles or more than 100 pages; version IDs must match the configured vault and secret. The credential needs list-version and update permissions. Discovery or update failures fail the sync rather than silently leaving versions enabled; earlier provider writes may already have succeeded.
+
+Disabled secrets remain in managed state under their logical names, not version IDs; `disabled` counts logical names. Missing secrets or empty version lists are dropped from managed state. Returning names receive a new enabled version, while older disabled versions stay disabled. It cannot be combined with `mode: mirror`; mirror deletes previously managed missing names. `disable_secret_deletion` suppresses both operations and retains ownership. Dry runs do not exchange credentials, discover versions or mutate the vault. Initial import is not implemented for Azure Key Vault.
 
 ## AWS Parameter Store
 
