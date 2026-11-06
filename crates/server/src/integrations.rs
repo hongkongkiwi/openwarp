@@ -5,7 +5,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona"];
 
-fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
+fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
 async fn req(r: reqwest::RequestBuilder) -> Result<String, String> {
@@ -86,8 +86,10 @@ pub fn trigger_targets(config: &Value) -> Vec<TriggerTarget> {
 fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
     let prefix = cfg(config, "prefix"); let include: Vec<String> = config.get("include_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
     let exclude: Vec<String> = config.get("exclude_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-    secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (format!("{}{}", prefix, k), v.clone())).collect()
+    let mut seen = std::collections::HashSet::new();
+    secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (format!("{}{}", prefix, k), v.clone())).filter(|(n, _)| seen.insert(n.clone())).collect()
 }
+pub fn desired_names(config: &Value, secrets: &[(String, String)]) -> Vec<String> { trigger_desired(config, secrets).into_iter().map(|(n, _)| n).collect() }
 pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let client = http_client(); let base_url = base(config, "https://api.trigger.dev");
     let mode = { let m = cfg(config, "mode"); if m.is_empty() { "upsert" } else { m } };
@@ -163,6 +165,7 @@ pub async fn instabox_sync(config: &Value, secrets: &[(String, String)], previou
     if delivery == "proxy" {
         if hosts.len() > 32 { return Err("Instabox hosts allows at most 32 entries".into()); }
         if let Some(bad) = hosts.iter().find(|h| h.as_str() != "*" && (h.contains("://") || h.contains('/') || h.contains(':') || h.contains('*'))) { return Err(format!("Instabox host {:?} must be a bare DNS hostname or *", bad)); }
+        if hosts.is_empty() && !config.get("allow_all_hosts").and_then(Value::as_bool).unwrap_or(false) { return Err("Instabox proxy delivery needs hosts, or set allow_all_hosts: true; without a host list the value may be sent to any public HTTPS destination".into()); }
     }
     let mode = match cfg(config, "mode") { "" => "upsert", value => value };
     if mode != "upsert" && mode != "mirror" { return Err("Instabox mode must be upsert or mirror".into()); }
@@ -471,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn instabox_dry_run_never_mutates() {
         let (base, calls) = start_mock();
-        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base, "dry_run": true});
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base, "dry_run": true, "allow_all_hosts": true});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
         let (report, _) = instabox_sync(&config, &secrets, &[]).await.expect("dry run");
         assert!(report.contains("dry-run"), "{}", report);
@@ -535,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn instabox_rejects_reserved_names() {
-        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1"});
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1", "allow_all_hosts": true});
         let secrets = vec![("PATH".to_string(), "/usr/bin".to_string())];
         let error = instabox_sync(&config, &secrets, &[]).await.expect_err("reserved name");
         assert!(error.contains("reserves"), "{}", error);
@@ -544,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn instabox_empty_environment_makes_no_import() {
         let (base, calls) = start_mock();
-        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base});
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": base, "allow_all_hosts": true});
         let (report, managed) = instabox_sync(&config, &[], &[]).await.expect("empty sync");
         assert!(managed.is_empty());
         assert!(report.contains("imported=0"), "{}", report);
@@ -553,9 +556,27 @@ mod tests {
 
     #[tokio::test]
     async fn instabox_rejects_names_the_api_cannot_store() {
-        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1"});
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1", "allow_all_hosts": true});
         let secrets = vec![("not-a-valid-name".to_string(), "v".to_string())];
         let error = instabox_sync(&config, &secrets, &[]).await.expect_err("invalid name");
         assert!(error.contains("invalid secret names"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn instabox_proxy_requires_an_explicit_host_list() {
+        let config = json!({"api_key": "ibk_test", "org": "team", "base_url": "http://127.0.0.1:1"});
+        let secrets = vec![("API_KEY".to_string(), "v".to_string())];
+        let error = instabox_sync(&config, &secrets, &[]).await.expect_err("missing hosts");
+        assert!(error.contains("allow_all_hosts"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn daytona_deduplicates_a_name_that_appears_on_two_paths() {
+        let (base, calls) = start_mock();
+        let config = json!({"api_key": "dtn_test", "base_url": base});
+        let secrets = vec![("API_KEY".to_string(), "one".to_string()), ("API_KEY".to_string(), "two".to_string())];
+        daytona_sync(&config, &secrets, &[]).await.expect("sync");
+        let posts = calls.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p.ends_with("/secret")).count();
+        assert_eq!(posts, 1, "the same remote name must be created once");
     }
 }

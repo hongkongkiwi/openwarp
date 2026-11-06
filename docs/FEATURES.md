@@ -142,7 +142,8 @@ Kind `instabox` syncs environment secrets into an Instabox organisation's
 Secrets over its REST API (`/v1/orgs/{org}/secrets`). Config: `api_key` (an
 `ibk_` key, or `token`), `org`, `delivery` (`proxy` default, or `env`),
 `hosts` (exact hostnames the Instabox proxy may substitute the value into;
-proxy delivery only), `mode` (`upsert` default, or `mirror`), `prefix`,
+proxy delivery only; required unless `allow_all_hosts: true` is set), `mode`
+(`upsert` default, or `mirror`), `prefix`,
 `include_keys`, `exclude_keys`, `base_url` for self-hosted, and `dry_run`.
 
 Sync lists remote metadata first, imports every desired name in one atomic

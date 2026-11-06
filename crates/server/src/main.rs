@@ -389,15 +389,33 @@ async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, J
     if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona") {
         let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
         let prev: Vec<String> = prev_rows.iter().map(|r| db::s(r, "remote_name")).collect();
-        let (msg, managed) = match kind.as_str() {
+        let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let result = match kind.as_str() {
             "trigger" => integrations::trigger_sync(&config, &pairs, &prev).await,
             "instabox" => integrations::instabox_sync(&config, &pairs, &prev).await,
             "boat" => integrations::boat_sync(&config, &pairs, &prev).await,
             _ => integrations::daytona_sync(&config, &pairs, &prev).await,
-        }.map_err(|e| bad(&e))?;
-        let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !dry { let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
-            for n in &managed { let hv = pairs.iter().find(|(k, _)| n.ends_with(k)).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); } }
+        };
+        let (msg, managed) = match result {
+            Ok(x) => x,
+            Err(e) => {
+                if !dry {
+                    // Some writes may have landed before the failure; keep ownership of them
+                    // so a later mirror sync can still prune the remote.
+                    let mut union = prev.clone();
+                    for n in integrations::desired_names(&config, &pairs) { if !union.contains(&n) { union.push(n); } }
+                    let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
+                    for n in &union { let base = n.strip_prefix(&prefix).unwrap_or(n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); }
+                }
+                return Err(bad(&e));
+            }
+        };
+        if !dry {
+            st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?;
+            for n in &managed { let base = n.strip_prefix(&prefix).unwrap_or(n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
+                st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?; }
+        }
         st.audit(&org, &app, &eid, uid, "integration.sync", &msg); return Ok(msg); }
     let msg = integrations::sync(&kind, &config, &pairs).await.map_err(|e| bad(&e))?;
     st.audit(&org, &app, &eid, uid, "integration.sync", &msg); Ok(msg)

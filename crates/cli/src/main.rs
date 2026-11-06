@@ -45,8 +45,20 @@ fn pick(explicit: &str, local: &Value, key: &str, flag: &str) -> String {
     std::process::exit(2) }
 fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
 fn token_expired(cfg: &Value) -> bool {
+    let has_refresh = cfg["refresh_token"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+    if !has_refresh { return false; }
     let at = cfg["obtained_at"].as_i64().unwrap_or(0);
-    at > 0 && now_secs() - at > 3000 && cfg["refresh_token"].as_str().map(|s| !s.is_empty()).unwrap_or(false) }
+    at == 0 || now_secs() - at > 3000 }
+fn refresh_lock() -> Option<std::path::PathBuf> {
+    let p = config_path().with_file_name("config.lock");
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(_) => return Some(p),
+            Err(_) => { let stale = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() > 30).unwrap_or(false);
+                if stale { let _ = std::fs::remove_file(&p); continue; } return None; }
+        }
+    }
+    None }
 fn refresh_tokens(client: &reqwest::blocking::Client, host: &str, cfg: &Value) -> Option<(String, String)> {
     let rt = cfg["refresh_token"].as_str()?; let cid = cfg["client_id"].as_str()?;
     let d: Value = client.post(format!("{}/oauth/token", host)).form(&[("grant_type", "refresh_token"), ("refresh_token", rt), ("client_id", cid)]).send().ok()?.json().ok()?;
@@ -67,7 +79,12 @@ fn main() {
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
     let saved_host = cfg["host"].as_str().map(|s| s.to_string());
-    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } }
+    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
+        match refresh_lock() {
+            Some(lock) => { if let Some((at, rt)) = refresh_tokens(&client, &host, &cfg) { cfg["access_token"] = json!(at); cfg["refresh_token"] = json!(rt); cfg["obtained_at"] = json!(now_secs()); save_config(&cfg); } let _ = std::fs::remove_file(lock); }
+            None => { std::thread::sleep(std::time::Duration::from_millis(300)); if let Ok(s) = std::fs::read_to_string(config_path()) { if let Ok(v) = serde_json::from_str::<Value>(&s) { cfg = v; } } }
+        }
+    }
     let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
