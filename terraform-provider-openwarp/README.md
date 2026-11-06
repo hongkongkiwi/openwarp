@@ -1,7 +1,8 @@
 # Terraform provider for OpenWarp
 
 Manages OpenWarp apps, environments, secrets and service tokens. The provider
-is built on the Terraform Plugin Framework and follows [`../openapi.json`](../openapi.json).
+is built on the Terraform Plugin Framework and follows the same REST API as the
+bundled SDKs.
 
 It is not published to the Registry yet. Build it locally and point Terraform
 at the binary with a development override.
@@ -102,14 +103,18 @@ exposes `value` (sensitive), `id`, `type` and `version`.
 ## Test
 
 ```bash
-# Compiles the provider and the acceptance tests.
-go test ./...
-
-# Client round trip against a real server binary.
+# Compiles the provider and runs the live client round trip. The client test
+# starts its own disposable server and uses a mock mail relay, so no external
+# instance is needed.
 cargo build -p openwarp-server
-OPENWARP_BIN="$PWD/../target/debug/openwarp-server" go test ./internal/client -v
+OPENWARP_BIN="$PWD/../target/debug/openwarp-server" go test ./...
 
-# Acceptance tests. They need a running instance, a token and an org id.
+# Acceptance tests. With TF_ACC=1 and no OPENWARP_HOST they start a disposable
+# server, register and verify an account, then run app, environment, secret and
+# service-token resources. A terraform binary must be on PATH.
+TF_ACC=1 go test ./internal/provider -v -timeout 20m
+
+# To run them against an existing instance instead:
 export OPENWARP_HOST=http://127.0.0.1:8080
 export OPENWARP_TOKEN=...
 export OPENWARP_TEST_ORG_ID=...

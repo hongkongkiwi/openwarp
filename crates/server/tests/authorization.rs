@@ -1273,3 +1273,37 @@ async fn rotation_hook_receives_a_signed_payload() {
     assert!(captured.contains("\"key\":\"ROTATE_ME\""), "{}", captured);
     assert!(captured.contains("\"value\":\"new-value\""), "{}", captured);
 }
+
+#[tokio::test]
+async fn rotation_schedules_store_provider_adapters_without_leaking_config() {
+    let s = Server::start().await;
+    let u = register(&s, "adapter@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "MAIL_KEY", "interval_secs": 60,
+        "config": {"kind": "resend", "api_key": "re_parent", "key_id": "old-key"}
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["provider_rotation"], json!(true));
+    assert_eq!(r.body["kind"], json!("resend"));
+    let listed = s.call(Method::GET, &format!("/api/envs/{}/rotations", envs[0]), Some(token), None).await;
+    assert_eq!(listed.status, 200, "{}", listed.text);
+    let row = listed.body.as_array().and_then(|rows| rows.first()).expect("rotation row");
+    assert_eq!(row["provider_rotation"], json!(1));
+    assert!(!row.as_object().unwrap().contains_key("config_enc"), "encrypted config must not be returned: {}", listed.text);
+    let bad = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "OTHER", "interval_secs": 60, "config": {"kind": "unknown"}
+    }))).await;
+    assert_eq!(bad.status, 400, "{}", bad.text);
+    let incomplete = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "OPENAI_KEY", "interval_secs": 60, "config": {"kind": "openai", "admin_key": "sk"}
+    }))).await;
+    assert_eq!(incomplete.status, 400, "{}", incomplete.text);
+    let relay = s.call(Method::POST, &format!("/api/envs/{}/rotations", envs[0]), Some(token), Some(json!({
+        "key": "RELAY_KEY", "interval_secs": 60, "config": {"rotation_url": "https://rotate.example.com/hook", "rotation_token": "tok"}
+    }))).await;
+    assert_eq!(relay.status, 200, "{}", relay.text);
+    assert_eq!(relay.body["kind"], json!("webhook"));
+}

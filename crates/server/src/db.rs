@@ -5,54 +5,62 @@ use std::sync::Mutex;
 pub type Row = HashMap<String, Value>;
 pub enum Db {
     Sqlite(Mutex<rusqlite::Connection>),
-    Postgres(r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>),
+    Postgres(deadpool_postgres::Pool),
 }
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
     out
 }
+fn pg_err(error: tokio_postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => db.message().to_string(),
+        None => error.to_string(),
+    }
+}
 impl Db {
-    pub fn open(url: &str) -> Result<Self, String> {
+    pub async fn open(url: &str) -> Result<Self, String> {
         if url.starts_with("postgres") {
-            // `postgres` sync client drives its own runtime; it cannot run inside tokio.
-            let url = url.to_string();
-            std::thread::spawn(move || {
-                let config: postgres::Config = url.parse().map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
-                let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
-                let size = std::env::var("OPENWARP_PG_POOL_SIZE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8).clamp(1, 64);
-                let pool = r2d2::Pool::builder().max_size(size).build(manager).map_err(|e| format!("postgres pool: {}", e))?;
-                let db = Db::Postgres(pool); db.migrate()?; Ok(db)
-            }).join().map_err(|_| "postgres connect thread panicked".to_string())?
+            let config: tokio_postgres::Config = url.parse().map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
+            let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+            let size = std::env::var("OPENWARP_PG_POOL_SIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 64);
+            let pool = deadpool_postgres::Pool::builder(manager).max_size(size).build().map_err(|e| format!("postgres pool: {}", e))?;
+            let db = Db::Postgres(pool); db.migrate().await?; Ok(db)
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
             let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
-            let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+            let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
         }
     }
     #[allow(dead_code)]
-    pub fn open_memory() -> Result<Self, String> {
+    pub async fn open_memory() -> Result<Self, String> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let db = Db::Sqlite(Mutex::new(conn)); db.migrate()?; Ok(db)
+        let db = Db::Sqlite(Mutex::new(conn)); db.migrate().await?; Ok(db)
     }
-    pub fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+    pub async fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
+            Db::Sqlite(c) => {
+                let result = { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) };
+                result
+            }
             Db::Postgres(pool) => {
-                let mut client = pool.get().map_err(|e| e.to_string())?;
+                let client = pool.get().await.map_err(|e| e.to_string())?;
                 let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
-                client.execute(sql2.as_str(), &refs[..]).map_err(|e| e.to_string())
+                client.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)
             }
         }
     }
-    pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+    pub async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
-            Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
+            Db::Sqlite(c) => {
+                let result = { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) };
+                result
+            }
             Db::Postgres(pool) => {
-                let mut client = pool.get().map_err(|e| e.to_string())?;
+                let client = pool.get().await.map_err(|e| e.to_string())?;
                 let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
-                let rows = client.query(sql2.as_str(), &refs[..]).map_err(|e| e.to_string())?;
+                let rows = client.query(sql2.as_str(), &refs[..]).await.map_err(pg_err)?;
                 let mut out = Vec::new();
                 for r in &rows {
                     let mut m = Row::new();
@@ -70,9 +78,9 @@ impl Db {
             }
         }
     }
-    pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
-    fn migrate(&self) -> Result<(), String> {
-        for stmt in SCHEMA { self.exec(stmt, &[])?; }
+    pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    async fn migrate(&self) -> Result<(), String> {
+        for stmt in SCHEMA { self.exec(stmt, &[]).await?; }
         for alter in [
             "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
             "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
@@ -87,27 +95,28 @@ impl Db {
             "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
             "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
             "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
+            "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
-        ] { let _ = self.exec(alter, &[]); }
-        for idx in INDEXES { let _ = self.exec(idx, &[]); }
+        ] { let _ = self.exec(alter, &[]).await; }
+        for idx in INDEXES { let _ = self.exec(idx, &[]).await; }
         // Record the baseline once, then apply numbered additive migrations.
-        if self.one("SELECT version FROM schema_migrations WHERE version=1", &[])?.is_none() {
-            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(now_secs())]);
+        if self.one("SELECT version FROM schema_migrations WHERE version=1", &[]).await?.is_none() {
+            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(now_secs())]).await;
         }
         for (version, statements) in MIGRATIONS {
-            if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)])?.is_some() { continue; }
+            if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)]).await?.is_some() { continue; }
             for stmt in *statements {
-                if let Err(e) = self.exec(stmt, &[]) {
+                if let Err(e) = self.exec(stmt, &[]).await {
                     let duplicate = e.contains("duplicate column") || e.contains("already exists");
                     if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
                 }
             }
-            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())])?;
+            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())]).await?;
         }
         // One-time backfill: environments that already had an allowlist keep it.
-        if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
-            let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
-            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]);
+        if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
+            let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
+            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(now_secs())]).await;
         }
         Ok(())
     }
@@ -116,7 +125,7 @@ enum PgOwned { S(String), I(i64), B(bool), N(Option<String>) }
 struct PgParams { owned: Vec<PgOwned> }
 impl PgParams {
     fn new(params: &[Value]) -> Self { Self { owned: params.iter().map(|v| match v { Value::String(s) => PgOwned::S(s.clone()), Value::Number(n) => PgOwned::I(n.as_i64().unwrap_or(0)), Value::Bool(b) => PgOwned::B(*b), _ => PgOwned::N(None) }).collect() } }
-    fn refs(&self) -> Vec<&(dyn postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
+    fn refs(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> { self.owned.iter().map(|o| -> &(dyn tokio_postgres::types::ToSql + Sync) { match o { PgOwned::S(s) => s, PgOwned::I(n) => n, PgOwned::B(b) => b, PgOwned::N(n) => n } }).collect() }
 }
 fn sqlite_val(v: &rusqlite::types::Value) -> Value {
     use rusqlite::types::Value as V;
@@ -187,7 +196,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS roles(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,permissions TEXT DEFAULT '[]')",
     "CREATE TABLE IF NOT EXISTS log_streams(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,secret TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS log_deliveries(id TEXT PRIMARY KEY,stream_id TEXT NOT NULL,event TEXT NOT NULL,payload TEXT DEFAULT '',status TEXT DEFAULT 'pending',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS rotation_schedules(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,key_name TEXT NOT NULL,path TEXT DEFAULT '/',interval_secs BIGINT NOT NULL,next_run BIGINT NOT NULL,enabled BIGINT DEFAULT 1,created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS rotation_schedules(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,key_name TEXT NOT NULL,path TEXT DEFAULT '/',interval_secs BIGINT NOT NULL,next_run BIGINT NOT NULL,enabled BIGINT DEFAULT 1,config_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS mfa_challenges(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS pki_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,cn TEXT NOT NULL,cert_pem TEXT NOT NULL,serial TEXT NOT NULL,revoked BIGINT DEFAULT 0,expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,window_start BIGINT NOT NULL,count BIGINT NOT NULL)",
@@ -246,6 +255,9 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE IF NOT EXISTS ldap_configs(org_id TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '',bind_dn TEXT NOT NULL DEFAULT '',bind_password_enc TEXT NOT NULL DEFAULT '',base_dn TEXT NOT NULL DEFAULT '',user_filter TEXT NOT NULL DEFAULT '(uid={username})',email_attr TEXT NOT NULL DEFAULT 'mail',name_attr TEXT NOT NULL DEFAULT 'displayName',group_attr TEXT NOT NULL DEFAULT 'memberOf',group_roles TEXT NOT NULL DEFAULT '',default_role TEXT NOT NULL DEFAULT 'developer',auto_provision BIGINT NOT NULL DEFAULT 0,allowed_domains TEXT NOT NULL DEFAULT '',ca_cert_pem TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS ldap_subjects(org_id TEXT NOT NULL,dn TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,role TEXT NOT NULL DEFAULT '',PRIMARY KEY(org_id,dn))",
     ]),
+    (11, &[
+        "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -269,10 +281,10 @@ const INDEXES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*; use serde_json::json;
-    #[test] fn sqlite_migrate_and_crud() {
-        let db = Db::open_memory().unwrap();
-        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).unwrap();
-        let rows = db.query("SELECT name FROM orgs WHERE id=?", &[json!("o1")]).unwrap();
+    #[tokio::test] async fn sqlite_migrate_and_crud() {
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).await.unwrap();
+        let rows = db.query("SELECT name FROM orgs WHERE id=?", &[json!("o1")]).await.unwrap();
         assert_eq!(s(&rows[0], "name"), "Acme");
         // placeholder translation used by Postgres backend
         assert_eq!(pg_sql("SELECT * FROM t WHERE a=? AND b=?"), "SELECT * FROM t WHERE a=$1 AND b=$2");

@@ -115,6 +115,132 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
 }
 
 
+// Provider rotation adapters reuse the key-lifecycle primitives below. The
+// adapter creates the replacement credential, the caller stores it, and only
+// then finalizes by revoking the previous credential, so a failed write never
+// destroys the working key.
+pub struct RotatedValue {
+    pub value: String,
+    pub config: Value,
+    pub cleanup: Option<Value>,
+    pub rollback: Option<Value>,
+}
+
+fn rotation_name(config: &Value, key: &str) -> String {
+    let configured = cfg(config, "name").trim();
+    let name = if configured.is_empty() { format!("openwarp-{}", key) } else { configured.to_string() };
+    name.chars().take(50).collect()
+}
+
+pub async fn rotate_value(config: &Value, key: &str, path: &str) -> Result<Option<RotatedValue>, String> {
+    let kind = cfg(config, "kind");
+    if kind.is_empty() || kind == "webhook" {
+        let url = cfg(config, "rotation_url");
+        if url.is_empty() { return Ok(None); }
+        let provider = { let p = cfg(config, "provider"); if p.is_empty() { "webhook" } else { p } };
+        let mut request = http_client().post(url).json(&json!({"key": key, "path": path, "provider": provider}));
+        let token = cfg(config, "rotation_token");
+        if !token.is_empty() { request = request.bearer_auth(token); }
+        let text = req(request).await.map_err(|e| format!("rotation endpoint failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("rotation endpoint returned invalid JSON: {}", e))?;
+        for field in ["value", "secret", "key", "api_key"] {
+            if let Some(found) = value.get(field).and_then(Value::as_str) {
+                if !found.is_empty() {
+                    return Ok(Some(RotatedValue { value: found.to_string(), config: config.clone(), cleanup: None, rollback: None }));
+                }
+            }
+        }
+        return Err("rotation endpoint returned no value, secret, key or api_key field".into());
+    }
+    if kind == "resend" {
+        let issued = resend_create_key(config, &rotation_name(config, key)).await?;
+        let value = issued["token"].as_str().unwrap_or("");
+        let id = issued["id"].as_str().unwrap_or("");
+        if value.is_empty() || !key_ref_ok(id) { return Err("Resend rotation returned no token or id".into()); }
+        let old = cfg(config, "key_id");
+        let mut next = config.clone();
+        next["key_id"] = json!(id);
+        let cleanup = if old.is_empty() { None } else { Some(json!({"kind": "resend", "base_url": cfg(config, "base_url"), "api_key": cfg(config, "api_key"), "id": old})) };
+        let rollback = Some(json!({"kind": "resend", "base_url": cfg(config, "base_url"), "api_key": cfg(config, "api_key"), "id": id}));
+        return Ok(Some(RotatedValue { value: value.to_string(), config: next, cleanup, rollback }));
+    }
+    if kind == "openrouter" {
+        let ttl = config.get("ttl_secs").and_then(Value::as_i64).unwrap_or(30 * 86400);
+        let issued = openrouter_create_key(config, &rotation_name(config, key), ttl).await?;
+        let value = issued["key"].as_str().unwrap_or("");
+        let hash = issued["hash"].as_str().unwrap_or("");
+        if value.is_empty() || !key_ref_ok(hash) { return Err("OpenRouter rotation returned no key or hash".into()); }
+        let old = cfg(config, "hash");
+        let mut next = config.clone();
+        next["hash"] = json!(hash);
+        let cleanup = if old.is_empty() { None } else { Some(json!({"kind": "openrouter", "base_url": cfg(config, "base_url"), "management_key": cfg(config, "management_key"), "hash": old})) };
+        let rollback = Some(json!({"kind": "openrouter", "base_url": cfg(config, "base_url"), "management_key": cfg(config, "management_key"), "hash": hash}));
+        return Ok(Some(RotatedValue { value: value.to_string(), config: next, cleanup, rollback }));
+    }
+    if kind == "openai" {
+        let ttl = config.get("ttl_secs").and_then(Value::as_i64).unwrap_or(90 * 86400);
+        let issued = openai_create_key(config, &rotation_name(config, key), ttl).await?;
+        let value = issued["value"].as_str().unwrap_or("");
+        let id = issued["id"].as_str().unwrap_or("");
+        if value.is_empty() || !key_ref_ok(id) { return Err("OpenAI rotation returned no value or id".into()); }
+        let old = cfg(config, "id");
+        let mut next = config.clone();
+        next["id"] = json!(id);
+        let cleanup = if old.is_empty() { None } else { Some(json!({"kind": "openai", "base_url": cfg(config, "base_url"), "admin_key": cfg(config, "admin_key"), "project_id": cfg(config, "project_id"), "id": old})) };
+        let rollback = Some(json!({"kind": "openai", "base_url": cfg(config, "base_url"), "admin_key": cfg(config, "admin_key"), "project_id": cfg(config, "project_id"), "id": id}));
+        return Ok(Some(RotatedValue { value: value.to_string(), config: next, cleanup, rollback }));
+    }
+    Err(format!("unknown rotation adapter kind: {}", kind))
+}
+
+pub async fn finalize_rotation(cleanup: &Value) -> Result<(), String> {
+    match cfg(cleanup, "kind") {
+        "resend" => resend_revoke_key(cfg(cleanup, "base_url"), cfg(cleanup, "api_key"), cfg(cleanup, "id")).await,
+        "openrouter" => openrouter_revoke_key(cfg(cleanup, "base_url"), cfg(cleanup, "management_key"), cfg(cleanup, "hash")).await,
+        "openai" => openai_revoke_key(cfg(cleanup, "base_url"), cfg(cleanup, "admin_key"), cfg(cleanup, "project_id"), cfg(cleanup, "id")).await,
+        other => Err(format!("unknown rotation cleanup kind: {}", other)),
+    }
+}
+
+// Validate before storing an encrypted schedule config. Credentials are never
+// echoed in the error, and provider base URLs go through the same public-host
+// gate as the dynamic lease code.
+pub fn validate_rotation_config(config: &Value) -> Result<(), String> {
+    if config.as_object().map(|o| o.is_empty()).unwrap_or(true) { return Ok(()); }
+    let kind = cfg(config, "kind");
+    match kind {
+        "" | "webhook" => {
+            let url = cfg(config, "rotation_url");
+            if url.is_empty() { return Err("rotation config requires kind or rotation_url".into()); }
+            lease_base(&json!({"base_url": url}), "")?;
+        }
+        "resend" => {
+            if cfg(config, "api_key").is_empty() { return Err("resend rotation requires api_key".into()); }
+            let permission = { let p = cfg(config, "permission"); if p.is_empty() { "sending_access" } else { p } };
+            if !matches!(permission, "sending_access" | "full_access") { return Err("resend permission must be sending_access or full_access".into()); }
+            if !cfg(config, "domain_id").is_empty() && permission != "sending_access" { return Err("resend domain_id is only valid with sending_access".into()); }
+            lease_base(config, "https://api.resend.com")?;
+        }
+        "openrouter" => {
+            if cfg(config, "management_key").is_empty() { return Err("openrouter rotation requires management_key".into()); }
+            lease_base(config, "https://openrouter.ai/api/v1")?;
+        }
+        "openai" => {
+            if cfg(config, "admin_key").is_empty() || !key_ref_ok(cfg(config, "project_id")) || !key_ref_ok(cfg(config, "service_account_id")) {
+                return Err("openai rotation requires admin_key, project_id and service_account_id".into());
+            }
+            lease_base(config, "https://api.openai.com/v1")?;
+        }
+        other => return Err(format!("unknown rotation adapter kind: {}", other)),
+    }
+    Ok(())
+}
+
+pub fn rotation_kind(config: &Value) -> String {
+    let kind = cfg(config, "kind");
+    if kind.is_empty() && !cfg(config, "rotation_url").is_empty() { "webhook".into() } else { kind.to_string() }
+}
+
 // ---------- Trigger.dev ----------
 pub struct TriggerTarget { pub project_ref: String, pub env: String, pub token: String }
 pub fn trigger_targets(config: &Value) -> Vec<TriggerTarget> {
@@ -4412,4 +4538,86 @@ mod tests {
         let err = ssh_file_sync(&overlap, &secrets, &[]).await.unwrap_err();
         assert!(err.contains("claimed by both"), "{}", err);
     }
+
+    #[tokio::test]
+    async fn resend_rotation_creates_then_revokes_the_previous_key() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /api-keys", 201, r#"{"id":"new-key","token":"re_new"}"#),
+            ("DELETE /api-keys/old-key", 200, r#"{"deleted":true}"#),
+        ]));
+        let config = json!({"kind":"resend","api_key":"re_admin","key_id":"old-key","base_url":base});
+        let rotated = rotate_value(&config, "MAIL_KEY", "/").await.expect("rotate").expect("adapter");
+        assert_eq!(rotated.value, "re_new");
+        assert_eq!(rotated.config["key_id"], "new-key");
+        let cleanup = rotated.cleanup.expect("cleanup");
+        assert_eq!(cleanup["id"], "old-key");
+        assert_eq!(rotated.rollback.expect("rollback")["id"], "new-key");
+        finalize_rotation(&cleanup).await.expect("cleanup");
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p == "/api-keys").expect("create");
+        assert!(create.2.contains("Bearer re_admin"));
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p == "/api-keys/old-key"));
+    }
+
+    #[tokio::test]
+    async fn openrouter_and_openai_rotation_replace_the_previous_credential() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /keys", 201, r#"{"key":"sk-or-new","data":{"hash":"newhash"}}"#),
+            ("DELETE /keys/oldhash", 200, r#"{"deleted":true}"#),
+            ("POST /organization/projects/proj_1/service_accounts/svc_1/api_keys", 200, r#"{"id":"newid","value":"sk-new"}"#),
+            ("DELETE /organization/projects/proj_1/api_keys/oldid", 200, r#"{"deleted":true}"#),
+        ]));
+        let openrouter = json!({"kind":"openrouter","management_key":"sk-or-admin","hash":"oldhash","base_url":base});
+        let rotated = rotate_value(&openrouter, "MODEL_KEY", "/").await.expect("rotated").expect("adapter");
+        assert_eq!(rotated.value, "sk-or-new");
+        assert_eq!(rotated.config["hash"], "newhash");
+        finalize_rotation(&rotated.cleanup.expect("cleanup")).await.expect("revoke");
+        let openai = json!({"kind":"openai","admin_key":"sk-admin","project_id":"proj_1","service_account_id":"svc_1","id":"oldid","base_url":base});
+        let rotated = rotate_value(&openai, "OPENAI_KEY", "/").await.expect("rotated").expect("adapter");
+        assert_eq!(rotated.value, "sk-new");
+        assert_eq!(rotated.config["id"], "newid");
+        finalize_rotation(&rotated.cleanup.expect("cleanup")).await.expect("revoke");
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p == "/keys/oldhash"));
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p == "/organization/projects/proj_1/api_keys/oldid"));
+    }
+
+    #[tokio::test]
+    async fn rotation_adapter_rejects_unknown_kinds_and_missing_values() {
+        let config = json!({"kind":"not-a-provider"});
+        assert!(rotate_value(&config, "KEY", "/").await.is_err());
+        let (base, _) = start_mock_routes(mock_routes(&[("POST /rotate", 200, r#"{"ok":true}"#)]));
+        let relay = json!({"rotation_url": format!("{}/rotate", base)});
+        assert!(rotate_value(&relay, "KEY", "/").await.is_err());
+    }
+
+    #[test]
+    fn rotation_config_validation_rejects_incomplete_adapters() {
+        assert!(validate_rotation_config(&json!({})).is_ok());
+        assert!(validate_rotation_config(&json!({"kind":"resend","api_key":"re_parent"})).is_ok());
+        assert!(validate_rotation_config(&json!({"kind":"resend"})).is_err());
+        assert!(validate_rotation_config(&json!({"kind":"openrouter","management_key":"sk-or"})).is_ok());
+        assert!(validate_rotation_config(&json!({"kind":"openrouter"})).is_err());
+        assert!(validate_rotation_config(&json!({"kind":"openai","admin_key":"sk","project_id":"p","service_account_id":"s"})).is_ok());
+        assert!(validate_rotation_config(&json!({"kind":"openai","admin_key":"sk"})).is_err());
+        assert!(validate_rotation_config(&json!({"kind":"nope"})).is_err());
+        assert!(validate_rotation_config(&json!({"rotation_url":"https://rotate.example.com/hook"})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn generic_rotation_relay_uses_the_returned_value() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /rotate", 200, r#"{"value":"rotated-value"}"#)]));
+        let config = json!({"rotation_url": format!("{}/rotate", base), "provider": "custom", "rotation_token": "tok"});
+        let rotated = rotate_value(&config, "CUSTOM_KEY", "/team").await.expect("rotate").expect("adapter");
+        assert_eq!(rotated.value, "rotated-value");
+        assert!(rotated.cleanup.is_none());
+        let calls = calls.lock().unwrap();
+        let request = calls.iter().find(|(m, p, _, _)| m == "POST" && p == "/rotate").expect("relay");
+        assert!(request.2.contains("Bearer tok"));
+        let body: Value = serde_json::from_str(&request.3).expect("json");
+        assert_eq!(body["key"], "CUSTOM_KEY");
+        assert_eq!(body["path"], "/team");
+        assert_eq!(body["provider"], "custom");
+    }
+
 }

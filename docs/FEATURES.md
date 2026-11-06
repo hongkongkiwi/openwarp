@@ -93,7 +93,8 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 - TOTP MFA with one-time recovery codes: setup/verify, login challenge
   (`mfa_required` + 5-minute `mfa_token`), `POST /api/auth/mfa`.
 - Lease renew, plus a rotation scheduler (30s tick) with per-key schedules
-  (`/api/envs/:id/rotations`); E2E envs are skipped by the scheduler.
+  (`/api/envs/:id/rotations`) and optional OpenAI, OpenRouter or Resend
+  provider adapters; E2E envs are skipped by the scheduler.
 - Log streams with persisted delivery history and 3-attempt HMAC-signed
   retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
@@ -394,10 +395,12 @@ Mail failures are logged and never expose the message body or credentials.
 
 `db.rs` records a baseline and numbered migrations in `schema_migrations`;
 additive column errors that mean "already applied" are recognised, anything
-else aborts boot. Postgres uses an `r2d2` connection pool sized by
-`OPENWARP_PG_POOL_SIZE` (default 8) instead of one serialized client and a
-thread per query. The storage API remains synchronous; a fully async database
-rewrite is still outstanding.
+else aborts boot. Postgres uses an asynchronous `tokio-postgres` client behind a
+`deadpool-postgres` pool sized by `OPENWARP_PG_POOL_SIZE` (default 8). The
+storage API is async end to end; SQLite keeps its rusqlite work inside the async
+methods under the existing mutex. The Postgres HTTP integration test creates a
+disposable database, migrates it and exercises registration, apps, environments
+and secrets through the real server.
 
 `POST /api/instance/rotate-master {new_key}` is instance-owner only. It
 preflights every master-wrapped value, re-wraps environment keys, OIDC and TOTP
@@ -418,6 +421,19 @@ environment admits members of a team granted that environment.
 `GET /api/envs/:id/scan` reports high-confidence AWS, GitHub, Slack, Stripe,
 Google and private-key patterns without returning values; deploy responses
 include `scan_findings` for the submitted secrets.
+
+### Provider rotation adapters
+
+Rotation schedules accept an encrypted `config` object. `kind: "resend"`,
+`"openrouter"` and `"openai"` create a replacement scoped credential through the
+provider API, store it, sync integrations, and only then revoke the previous
+credential. A failed secret write rolls back the newly created credential. The
+generic signed webhook remains available as `kind: "webhook"` or a
+`rotation_url`; it posts the key identity and consumes the returned value.
+`GET /api/envs/:id/rotations` reports whether a provider adapter is configured
+without returning the encrypted config. The OpenAI/OpenRouter/Resend adapters
+are covered by mock-provider tests; the schedule endpoint has an HTTP
+integration test.
 
 ### PKI, AWS leases and HA
 
@@ -495,20 +511,20 @@ this route.
 
 ### Clients and deployment
 
-- TypeScript SDK: `sdk/typescript`
+- TypeScript SDK: `sdk/typescript` (tsc build, mock tests and a live-server test)
 - Python SDK: `sdk/python`
 - Go SDK: `sdk/go`
-- Rust SDK: `sdk/rust`
-- Terraform provider scaffold: `terraform-provider-openwarp`
+- Rust SDK: `sdk/rust` (unit tests and a live-server test)
+- Terraform provider: `terraform-provider-openwarp` (framework resources plus
+  self-starting acceptance tests)
 - Helm chart: `deploy/helm/openwarp` (two replicas, probes, ingress, PDB)
 - Export action: `action/` (`openwarp` environment to dotenv or JSON)
 
-The Python, Go, Helm and action deliverables have runnable local tests. The
-TypeScript, Rust and Terraform sources are not compiled or integration-tested
-in this repository.
+CI compiles the TypeScript, Rust and Terraform deliverables and runs their
+live-server tests against the built binary.
 
 ### Still not implemented
 
-SAML 2.0 SSO, an OCSP responder, provider-specific secret rotation (the generic
-rotation webhook is not shipped), and a fully asynchronous Postgres API. Do not
-treat CRL support as an OCSP replacement.
+A Kubernetes operator, provider adapters beyond OpenAI, OpenRouter and Resend,
+and automatic Postgres failover remain. Do not treat CRL support as an OCSP
+replacement.
