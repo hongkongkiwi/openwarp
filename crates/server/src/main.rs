@@ -1,4 +1,4 @@
-mod db; mod inference_leases; mod integrations; mod mailer; mod ssh_keys; mod ui;
+mod db; mod inference_leases; mod integrations; mod kms; mod mailer; mod ssh_keys; mod ui;
 #[cfg(feature = "ldap")] mod ldap;
 use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
@@ -20,6 +20,7 @@ pub struct AppState {
     instance_id: String,
     pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
+    kms: Option<kms::Kms>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: broadcast::Sender<Arc<str>>,
 }
@@ -159,7 +160,20 @@ impl AppState {
     }
     async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
-        let raw = oc::decrypt_symmetric(&self.master(), &db::s(&row, "env_key_wrapped")).map_err(|e| bad(&e))?;
+        let wrapped = db::s(&row, "env_key_wrapped");
+        if wrapped.is_empty() { return Err(err(StatusCode::CONFLICT, "this environment is client-encrypted; the server has no key for it")); }
+        if wrapped.starts_with("owkms:") {
+            let kms = self.kms.as_ref().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "this environment is wrapped by a KMS that is not configured"))?;
+            let raw = kms.unwrap(&wrapped, &format!("env:{}", env_id)).map_err(|e| bad(&format!("KMS could not unwrap the environment key: {}", e)))?;
+            return raw.try_into().map_err(|_| bad("bad env key")); }
+        // A row written before KMS was enabled is rewrapped on first use. The
+        // legacy master stays valid for every other root-encrypted record.
+        let raw = oc::decrypt_symmetric(&self.master(), &wrapped).map_err(|e| bad(&e))?;
+        if let Some(kms) = &self.kms {
+            if let Ok(rewrapped) = kms.wrap(&raw, &format!("env:{}", env_id)) {
+                let _ = self.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(rewrapped), json!(&env_id)]).await;
+            }
+        }
         raw.try_into().map_err(|_| bad("bad env key"))
     }
     fn master(&self) -> [u8; 32] { *self.master.read().unwrap_or_else(|e| e.into_inner()) }
@@ -453,7 +467,11 @@ async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     for name in ["Development", "Staging", "Production"] { create_env_inner(&st, &aid, name).await?; }
     st.audit(&oid, &aid, "", &uid, "app.create", &r.name).await; Ok(j(json!({"id": aid}))) }
 async fn create_env_inner(st: &S, app_id: &str, name: &str) -> Result<String, (StatusCode, Json<Value>)> {
-    let eid = id(); let key = oc::random_key(); let wrapped = oc::encrypt_symmetric(&st.master(), &key);
+    let eid = id(); let key = oc::random_key();
+    let wrapped = match &st.kms {
+        Some(kms) => kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap the environment key: {}", e)))?,
+        None => oc::encrypt_symmetric(&st.master(), &key),
+    };
     st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,created_at) VALUES(?,?,?,?,?)", &[json!(eid), json!(app_id), json!(name), json!(wrapped), json!(now())]).await.map_err(|e| bad(&e))?; Ok(eid) }
 async fn list_apps(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
     let rows = st.db.query("SELECT id,org_id,name,readme,created_at,reuse_check FROM apps WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?;
@@ -2271,6 +2289,26 @@ async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>)
     meta_set(&st, "signups_open", if open { "1" } else { "0" }).await;
     st.audit("", "", "", &uid, "instance.signups", if open { "open" } else { "invite" }).await;
     Ok(j(json!({"signups_open": open}))) }
+async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rewrap environment keys")); }
+    let kms = st.kms.as_ref().ok_or_else(|| bad("no KMS is configured; environment keys are wrapped by the instance master"))?;
+    let rows = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>''", &[]).await.map_err(|e| bad(&e))?;
+    let mut rewrapped = 0;
+    let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
+    for r in &rows {
+        let eid = db::s(r, "id");
+        // env_key unwraps both legacy and KMS rows, so this also migrates a
+        // deployment that enabled KMS after its data was created.
+        if let Ok(key) = st.env_key(&eid).await {
+            let wrapped = kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
+            stmts.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(&eid)]));
+            rewrapped += 1;
+        }
+    }
+    st.db.batch(&stmts).await.map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "instance.rewrap_keys", &format!("{} environments, key {}", rewrapped, kms.key_id())).await;
+    Ok(j(json!({"rewrapped": rewrapped, "key_id": kms.key_id()}))) }
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
@@ -2282,7 +2320,11 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
     let mut env_updates = Vec::new();
     for r in &envs {
-        let plain = oc::decrypt_symmetric(&old, &db::s(r, "env_key_wrapped"))
+        let wrapped = db::s(r, "env_key_wrapped");
+        // KMS-wrapped and client-encrypted environments do not depend on the
+        // local master key, so leave their blobs untouched.
+        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
+        let plain = oc::decrypt_symmetric(&old, &wrapped)
             .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
         env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
     }
@@ -3407,6 +3449,9 @@ async fn main() {
         return;
     }
     let master = load_master(&db).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+    // A configured KMS must fail closed: an unreachable or invalid bridge is
+    // not a reason to fall back to a local root key.
+    let kms = match kms::Kms::from_env() { Ok(k) => k, Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
     if !mailer::MailConfig::from_env().enabled() {
         if production() {
             eprintln!("no email provider is configured: password signup is disabled until one is set; configured SSO sign-in still works");
@@ -3418,7 +3463,7 @@ async fn main() {
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
     let (live, _) = broadcast::channel(256);
-    let state = Arc::new(AppState { db, db_url: db_url.clone(), instance_id: oc::random_token("inst"), pub_url, master: std::sync::RwLock::new(master), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn), live });
+    let state = Arc::new(AppState { db, db_url: db_url.clone(), instance_id: oc::random_token("inst"), pub_url, master: std::sync::RwLock::new(master), kms, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn), live });
     { let st2 = state.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", &st2.instance_id, 60).await { process_rotations(&st2).await; } } }); }
     // One poll for the whole process. With no sockets subscribed it only reads
@@ -3444,7 +3489,7 @@ async fn main() {
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
