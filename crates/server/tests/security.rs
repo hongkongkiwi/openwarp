@@ -353,6 +353,8 @@ async fn env_scoped_token_cannot_escape_through_mcp_or_mint_tokens() {
     assert_eq!(r.status, 200, "token creation failed: {}", r.text);
     let pat = r.body["token"].as_str().unwrap().to_string();
 
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&pat), None).await;
+    assert_eq!(r.status, 200, "the scoped token should still work on its own environment: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[1]), Some(&pat), None).await;
     assert_eq!(r.status, 403, "REST scope escape should already be blocked");
 
@@ -822,6 +824,56 @@ async fn oidc_provisions_a_new_user() {
     let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
     assert_eq!(me.status, 200, "provisioned session failed: {}", me.text);
     assert_eq!(me.body["email"].as_str().unwrap_or(""), "oidc-newcomer@test.invalid");
+}
+
+#[tokio::test]
+async fn production_rejects_a_master_key_left_in_the_database() {
+    let dir = std::env::temp_dir().join(format!("openwarp-it-prod2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/test.db", dir.display());
+    let port = free_port();
+    let mut dev = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
+        .env("DATABASE_URL", &db)
+        .env("ADDR", format!("127.0.0.1:{}", port))
+        .env_remove("OPENWARP_MASTER_KEY")
+        .env_remove("OPENWARP_ENV")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dev server");
+    let client = Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().expect("client");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut healthy = false;
+    while Instant::now() < deadline {
+        if let Ok(r) = client.get(format!("http://127.0.0.1:{}/health", port)).send().await {
+            if r.status().is_success() { healthy = true; break; }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = dev.kill();
+    let _ = dev.wait();
+    assert!(healthy, "the development server did not start");
+
+    let mut prod = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
+        .env("DATABASE_URL", &db)
+        .env("ADDR", format!("127.0.0.1:{}", port))
+        .env("OPENWARP_ENV", "production")
+        .env_remove("OPENWARP_MASTER_KEY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn production server");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut exited = None;
+    while Instant::now() < deadline {
+        if let Some(status) = prod.try_wait().unwrap() { exited = Some(status); break; }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if exited.is_none() { let _ = prod.kill(); }
+    let _ = prod.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = exited.expect("production must refuse a database-stored master key");
+    assert!(!status.success(), "production started with only the database master key");
 }
 
 #[tokio::test]
