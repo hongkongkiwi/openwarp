@@ -79,6 +79,14 @@ impl Server {
             .env_remove("OPENWARP_SIGNUPS")
             .env_remove("OPENWARP_GOOGLE_CLIENT_ID")
             .env_remove("OPENWARP_GITHUB_CLIENT_ID")
+            .env_remove("OPENWARP_MICROSOFT_CLIENT_ID")
+            .env_remove("OPENWARP_APPLE_CLIENT_ID")
+            .env_remove("OPENWARP_GITLAB_CLIENT_ID")
+            .env_remove("OPENWARP_X_CLIENT_ID")
+            .env_remove("OPENWARP_DISCORD_CLIENT_ID")
+            .env_remove("OPENWARP_LINKEDIN_CLIENT_ID")
+            .env_remove("OPENWARP_SLACK_CLIENT_ID")
+            .env_remove("OPENWARP_WORKOS_CLIENT_ID")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (k, v) in extra {
@@ -112,6 +120,15 @@ impl Server {
     }
 
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
+
+    async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Resp {
+        let response = self.client.post(self.url(path)).form(form).send().await.expect("form request");
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Resp { status, text, body, headers }
+    }
 }
 
 async fn register(s: &Server, email: &str) -> Resp {
@@ -153,10 +170,27 @@ OF8MHpy7ObWoOf5KfrHRRwqkYrAapKkT9R5+4rm10oNt9nMitwUOng9IsDyIm1l2
 zx/UpPmCIb8/3cJ8IR+QpA==
 -----END PRIVATE KEY-----"#;
 const TEST_N: &str = "uTt-NHHm3ZFrMRYklTgNMQpbuY5FXX5P09Yen7BB6hyQ0S7cUYiXr2jAa-5ipW6eHej0FkOsnRc7IeoG-CKhO_1DjSjYavmSv0qSmmNA4qKxaV-1C36HPUb2W_9M8AbhYuI-JJtgQ2n9PVrxCHf0G4osxPaNBL9WEJMqnJO3c9bediZxOLSNGjs-owL8HHleUH5T7Bpimvj4iZ1xH2Yp-1UU4vyEEV757ULSA5OAjJdqk-Vf3BjSjbaR4vtfc2veqrdISKYbA_z8DGDfQM9QWfP5coE0542SH3KzJ2RG1TUn2U7QGtrc4LngJVMfgiZhBOidTH1VugBhxr-0kel1Yw";
+/// Throwaway P-256 key used only to exercise the Apple client-secret JWT.
+const TEST_EC_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxez2d6B6aaxPMsLl
+E0kd8ZXDFbVQHnUYVBnnf6Gc13ehRANCAARRGIga3OKqKFQ2dnQJ1ug/bXSLFMtD
++xhILfYVqUx6/v4lGtOF0bGQ6mWGqG15GufUAXqflh6E2VQUQDePzs/9
+-----END PRIVATE KEY-----"#;
+
+fn request_param(head: &str, key: &str) -> String {
+    head.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or("")
+        .split('&').filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key).map(|(_, v)| v.to_string()).unwrap_or_default()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MockMode { Normal, MicrosoftNoEmail, XNoEmail, DiscordUnverified }
 
 /// Mock identity provider: discovery, JWKS, and a token endpoint that signs an
-/// id_token for the requested email. Also serves the GitHub endpoints.
-fn start_mock(email: &'static str) -> String {
+/// id_token for the requested email. Also serves the GitHub, X, Discord and
+/// WorkOS endpoints. Variants cover the negative identity paths.
+fn start_mock(email: &'static str) -> String { start_mock_mode(email, MockMode::Normal) }
+fn start_mock_mode(email: &'static str, mode: MockMode) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
     let addr = listener.local_addr().expect("mock addr");
     let issuer = format!("http://{}", addr);
@@ -179,18 +213,37 @@ fn start_mock(email: &'static str) -> String {
             let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
             let payload = if path.starts_with("/.well-known/openid-configuration") {
                 json!({"issuer": thread_issuer, "authorization_endpoint": format!("{}/authorize", thread_issuer),
-                       "token_endpoint": format!("{}/token", thread_issuer), "jwks_uri": format!("{}/jwks", thread_issuer)}).to_string()
+                       "token_endpoint": format!("{}/token", thread_issuer), "jwks_uri": format!("{}/jwks", thread_issuer),
+                       "userinfo_endpoint": format!("{}/openid/connect/userInfo", thread_issuer)}).to_string()
             } else if path.starts_with("/jwks") {
                 json!({"keys": [{"kty": "RSA", "kid": "t1", "use": "sig", "alg": "RS256", "n": TEST_N, "e": "AQAB"}]}).to_string()
             } else if path.starts_with("/token") {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let aud = { let v = request_param(&head, "client_id"); if v.is_empty() { "test-google".to_string() } else { v } };
                 let header = jsonwebtoken::Header { alg: jsonwebtoken::Algorithm::RS256, kid: Some("t1".into()), ..Default::default() };
-                let claims = json!({"iss": thread_issuer, "aud": "test-google", "sub": "google-subject-1", "email": email, "email_verified": true, "iat": now, "exp": now + 300});
+                let mut claims = json!({"iss": thread_issuer, "aud": aud, "sub": "mock-subject-1", "email": email, "email_verified": true, "iat": now, "exp": now + 300});
+                if mode == MockMode::MicrosoftNoEmail {
+                    claims.as_object_mut().expect("claims object").remove("email");
+                    claims["preferred_username"] = json!(email);
+                }
                 let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_PEM.as_bytes()).expect("rsa pem");
                 let id_token = jsonwebtoken::encode(&header, &claims, &key).expect("sign id token");
                 json!({"access_token": "x", "id_token": id_token, "token_type": "Bearer"}).to_string()
             } else if path.starts_with("/login/oauth/access_token") {
                 json!({"access_token": "gho_test", "token_type": "bearer", "scope": "user:email"}).to_string()
+            } else if path.starts_with("/user_management/authenticate") {
+                json!({"user": {"id": "workos-user-1", "email": email, "email_verified": true}, "access_token": "x"}).to_string()
+            } else if path.starts_with("/openid/connect/userInfo") {
+                json!({"ok": true, "sub": "mock-subject-1", "email": email, "email_verified": true}).to_string()
+            } else if path.starts_with("/2/oauth2/token") {
+                json!({"access_token": "x-token", "token_type": "bearer"}).to_string()
+            } else if path.starts_with("/2/users/me") {
+                if mode == MockMode::XNoEmail { json!({"data": {"id": "x-user-1"}}).to_string() }
+                else { json!({"data": {"id": "x-user-1", "confirmed_email": email}}).to_string() }
+            } else if path.starts_with("/api/oauth2/token") {
+                json!({"access_token": "discord-token", "token_type": "bearer"}).to_string()
+            } else if path.starts_with("/api/users/@me") {
+                json!({"id": "discord-user-1", "email": email, "verified": mode != MockMode::DiscordUnverified}).to_string()
             } else if path.starts_with("/user/emails") {
                 json!([{"email": email, "primary": true, "verified": true}]).to_string()
             } else if path.starts_with("/user") {
@@ -252,6 +305,9 @@ async fn providers_are_hidden_when_not_configured() {
     assert_eq!(r.status, 200, "{}", r.text);
     assert_eq!(r.body["google"], json!(false), "{}", r.text);
     assert_eq!(r.body["github"], json!(false), "{}", r.text);
+    assert_eq!(r.body["microsoft"], json!(false), "{}", r.text);
+    assert_eq!(r.body["workos"], json!(false), "{}", r.text);
+    assert_eq!(r.body["providers"], json!([]), "{}", r.text);
     assert_eq!(r.body["signups"], json!("open"), "{}", r.text);
     let r = s.get("/api/auth/social/google/start").await;
     assert_eq!(r.status, 404, "an unconfigured provider must not start a flow, got {} {}", r.status, r.text);
@@ -307,6 +363,207 @@ async fn github_login_provisions_a_user() {
     assert!(!token.is_empty(), "no session issued: {}", r.header("location"));
     let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
     assert_eq!(me.body["email"], json!("octo@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn microsoft_login_provisions_a_user() {
+    let idp = start_mock("microsoft-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_MICROSOFT_CLIENT_ID", "test-microsoft".to_string()),
+        ("OPENWARP_MICROSOFT_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_MICROSOFT_ISSUER", idp.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["microsoft"], json!(true), "{}", r.text);
+    assert!(r.body["providers"].as_array().map(|a| a.iter().any(|p| p["id"] == json!("microsoft"))).unwrap_or(false), "{}", r.text);
+
+    let r = s.get("/api/auth/social/microsoft/start").await;
+    assert_eq!(r.status, 307, "microsoft start failed: {} {}", r.status, r.text);
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/microsoft/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "microsoft callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    assert!(!token.is_empty(), "no session issued: {}", r.header("location"));
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("microsoft-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn slack_login_reads_the_email_from_userinfo() {
+    let idp = start_mock("slack-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_SLACK_CLIENT_ID", "test-slack".to_string()),
+        ("OPENWARP_SLACK_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_SLACK_ISSUER", idp.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["slack"], json!(true), "{}", r.text);
+    let r = s.get("/api/auth/social/slack/start").await;
+    assert_eq!(r.status, 307, "slack start failed: {} {}", r.status, r.text);
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/slack/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "slack callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("slack-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn apple_login_builds_a_client_secret_and_provisions_a_user() {
+    let idp = start_mock("apple-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_APPLE_CLIENT_ID", "test-apple".to_string()),
+        ("OPENWARP_APPLE_TEAM_ID", "TEAM123456".to_string()),
+        ("OPENWARP_APPLE_KEY_ID", "KEY1234567".to_string()),
+        ("OPENWARP_APPLE_PRIVATE_KEY", TEST_EC_PEM.to_string()),
+        ("OPENWARP_APPLE_ISSUER", idp.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["apple"], json!(true), "{}", r.text);
+    let r = s.get("/api/auth/social/apple/start").await;
+    assert_eq!(r.status, 307, "apple start failed: {} {}", r.status, r.text);
+    assert!(r.header("location").contains("response_mode=form_post"), "Apple needs form_post: {}", r.header("location"));
+    let state = query_param(&r.header("location"), "state");
+    // Apple posts the authorization result as a form, not a query string.
+    let r = s.post_form("/api/auth/social/apple/callback", &[("code", "abc"), ("state", &state)]).await;
+    assert_eq!(r.status, 307, "apple form_post callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("apple-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn workos_login_uses_the_user_management_api() {
+    let api = start_mock("workos-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_WORKOS_CLIENT_ID", "client_test".to_string()),
+        ("OPENWARP_WORKOS_CLIENT_SECRET", "sk_test".to_string()),
+        ("OPENWARP_WORKOS_API", api.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["workos"], json!(true), "{}", r.text);
+
+    let r = s.get("/api/auth/social/workos/start").await;
+    assert_eq!(r.status, 307, "workos start failed: {} {}", r.status, r.text);
+    assert!(r.header("location").contains("/user_management/authorize"), "{}", r.header("location"));
+    assert!(r.header("location").contains("provider=authkit"), "{}", r.header("location"));
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/workos/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "workos callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("workos-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn x_login_uses_pkce_and_confirmed_email() {
+    let api = start_mock("x-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_X_CLIENT_ID", "test-x".to_string()),
+        ("OPENWARP_X_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_X_WEB", api.clone()),
+        ("OPENWARP_X_API", api.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["x"], json!(true), "{}", r.text);
+    let r = s.get("/api/auth/social/x/start").await;
+    assert_eq!(r.status, 307, "x start failed: {} {}", r.status, r.text);
+    let location = r.header("location");
+    assert!(location.contains("code_challenge=") && location.contains("code_challenge_method=S256"), "X needs PKCE: {}", location);
+    let state = query_param(&location, "state");
+    let r = s.get(&format!("/api/auth/social/x/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "x callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("x-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn discord_login_provisions_a_user() {
+    let api = start_mock("discord-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_DISCORD_CLIENT_ID", "test-discord".to_string()),
+        ("OPENWARP_DISCORD_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_DISCORD_API", api.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["discord"], json!(true), "{}", r.text);
+    let r = s.get("/api/auth/social/discord/start").await;
+    assert_eq!(r.status, 307, "discord start failed: {} {}", r.status, r.text);
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/discord/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "discord callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("discord-user@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn microsoft_login_refuses_a_token_without_an_email_claim() {
+    let idp = start_mock_mode("microsoft-upn@test.invalid", MockMode::MicrosoftNoEmail);
+    let s = Server::start_env(&[
+        ("OPENWARP_MICROSOFT_CLIENT_ID", "test-microsoft".to_string()),
+        ("OPENWARP_MICROSOFT_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_MICROSOFT_ISSUER", idp.clone()),
+    ]).await;
+    let r = s.get("/api/auth/social/microsoft/start").await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/microsoft/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "an unverified preferred_username must not create an account: {} {}", r.status, r.text);
+    assert!(r.text.contains("email"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn x_login_refuses_a_new_account_without_a_confirmed_email() {
+    let api = start_mock_mode("x-no-email@test.invalid", MockMode::XNoEmail);
+    let s = Server::start_env(&[
+        ("OPENWARP_X_CLIENT_ID", "test-x".to_string()),
+        ("OPENWARP_X_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_X_WEB", api.clone()),
+        ("OPENWARP_X_API", api.clone()),
+    ]).await;
+    let r = s.get("/api/auth/social/x/start").await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/x/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "an account without a confirmed email must be refused: {} {}", r.status, r.text);
+    assert!(r.text.contains("email"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn discord_login_refuses_an_unverified_email() {
+    let api = start_mock_mode("discord-unverified@test.invalid", MockMode::DiscordUnverified);
+    let s = Server::start_env(&[
+        ("OPENWARP_DISCORD_CLIENT_ID", "test-discord".to_string()),
+        ("OPENWARP_DISCORD_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_DISCORD_API", api.clone()),
+    ]).await;
+    let r = s.get("/api/auth/social/discord/start").await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/discord/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "an unverified Discord email must be refused: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn social_state_is_single_use_and_bound_to_its_provider() {
+    let idp = start_mock("state-user@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.clone()),
+        ("OPENWARP_GITHUB_CLIENT_ID", "test-github".to_string()),
+        ("OPENWARP_GITHUB_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GITHUB_WEB", idp.clone()),
+        ("OPENWARP_GITHUB_API", idp.clone()),
+    ]).await;
+    let r = s.get("/api/auth/social/google/start").await;
+    let state = query_param(&r.header("location"), "state");
+    assert!(!state.is_empty(), "no state in {}", r.header("location"));
+    let r = s.get(&format!("/api/auth/social/github/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "a Google state must not be accepted by GitHub: {} {}", r.status, r.text);
+    let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "the rejected callback must not consume the state: {} {}", r.status, r.text);
+    let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "a state must be single use: {} {}", r.status, r.text);
 }
 
 #[tokio::test]

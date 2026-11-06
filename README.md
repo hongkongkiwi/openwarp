@@ -54,11 +54,13 @@ that succeeds; `OPENWARP_NO_KEYRING=1` forces the 0600 file, and
 
 ## Sign-in and signups
 
-Password sign-in is always available. Google and GitHub sign-in appear on the
-login screen when `OPENWARP_GOOGLE_CLIENT_ID`/`_SECRET` or
-`OPENWARP_GITHUB_CLIENT_ID`/`_SECRET` are set; an unconfigured provider returns
-404 and is not advertised. Verified email addresses are required, and an account
-that already has a password is never linked to a social identity silently.
+Password sign-in is always available. Google, GitHub, Microsoft, Apple, GitLab,
+X, Discord, LinkedIn, Slack and WorkOS appear on the login screen when their
+client credentials are set; an unconfigured provider returns 404 and is not
+advertised. Verified email addresses are required where the provider reports
+verification, and an account that already has a password is never linked to a
+social identity silently. Provider variables, callback URLs and per-provider
+notes are in [docs/AUTH_PROVIDERS.md](docs/AUTH_PROVIDERS.md).
 
 Signups are open on a new instance. The instance owner (the first account) can
 close them under Settings, or pin the policy with `OPENWARP_SIGNUPS=closed`.

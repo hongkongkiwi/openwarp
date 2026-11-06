@@ -42,6 +42,15 @@ docker compose up -d --build
 | `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
 | `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
 | `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
+| `OPENWARP_MICROSOFT_CLIENT_ID` / `OPENWARP_MICROSOFT_CLIENT_SECRET` | Microsoft Entra ID sign-in |
+| `OPENWARP_MICROSOFT_TENANT` | Entra tenant, default `common`; pin it in production |
+| `OPENWARP_APPLE_CLIENT_ID` / `OPENWARP_APPLE_TEAM_ID` / `OPENWARP_APPLE_KEY_ID` / `OPENWARP_APPLE_PRIVATE_KEY` | Apple sign-in; the private key is the `.p8` PEM |
+| `OPENWARP_GITLAB_CLIENT_ID` / `OPENWARP_GITLAB_CLIENT_SECRET` | GitLab sign-in |
+| `OPENWARP_X_CLIENT_ID` / `OPENWARP_X_CLIENT_SECRET` | X sign-in; the app needs `users.email` |
+| `OPENWARP_DISCORD_CLIENT_ID` / `OPENWARP_DISCORD_CLIENT_SECRET` | Discord sign-in |
+| `OPENWARP_LINKEDIN_CLIENT_ID` / `OPENWARP_LINKEDIN_CLIENT_SECRET` | LinkedIn sign-in |
+| `OPENWARP_SLACK_CLIENT_ID` / `OPENWARP_SLACK_CLIENT_SECRET` | Slack sign-in |
+| `OPENWARP_WORKOS_CLIENT_ID` / `OPENWARP_WORKOS_CLIENT_SECRET` | WorkOS AuthKit sign-in |
 | `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
 | `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
 | `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider |
@@ -49,10 +58,13 @@ docker compose up -d --build
 | `OPENWARP_REQUIRE_EMAIL_VERIFICATION` | `1` blocks password sign-in until the emailed link is opened; requires the webhook |
 | `REDIS_URL` | Optional session cache |
 
-Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
-GitHub callback URL: `{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback`.
-GitHub needs the `read:user` and `user:email` scopes; only a verified address
-can create or match an account.
+Every provider callback is
+`{OPENWARP_PUBLIC_URL}/api/auth/social/{provider}/callback`, where provider is
+one of `google`, `github`, `microsoft`, `apple`, `gitlab`, `x`, `discord`,
+`linkedin`, `slack` or `workos`. GitHub needs the `read:user` and `user:email`
+scopes; only a verified address can create or match an account. See
+[docs/AUTH_PROVIDERS.md](AUTH_PROVIDERS.md) for the remaining scopes and
+provider-specific setup.
 
 ## Signups and invitations
 

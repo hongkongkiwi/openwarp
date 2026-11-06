@@ -1223,18 +1223,108 @@ fn instance_owner(st: &S) -> Option<String> {
     let uid = st.db.one("SELECT id FROM users ORDER BY created_at, id LIMIT 1", &[]).ok().flatten().map(|r| db::s(&r, "id"));
     if let Some(u) = &uid { claim_instance_owner(st, u); }
     uid }
-fn social_provider(provider: &str) -> Option<(String, String)> {
-    let (id_key, secret_key) = match provider {
-        "google" => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
-        "github" => ("OPENWARP_GITHUB_CLIENT_ID", "OPENWARP_GITHUB_CLIENT_SECRET"),
-        _ => return None };
-    let id = std::env::var(id_key).ok().unwrap_or_default();
-    let secret = std::env::var(secret_key).ok().unwrap_or_default();
-    if id.trim().is_empty() || secret.trim().is_empty() { None } else { Some((id, secret)) } }
-fn google_issuer() -> String { std::env::var("OPENWARP_GOOGLE_ISSUER").unwrap_or_else(|_| "https://accounts.google.com".into()) }
-fn github_web() -> String { std::env::var("OPENWARP_GITHUB_WEB").unwrap_or_else(|_| "https://github.com".into()) }
-fn github_api() -> String { std::env::var("OPENWARP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()) }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SocialKind { Google, GitHub, Microsoft, Apple, GitLab, X, Discord, LinkedIn, Slack, WorkOs }
+struct SocialProvider { key: &'static str, label: &'static str, kind: SocialKind }
+static SOCIAL_PROVIDERS: &[SocialProvider] = &[
+    SocialProvider { key: "google", label: "Google", kind: SocialKind::Google },
+    SocialProvider { key: "github", label: "GitHub", kind: SocialKind::GitHub },
+    SocialProvider { key: "microsoft", label: "Microsoft", kind: SocialKind::Microsoft },
+    SocialProvider { key: "apple", label: "Apple", kind: SocialKind::Apple },
+    SocialProvider { key: "gitlab", label: "GitLab", kind: SocialKind::GitLab },
+    SocialProvider { key: "x", label: "X", kind: SocialKind::X },
+    SocialProvider { key: "discord", label: "Discord", kind: SocialKind::Discord },
+    SocialProvider { key: "linkedin", label: "LinkedIn", kind: SocialKind::LinkedIn },
+    SocialProvider { key: "slack", label: "Slack", kind: SocialKind::Slack },
+    SocialProvider { key: "workos", label: "WorkOS", kind: SocialKind::WorkOs },
+];
+fn social_provider(key: &str) -> Option<&'static SocialProvider> { SOCIAL_PROVIDERS.iter().find(|p| p.key == key) }
+fn provider_env(kind: SocialKind) -> (&'static str, &'static str) {
+    match kind {
+        SocialKind::Google => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
+        SocialKind::GitHub => ("OPENWARP_GITHUB_CLIENT_ID", "OPENWARP_GITHUB_CLIENT_SECRET"),
+        SocialKind::Microsoft => ("OPENWARP_MICROSOFT_CLIENT_ID", "OPENWARP_MICROSOFT_CLIENT_SECRET"),
+        SocialKind::Apple => ("OPENWARP_APPLE_CLIENT_ID", ""),
+        SocialKind::GitLab => ("OPENWARP_GITLAB_CLIENT_ID", "OPENWARP_GITLAB_CLIENT_SECRET"),
+        SocialKind::X => ("OPENWARP_X_CLIENT_ID", "OPENWARP_X_CLIENT_SECRET"),
+        SocialKind::Discord => ("OPENWARP_DISCORD_CLIENT_ID", "OPENWARP_DISCORD_CLIENT_SECRET"),
+        SocialKind::LinkedIn => ("OPENWARP_LINKEDIN_CLIENT_ID", "OPENWARP_LINKEDIN_CLIENT_SECRET"),
+        SocialKind::Slack => ("OPENWARP_SLACK_CLIENT_ID", "OPENWARP_SLACK_CLIENT_SECRET"),
+        SocialKind::WorkOs => ("OPENWARP_WORKOS_CLIENT_ID", "OPENWARP_WORKOS_CLIENT_SECRET") } }
+fn env_nonempty(key: &str) -> String { std::env::var(key).ok().map(|v| v.trim().to_string()).unwrap_or_default() }
+fn env_or(key: &str, default: &str) -> String { let v = env_nonempty(key); if v.is_empty() { default.to_string() } else { v } }
+fn apple_config_present() -> bool {
+    !env_nonempty("OPENWARP_APPLE_CLIENT_ID").is_empty()
+        && !env_nonempty("OPENWARP_APPLE_TEAM_ID").is_empty()
+        && !env_nonempty("OPENWARP_APPLE_KEY_ID").is_empty()
+        && !env_nonempty("OPENWARP_APPLE_PRIVATE_KEY").is_empty() }
+fn social_enabled(p: &SocialProvider) -> bool {
+    let (id_env, secret_env) = provider_env(p.kind);
+    if env_nonempty(id_env).is_empty() { return false; }
+    if p.kind == SocialKind::Apple { apple_config_present() } else { !env_nonempty(secret_env).is_empty() } }
+fn social_credentials(p: &SocialProvider) -> Option<(String, String)> {
+    if !social_enabled(p) { return None; }
+    let (id_env, secret_env) = provider_env(p.kind);
+    Some((env_nonempty(id_env), if p.kind == SocialKind::Apple { String::new() } else { env_nonempty(secret_env) })) }
+fn google_issuer() -> String { env_or("OPENWARP_GOOGLE_ISSUER", "https://accounts.google.com") }
+fn microsoft_issuer() -> String {
+    let tenant = env_or("OPENWARP_MICROSOFT_TENANT", "common");
+    env_or("OPENWARP_MICROSOFT_ISSUER", &format!("https://login.microsoftonline.com/{}/v2.0", tenant)) }
+fn apple_issuer() -> String { env_or("OPENWARP_APPLE_ISSUER", "https://appleid.apple.com") }
+fn gitlab_issuer() -> String { env_or("OPENWARP_GITLAB_ISSUER", "https://gitlab.com") }
+fn linkedin_issuer() -> String { env_or("OPENWARP_LINKEDIN_ISSUER", "https://www.linkedin.com/oauth") }
+fn slack_issuer() -> String { env_or("OPENWARP_SLACK_ISSUER", "https://slack.com") }
+fn github_web() -> String { env_or("OPENWARP_GITHUB_WEB", "https://github.com") }
+fn github_api() -> String { env_or("OPENWARP_GITHUB_API", "https://api.github.com") }
+fn x_web() -> String { env_or("OPENWARP_X_WEB", "https://x.com") }
+fn x_api() -> String { env_or("OPENWARP_X_API", "https://api.x.com") }
+fn discord_api() -> String { env_or("OPENWARP_DISCORD_API", "https://discord.com") }
+fn workos_api() -> String { env_or("OPENWARP_WORKOS_API", "https://api.workos.com") }
+fn oidc_issuer(kind: SocialKind) -> String {
+    match kind {
+        SocialKind::Google => google_issuer(), SocialKind::Microsoft => microsoft_issuer(),
+        SocialKind::Apple => apple_issuer(), SocialKind::GitLab => gitlab_issuer(),
+        SocialKind::LinkedIn => linkedin_issuer(), SocialKind::Slack => slack_issuer(),
+        _ => String::new() } }
+fn social_scopes(kind: SocialKind) -> &'static str {
+    match kind {
+        SocialKind::Google | SocialKind::Microsoft | SocialKind::GitLab => "openid email profile",
+        SocialKind::Apple => "openid email name",
+        SocialKind::LinkedIn | SocialKind::Slack => "openid profile email",
+        SocialKind::X => "tweet.read users.read users.email",
+        SocialKind::Discord => "identify email",
+        SocialKind::GitHub => "read:user user:email",
+        SocialKind::WorkOs => "" } }
+fn social_email_claims(_kind: SocialKind) -> &'static [&'static str] { &["email"] }
 fn social_redirect(st: &S, h: &HeaderMap, provider: &str) -> String { format!("{}/api/auth/social/{}/callback", issuer(st, h), provider) }
+// Provider endpoints carry client secrets, so plaintext HTTP is limited to a
+// loopback provider used in development, exactly like organisation OIDC.
+fn social_endpoint_ok(u: &str) -> bool { issuer_url_ok(u) && egress_allowed(u) }
+fn token_error(v: &Value) -> String {
+    ["error_description", "error", "message"].iter().find_map(|k| v.get(*k).and_then(|x| x.as_str())).unwrap_or("no error detail").to_string() }
+fn claim_bool(v: Option<&Value>) -> Option<bool> {
+    match v {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() { "true" => Some(true), "false" => Some(false), _ => None },
+        _ => None } }
+fn clean_email(s: &str) -> Option<String> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.contains('@') && !s.chars().any(char::is_whitespace) { Some(s) } else { None } }
+struct SocialIdentity { subject: String, email: Option<String> }
+fn identity_from_claims(claims: &Value, label: &str, email_claims: &[&str]) -> Result<SocialIdentity, String> {
+    let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if subject.is_empty() { return Err(format!("{} id_token has no subject", label)); }
+    let email = email_claims.iter().find_map(|k| claims.get(*k).and_then(|v| v.as_str()).and_then(clean_email));
+    if claim_bool(claims.get("email_verified")) == Some(false) { return Err(format!("{} account email is not verified", label)); }
+    Ok(SocialIdentity { subject, email }) }
+// The authorization server sends the user back through a provider it names;
+// only an issuer match prevents a forged id_token from another tenant.
+fn issuer_matches(actual: &str, expected: &str) -> bool {
+    if actual == expected { return true; }
+    let Some(rest) = expected.strip_prefix("https://login.microsoftonline.com/") else { return false };
+    if !(rest.starts_with("common/") || rest.starts_with("organizations/") || rest.starts_with("consumers/")) { return false; }
+    let suffix = rest.split_once('/').map(|(_, s)| s).unwrap_or("");
+    !suffix.is_empty() && actual.starts_with("https://login.microsoftonline.com/") && actual.ends_with(&format!("/{}", suffix)) }
 async fn verify_id_token(id_token: &str, issuer: &str, audience: &str, jwks_uri: &str) -> Result<Value, String> {
     let header = jsonwebtoken::decode_header(id_token).map_err(|e| e.to_string())?;
     let kid = header.kid.ok_or("id_token has no kid")?;
@@ -1242,30 +1332,66 @@ async fn verify_id_token(id_token: &str, issuer: &str, audience: &str, jwks_uri:
     let jwk = jwks.get("keys").and_then(|v| v.as_array()).and_then(|ks| ks.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid))).ok_or("kid not found in JWKS")?;
     let dkey = jsonwebtoken::DecodingKey::from_rsa_components(jwk.get("n").and_then(|v| v.as_str()).unwrap_or(""), jwk.get("e").and_then(|v| v.as_str()).unwrap_or("")).map_err(|e| e.to_string())?;
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[audience]); validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
     let data = jsonwebtoken::decode::<Value>(id_token, &dkey, &validation).map_err(|e| e.to_string())?;
+    let actual = data.claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+    if !issuer_matches(actual, issuer) { return Err(format!("id_token issuer {} does not match {}", actual, issuer)); }
     Ok(data.claims) }
-async fn google_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
-    let issuer = google_issuer();
+fn apple_client_secret(client_id: &str) -> Result<String, String> {
+    let team = env_nonempty("OPENWARP_APPLE_TEAM_ID");
+    let key_id = env_nonempty("OPENWARP_APPLE_KEY_ID");
+    let pem = env_nonempty("OPENWARP_APPLE_PRIVATE_KEY").replace("\\n", "\n");
+    if team.is_empty() || key_id.is_empty() || pem.is_empty() {
+        return Err("Apple sign-in needs OPENWARP_APPLE_TEAM_ID, OPENWARP_APPLE_KEY_ID and OPENWARP_APPLE_PRIVATE_KEY".into()); }
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(key_id);
+    let claims = json!({"iss": team, "iat": now(), "exp": now() + 300, "aud": "https://appleid.apple.com", "sub": client_id});
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| e.to_string())?;
+    jsonwebtoken::encode(&header, &claims, &key).map_err(|e| e.to_string()) }
+fn pkce_challenge(verifier: &str) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    Base64UrlUnpadded::encode_string(digest.as_slice()) }
+async fn oidc_social_identity(p: &SocialProvider, client_id: &str, client_secret: &str, redirect: &str, code: &str, nonce: &str) -> Result<SocialIdentity, String> {
+    let issuer = oidc_issuer(p.kind);
+    if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(format!("{} issuer must be https, or http on a loopback address", p.label)); }
     let disc = oidc_discovery(&issuer).await.map_err(|(_, j)| j.to_string())?;
     let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or("");
     let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
-    if !url_ok(token_ep) || !url_ok(jwks_uri) { return Err("Google discovery returned no usable endpoints".into()); }
-    let tok: Value = http_client().post(token_ep)
+    if !social_endpoint_ok(token_ep) || !social_endpoint_ok(jwks_uri) { return Err(format!("{} discovery returned no usable token_endpoint or jwks_uri", p.label)); }
+    let resp = http_client().post(token_ep)
         .form(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect), ("client_id", client_id), ("client_secret", client_secret)])
-        .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
-    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or("Google token response has no id_token")?;
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status(); let tok: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("{} token exchange failed: {}", p.label, token_error(&tok))); }
+    let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or_else(|| format!("{} token response has no id_token", p.label))?;
     let claims = verify_id_token(id_token, &issuer, client_id, jwks_uri).await?;
-    if claims.get("email_verified").and_then(|v| v.as_bool()) == Some(false) { return Err("Google account email is not verified".into()); }
-    let email = claims.get("email").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if email.is_empty() || subject.is_empty() { return Err("Google id_token has no email or subject".into()); }
-    Ok((subject, email)) }
-async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
-    let tok: Value = http_client().post(format!("{}/login/oauth/access_token", github_web()))
+    if !nonce.is_empty() {
+        if let Some(returned) = claims.get("nonce").and_then(|v| v.as_str()) {
+            if returned != nonce { return Err(format!("{} id_token nonce does not match this login attempt", p.label)); } } }
+    let mut ident = identity_from_claims(&claims, p.label, social_email_claims(p.kind))?;
+    // Slack keeps the email on its userinfo endpoint, not in the id_token.
+    if p.kind == SocialKind::Slack {
+        let at = tok.get("access_token").and_then(|v| v.as_str()).ok_or("Slack token response has no access_token")?;
+        let userinfo = disc.get("userinfo_endpoint").and_then(|v| v.as_str()).unwrap_or("");
+        if !social_endpoint_ok(userinfo) { return Err("Slack discovery returned no usable userinfo_endpoint".into()); }
+        let resp = http_client().get(userinfo).bearer_auth(at).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status(); let info: Value = resp.json().await.map_err(|e| e.to_string())?;
+        if !status.is_success() || info.get("ok").and_then(|v| v.as_bool()) == Some(false) { return Err(format!("Slack userinfo request failed: {}", token_error(&info))); }
+        let sub = info.get("sub").and_then(|v| v.as_str()).unwrap_or("");
+        if !sub.is_empty() && sub != ident.subject { return Err("Slack userinfo subject does not match the id_token".into()); }
+        ident.email = info.get("email").and_then(|v| v.as_str()).and_then(clean_email);
+        if claim_bool(info.get("email_verified")) == Some(false) { return Err("Slack account email is not verified".into()); } }
+    Ok(ident) }
+async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<SocialIdentity, String> {
+    if !social_endpoint_ok(&github_web()) || !social_endpoint_ok(&github_api()) { return Err("GitHub endpoints must be https, or http on a loopback address".into()); }
+    let resp = http_client().post(format!("{}/login/oauth/access_token", github_web()))
         .header("Accept", "application/json").header("User-Agent", "openwarp")
         .form(&[("client_id", client_id), ("client_secret", client_secret), ("code", code), ("redirect_uri", redirect)])
-        .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status(); let tok: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("GitHub token exchange failed: {}", token_error(&tok))); }
     let at = tok.get("access_token").and_then(|v| v.as_str()).ok_or("GitHub token response has no access_token")?;
     let user: Value = http_client().get(format!("{}/user", github_api()))
         .bearer_auth(at).header("Accept", "application/vnd.github+json").header("User-Agent", "openwarp")
@@ -1281,19 +1407,77 @@ async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, c
             .or_else(|| arr.iter().find(|e| e.get("verified").and_then(|v| v.as_bool()) == Some(true))) });
     let email = verified.and_then(|e| e.get("email").and_then(|v| v.as_str())).unwrap_or("").to_lowercase();
     if email.is_empty() { return Err("GitHub account has no verified email".into()); }
-    Ok((subject, email)) }
-fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    Ok(SocialIdentity { subject, email: Some(email) }) }
+async fn x_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str) -> Result<SocialIdentity, String> {
+    let token_ep = format!("{}/2/oauth2/token", x_api());
+    let user_ep = format!("{}/2/users/me?user.fields=confirmed_email", x_api());
+    if !social_endpoint_ok(&token_ep) || !social_endpoint_ok(&user_ep) { return Err("X endpoints must be https, or http on a loopback address".into()); }
+    let resp = http_client().post(&token_ep).basic_auth(client_id, Some(client_secret))
+        .form(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect), ("code_verifier", verifier)])
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status(); let tok: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("X token exchange failed: {}", token_error(&tok))); }
+    let at = tok.get("access_token").and_then(|v| v.as_str()).ok_or("X token response has no access_token")?;
+    let me: Value = http_client().get(&user_ep).bearer_auth(at).header("User-Agent", "openwarp")
+        .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let data = me.get("data").ok_or_else(|| format!("X user lookup failed: {}", token_error(&me)))?;
+    let subject = data.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .or_else(|| data.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string())).ok_or("X user has no id")?;
+    // X only returns confirmed_email when the app has the users.email scope.
+    let email = data.get("confirmed_email").and_then(|v| v.as_str()).and_then(clean_email)
+        .or_else(|| data.get("email").and_then(|v| v.as_str()).and_then(clean_email));
+    Ok(SocialIdentity { subject, email }) }
+async fn discord_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<SocialIdentity, String> {
+    let token_ep = format!("{}/api/oauth2/token", discord_api());
+    let user_ep = format!("{}/api/users/@me", discord_api());
+    if !social_endpoint_ok(&token_ep) || !social_endpoint_ok(&user_ep) { return Err("Discord endpoints must be https, or http on a loopback address".into()); }
+    let resp = http_client().post(&token_ep)
+        .form(&[("client_id", client_id), ("client_secret", client_secret), ("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)])
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status(); let tok: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("Discord token exchange failed: {}", token_error(&tok))); }
+    let at = tok.get("access_token").and_then(|v| v.as_str()).ok_or("Discord token response has no access_token")?;
+    let me: Value = http_client().get(&user_ep).bearer_auth(at).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let subject = me.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .or_else(|| me.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string())).ok_or("Discord user has no id")?;
+    let verified = claim_bool(me.get("verified"));
+    if verified == Some(false) { return Err("Discord account email is not verified".into()); }
+    Ok(SocialIdentity { subject, email: me.get("email").and_then(|v| v.as_str()).and_then(clean_email) }) }
+async fn workos_identity(client_id: &str, client_secret: &str, code: &str) -> Result<SocialIdentity, String> {
+    let endpoint = format!("{}/user_management/authenticate", workos_api());
+    if !social_endpoint_ok(&endpoint) { return Err("WorkOS API must be https, or http on a loopback address".into()); }
+    let resp = http_client().post(&endpoint)
+        .json(&json!({"client_id": client_id, "client_secret": client_secret, "grant_type": "authorization_code", "code": code}))
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status(); let tok: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("WorkOS authentication failed: {}", token_error(&tok))); }
+    let user = tok.get("user").ok_or("WorkOS response has no user")?;
+    let subject = user.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if subject.is_empty() { return Err("WorkOS user has no id".into()); }
+    let verified = claim_bool(user.get("email_verified"));
+    if verified == Some(false) { return Err("WorkOS account email is not verified".into()); }
+    Ok(SocialIdentity { subject, email: user.get("email").and_then(|v| v.as_str()).and_then(clean_email) }) }
+async fn social_identity(p: &SocialProvider, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, nonce: &str) -> Result<SocialIdentity, String> {
+    match p.kind {
+        SocialKind::Google | SocialKind::Microsoft | SocialKind::Apple | SocialKind::GitLab | SocialKind::LinkedIn | SocialKind::Slack =>
+            oidc_social_identity(p, client_id, client_secret, redirect, code, nonce).await,
+        SocialKind::GitHub => github_identity(client_id, client_secret, redirect, code).await,
+        SocialKind::X => x_identity(client_id, client_secret, redirect, code, verifier).await,
+        SocialKind::Discord => discord_identity(client_id, client_secret, redirect, code).await,
+        SocialKind::WorkOs => workos_identity(client_id, client_secret, code).await } }
+fn resolve_social(st: &S, provider: &str, subject: &str, email: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
     if let Some(bound) = st.db.one("SELECT user_id FROM social_subjects WHERE provider=? AND subject=?", &[json!(provider), json!(subject)]).map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
         if !st.principal_active(&uid) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
         return Ok(uid); }
-    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.is_some() {
+    let email = email.and_then(clean_email).ok_or_else(|| bad("this provider did not return an email address; an account cannot be created without one"))?;
+    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).map_err(|e| bad(&e))?.is_some() {
         return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password first")); }
     // A pending invite admits the user even when self-signup is closed.
-    let invite = st.db.one("SELECT * FROM invites WHERE email=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(email), json!(now())]).map_err(|e| bad(&e))?;
+    let invite = st.db.one("SELECT * FROM invites WHERE email=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&email), json!(now())]).map_err(|e| bad(&e))?;
     if invite.is_none() && !signups_open(st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     let kp = oc::Keypair::generate(); let pw = oc::random_token("social"); let uid = id();
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(uid), json!(&email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(provider), json!(subject), json!(uid), json!(now())]).map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid);
     match invite {
@@ -1307,48 +1491,93 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
     }
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email));
     Ok(uid) }
+fn social_state_fields(row: &Row) -> (String, String, String) {
+    let raw = db::s(row, "provider"); let mut parts = raw.split('|');
+    (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string()) }
 async fn auth_providers(State(st): State<S>) -> Res {
-    Ok(j(json!({
-        "password": true,
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-        "signups": if signups_open(&st) { "open" } else { "invite" },
-    }))) }
+    let mut out = serde_json::Map::new();
+    out.insert("password".into(), json!(true));
+    let mut listed = Vec::new();
+    for p in SOCIAL_PROVIDERS {
+        let enabled = social_enabled(p);
+        out.insert(p.key.into(), json!(enabled));
+        if enabled { listed.push(json!({"id": p.key, "label": p.label})); } }
+    out.insert("providers".into(), json!(listed));
+    out.insert("signups".into(), json!(if signups_open(&st) { "open" } else { "invite" }));
+    Ok(j(Value::Object(out))) }
 async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
-    let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let p = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let (client_id, _) = social_credentials(p).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
-    let state = oc::random_token("sst");
-    st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
-    let url = if provider == "google" {
-        let disc = oidc_discovery(&google_issuer()).await?;
-        let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
-        if !url_ok(auth_ep) { return Err(bad("Google discovery returned no authorization_endpoint")); }
-        format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}", auth_ep, urlencode(&client_id), urlencode(&redirect), state)
-    } else {
-        format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state) };
+    let state = oc::random_token("sst"); let verifier = oc::random_token("pkce"); let nonce = oc::random_token("n");
+    // The verifier and nonce stay server-side with the state; the provider
+    // column carries them so the schema needs no extra columns.
+    st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(format!("{}|{}|{}", p.key, verifier, nonce)), json!(now())]).map_err(|e| bad(&e))?;
+    let url = match p.kind {
+        SocialKind::Google | SocialKind::Microsoft | SocialKind::Apple | SocialKind::GitLab | SocialKind::LinkedIn | SocialKind::Slack => {
+            let issuer = oidc_issuer(p.kind);
+            if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad(&format!("{} issuer must be https, or http on a loopback address", p.label))); }
+            let disc = oidc_discovery(&issuer).await?;
+            let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
+            if !social_endpoint_ok(auth_ep) { return Err(bad(&format!("{} discovery returned no usable authorization_endpoint", p.label))); }
+            let mut url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&nonce={}",
+                auth_ep, urlencode(&client_id), urlencode(&redirect), urlencode(social_scopes(p.kind)), state, nonce);
+            if p.kind == SocialKind::Apple { url.push_str("&response_mode=form_post"); }
+            url }
+        SocialKind::GitHub => {
+            if !social_endpoint_ok(&github_web()) { return Err(bad("GitHub web endpoint must be https, or http on a loopback address")); }
+            format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope={}&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scopes(p.kind)), state) }
+        SocialKind::X => {
+            if !social_endpoint_ok(&x_web()) { return Err(bad("X authorization endpoint must be https, or http on a loopback address")); }
+            format!("{}/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+                x_web(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scopes(p.kind)), state, pkce_challenge(&verifier)) }
+        SocialKind::Discord => {
+            if !social_endpoint_ok(&discord_api()) { return Err(bad("Discord API must be https, or http on a loopback address")); }
+            format!("{}/api/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}", discord_api(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scopes(p.kind)), state) }
+        SocialKind::WorkOs => {
+            let api = workos_api();
+            if !social_endpoint_ok(&api) { return Err(bad("WorkOS API must be https, or http on a loopback address")); }
+            let connection = env_nonempty("OPENWARP_WORKOS_CONNECTION_ID");
+            let selector = if connection.is_empty() { format!("&provider={}", urlencode(&env_or("OPENWARP_WORKOS_PROVIDER", "authkit"))) }
+                else { format!("&connection_id={}", urlencode(&connection)) };
+            format!("{}/user_management/authorize?response_type=code&client_id={}&redirect_uri={}&state={}{}", api, urlencode(&client_id), urlencode(&redirect), state, selector) } };
     Ok(axum::response::Redirect::temporary(&url)) }
 async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
-    let (client_id, client_secret) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    social_callback_inner(&st, &h, provider, q).await }
+async fn social_callback_post(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, axum::extract::Form(q): axum::extract::Form<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    social_callback_inner(&st, &h, provider, q).await }
+async fn social_callback_inner(st: &S, h: &HeaderMap, provider: String, q: HashMap<String,String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    let p = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let (client_id, mut client_secret) = social_credentials(p).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let row = st.db.one("SELECT provider,created_at FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
-    let _ = st.db.exec("DELETE FROM social_states WHERE state=?", &[json!(state)]);
-    if db::s(&row, "provider") != provider || db::n(&row, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
+    let raw = db::s(&row, "provider");
+    let (stored_provider, verifier, nonce) = social_state_fields(&row);
+    if stored_provider != p.key || db::n(&row, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     if code.is_empty() { return Err(bad("missing authorization code")); }
-    let redirect = social_redirect(&st, &h, &provider);
-    let (subject, email) = if provider == "google" { google_identity(&client_id, &client_secret, &redirect, &code).await }
-        else { github_identity(&client_id, &client_secret, &redirect, &code).await }.map_err(|e| bad(&e))?;
-    let uid = resolve_social(&st, &provider, &subject, &email)?;
-    let token = make_session(&st, &uid)?;
+    // Consume the state only after it validates, and make the delete the
+    // single-use checkpoint so two concurrent callbacks cannot both proceed.
+    let consumed = st.db.exec("DELETE FROM social_states WHERE state=? AND provider=?", &[json!(state), json!(raw)]).map_err(|e| bad(&e))?;
+    if consumed == 0 { return Err(bad("invalid or expired state")); }
+    if p.kind == SocialKind::Apple { client_secret = apple_client_secret(&client_id).map_err(|e| bad(&e))?; }
+    let redirect = social_redirect(st, h, &provider);
+    let ident = social_identity(p, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))?;
+    let uid = resolve_social(st, p.key, &ident.subject, ident.email.as_deref())?;
+    let token = make_session(st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h)?;
-    Ok(j(json!({
-        "signups_open": signups_open(&st),
-        "signups_env_locked": std::env::var("OPENWARP_SIGNUPS").is_ok(),
-        "instance_owner": instance_owner(&st).as_deref() == Some(uid.as_str()),
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-    }))) }
+    let mut out = serde_json::Map::new();
+    out.insert("signups_open".into(), json!(signups_open(&st)));
+    out.insert("signups_env_locked".into(), json!(std::env::var("OPENWARP_SIGNUPS").is_ok()));
+    out.insert("instance_owner".into(), json!(instance_owner(&st).as_deref() == Some(uid.as_str())));
+    let mut listed = Vec::new();
+    for p in SOCIAL_PROVIDERS {
+        let enabled = social_enabled(p);
+        out.insert(p.key.into(), json!(enabled));
+        if enabled { listed.push(json!({"id": p.key, "label": p.label})); } }
+    out.insert("providers".into(), json!(listed));
+    Ok(j(Value::Object(out))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -2218,7 +2447,7 @@ async fn main() {
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
-        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
+        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback_post))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
@@ -2263,5 +2492,25 @@ fn load_master(db: &Db) -> Result<[u8;32], String> {
     let k = oc::random_key(); let _ = db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&k))]);
     eprintln!("warning: OPENWARP_MASTER_KEY is not set; a generated key was stored in the database. Set OPENWARP_MASTER_KEY before production use.");
     Ok(k)
+}
+
+#[cfg(test)]
+mod social_tests {
+    use super::{issuer_matches, pkce_challenge};
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_vector() {
+        assert_eq!(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn microsoft_common_issuer_accepts_tenant_specific_tokens() {
+        assert!(issuer_matches("https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0", "https://login.microsoftonline.com/common/v2.0"));
+        assert!(issuer_matches("https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0", "https://login.microsoftonline.com/consumers/v2.0"));
+        assert!(!issuer_matches("https://login.microsoftonline.com.evil.example/72f988bf/v2.0", "https://login.microsoftonline.com/common/v2.0"));
+        assert!(!issuer_matches("https://login.microsoftonline.com/72f988bf/v1.0", "https://login.microsoftonline.com/common/v2.0"));
+        assert!(!issuer_matches("https://login.microsoftonline.com/72f988bf/v2.0", "https://accounts.google.com"));
+        assert!(issuer_matches("https://accounts.google.com", "https://accounts.google.com"));
+    }
 }
 
