@@ -127,6 +127,31 @@ check('secret readable with its plaintext value', !!found && found.value === 'sm
 const history = await call('GET', `/api/envs/${env.id}/secrets`, token);
 check('repeat read is stable', history.status === 200, history.text);
 
+const batch = await call('PUT', `/api/envs/${env.id}/secrets`, token, { secrets: [
+  { key: 'SMOKE_KEY', value: 'smoke-updated', expected_version: 1 },
+  { key: 'SMOKE_BATCH', value: 'batch-value', expected_version: 0 },
+] });
+check('checked multi-secret write commits', batch.status === 200 && batch.json.deployed === 2, batch.text);
+const committed = await call('GET', `/api/envs/${env.id}/secrets`, token);
+check('checked update and insert are both readable', committed.status === 200
+  && (committed.json.secrets || []).some(s => s.key === 'SMOKE_KEY' && s.value === 'smoke-updated' && s.version === 2)
+  && (committed.json.secrets || []).some(s => s.key === 'SMOKE_BATCH' && s.value === 'batch-value' && s.version === 1), committed.text);
+
+// A later invalid input or stale version must not persist the earlier valid write.
+for (const [name, later, status] of [
+  ['invalid later input', { key: 'INVALID KEY', value: 'invalid' }, 400],
+  ['stale later CAS', { key: 'SMOKE_BATCH', value: 'stale', expected_version: 0 }, 409],
+]) {
+  const rejected = await call('PUT', `/api/envs/${env.id}/secrets`, token, { secrets: [
+    { key: 'SMOKE_KEY', value: 'must-not-persist', expected_version: 2 }, later,
+  ] });
+  check(`${name} rejects the batch`, rejected.status === status, `${rejected.status} ${rejected.text}`);
+  const unchanged = await call('GET', `/api/envs/${env.id}/secrets`, token);
+  check(`${name} leaves both committed secrets unchanged`, unchanged.status === 200
+    && (unchanged.json.secrets || []).some(s => s.key === 'SMOKE_KEY' && s.value === 'smoke-updated' && s.version === 2)
+    && (unchanged.json.secrets || []).some(s => s.key === 'SMOKE_BATCH' && s.value === 'batch-value' && s.version === 1), unchanged.text);
+}
+
 // A Durable Object statement must report its affected rows: SCIM deactivation
 // branches on the DELETE count and would report "cannot remove the last owner"
 // while already having removed the row.

@@ -241,8 +241,13 @@ impl Db {
                     for (index, (statement, params)) in statements.iter().enumerate() {
                         let cursor = sql.exec(statement, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
                         for row in cursor.raw() { row.map_err(|e| JsValue::from_str(&e.to_string()))?; }
-                        if require_one.contains(&index) && cursor.rows_written() != 1 {
-                            return Err(JsValue::from_str("version conflict: concurrent secret change"));
+                        if require_one.contains(&index) {
+                            // rowsWritten includes index writes; changes() counts affected table rows.
+                            let changes: Value = sql.exec("SELECT changes() AS affected", None).map_err(|e| JsValue::from_str(&e.to_string()))?
+                                .one().map_err(|e| JsValue::from_str(&e.to_string()))?;
+                            if changes["affected"].as_u64() != Some(1) {
+                                return Err(JsValue::from_str("version conflict: concurrent secret change"));
+                            }
                         }
                     }
                     Ok(JsValue::UNDEFINED)

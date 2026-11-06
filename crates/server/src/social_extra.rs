@@ -48,7 +48,7 @@ pub fn authorize_url(provider: &str, client_id: &str, redirect: &str, state: &st
 
 async fn response_json(response: crate::http::Response) -> Result<Value, String> {
     if !response.status().is_success() { return Err("provider request failed".into()); }
-    let bytes = response.bytes().await.map_err(|_| "provider response could not be read")?;
+    let bytes = crate::http::read_bounded(response, 1024 * 1024).await?;
     if bytes.len() > 1024 * 1024 { return Err("provider response is too large".into()); }
     serde_json::from_slice(&bytes).map_err(|_| "provider response is invalid JSON".into()) }
 

@@ -1130,7 +1130,7 @@ async fn list_tags(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -
     let mut counts: HashMap<String, i64> = HashMap::new();
     for (_, _, raw) in st.list_secrets_decrypted(&eid, &uid).await? {
         for tag in raw["tags"].as_str().unwrap_or("").split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
-            *counts.entry(tag.to_string()).or_insert(0) += 1; }
+            *counts.entry(tag.to_ascii_lowercase()).or_insert(0) += 1; }
     }
     let mut tags: Vec<Value> = counts.into_iter().map(|(tag, count)| json!({"tag": tag, "count": count})).collect();
     tags.sort_by(|a, b| a["tag"].as_str().unwrap_or("").cmp(b["tag"].as_str().unwrap_or("")));
@@ -1508,7 +1508,10 @@ async fn open_lockbox(State(st): State<S>, Path(lid): Path<String>, h: HeaderMap
         st.db.exec("UPDATE lockbox SET views=views+1 WHERE id=? AND views<max_views AND expires_at>=?", &[json!(lid), json!(now())]).await
     }.map_err(|e| bad(&e))?;
     if taken == 0 { return Err(err(StatusCode::NOT_FOUND,"lockbox not found or already viewed")); }
-    Ok(j(json!({"value": String::from_utf8_lossy(&val), "views_remaining": (max_views - db::n(&row,"views") - 1).max(0)}))) }
+    let remaining = if max_views == 1 { 0 } else {
+        st.db.one("SELECT views,max_views FROM lockbox WHERE id=?", &[json!(&lid)]).await.map_err(|e| bad(&e))?
+            .map(|r| (db::n(&r,"max_views") - db::n(&r,"views")).max(0)).unwrap_or(0) };
+    Ok(j(json!({"value": String::from_utf8_lossy(&val), "views_remaining": remaining}))) }
 // Response wrapping: a single-use token whose ciphertext is bound to one
 // environment and a short TTL. The holder can look it up before redeeming it.
 async fn create_wrap(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;

@@ -9,6 +9,21 @@
 pub use inner::*;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "provider response could not be read")? {
+        if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn read_bounded(response: Response, limit: usize) -> Result<Vec<u8>, String> {
+    response.bounded_bytes(limit).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 mod inner {
     pub use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 }
@@ -78,6 +93,20 @@ mod inner {
         }
         pub async fn bytes(self) -> Result<Vec<u8>, String> {
             SendFuture::new(async move { self.0.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string()) }).await
+        }
+        pub async fn bounded_bytes(self, limit: usize) -> Result<Vec<u8>, String> {
+            SendFuture::new(async move {
+                use futures_util::StreamExt;
+                let stream = self.0.bytes_stream();
+                futures_util::pin_mut!(stream);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|_| "provider response could not be read")?;
+                    if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes)
+            }).await
         }
     }
 }

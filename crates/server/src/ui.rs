@@ -796,7 +796,7 @@ async function loadSshCerts(id){let host=$('ssh-certs');if(!host)return;try{let 
 async function revokeSshCert(cid,ca){if(!confirm('Revoke this certificate? A host only enforces it once its RevokedKeys file is refreshed.'))return;
   try{await api('POST',`/api/ssh/certs/${cid}/revoke`,{});toast('Revoked');openSshCA(ca)}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
-async function transferInstance(){try{await api('PUT','/api/instance/owner',{email:$('set-instance-owner').value});toast('Instance ownership transferred');renderSettings()}catch(e){toast(e.message,true)}}
+async function transferInstance(){let email=$('set-instance-owner').value.trim();if(!email){toast('Enter the new owner email',true);return}if(!confirm(`Transfer instance control to ${email}? You will lose instance owner controls.`))return;try{await api('PUT','/api/instance/owner',{email});toast('Instance ownership transferred');renderSettings()}catch(e){toast(e.message,true)}}
 async function deleteWorkspace(name){try{
   if($('del-org-name').value!==name){toast('Type the workspace name exactly to confirm',true);return}
   if(!confirm(`Delete ${name} and everything in it? This cannot be undone.`))return;
