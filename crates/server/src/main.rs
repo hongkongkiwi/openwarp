@@ -138,10 +138,9 @@ impl AppState {
         let _ = self.db.exec("INSERT INTO audit(id,org_id,app_id,env_id,actor,action,detail,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(id()), json!(org), json!(app), json!(env), json!(actor), json!(action), json!(detail), json!(now())]).await;
         // Names and actions only. Values stay in the encrypted tables, so a
         // replica can forward the event without ever seeing plaintext.
-        let mut seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
-        for _ in 0..4 {
+        let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+        for seq in (start..).take(4) {
             if self.db.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq), json!(org), json!(app), json!(env), json!(action), json!(detail), json!(now())]).await.is_ok() { break; }
-            seq += 1;
         }
     }
     async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
@@ -3008,6 +3007,7 @@ fn mcp_tools() -> Value { json!([
 ]) }
 fn rpc_result(id: &Value, result: Value) -> Value { json!({"jsonrpc":"2.0","id":id,"result":result}) }
 fn rpc_error(id: &Value, code: i64, msg: &str) -> Value { json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}}) }
+#[allow(clippy::result_large_err)]
 async fn mcp_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusCode, HeaderMap, Json<Value>)> {
     let iss = issuer(st, h);
     let mut hdr = HeaderMap::new(); hdr.insert("www-authenticate", format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"", iss).parse().unwrap());
