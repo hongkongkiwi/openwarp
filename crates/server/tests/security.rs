@@ -505,8 +505,10 @@ async fn authorize_page_escapes_untrusted_parameters() {
     let verifier = "integration-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
     let challenge = { use sha2::{Digest, Sha256}; base64url(&Sha256::digest(verifier.as_bytes())) };
     let payload = "%22%3E%3Cscript%3Ealert(1)%3C/script%3E%3Cinput%20name%3D%22";
+    // The payload travels in a parameter the page renders, so the assertion
+    // proves the value is escaped rather than dropped with unknown fields.
     let path = format!(
-        "/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8917%2Fcallback&response_type=code&scope=secrets%3Aread&code_challenge={}&code_challenge_method=S256&{}=1",
+        "/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8917%2Fcallback&response_type=code&scope=secrets%3Aread&code_challenge={}&code_challenge_method=S256&state={}",
         client_id, challenge, payload
     );
     let r = s.call(Method::GET, &path, None, None).await;

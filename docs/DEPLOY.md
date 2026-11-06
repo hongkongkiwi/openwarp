@@ -72,6 +72,40 @@ DATABASE_URL=... openwarp-server --migrate   # prints the current version and ex
 Existing databases created before the ledger are baselined at version 1 and
 upgraded in place. Take a backup first; see [BACKUP.md](BACKUP.md).
 
+## Encryption and key custody
+
+- SSE environments use a per-environment key wrapped by the instance root. Set
+  `OPENWARP_KMS_URL`, `OPENWARP_KMS_TOKEN` and `OPENWARP_KMS_KEY_ID` to wrap the
+  root and environment keys through an external KMS/HSM bridge. After changing
+  key IDs, run `POST /api/instance/rewrap` as the instance owner. Back up the KMS
+  key; the database alone is not enough.
+- An existing local database adopts its `meta.master` into `meta.kms_root` on
+  the first boot with a KMS and deletes the plaintext row.
+- Run `POST /api/instance/encrypt-metadata` once as the instance owner after
+  upgrading a database written before secret metadata was encrypted.
+- Delegated and E2E environments keep the environment key on the client. See
+  [ENCRYPTION.md](ENCRYPTION.md).
+
+## Sign-in methods and second factors
+
+- `OPENWARP_AUTH_PROVIDERS` pins the enabled methods as a comma-separated list.
+  Without it the instance owner can change them under instance settings. At
+  least one configured method must stay enabled.
+- Passkeys need `OPENWARP_RP_ID` and `OPENWARP_RP_ORIGIN` (the HTTPS origin).
+  Both must match what browsers see.
+- Email second factors use the configured mail provider; outside production a
+  suppressed code is written to the server log.
+- Client-derived sign-in is documented in [AUTH-PROTOCOL.md](AUTH-PROTOCOL.md).
+  The console still uses password registration and sign-in.
+
+## Delegated environments and the runner
+
+Create a runner in the workspace, then start `openwarp-runner` in the customer
+network with `OPENWARP_URL`, `OPENWARP_RUNNER_TOKEN` and `OPENWARP_RUNNER_KEY`
+(the base64 X25519 private key). It polls outbound only; `OPENWARP_RUNNER_ONCE=1`
+runs one pass and `OPENWARP_RUNNER_INTERVAL` sets the poll interval. Provider
+configs are sealed to the runner, and sealed secrets are never sent.
+
 ## Operational checks
 
 Treat rendered Compose configuration and logs as sensitive: they can include credentials or connection strings. The source Compose file binds port 8080 on host interfaces. Restrict it with firewall or binding configuration before exposing the host. If a reverse proxy runs in another container, its address is not necessarily loopback.

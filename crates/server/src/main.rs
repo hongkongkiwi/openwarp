@@ -1,5 +1,5 @@
 use openwarp_crypto as oc;
-use openwarp_server::{backfill_value_fingerprints, new_state, process_maintenance, production, router, try_leader};
+use openwarp_server::{backfill_value_fingerprints, install_kms, kms, new_state, process_maintenance, production, router, try_leader, validate_auth_env};
 use openwarp_server::db::{self, Db};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -15,7 +15,11 @@ async fn main() {
         match db.version().await { Ok(v) => println!("schema version {}", v), Err(e) => { eprintln!("{}", e); std::process::exit(1); } }
         return;
     }
-    let master = load_master(&db).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+    // A configured KMS must fail closed: an unreachable or invalid bridge is
+    // not a reason to fall back to a locally generated root key.
+    let kms = match kms::Kms::from_env() { Ok(k) => k, Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
+    let master = load_master(&db, kms.as_ref()).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+    if let Err(e) = validate_auth_env() { eprintln!("{}", e); std::process::exit(1); }
     if !openwarp_server::mailer::MailConfig::from_env().enabled() {
         if production() {
             eprintln!("no email provider is configured: password signup is disabled until one is set; configured SSO sign-in still works");
@@ -28,6 +32,7 @@ async fn main() {
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
     let (live, _) = broadcast::channel(256);
     let state = new_state(db, db_url.clone(), oc::random_token("inst"), pub_url, master, live, #[cfg(feature = "redis-cache")] redis_conn);
+    install_kms(&state, kms);
     { let st2 = state.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", st2.instance_id(), 60).await { process_maintenance(&st2).await; } } }); }
     // One poll for the whole process. With no sockets subscribed it only reads
@@ -66,12 +71,37 @@ async fn shutdown_signal() {
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     eprintln!("shutdown signal received; draining connections"); }
 
-async fn load_master(db: &Db) -> Result<[u8;32], String> {    if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") {
+async fn put_meta(db: &Db, key: &str, value: &str) {
+    if db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(key), json!(value)]).await.is_err() {
+        let _ = db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(key)]).await; } }
+
+async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String> {
+    if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") {
         let bytes = oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string())?;
         return bytes.try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string());
     }
     if std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) {
         return Err("OPENWARP_MASTER_KEY is required in production. If this database already has a generated key in the meta table, copy it into OPENWARP_MASTER_KEY, or start once with OPENWARP_ENV unset and set the key before going live.".into());
+    }
+    if let Some(kms) = kms {
+        // Adopt a database that predates KMS: wrap the existing master and
+        // remove the plaintext row. Later boots unwrap it through the KMS.
+        if let Some(r) = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| e.to_string())? {
+            let raw = kms.unwrap(&db::s(&r, "v"), "master").map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
+            return raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string());
+        }
+        // A present-but-unreadable master row must stop the boot. Minting a new
+        // root here would make every record under the old key undecryptable and
+        // delete the only copy of the old root.
+        let local: Option<[u8; 32]> = if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
+            let raw = oc::unb64(&db::s(&r, "v")).map_err(|_| "the stored master root is not valid base64; refusing to generate a replacement".to_string())?;
+            Some(raw.try_into().map_err(|_| "the stored master root is not 32 bytes; refusing to generate a replacement".to_string())?)
+        } else { None };
+        let k = local.unwrap_or_else(oc::random_key);
+        let wrapped = kms.wrap(&k, "master")?;
+        put_meta(db, "kms_root", &wrapped).await;
+        let _ = db.exec("DELETE FROM meta WHERE k='master'", &[]).await;
+        return Ok(k);
     }
     if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await { if let Ok(b) = oc::unb64(&db::s(&r,"v")) { if let Ok(k) = b.try_into() { return Ok(k); } } }
     let k = oc::random_key(); let _ = db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&k))]).await;

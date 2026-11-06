@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check openapi.json against the routes registered in crates/server/src/main.rs.
+"""Check openapi.json against the routes registered in crates/server/src/app.rs.
 
 Fails when the spec documents a path or method the server does not serve, when a
 $ref is missing, or when a path parameter is not declared. Routes the spec does
@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "openapi.json"
-MAIN = ROOT / "crates/server/src/main.rs"
+MAIN = ROOT / "crates/server/src/app.rs"
 
 def norm(path: str) -> str:
     return re.sub(r"\{[^}]+\}", "{}", path)

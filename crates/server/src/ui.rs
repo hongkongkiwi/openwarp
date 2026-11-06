@@ -92,9 +92,12 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null,
+  E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
+function e2eDrafts(){return (ENV&&E2E_DRAFTS[ENV.id])||{}}
+function e2eDraftList(){return Object.values(e2eDrafts())}
 const $=id=>document.getElementById(id);
 const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
 async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
@@ -196,7 +199,7 @@ async function doAuth(){try{
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
-  let me=await api('GET','/api/me');$('whoami').textContent=me.email;
+  let me=await api('GET','/api/me');$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
   $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
   $('orgs').value=ORG;
@@ -230,10 +233,11 @@ async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET
 async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
   if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
   if(!ENV)ENV=ENVS[0];
-  if((ENV.mode||'sse')==='e2e'){await renderE2eEnv();return}
+  if(isDelegated(ENV)){await renderDelegatedEnv();return}
+  if(isE2E(ENV)){await renderE2eEnv();return}
   let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
   $('view').innerHTML=`
-  <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
+  ${envTabs()}
   <div class="row" style="margin-bottom:12px">
     <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawSecrets()">
     <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button><button onclick="appSettings()">App settings</button>
@@ -242,18 +246,48 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pag
   <div id="stable"></div>
   ${APP?.readme?`<div class="card" style="margin-top:14px"><h3>Readme</h3><pre class="val" style="white-space:pre-wrap">${esc(APP.readme)}</pre></div>`:''}`;
   drawSecrets();updateDeployBar()}
+function envTabs(){return `<div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}${isE2E(e)?' · E2E':''}${e.mode==='delegated'?' · delegated':''}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>`}
 async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
-  $('view').innerHTML=`
-  <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}${e.mode==='e2e'?' · E2E':''}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
-  <div class="card"><h3>End-to-end encrypted environment</h3>
-    <p class="mut">The server stores only ciphertext for this environment. Paste your recovery kit to decrypt it in this browser. The kit is never sent to the server.</p>
-    <div class="field"><label for="e2e-kit">Recovery kit</label><input id="e2e-kit" type="password" autocomplete="off" placeholder="base64 recovery kit" style="width:100%"></div>
-    <button class="primary" onclick="loadE2E('${ENV.id}')">Decrypt secrets</button>
-    <pre class="val" id="e2e-out" style="margin-top:12px"></pre></div>`;
+  let id=ENV.id;
+  if(!E2E_DATA[id]&&E2E_LOADING[id]){$('view').innerHTML=envTabs()+'<div class="empty"><div class="big">Unlocking…</div>Decrypting this environment in the browser.</div>';updateDeployBar();return}
+  if(!E2E_DATA[id]&&E2E_KIT&&!E2E_LOCKED[id]&&!E2E_LOADING[id]){
+    $('view').innerHTML=envTabs()+'<div class="empty"><div class="big">Unlocking…</div>Decrypting this environment with the key from your session.</div>';
+    try{await e2eLoad(id,E2E_KIT)}catch(e){E2E_ERR[id]=e.message}
+  }
+  if(!E2E_DATA[id]){
+    let err=E2E_ERR[id]?`<p class="small" style="color:var(--bad)">${esc(E2E_ERR[id])}</p>`:'';
+    $('view').innerHTML=`${envTabs()}
+    <div class="card"><h3>End-to-end encrypted environment</h3>
+      <p class="mut">The server stores only ciphertext here, so this console has to decrypt it in the browser. Paste the recovery kit you saved at registration.</p>
+      ${err}
+      <div class="field"><label for="e2e-kit">Recovery kit</label><input id="e2e-kit" type="password" autocomplete="off" placeholder="base64 recovery kit" style="width:100%"></div>
+      <button class="primary" onclick="unlockE2EEnv()">Unlock environment</button>
+      <p class="small mut">The kit and the decrypted key stay in this tab and are never sent to the server. A reload locks the environment again.</p></div>`;
+    updateDeployBar();return}
+  let meta=E2E_META[id]||{};
+  let banner=meta.rekey_required?`<div class="card" style="border-color:var(--bad)"><h3>Access changed</h3>
+    <p>A member's key grant was removed, but the stored ciphertext is still encrypted under the old environment key. Rotate the key to re-encrypt every secret under a new key and wrap that key to the current members. Rotation cannot take back ciphertext someone already copied.</p>
+    <button class="primary" onclick="e2eRekey()">Rotate key now</button></div>`:'';
+  $('view').innerHTML=`${envTabs()}${banner}
+  <div class="row" style="margin-bottom:12px">
+    <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawE2E()">
+    <button onclick="e2eGrantsModal()">Access</button>
+    <button onclick="renderE2eEnv()">Refresh</button>
+    <button onclick="lockE2E()">Lock</button>
+    <span class="grow"></span><button class="primary" onclick="e2eAddRow()">+ New secret</button>
+  </div>
+  <p class="small mut">Decrypted in this tab only. Staged changes deploy together and are lost if you reload before deploying.</p>
+  <div id="stable"></div>`;
+  drawE2E();updateDeployBar()}
+async function renderDelegatedEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
+  $('view').innerHTML=`${envTabs()}<div class="card"><h3>Delegated environment</h3>
+    <p class="mut">This environment is client-encrypted, and a runner you host holds a key grant for provider sync. The console cannot read these secrets. Manage them with the CLI (<span class="mono">openwarp e2e</span>) or an E2E-capable client; provider sync runs on the runner.</p></div>`;
   updateDeployBar()}
+function isE2E(e){return !!e&&(e.mode||'sse')==='e2e'}
+function isDelegated(e){return !!e&&e.mode==='delegated'}
 async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
-  if(cur&&Object.keys(drafts()).length&&!confirm('Discard staged changes?'))return;
-  if(cur)delete DRAFTS[cur];
+  if(cur&&(Object.keys(drafts()).length||Object.keys(e2eDrafts()).length)&&!confirm('Discard staged changes?'))return;
+  if(cur){delete DRAFTS[cur];delete E2E_DRAFTS[cur]}
   ENV=ENVS.find(e=>e.id===id);await renderEnv()}
 function envMode(e){return e&&e.mode==='e2e'?'e2e':'sse'}
 async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
@@ -266,9 +300,186 @@ function appSettings(){if(!APP){toast('Open an app first',true);return}let on=AP
 async function saveAppSettings(){try{let on=$('app-reuse').checked;
   await api('PUT',`/api/apps/${APP.id}/settings`,{reuse_check:on});
   APP.reuse_check=on;closeModal();toast('App settings saved')}catch(e){toast(e.message,true)}}
-async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
-async function createE2eEnv(){try{let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name:$('ne2-name').value});closeModal();toast('E2E environment created: '+d.id);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);renderEnv()}catch(e){toast(e.message,true)}}
-async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
+function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3>
+  <p class="mut">The environment key is generated in this browser and wrapped to your account key. The server stores only ciphertext and cannot read these secrets.</p>
+  <div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div>
+  ${E2E_KIT?'':'<div class="field"><label for="ne2-kit">Recovery kit (needed to wrap the new key)</label><input id="ne2-kit" type="password" autocomplete="off" placeholder="base64 recovery kit" style="width:100%"></div>'}
+  <div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+  <p class="small mut">Provider sync needs a delegated environment with a runner.</p>`)}
+async function createE2eEnv(){try{
+  if(!E2E_KIT){let kit=($('ne2-kit')?.value||'').trim();if(!kit)throw new Error('paste the recovery kit for this account');E2E_KIT=kit}
+  if(!MY_PUBKEY)throw new Error('account public key unavailable; reload and sign in again');
+  let name=$('ne2-name').value.trim();
+  let envKey=crypto.getRandomValues(new Uint8Array(32));
+  let wrapped=await OW.encryptAsymmetric(MY_PUBKEY,envKey);
+  let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name,wrapped_key:wrapped});
+  if(d.server_generated)throw new Error('the server generated the key instead of using the client one; treat this environment as server-readable');
+  closeModal();E2E_KEYS[d.id]=envKey;
+  ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS.find(e=>e.id===d.id)||ENV;
+  await e2eLoad(d.id,E2E_KIT);toast('E2E environment created');await renderE2eEnv()
+}catch(e){toast(e.message,true)}}
+async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];delete E2E_KEYS[removed];delete E2E_DATA[removed];delete E2E_DRAFTS[removed];delete E2E_META[removed];delete E2E_GRANTS[removed];delete E2E_LOCKED[removed];delete E2E_ERR[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
+function enc(s){return new TextEncoder().encode(s)}
+function dec(b){return new TextDecoder().decode(b)}
+async function e2eHash(path,key,envKey){
+  // Match the server's blind index: HMAC under the environment key, not a bare
+  // SHA-256 a database thief could test guesses against offline.
+  let k=await crypto.subtle.importKey('raw',envKey,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  let sig=await crypto.subtle.sign('HMAC',k,enc('ow-key-index:v1|'+String(path||'/')+'|'+String(key||'').toUpperCase()));
+  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('')}
+async function e2eLoad(id,kit){E2E_LOADING[id]=true;delete E2E_ERR[id];
+  try{
+    let d=await api('GET',`/api/envs/${id}/e2e/secrets`);
+    let key=await OW.decryptAsymmetric(kit,d.wrapped_key);
+    let rows=[];
+    for(const s of d.secrets){
+      let name,value;
+      try{name=dec(await OW.decryptSymmetric(key,s.key_enc));value=dec(await OW.decryptSymmetric(key,s.value_enc))}
+      catch(e){throw new Error('a stored secret could not be decrypted under your key grant; it may predate a rotation. Ask a member with current access, or the CLI, to rekey it')}
+      let path=s.path_enc?dec(await OW.decryptSymmetric(key,s.path_enc)):(s.path||'/');
+      rows.push({id:s.id,key:name,value,path,key_hash:s.key_hash,version:s.version||1,updated_at:s.updated_at});
+    }
+    rows.sort((a,b)=>a.key.localeCompare(b.key));
+    E2E_KEYS[id]=key;E2E_DATA[id]=rows;E2E_DRAFTS[id]={};
+    let [meta,grants]=await Promise.all([api('GET',`/api/envs/${id}/e2e/meta`).catch(()=>null),api('GET',`/api/envs/${id}/e2e/grants`).catch(()=>[])]);
+    if(meta)E2E_META[id]=meta;E2E_GRANTS[id]=grants;
+  }finally{delete E2E_LOADING[id]}}
+async function unlockE2EEnv(){let kit=($('e2e-kit')?.value||'').trim()||E2E_KIT;
+  if(!kit){toast('Paste the recovery kit for this account',true);return}
+  try{await e2eLoad(ENV.id,kit);E2E_KIT=kit;delete E2E_LOCKED[ENV.id];toast('Environment unlocked');await renderE2eEnv()}catch(e){toast('Could not unlock: '+e.message,true)}}
+function lockE2E(){if(e2eDraftList().length&&!confirm('Discard staged changes and lock this environment?'))return;
+  E2E_LOCKED[ENV.id]=true;delete E2E_KEYS[ENV.id];delete E2E_DATA[ENV.id];delete E2E_DRAFTS[ENV.id];delete E2E_ERR[ENV.id];renderE2eEnv()}
+function drawE2E(){
+  let id=ENV.id,data=E2E_DATA[id]||[],dmap=e2eDrafts();
+  let rows=data.map(s=>({s,st:dmap[s.id]})).filter(x=>matchesFilter(x.st?x.st.key:x.s.key,x.st?x.st.path:x.s.path));
+  let news=Object.values(dmap).filter(d=>d.isNew&&!d.deleted&&matchesFilter(d.key,d.path)).map(d=>({s:d,st:d}));
+  let all=rows.concat(news);
+  if(!all.length){
+    let any=data.length||Object.keys(dmap).length;
+    $('stable').innerHTML=any
+      ?'<div class="empty"><div class="big">No matching secrets</div>Nothing here matches that filter. Clear it to see every secret in this environment.</div>'
+      :'<div class="empty"><div class="big">No secrets here yet</div>Click “+ New secret” to add one. Everything is encrypted in this browser before it is sent.</div>';
+    return}
+  $('stable').innerHTML=`<table><thead><tr><th style="width:28%">Key</th><th>Value</th><th style="width:13%">Path</th><th style="width:10%">Version</th><th style="width:14%"></th></tr></thead><tbody>
+  ${all.map(({s,st})=>{let gone=!!(st&&st.deleted);let key=st?st.key:s.key;let value=st?st.value:s.value;let path=st?st.path:s.path;let dirty=!!st&&!st.isNew;
+    return `<tr${gone?' style="opacity:.55"':''}><td>${dirty&&!gone?'<span class="stagedot"></span>':''}<span class="mono">${esc(key)}</span>${st&&st.isNew?' <span class="chip">new</span>':''}${gone?' <span class="chip">delete</span>':''}</td>
+    <td>${gone?'<span class="mut">deleted on deploy</span>':`<span class="val" data-val="${esc(value??'')}" data-show="0">••••••••••</span>`}</td>
+    <td class="mono mut">${esc(path||'/')}</td><td class="mut">${st&&st.isNew?'new':(st&&!gone?'staged':'v'+(s.version||1))}</td>
+    <td style="white-space:nowrap;text-align:right">${gone
+      ?`<button class="iconbtn" title="Undo delete" aria-label="Undo delete" onclick="e2eUndoDelete('${jsq(s.id)}')">↺</button>`
+      :`<button class="iconbtn" title="Reveal" aria-label="Reveal" onclick="revealVal(this)">◉</button><button class="iconbtn" title="Copy value" aria-label="Copy value" onclick="copyVal(this)">⧉</button>
+        <button class="iconbtn" title="Edit" aria-label="Edit" onclick="e2eEditRow('${jsq(s.id)}')">✎</button>
+        <button class="iconbtn" title="Delete" aria-label="Delete" onclick="e2eDelRow('${jsq(s.id)}','${jsq(key)}')">🗑</button>`}</td></tr>`}).join('')}
+  </tbody></table>`}
+function e2eAddRow(){if(!E2E_DATA[ENV.id]){toast('Unlock the environment first',true);return}let id='new-'+Date.now();
+  modal(`<h3>New secret</h3>
+    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL"></div>
+    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3"></textarea></div>
+    <div class="field"><label for="ns-path">Path</label><input id="ns-path" value="/"></div>
+    <div class="row"><button class="primary" onclick="e2eStageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+    <p class="small mut">Encrypted in this browser on deploy. There is no server-readable history for this environment.</p>`,'New secret')}
+function e2eStageNew(id){let k=$('ns-key').value.trim().toUpperCase(),path=$('ns-path').value||'/';
+  if(!/^[A-Za-z0-9_.-]{1,128}$/.test(k)){toast('Key must match [A-Za-z0-9_.-]{1,128}',true);return}
+  let dup=(E2E_DATA[ENV.id]||[]).some(s=>s.key===k&&s.path===path)||Object.values(e2eDrafts()).some(d=>!d.deleted&&d.key===k&&d.path===path);
+  if(dup){toast('A secret with that key and path already exists',true);return}
+  if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};
+  E2E_DRAFTS[ENV.id][id]={id,key:k,value:$('ns-val').value,path,isNew:true};
+  closeModal();drawE2E();updateDeployBar()}
+function e2eEditRow(id){let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
+  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div>
+    <div class="row"><button class="primary" onclick="e2eStageEdit('${jsq(id)}')">Stage change</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
+    <p class="small mut">Renaming is not staged here: delete the secret and add it under the new key. Rotate the key after a delete if the old value must stop being readable.</p>`,'Edit secret')}
+function e2eStageEdit(id){let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
+  if(d){d.value=$('ed-val').value;d.deleted=false}
+  else{if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};E2E_DRAFTS[ENV.id][id]={id,key:s.key,value:$('ed-val').value,path:s.path,key_hash:s.key_hash}}
+  closeModal();drawE2E();updateDeployBar();toast('Change staged, deploy when ready')}
+function e2eDelRow(id,key){let d=e2eDrafts()[id];
+  if(d&&d.isNew){delete e2eDrafts()[id];drawE2E();updateDeployBar();return}
+  if(!confirm('Delete '+key+'? The console keeps no history for this environment, so the value cannot be restored here.'))return;
+  let s=(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
+  if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};
+  E2E_DRAFTS[ENV.id][id]={id,key:s.key,value:s.value,path:s.path,key_hash:s.key_hash,deleted:true};
+  drawE2E();updateDeployBar()}
+function e2eUndoDelete(id){delete e2eDrafts()[id];drawE2E();updateDeployBar()}
+async function deployE2E(){
+  let id=ENV.id,key=E2E_KEYS[id];if(!key){toast('Unlock the environment first',true);return}
+  let list=e2eDraftList();if(!list.length)return;
+  let dels=list.filter(d=>d.deleted&&!d.isNew),puts=list.filter(d=>!d.deleted);
+  let seen=new Set();
+  for(const d of puts){let k=(d.key||'').trim().toUpperCase();
+    if(!/^[A-Za-z0-9_.-]{1,128}$/.test(k)){toast('Invalid key: '+k,true);return}
+    let pk=(d.path||'/')+':'+k;if(seen.has(pk)){toast('Duplicate key in this deploy: '+k,true);return}seen.add(pk)}
+  try{
+    let items=[],expected=new Map();
+    for(const d of puts){
+      let k=(d.key||'').trim().toUpperCase(),path=d.path||'/';
+      let kh=d.key_hash||await e2eHash(path,k,key);
+      items.push({key_enc:await OW.encryptSymmetric(key,enc(k)),value_enc:await OW.encryptSymmetric(key,enc(d.value??'')),key_hash:kh,path_enc:await OW.encryptSymmetric(key,enc(path))});
+      expected.set(kh,[k,d.value??'']);
+    }
+    // Writes go first: if they fail, the staged deletes are still unapplied and
+    // the user can retry. A delete is only issued once every put is stored.
+    if(items.length){let r=await api('PUT',`/api/envs/${id}/e2e/secrets`,{secrets:items});
+      if(r.deployed!==items.length)throw new Error(`the server stored ${r.deployed} of ${items.length} secrets`)}
+    for(const d of dels)await api('DELETE',`/api/secrets/${d.id}`);
+    await e2eLoad(id,E2E_KIT);
+    for(const [kh,[k,v]] of expected){let row=(E2E_DATA[id]||[]).find(r=>r.key_hash===kh);
+      if(!row)throw new Error('the deploy was stored but read-back could not find '+k);
+      if(row.key!==k||row.value!==v)throw new Error('the deploy was stored but read-back returned a different value for '+k)}
+    for(const d of dels){if((E2E_DATA[id]||[]).some(r=>r.id===d.id))throw new Error('deleted secret '+d.key+' is still present after deploy')}
+    toast(`Deployed ${items.length} secret${items.length!==1?'s':''}${dels.length?` and deleted ${dels.length}`:''}`);await renderE2eEnv();
+  }catch(e){toast('Deploy failed: '+e.message,true)}}
+async function e2eGrantsModal(){
+  let id=ENV.id;if(!E2E_KEYS[id]){toast('Unlock the environment first',true);return}
+  try{let [grants,meta]=await Promise.all([api('GET',`/api/envs/${id}/e2e/grants`),api('GET',`/api/envs/${id}/e2e/meta`)]);E2E_GRANTS[id]=grants;E2E_META[id]=meta}
+  catch(e){toast(e.message,true);return}
+  let meta=E2E_META[id]||{};
+  let rows=grants=>grants.map(g=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0">
+    <span class="mono small">${esc(g.email)}${g.user_id===MY_UID?' · you':''}</span>
+    ${g.user_id===MY_UID?'':`<button class="danger" onclick="e2eRevoke('${jsq(g.user_id)}','${jsq(g.email)}')">Remove access</button>`}</div>`).join('')||'<p class="mut">No key grants yet.</p>';
+  modal(`<h3>Who can decrypt this environment</h3>
+    <p class="mut">Each member gets the environment key wrapped to their account public key. The server never sees the key or the plaintext.</p>
+    ${rows(E2E_GRANTS[id]||[])}
+    <div class="field" style="margin-top:14px"><label for="eg-email">Grant access by email</label><input id="eg-email" type="email" placeholder="teammate@example.com"></div>
+    <div class="row"><button class="primary" onclick="e2eGrant()">Grant access</button><button class="ghost" onclick="closeModal()">Close</button></div>
+    ${meta.rekey_required?'<p class="small" style="color:var(--bad)">A grant was removed. Rotate the key from the environment banner so future secrets are not readable to the old grantee.</p>':''}`,'Environment access')}
+async function e2eGrant(){
+  let id=ENV.id,key=E2E_KEYS[id];if(!key)return;let email=$('eg-email').value.trim();
+  if(!email){toast('Enter the email of an existing member',true);return}
+  try{
+    let u=await api('GET',`/api/users/lookup?email=${encodeURIComponent(email)}`);
+    if(!u.pubkey)throw new Error('that account has no public key');
+    let wrapped=await OW.encryptAsymmetric(u.pubkey,key);
+    await api('POST',`/api/envs/${id}/e2e/grant`,{email:u.email,wrapped_key:wrapped});
+    let grants=await api('GET',`/api/envs/${id}/e2e/grants`);E2E_GRANTS[id]=grants;
+    if(!grants.some(g=>g.user_id===u.id))throw new Error('the grant was not stored');
+    toast('Access granted to '+u.email);await e2eGrantsModal();
+  }catch(e){toast('Grant failed: '+e.message,true)}}
+async function e2eRevoke(uid,email){
+  if(uid===MY_UID){toast('You cannot remove your own grant here; ask another member to rotate afterwards',true);return}
+  if(!confirm('Remove access for '+email+'? Rotate the environment key afterwards so they cannot read future secrets.'))return;
+  try{await api('DELETE',`/api/envs/${ENV.id}/e2e/grants/${uid}`);
+    E2E_META[ENV.id]={...(E2E_META[ENV.id]||{}),rekey_required:true};
+    E2E_GRANTS[ENV.id]=await api('GET',`/api/envs/${ENV.id}/e2e/grants`);
+    await e2eGrantsModal();await renderE2eEnv();toast('Access removed; rotate the key next')
+  }catch(e){toast(e.message,true)}}
+async function e2eRekey(){
+  let id=ENV.id,key=E2E_KEYS[id];if(!key)return;
+  if(e2eDraftList().length){toast('Deploy or discard staged changes before rotating the key',true);return}
+  if((E2E_META[id]||{}).runner){toast('Delegated environments rotate through the runner; use the CLI',true);return}
+  if(!(E2E_DATA[id]||[]).length){toast('Nothing to rotate yet: add a secret first',true);return}
+  if(!confirm('Rotate the environment key? Every secret is re-encrypted and each current member gets the new key wrapped to them.'))return;
+  try{
+    let newKey=crypto.getRandomValues(new Uint8Array(32));
+    let secrets=[];
+    for(const r of E2E_DATA[id])secrets.push({key_hash:r.key_hash,key_enc:await OW.encryptSymmetric(newKey,enc(r.key)),value_enc:await OW.encryptSymmetric(newKey,enc(r.value)),path_enc:await OW.encryptSymmetric(newKey,enc(r.path||'/'))});
+    let grants=await api('GET',`/api/envs/${id}/e2e/grants`);
+    if(!grants.some(g=>g.user_id===MY_UID))throw new Error('your own grant is missing; refresh and try again');
+    let payload=[];
+    for(const g of grants){if(!g.pubkey)throw new Error('grantee '+g.email+' has no public key');payload.push({user_id:g.user_id,wrapped_key:await OW.encryptAsymmetric(g.pubkey,newKey)})}
+    await api('POST',`/api/envs/${id}/e2e/rekey`,{secrets,grants:payload});
+    E2E_KEYS[id]=newKey;await e2eLoad(id,E2E_KIT);toast('Environment key rotated');await renderE2eEnv();
+  }catch(e){toast('Rotation failed: '+e.message,true)}}
 function matchesFilter(key,path){let q=($('sfilter')?.value||'').toLowerCase();return !q||String(key||'').toLowerCase().includes(q)||String(path||'').toLowerCase().includes(q)}
 function drawSecrets(){
   let all=SECRETS.map(s=>({s,isNew:false,d:drafts()[s.id]})).filter(x=>matchesFilter(x.d?x.d.key:x.s.key,x.d?x.d.path:x.s.path));
@@ -370,11 +581,12 @@ async function delSecret(id,key){let d=drafts()[id];
   let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
   if(!confirm('Delete '+key+'? You can restore it from history.'))return;
   try{await api('DELETE',`/api/secrets/${id}`);delete drafts()[id];toast('Secret deleted');await renderEnv()}catch(e){toast(e.message,true)}}
-function updateDeployBar(){let n=draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
+function updateDeployBar(){let n=isE2E(ENV)?e2eDraftList().length:draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
   $('deploybar').classList.toggle('show',active);
   $('deploytext').innerHTML=active?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
-function discardStage(){if(ENV)delete DRAFTS[ENV.id];drawSecrets();updateDeployBar()}
-async function deployStage(){try{let items=draftList().map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));
+function discardStage(){if(!ENV)return;delete DRAFTS[ENV.id];delete E2E_DRAFTS[ENV.id];
+  if(isE2E(ENV))drawE2E();else drawSecrets();updateDeployBar()}
+async function deployStage(){if(isE2E(ENV))return deployE2E();try{let items=draftList().map(s=>({key:s.key,value:s.value,path:s.path,type:s.type,comment:s.comment||''}));
   if(!items.length)return;let envId=ENV.id;
   let d=await api('PUT',`/api/envs/${envId}/secrets`,{secrets:items});
   if(ENV&&ENV.id===envId)delete DRAFTS[envId];
@@ -583,6 +795,15 @@ function boot(){
     let parts=h.slice(6).split('&');T=decodeURIComponent(parts[0]);
     for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
     history.replaceState(null,'',location.pathname);}
+  else if(h.startsWith('mfa=')){
+    // Social and OIDC sign-in hand the browser an MFA challenge instead of a
+    // session when the account has a second factor.
+    let parts=h.slice(4).split('&');MFA=decodeURIComponent(parts[0]);
+    for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
+    history.replaceState(null,'',location.pathname);
+    $('auth').style.display='grid';$('shell').style.display='none';
+    $('authtitle').textContent='Two-step verification';$('mfafield').style.display='block';
+    $('authbtn').textContent='Verify code';$('authbtn').onclick=doMfa;}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
 }
@@ -590,6 +811,9 @@ boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
 $('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
 </script>
+<script src="/libsodium.js" integrity="sha384-3KUAqev6nUaNHDSTa/UjyEycVN8iMfq/UtzKf3ZDTuGSb+P3y9kMu/WCVqnLAxUB"></script>
+<script src="/libsodium-wrappers.js" integrity="sha384-uj62oy76l27Bkf3eEP5knMYc094z6HzwAR7Rn8ZZcBBsg5nMibZXSvjRqgZMFg/L"></script>
 <script src="/e2e.js"></script>
+<script src="/auth-v2.js"></script>
 </body></html>
 "##;

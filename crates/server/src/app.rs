@@ -1,4 +1,4 @@
-use crate::{db, inference_leases, integrations, mailer, ssh_ca, ssh_keys, ui};
+use crate::{db, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
 #[cfg(feature = "ldap")] use crate::ldap;
 #[cfg(not(target_arch = "wasm32"))]
 use axum::body::Bytes;
@@ -53,31 +53,35 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 }
 
 pub struct AppState {
-    db: Db,
+    pub(crate) db: Db,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     db_url: String,
     instance_id: String,
-    pub_url: String,
+    pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
+    kms: std::sync::OnceLock<Option<kms::Kms>>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
-type Res = Result<Json<Value>, (StatusCode, Json<Value>)>;
+/// The root KMS is installed once at boot by the native entrypoint. The
+/// Workers build has no blocking HTTP client, so its slot stays empty.
+pub fn install_kms(st: &S, kms: Option<kms::Kms>) { let _ = st.kms.set(kms); }
+pub type Res = Result<Json<Value>, (StatusCode, Json<Value>)>;
 fn issuer(st: &S, h: &HeaderMap) -> String { if !st.pub_url.is_empty() { return st.pub_url.trim_end_matches('/').to_string(); } let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8080"); format!("http://{}", host) }
 fn cookie_val(h: &HeaderMap, name: &str) -> String { h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").split(';').filter_map(|p| p.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.to_string()).unwrap_or_default() }
-fn session_cookie(token: &str) -> String {
+pub(crate) fn session_cookie(token: &str) -> String {
     let secure = crate::envcfg::var("OPENWARP_PUBLIC_URL").map(|v| v.starts_with("https://")).unwrap_or(false)
         || crate::envcfg::var("OPENWARP_SECURE_COOKIES").map(|v| v == "1").unwrap_or(false);
     format!("ow_session={}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800{}", token, if secure { "; Secure" } else { "" }) }
-fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) { (code, Json(json!({"error": msg}))) }
-fn bad(msg: &str) -> (StatusCode, Json<Value>) { err(StatusCode::BAD_REQUEST, msg) }
-fn now() -> i64 { crate::clock::now() }
-fn id() -> String { oc::random_token("id").replace("id_", "") }
-fn j(v: impl Into<Value>) -> Json<Value> { Json(v.into()) }
+pub(crate) fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) { (code, Json(json!({"error": msg}))) }
+pub(crate) fn bad(msg: &str) -> (StatusCode, Json<Value>) { err(StatusCode::BAD_REQUEST, msg) }
+pub(crate) fn now() -> i64 { crate::clock::now() }
+pub(crate) fn id() -> String { oc::random_token("id").replace("id_", "") }
+pub(crate) fn j(v: impl Into<Value>) -> Json<Value> { Json(v.into()) }
 fn esc(s: &str) -> String { s.chars().map(|c| match c { '&' => "&amp;".into(), '<' => "&lt;".into(), '>' => "&gt;".into(), '"' => "&quot;".into(), '\'' => "&#39;".into(), c => c.to_string() }).collect() }
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     use hmac::{Hmac, Mac};
@@ -85,7 +89,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.update(data);
     let out = m.finalize().into_bytes();
     let mut bytes = [0u8; 32]; bytes.copy_from_slice(&out); bytes }
-fn hmac_hex(key: &[u8], data: &[u8]) -> String { hmac_sha256(key, data).iter().map(|b| format!("{:02x}", b)).collect() }
+pub(crate) fn hmac_hex(key: &[u8], data: &[u8]) -> String { hmac_sha256(key, data).iter().map(|b| format!("{:02x}", b)).collect() }
 // Reuse detection stores a keyed digest, never a bare hash: an operator with
 // the database but not the master key cannot test a password list offline.
 // The workspace id is part of the input so equal values in two workspaces do
@@ -98,13 +102,39 @@ fn value_fingerprint(master: &[u8; 32], org: &str, value: &str) -> String {
     data.push(0);
     data.extend_from_slice(value.as_bytes());
     hmac_hex(&key, &data) }
-#[cfg(not(target_arch = "wasm32"))]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) { return None; }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect() }
 const OAUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
-fn html_csp(body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP)); r }
-fn hidden_fields(form: &HashMap<String, String>) -> String { form.iter().filter(|(k, _)| k.as_str() != "otp").map(|(k, v)| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v))).collect() }
+const OAUTH_AUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const OAUTH_AUTH_JS: &str = r#"<script src="/auth-v2.js"></script><script>
+document.getElementById('oauthlogin').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var f = e.target;
+  (async function() {
+    try {
+      function add(name, value) { var i = document.createElement('input'); i.type = 'hidden'; i.name = name; i.value = value; f.appendChild(i); }
+      var kdf = await AuthV2.kdf(f.email.value);
+      if (kdf.version === 1) { add('approve', '1'); f.submit(); return; }
+      var keys = await AuthV2.deriveKeys(f.password.value, kdf.salt, kdf.iterations);
+      var ch = await AuthV2.challenge(f.email.value);
+      var proof = await AuthV2.proof(keys.auth, ch.challenge, ch.challenge_id);
+      f.password.value = '';
+      add('challenge_id', ch.challenge_id);
+      add('proof', proof);
+      add('approve', '1');
+      f.submit();
+    } catch (err) { alert(err.message || String(err)); }
+  })();
+});
+</script>"#;
+fn html_csp(body: String) -> Response { html_csp_with(OAUTH_CSP, body) }
+fn html_csp_with(csp: &'static str, body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(csp)); r }
+// Only authorization parameters may survive a failed attempt. Passwords,
+// proofs and one-time codes must never be echoed back into the page.
+fn hidden_fields(form: &HashMap<String, String>) -> String {
+    ["client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method", "resource"]
+        .iter().filter_map(|k| form.get(*k).map(|v| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v)))).collect() }
 fn bearer_token(h: &HeaderMap) -> String { h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").strip_prefix("Bearer ").unwrap_or("").to_string() }
 #[cfg(not(target_arch = "wasm32"))]
 static DELIVERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -134,39 +164,22 @@ fn valid_cidr_list(list: &str) -> bool {
 fn valid_domain_list(list: &str) -> bool {
     list.split(',').map(str::trim).filter(|s| !s.is_empty())
         .all(|d| !d.is_empty() && d.len() <= 253 && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')) }
-#[cfg(not(target_arch = "wasm32"))]
 fn valid_email(e: &str) -> bool {
     let e = e.trim();
     let Some((local, domain)) = e.split_once('@') else { return false };
     !local.is_empty() && !domain.is_empty() && e.len() <= 254 && !e.contains(char::is_whitespace) && domain.contains('.') }
-async fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
-    if meta_get(st, &format!("totp_enabled:{}", uid)).await != "1" { return true; }
-    if code.is_empty() { return false; }
-    if let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) {
-        let counter = (now() / 30) as u64;
-        for c in [counter.wrapping_sub(1), counter, counter + 1] {
-            if totp_code(&secret, c) == code {
-                let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
-                if c <= last { return false; }
-                meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
-                return true;
-            }
-        }
-    }
-    let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await; let hash = oc::hash_token(code);
-    let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; return true; }
-    false }
-
 #[derive(Deserialize, Default)] struct AuthReq { email: String, password: String }
-#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64, #[serde(default)] scopes: String }
+#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64, #[serde(default)] scopes: String,
+    // Delegated environments: the client generates the environment key and
+    // supplies it wrapped to itself and to the customer-run sync runner.
+    #[serde(default)] mode: String, #[serde(default)] runner_id: String, #[serde(default)] wrapped_key: String, #[serde(default)] runner_wrapped_key: String }
 #[derive(Deserialize, Default, Clone)] struct SecretIn { key: String, value: String, #[serde(default = "def_path")] path: String, #[serde(default)] comment: String, #[serde(default)] tags: String, #[serde(default, rename = "type")] secret_type: String }
 fn def_path() -> String { "/".into() }
 #[derive(Deserialize, Default)] struct DeployReq { #[serde(default)] secrets: Vec<SecretIn>, #[serde(default)] text: String }
 #[derive(Deserialize, Default)] struct ReuseReq { #[serde(default)] secrets: Vec<SecretIn>, #[serde(default)] exclude: Vec<String> }
 
 impl AppState {
-    async fn audit(&self, org: &str, app: &str, env: &str, actor: &str, action: &str, detail: &str) {
+    pub(crate) async fn audit(&self, org: &str, app: &str, env: &str, actor: &str, action: &str, detail: &str) {
         // log streams (T10): persist delivery then send with retries in a thread
         if let Ok(streams) = self.db.query("SELECT id,url,secret FROM log_streams WHERE org_id=?", &[json!(org)]).await { for srow in &streams {
             let did = id(); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}).to_string();
@@ -222,17 +235,31 @@ impl AppState {
     pub fn live(&self) -> &LiveSender { &self.live }
     async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
-        let raw = oc::decrypt_symmetric(&self.master(), &db::s(&row, "env_key_wrapped")).map_err(|e| bad(&e))?;
+        let wrapped = db::s(&row, "env_key_wrapped");
+        if wrapped.is_empty() { return Err(err(StatusCode::CONFLICT, "this environment is client-encrypted; the server has no key for it")); }
+        if wrapped.starts_with("owkms:") {
+            let kms = self.kms().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "this environment is wrapped by a KMS that is not configured"))?;
+            let raw = kms.unwrap(&wrapped, &format!("env:{}", env_id)).map_err(|e| bad(&format!("KMS could not unwrap the environment key: {}", e)))?;
+            return raw.try_into().map_err(|_| bad("bad env key")); }
+        // A row written before KMS was enabled is rewrapped on first use. The
+        // legacy master stays valid for every other root-encrypted record.
+        let raw = oc::decrypt_symmetric(&self.master(), &wrapped).map_err(|e| bad(&e))?;
+        if let Some(kms) = self.kms() {
+            if let Ok(rewrapped) = kms.wrap(&raw, &format!("env:{}", env_id)) {
+                let _ = self.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(rewrapped), json!(&env_id)]).await;
+            }
+        }
         raw.try_into().map_err(|_| bad("bad env key"))
     }
-    fn master(&self) -> [u8; 32] { *self.master.read().unwrap_or_else(|e| e.into_inner()) }
+    fn kms(&self) -> Option<&kms::Kms> { self.kms.get().and_then(|k| k.as_ref()) }
+    pub(crate) fn master(&self) -> [u8; 32] { *self.master.read().unwrap_or_else(|e| e.into_inner()) }
     async fn reuse_enabled(&self, org: &str, app: &str) -> bool {
         let org_on = self.db.one("SELECT reuse_check FROM orgs WHERE id=?", &[json!(org)]).await.ok().flatten()
             .map(|r| db::n(&r, "reuse_check") != 0).unwrap_or(false);
         if !org_on { return false; }
         self.db.one("SELECT reuse_check FROM apps WHERE id=?", &[json!(app)]).await.ok().flatten()
             .map(|r| db::n(&r, "reuse_check") != 0).unwrap_or(false) }
-    async fn token_user(&self, headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
+    pub(crate) async fn token_user(&self, headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
         let mut token = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
         // The browser console keeps its session in the HttpOnly cookie, so an
@@ -295,12 +322,12 @@ impl AppState {
     async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
     // Counters live in the database so a restart, or a second replica behind a
     // load balancer, does not reset an attacker's budget.
-    async fn rate_ok(&self, key: &str, max: usize, window: i64) -> bool {
+    pub(crate) async fn rate_ok(&self, key: &str, max: usize, window: i64) -> bool {
         let cutoff = now() - window;
         let count = self.db.one("SELECT count FROM rate_limits WHERE key=? AND window_start>?", &[json!(key), json!(cutoff)]).await
             .ok().flatten().map(|r| db::n(&r, "count")).unwrap_or(0);
         (count as usize) < max }
-    async fn rate_fail(&self, key: &str, window: i64) {
+    pub(crate) async fn rate_fail(&self, key: &str, window: i64) {
         let current = now(); let cutoff = current - window;
         let _ = self.db.query(
             "INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) \
@@ -309,7 +336,7 @@ impl AppState {
                window_start = CASE WHEN rate_limits.window_start <= ? THEN ? ELSE rate_limits.window_start END \
              RETURNING count",
             &[json!(key), json!(current), json!(cutoff), json!(cutoff), json!(current)]).await; }
-    async fn rate_clear(&self, key: &str) { let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(key)]).await; }
+    pub(crate) async fn rate_clear(&self, key: &str) { let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(key)]).await; }
     // Deactivated users and deleted identities must lose every credential at once.
     async fn principal_active(&self, uid: &str) -> bool {
         match self.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(uid)]).await {
@@ -345,25 +372,29 @@ impl AppState {
         Err(err(StatusCode::FORBIDDEN, "no access to this environment"))
     }
     async fn decrypt_secret(&self, key: &[u8;32], row: &Row, user: Option<&str>) -> Value {
-        let sid = db::s(row, "id");
-        let (mut value, mut decrypt_error) = match oc::decrypt_symmetric(key, &db::s(row, "value_enc")) {
+        let sid = db::s(row, "id"); let env = db::s(row, "env_id"); let version = db::n(row, "version");
+        let (mut value, mut decrypt_error) = match decrypt_secret_value(key, &env, &sid, "value", version, &db::s(row, "value_enc")) {
             Ok(b) => (String::from_utf8_lossy(&b).into_owned(), false),
             Err(_) => (String::new(), true) };
         if let Some(user) = user {
             if let Ok(Some(ov)) = self.db.one("SELECT value_enc FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(user)]).await {
-                if let Ok(b) = oc::decrypt_symmetric(key, &db::s(&ov, "value_enc")) { value = String::from_utf8_lossy(&b).into_owned(); decrypt_error = false; }
+                if let Ok(b) = decrypt_secret_value(key, &env, &sid, &format!("override:{}", user), version, &db::s(&ov, "value_enc")) { value = String::from_utf8_lossy(&b).into_owned(); decrypt_error = false; }
             }
         }
         let stype = db::s(row, "secret_type");
-        json!({"id": sid, "key": oc::decrypt_symmetric(key, &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+        let path = if db::s(row, "path_enc").is_empty() { db::s(row, "path") } else {
+            decrypt_secret_value(key, &env, &sid, "path", version, &db::s(row, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "path")) };
+        let tags = if db::s(row, "tags_enc").is_empty() { db::s(row, "tags") } else {
+            decrypt_secret_value(key, &env, &sid, "tags", version, &db::s(row, "tags_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "tags")) };
+        json!({"id": sid, "key": oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "key"), &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
             "value": if stype == "sealed" { Value::Null } else { json!(value) }, "decrypt_error": decrypt_error,
-            "path": db::s(row,"path"), "comment": oc::decrypt_symmetric(key, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            "tags": db::s(row,"tags"), "type": stype, "version": db::n(row,"version"), "updated_at": db::n(row,"updated_at")})
+            "path": path, "comment": decrypt_secret_value(key, &env, &sid, "comment", version, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            "tags": tags, "type": stype, "version": version, "updated_at": db::n(row,"updated_at")})
     }
     #[allow(clippy::type_complexity)]
     async fn list_secrets_with(&self, env_id: &str, user: Option<&str>) -> Result<Vec<(String, String, Value)>, (StatusCode, Json<Value>)> {
         let key = self.env_key(env_id).await?;
-        let rows = self.db.query("SELECT * FROM secrets WHERE env_id=? AND deleted=0 ORDER BY path, key_hash", &[json!(env_id)]).await.map_err(|e| bad(&e))?;
+        let rows = self.db.query("SELECT * FROM secrets WHERE env_id=? AND deleted=0 ORDER BY key_index, key_hash", &[json!(env_id)]).await.map_err(|e| bad(&e))?;
         let mut out = Vec::new();
         for r in &rows { let v = self.decrypt_secret(&key, r, user).await; out.push((v["key"].as_str().unwrap_or("").to_string(), v["value"].as_str().unwrap_or("").to_string(), v)); }
         // resolve ${KEY} and ${/path/KEY} references
@@ -380,6 +411,27 @@ impl AppState {
     async fn list_secrets_base(&self, env_id: &str) -> Result<Vec<(String, String, Value)>, (StatusCode, Json<Value>)> {
         self.list_secrets_with(env_id, None).await }
 }
+// Bind ciphertext to the record it belongs to. The version is deliberately not
+// included in the key/path/tags fields: restore and point-in-time recovery copy
+// those, and a version binding would make the copy unreadable. Value and
+// comment are bound to the version and re-encrypted when restored.
+fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
+// A deterministic index is still needed to look a secret up. HMAC under the
+// environment key removes the offline dictionary attack a bare SHA-256 allows.
+fn key_index(env_key: &[u8;32], path: &str, key: &str) -> String { hmac_hex(env_key, format!("ow-key-index:v1|{}|{}", path, key).as_bytes()) }
+fn secret_aad_v(env: &str, sid: &str, field: &str, version: i64) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}|v{}", env, sid, field, version).into_bytes() }
+fn integration_aad(env: &str, iid: &str, field: &str) -> Vec<u8> { format!("ow-integration:v1|{}|{}|{}", env, iid, field).into_bytes() }
+fn lease_aad(env: &str, lid: &str, field: &str) -> Vec<u8> { format!("ow-lease:v1|{}|{}|{}", env, lid, field).into_bytes() }
+fn proposal_aad(env: &str, pid: &str, field: &str) -> Vec<u8> { format!("ow-proposal:v1|{}|{}|{}", env, pid, field).into_bytes() }
+// Version rows are bound to their version, but value and comment ciphertext
+// written before that binding (or by an earlier release) must stay readable.
+fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
+    if payload.starts_with("ow2:") {
+        if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad_v(env, sid, field, version), payload) { return Ok(v); }
+        if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad(env, sid, field), payload) { return Ok(v); }
+    }
+    oc::decrypt_symmetric(key, payload)
+}
 fn resolve_refs(v: &str, by_path: &HashMap<String, String>, by_key: &HashMap<String, String>) -> String {
     let mut out = String::new(); let mut rest = v;
     while let Some(start) = rest.find("${") { out.push_str(&rest[..start]); let tail = &rest[start + 2..];
@@ -392,6 +444,7 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     let rl = format!("register:{}", addr);
     if !st.rate_ok(&rl, 5, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
     st.rate_fail(&rl, 3600).await;
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password registration is disabled on this instance; sign in with a configured provider")); }
     if r.email.is_empty() || r.password.len() < 8 { return Err(bad("email and password (>=8 chars) required")); }
     if !signups_open(&st).await { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     if production() && !mailer::MailConfig::from_env().enabled() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "password signup is unavailable: no email provider is configured; use a configured sign-in provider or ask an administrator")); }
@@ -403,26 +456,210 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,0)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    mfa::note_password_login(&st, &uid).await;
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
     Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))))
 }
-async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
+pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; use a configured provider")); }
     let key = format!("login:{}:{}", addr, r.email.trim().to_lowercase());
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
     let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).await.map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+    // A version 2 account has no server-usable password, even if an old reset
+    // path left a hash behind; it must use the challenge login.
+    if db::n(&row, "auth_version") == 2 { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key).await;
     let uid = db::s(&row, "id");
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+    mfa::note_password_login(&st, &uid).await;
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await})))); }
     let token = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")}))))
 }
+
+// ---------- client-derived auth (version 2) ----------
+const KDF_ITERATIONS: i64 = 600_000;
+const KDF_ALGO: &str = "pbkdf2-sha256";
+fn auth_key_aad(uid: &str) -> Vec<u8> { format!("auth-key|{}", uid).into_bytes() }
+fn valid_kdf(salt: &str, iterations: i64, algo: &str) -> bool {
+    algo == KDF_ALGO && (600_000..=5_000_000).contains(&iterations) && oc::unb64(salt).map(|b| b.len() == 16).unwrap_or(false) }
+fn valid_key32(s: &str) -> bool { oc::unb64(s).map(|b| b.len() == 32).unwrap_or(false) }
+fn valid_wrapped_key(s: &str) -> bool { s.starts_with("owv2:") && s.len() <= 4096 }
+fn verify_proof(auth_key: &[u8], challenge: &str, challenge_id: &str, proof_hex: &str) -> bool {
+    use hmac::Mac;
+    let Some(proof) = hex_decode(proof_hex) else { return false };
+    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(auth_key) else { return false };
+    mac.update(format!("{}|{}", challenge, challenge_id).as_bytes());
+    mac.verify_slice(&proof).is_ok() }
+async fn login_outcome(st: &S, uid: &str, pubkey: &str, wrapped: Option<&str>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if mfa::required(st, uid).await {
+        let challenge = mfa::new_challenge(st, uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(st, uid).await, "email_available": mfa::email_available() && mfa::email_enabled(st, uid).await})))); }
+    let token = make_session(st, uid).await?;
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    let mut out = json!({"token": token, "user_id": uid, "public_key": pubkey});
+    if let Some(wrapped) = wrapped { out["wrapped_privkey"] = json!(wrapped); }
+    Ok((hdr, j(out))) }
+async fn auth_kdf(State(st): State<S>, PeerAddr(addr): PeerAddr, Query(q): Query<HashMap<String,String>>) -> Res {
+    let key = format!("kdf:{}", addr);
+    if !st.rate_ok(&key, 60, 60).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many requests; try again later")); }
+    st.rate_fail(&key, 60).await;
+    let email = q.get("email").cloned().unwrap_or_default().trim().to_lowercase();
+    if let Some(r) = st.db.one("SELECT auth_version,kdf_salt,kdf_iterations,kdf_algo FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))? {
+        if db::n(&r, "auth_version") == 2 {
+            if !valid_kdf(&db::s(&r,"kdf_salt"), db::n(&r,"kdf_iterations"), &db::s(&r,"kdf_algo")) {
+                return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "this account's sign-in parameters are invalid; reset your password")); }
+            return Ok(j(json!({"version":2, "salt":db::s(&r,"kdf_salt"), "iterations":db::n(&r,"kdf_iterations"), "algo":db::s(&r,"kdf_algo")}))); }
+        return Ok(j(json!({"version":1}))); }
+    Ok(j(json!({"version":2, "salt":oc::b64(&oc::random_key()[..16]), "iterations":KDF_ITERATIONS, "algo":KDF_ALGO}))) }
+#[derive(Deserialize, Default)] struct RegisterV2Req { email: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
+async fn register_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<RegisterV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let rl = format!("register:{}", addr);
+    if !st.rate_ok(&rl, 5, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
+    st.rate_fail(&rl, 3600).await;
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password registration is disabled on this instance; sign in with a configured provider")); }
+    if production() && !mailer::MailConfig::from_env().enabled() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "password signup is unavailable: no email provider is configured; use a configured sign-in provider or ask an administrator")); }
+    let email = r.email.trim().to_lowercase();
+    if email.is_empty() || !valid_email(&email) { return Err(bad("email required")); }
+    if !signups_open(&st).await { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
+    if !valid_kdf(&r.salt, r.iterations, &r.algo) { return Err(bad("unsupported KDF parameters")); }
+    let auth_key = oc::unb64(&r.auth_key).map_err(|_| bad("auth_key must be base64"))?;
+    if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
+    if !valid_key32(&r.public_key) { return Err(bad("public_key must be 32-byte base64")); }
+    if !valid_wrapped_key(&r.wrapped_privkey) { return Err(bad("wrapped_privkey must be an owv2 payload")); }
+    let uid = id();
+    let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
+    let hash = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,0,2,?,?,?,?)",
+        &[json!(&uid), json!(&email), json!(hash), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)])
+        .await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
+    let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(&oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    claim_instance_owner(&st, &uid).await;
+    // A v2 account never proves a password, so factor management must not ask
+    // for one; the session or auth-key proof is the credential.
+    st.audit("", "", "", &uid, "auth.register_v2", &email).await;
+    let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
+    let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
+    send_template(&email, "verify", &[("link", &link), ("email", &email)]).await;
+    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": r.public_key, "verification_required": true})))) }
+#[derive(Deserialize, Default)] struct ChallengeReq { email: String }
+async fn auth_challenge(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ChallengeReq>) -> Res {
+    let key = format!("challenge:{}", addr);
+    if !st.rate_ok(&key, 30, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many requests; try again later")); }
+    st.rate_fail(&key, 900).await;
+    let email = r.email.trim().to_lowercase();
+    let user = st.db.one("SELECT id,auth_version FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid credentials"))?;
+    if db::n(&user, "auth_version") != 2 { return Err(bad("this account uses password sign-in")); }
+    let uid = db::s(&user, "id");
+    let _ = st.db.exec("DELETE FROM auth_challenges WHERE user_id=?", &[json!(&uid)]).await;
+    let cid = oc::random_token("ch"); let challenge = oc::random_token("chal");
+    st.db.exec("INSERT INTO auth_challenges(id_hash,user_id,challenge,created_at) VALUES(?,?,?,?)",
+        &[json!(oc::hash_token(&cid)), json!(&uid), json!(&challenge), json!(now())]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!({"challenge_id": cid, "challenge": challenge, "expires_at": now() + 120}))) }
+#[derive(Deserialize, Default)] struct LoginV2Req { email: String, challenge_id: String, proof: String }
+async fn login_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<LoginV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; use a configured provider")); }
+    let email = r.email.trim().to_lowercase();
+    let key = format!("login:{}:{}", addr, email);
+    if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
+    let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.pubkey AS pubkey,u.wrapped_privkey AS wrapped_privkey,u.auth_key_enc AS auth_key_enc,u.kdf_salt AS kdf_salt,u.kdf_iterations AS kdf_iterations,u.kdf_algo AS kdf_algo FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]).await.map_err(|e| bad(&e))? {
+        Some(x) => x, None => { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
+    if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2
+        || !valid_kdf(&db::s(&row,"kdf_salt"), db::n(&row,"kdf_iterations"), &db::s(&row,"kdf_algo")) {
+        st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    let uid = db::s(&row, "user_id");
+    let auth_key = oc::decrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &db::s(&row, "auth_key_enc")).map_err(|_| bad("authentication key is unavailable"))?;
+    if !verify_proof(&auth_key, &db::s(&row, "challenge"), &r.challenge_id, &r.proof) {
+        st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    // Consume atomically: two concurrent requests with the same proof must not
+    // both mint a session.
+    let consumed = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]).await.unwrap_or(0);
+    if consumed == 0 { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    st.rate_clear(&key).await;
+    if db::n(&row, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+    if db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
+    st.audit("", "", "", &uid, "auth.login_v2", "").await;
+    login_outcome(&st, &uid, &db::s(&row, "pubkey"), Some(&db::s(&row, "wrapped_privkey"))).await }
+#[derive(Deserialize, Default)] struct ResetV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String, #[serde(default)] discard_e2e_key: bool }
+async fn reset_password_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ResetV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance")); }
+    let key = format!("reset:{}", addr);
+    if !st.rate_ok(&key, 10, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
+    if !valid_kdf(&r.salt, r.iterations, &r.algo) { return Err(bad("unsupported KDF parameters")); }
+    let auth_key = oc::unb64(&r.auth_key).map_err(|_| bad("auth_key must be base64"))?;
+    if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
+    if !valid_key32(&r.public_key) { return Err(bad("public_key must be 32-byte base64")); }
+    if !valid_wrapped_key(&r.wrapped_privkey) { return Err(bad("wrapped_privkey must be an owv2 payload")); }
+    let hash = oc::hash_token(r.token.trim());
+    let row = st.db.one("SELECT user_id FROM auth_tokens WHERE token_hash=? AND kind='reset' AND used=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
+    st.rate_fail(&key, 900).await;
+    let uid = db::s(&row, "user_id");
+    let user = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    let stored_pub = db::s(&user, "pubkey");
+    let replaced = r.public_key != stored_pub;
+    if replaced && !r.discard_e2e_key {
+        return Err(bad("recovery kit does not match this account; pass discard_e2e_key=true to replace your key and lose end-to-end access")); }
+    let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
+    let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE users SET pass_hash=?,pubkey=?,wrapped_privkey=?,email_verified=1,auth_version=2,kdf_salt=?,kdf_iterations=?,kdf_algo=?,auth_key_enc=? WHERE id=?",
+        &[json!(pass), json!(&r.public_key), json!(&r.wrapped_privkey), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]).await;
+    let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await;
+    let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]).await;
+    st.audit("", "", "", &uid, "auth.password_reset_v2", if replaced { "key replaced" } else { "kit supplied" }).await;
+    login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
+#[derive(Deserialize, Default)] struct ResetInfoReq { token: String }
+async fn reset_info(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ResetInfoReq>) -> Res {
+    let key = format!("reset-info:{}", addr);
+    if !st.rate_ok(&key, 20, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
+    st.rate_fail(&key, 900).await;
+    let hash = oc::hash_token(r.token.trim());
+    let row = st.db.one("SELECT u.pubkey AS public_key,u.auth_version AS auth_version FROM auth_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.kind='reset' AND t.used=0 AND t.expires_at>?",
+        &[json!(&hash), json!(now())]).await.map_err(|_| bad("reset link is invalid, already used, or expired"))?
+        .ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
+    Ok(j(json!({"public_key": db::s(&row, "public_key"), "auth_version": db::n(&row, "auth_version")}))) }
+async fn me_auth(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT auth_version,kdf_salt,kdf_iterations,kdf_algo,pubkey,wrapped_privkey FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
+    Ok(j(json!({"auth_version": db::n(&row,"auth_version"), "kdf_salt": db::s(&row,"kdf_salt"), "kdf_iterations": db::n(&row,"kdf_iterations"), "kdf_algo": db::s(&row,"kdf_algo"), "public_key": db::s(&row,"pubkey"), "wrapped_privkey": db::s(&row,"wrapped_privkey")}))) }
+#[derive(Deserialize, Default)] struct InviteV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
+async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
+    let rl = format!("invite-accept:{}", addr);
+    if !st.rate_ok(&rl, 10, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many invite attempts; try again later")); }
+    st.rate_fail(&rl, 3600).await;
+    if !valid_kdf(&r.salt, r.iterations, &r.algo) { return Err(bad("unsupported KDF parameters")); }
+    let auth_key = oc::unb64(&r.auth_key).map_err(|_| bad("auth_key must be base64"))?;
+    if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
+    if !valid_key32(&r.public_key) { return Err(bad("public_key must be 32-byte base64")); }
+    if !valid_wrapped_key(&r.wrapped_privkey) { return Err(bad("wrapped_privkey must be an owv2 payload")); }
+    let hash = oc::hash_token(r.token.trim());
+    let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
+    let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
+    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
+    let uid = id();
+    let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
+    let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)",
+        &[json!(&uid), json!(&email), json!(pass), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    claim_instance_owner(&st, &uid).await;
+    st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
+    login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
 
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     // A caller can always learn the environment its own credential is confined to.
@@ -494,6 +731,7 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     Ok(j(json!({"ok": true, "invite_token": token, "expires_at": expires, "note": "single use, valid 7 days; the invitee redeems it at POST /api/auth/accept-invite or by signing in with a configured social provider"}))) }
 #[derive(Deserialize)] struct InviteReq { token: String, password: String }
 async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
     if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
@@ -515,7 +753,11 @@ async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     for name in ["Development", "Staging", "Production"] { create_env_inner(&st, &aid, name).await?; }
     st.audit(&oid, &aid, "", &uid, "app.create", &r.name).await; Ok(j(json!({"id": aid}))) }
 async fn create_env_inner(st: &S, app_id: &str, name: &str) -> Result<String, (StatusCode, Json<Value>)> {
-    let eid = id(); let key = oc::random_key(); let wrapped = oc::encrypt_symmetric(&st.master(), &key);
+    let eid = id(); let key = oc::random_key();
+    let wrapped = match st.kms() {
+        Some(kms) => kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap the environment key: {}", e)))?,
+        None => oc::encrypt_symmetric(&st.master(), &key),
+    };
     st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,created_at) VALUES(?,?,?,?,?)", &[json!(eid), json!(app_id), json!(name), json!(wrapped), json!(now())]).await.map_err(|e| bad(&e))?; Ok(eid) }
 async fn list_apps(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
     let rows = st.db.query("SELECT id,org_id,name,readme,created_at,reuse_check FROM apps WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?;
@@ -523,10 +765,22 @@ async fn list_apps(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -
 async fn create_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; let org = db::s(&app,"org_id"); st.require_org(&org, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     if !r.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || r.name.is_empty() || r.name.len() > 32 { return Err(bad("env name must match ^[a-zA-Z0-9-_]{1,32}$")); }
+    if r.mode == "delegated" {
+        if r.runner_id.is_empty() || r.wrapped_key.is_empty() || r.runner_wrapped_key.is_empty() {
+            return Err(bad("delegated environments need runner_id, wrapped_key and runner_wrapped_key")); }
+        if st.db.one("SELECT id FROM runners WHERE id=? AND org_id=?", &[json!(&r.runner_id), json!(&org)]).await.map_err(|e| bad(&e))?.is_none() {
+            return Err(bad("runner not found in this organisation")); }
+        let eid = id();
+        st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,runner_id,created_at) VALUES(?,?,?,'','delegated',?,?)",
+            &[json!(&eid), json!(&aid), json!(&r.name), json!(&r.runner_id), json!(now())]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(&eid), json!(&uid), json!(&r.wrapped_key)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO runner_env_keys(runner_id,env_id,wrapped_key) VALUES(?,?,?)", &[json!(&r.runner_id), json!(&eid), json!(&r.runner_wrapped_key)]).await.map_err(|e| bad(&e))?;
+        st.audit(&org, &aid, &eid, &uid, "env.create.delegated", &r.runner_id).await;
+        return Ok(j(json!({"id": eid, "mode": "delegated", "runner_id": r.runner_id}))); }
     let eid = create_env_inner(&st, &aid, &r.name).await?; Ok(j(json!({"id": eid}))) }
 async fn list_envs(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; st.require_org(&db::s(&app,"org_id"), &uid).await?;
-    let rows = st.db.query("SELECT id,app_id,name,mode,restricted,require_approval,created_at FROM envs WHERE app_id=? ORDER BY created_at", &[json!(aid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,app_id,name,mode,runner_id,restricted,require_approval,created_at FROM envs WHERE app_id=? ORDER BY created_at", &[json!(aid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?;
     st.check_admin(&org, &uid).await?;
@@ -535,6 +789,8 @@ async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) 
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
         "DELETE FROM secrets WHERE env_id=?",
         "DELETE FROM env_keys WHERE env_id=?",
+        "DELETE FROM runner_env_keys WHERE env_id=?",
+        "DELETE FROM sync_jobs WHERE env_id=?",
         "DELETE FROM leases WHERE env_id=?",
         "DELETE FROM integration_sync_state WHERE integration_id IN (SELECT id FROM integrations WHERE env_id=?)",
         "DELETE FROM integrations WHERE env_id=?",
@@ -591,6 +847,8 @@ async fn delete_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) 
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM env_keys WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
+        "DELETE FROM runner_env_keys WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
+        "DELETE FROM sync_jobs WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM leases WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM integration_sync_state WHERE integration_id IN (SELECT id FROM integrations WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM integrations WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
@@ -616,15 +874,17 @@ async fn clone_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     let (torg, tapp) = st.require_env(target, &uid).await?; st.check_perm(&torg, &uid, "secrets:write").await?;
     if torg != org || tapp != app { return Err(bad("source and target must belong to the same app")); }
     let overwrite = body.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
-    for id in [eid.as_str(), target] { let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(id)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"mode")).unwrap_or_default(); if mode == "e2e" { return Err(bad("E2E environments cannot be cloned server-side; use the CLI")); } }
+    for id in [eid.as_str(), target] { let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(id)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"mode")).unwrap_or_default(); if mode == "e2e" || mode == "delegated" { return Err(bad("client-encrypted environments cannot be cloned server-side; use the CLI")); } }
     let items = st.list_secrets_base(&eid).await?; let key = st.env_key(target).await?;
     let mut cloned = 0; let mut skipped = 0;
     for (_, _, raw) in items {
         let stype = raw["type"].as_str().unwrap_or("secret");
         if stype == "sealed" { skipped += 1; continue; }
         let s = SecretIn{ key: raw["key"].as_str().unwrap_or("").into(), value: raw["value"].as_str().unwrap_or("").into(), path: raw["path"].as_str().unwrap_or("/").into(), comment: raw["comment"].as_str().unwrap_or("").into(), tags: raw["tags"].as_str().unwrap_or("").into(), secret_type: stype.into() };
-        let khash = oc::hash_token(&format!("{}:{}", s.path, s.key.to_uppercase()));
-        if !overwrite && st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(target), json!(&khash)]).await.map_err(|e| bad(&e))?.is_some() { skipped += 1; continue; }
+        let kname = s.key.to_uppercase();
+        let khash = key_index(&key, &s.path, &kname);
+        let legacy = oc::hash_token(&format!("{}:{}", s.path, kname));
+        if !overwrite && st.db.one("SELECT id FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(target), json!(&khash), json!(&legacy)]).await.map_err(|e| bad(&e))?.is_some() { skipped += 1; continue; }
         upsert_secret(&st, target, &org, &key, &uid, &s).await?; cloned += 1;
     }
     let sync_errors = trigger_sync(&st, target, &uid).await;
@@ -671,8 +931,9 @@ async fn upsert_secret(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &str, s
     let kname = s.key.trim().to_uppercase();
     if !valid_secret_key(&kname) { return Err(bad("secret key must match [A-Za-z0-9_.-]{1,128}")); }
     if !valid_path(&s.path) { return Err(bad("secret path must be 1-256 printable characters")); }
-    let khash = oc::hash_token(&format!("{}:{}", s.path, kname));
-    let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).await.map_err(|e| bad(&e))?;
+    let khash = key_index(key, &s.path, &kname);
+    let legacy = oc::hash_token(&format!("{}:{}", s.path, kname));
+    let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(&khash), json!(&legacy)]).await.map_err(|e| bad(&e))?;
     let mut stype = if s.secret_type.is_empty() { "secret".to_string() } else { s.secret_type.clone() };
     if !matches!(stype.as_str(), "secret" | "sealed" | "ssh_key" | "config") { return Err(bad("secret type must be secret, sealed, ssh_key or config")); }
     if stype == "ssh_key" && ssh_keys::public_key_error(&kname, &s.value).is_some() { return Err(bad("an ssh_key value must be a single-line OpenSSH public key")); }
@@ -682,11 +943,24 @@ async fn upsert_secret(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &str, s
     // and public ssh keys are not credentials.
     let fp = if stype == "secret" && !s.value.is_empty() { value_fingerprint(&st.master(), org, &s.value) } else { String::new() };
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
-        st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(&fp), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", ver), s.value.as_bytes());
+        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", ver), s.comment.as_bytes());
+        let path_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "path"), s.path.as_bytes());
+        let tags_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "tags"), s.tags.as_bytes());
+        st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,path='',path_enc=?,tags='',tags_enc=?,key_hash=?,key_index=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?",
+            &[json!(value_enc), json!(&fp), json!(comment_enc), json!(path_enc), json!(tags_enc), json!(&khash), json!(&khash), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes())), json!(value_enc), json!(comment_enc), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     } else { let sid = id();
-        st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,value_fp,comment_enc,tags,secret_type,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)", &[json!(sid), json!(eid), json!(s.path), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(khash), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(&fp), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+        let key_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes());
+        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", 1), s.value.as_bytes());
+        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", 1), s.comment.as_bytes());
+        let path_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "path"), s.path.as_bytes());
+        let tags_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "tags"), s.tags.as_bytes());
+        st.db.exec("INSERT INTO secrets(id,env_id,path,path_enc,key_enc,key_hash,key_index,value_enc,value_fp,comment_enc,tags,tags_enc,secret_type,version,updated_at,updated_by) VALUES(?,?,'',?,?,?,?,?,?,?,'',?,?,1,?,?)",
+            &[json!(sid), json!(eid), json!(path_enc), json!(key_enc), json!(&khash), json!(&khash), json!(value_enc), json!(&fp), json!(comment_enc), json!(tags_enc), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?,?,?)",
+            &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(comment_enc), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     } Ok(()) }
 fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pending_comment = String::new();
     for line in text.lines() { let l = line.trim(); if l.is_empty() { continue; } else if l.starts_with('#') { pending_comment = l.trim_start_matches('#').trim().to_string(); continue; }
@@ -699,7 +973,7 @@ async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> 
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let key = st.env_key(&eid).await?; let sealed = st.db.one("SELECT secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map(|r| r.map(|x| db::s(&x,"secret_type") == "sealed").unwrap_or(false)).unwrap_or(false);
     let rows = st.db.query("SELECT * FROM secret_versions WHERE secret_id=? ORDER BY version DESC", &[json!(sid)]).await.map_err(|e| bad(&e))?;
-    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "path": db::s(r,"path"), "tags": db::s(r,"tags"), "value": if sealed { "[SEALED]".to_string() } else { oc::decrypt_symmetric(&key,&db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
+    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "path": db::s(r,"path"), "tags": db::s(r,"tags"), "value": if sealed { "[SEALED]".to_string() } else { decrypt_secret_value(&key, &eid, &sid, "value", db::n(r,"version"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
     Ok(j(json!(items))) }
 async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(String, i64)>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
@@ -707,21 +981,31 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
-    let cur = st.db.one("SELECT version,path FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?;
+    let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?;
     let new_ver = cur.as_ref().map(|r| db::n(r,"version")).unwrap_or(0) + 1;
-    let cur_path = cur.as_ref().map(|r| db::s(r,"path")).unwrap_or_else(|| db::s(&v,"path"));
-    let vpath = { let p = db::s(&v,"path"); if p.is_empty() { cur_path } else { p } };
-    let restored_fp = if db::s(&v,"secret_type") == "secret" {
-        key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
-            .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
-    } else { String::new() };
-    st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(&restored_fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"tags")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+    let vpath = { let p = db::s(&v,"path"); if p.is_empty() { "/".to_string() } else { p } };
+    // Version ciphertext is bound to its version, so restoring it under a new
+    // version means decrypting and re-binding rather than copying the blob.
+    // A client-encrypted environment has no server key; its blob is copied.
+    let (value_enc, comment_enc, restored_fp, tags_plain, tags_enc) = match key {
+        Some(key) => {
+            let plain_value = decrypt_secret_value(&key, &eid, &sid, "value", ver, &db::s(&v,"value_enc")).map_err(|e| bad(&e))?;
+            let plain_comment = decrypt_secret_value(&key, &eid, &sid, "comment", ver, &db::s(&v,"comment_enc")).map_err(|e| bad(&e))?;
+            let fp = if db::s(&v,"secret_type") == "secret" { value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&plain_value)) } else { String::new() };
+            (oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid,&sid,"value",new_ver), &plain_value),
+             oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid,&sid,"comment",new_ver), &plain_comment),
+             fp, String::new(),
+             oc::encrypt_symmetric_aad(&key, &secret_aad(&eid,&sid,"tags"), db::s(&v,"tags").as_bytes()))
+        }
+        None => (db::s(&v,"value_enc"), db::s(&v,"comment_enc"), String::new(), db::s(&v,"tags"), String::new()),
+    };
+    st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,tags_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(value_enc), json!(&restored_fp), json!(comment_enc), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)).await; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.require_env(&eid,&uid).await?;
     let key = st.env_key(&eid).await?; let val = r.secrets.first().map(|s| s.value.clone()).unwrap_or_default();
-    let enc = oc::encrypt_symmetric(&key, val.as_bytes());
+    let enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, &format!("override:{}", uid)), val.as_bytes());
     if st.db.exec("INSERT INTO overrides(secret_id,user_id,value_enc) VALUES(?,?,?)", &[json!(sid), json!(uid), json!(&enc)]).await.is_err() {
         st.db.exec("UPDATE overrides SET value_enc=? WHERE secret_id=? AND user_id=?", &[json!(&enc), json!(sid), json!(uid)]).await.map_err(|e| bad(&e))?;
     }
@@ -758,7 +1042,7 @@ async fn reuse_check(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
         let mut params: Vec<Value> = vec![json!(&org)];
         let mut marks: Vec<&str> = Vec::new();
         for c in chunk { marks.push("?"); params.push(json!(&c.1)); }
-        let sql = format!("SELECT s.id AS id,s.env_id AS env_id,s.key_enc AS key_enc,s.path AS path,s.value_fp AS value_fp,s.updated_at AS updated_at,e.name AS env_name,a.id AS app_id,a.name AS app_name \
+        let sql = format!("SELECT s.id AS id,s.env_id AS env_id,s.key_enc AS key_enc,s.path AS path,s.path_enc AS path_enc,s.value_fp AS value_fp,s.updated_at AS updated_at,e.name AS env_name,a.id AS app_id,a.name AS app_name \
             FROM secrets s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id \
             WHERE a.org_id=? AND s.deleted=0 AND s.e2e=0 AND s.secret_type='secret' AND s.value_fp IN ({})", marks.join(","));
         let rows = st.db.query(&sql, &params).await.map_err(|e| bad(&e))?;
@@ -778,9 +1062,11 @@ async fn reuse_check(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
                 Some(k) => *k,
                 None => { match st.env_key(&menv).await { Ok(k) => { env_keys.insert(menv.clone(), k); k }, Err(_) => continue } },
             };
-            let matched_key = oc::decrypt_symmetric(&key, &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+            let matched_key = oc::decrypt_symmetric_compat(&key, &secret_aad(&menv, &sid, "key"), &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+            let matched_path = if db::s(row, "path_enc").is_empty() { db::s(row, "path") } else {
+                oc::decrypt_symmetric_compat(&key, &secret_aad(&menv, &sid, "path"), &db::s(row, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "path")) };
             by_fp.entry(db::s(row, "value_fp")).or_default().push(json!({
-                "secret_id": sid, "key": matched_key, "path": db::s(row, "path"),
+                "secret_id": sid, "key": matched_key, "path": matched_path,
                 "app_id": db::s(row, "app_id"), "app_name": db::s(row, "app_name"),
                 "env_id": menv, "env_name": db::s(row, "env_name"),
                 "updated_at": db::n(row, "updated_at")
@@ -895,12 +1181,16 @@ async fn open_lockbox(State(st): State<S>, Path(lid): Path<String>, h: HeaderMap
     Ok(j(json!({"value": String::from_utf8_lossy(&val)}))) }
 async fn list_leases(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let key = st.env_key(&eid).await?; let rows = st.db.query("SELECT * FROM leases WHERE env_id=? AND revoked=0 AND expires_at>?", &[json!(eid), json!(now())]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "value": oc::decrypt_symmetric(&key,&db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(), "expires_at": db::n(r,"expires_at")})).collect::<Vec<_>>()))) }
+    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "value": oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &db::s(r,"id"), "value"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(), "expires_at": db::n(r,"expires_at")})).collect::<Vec<_>>()))) }
 
 async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
     let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or(""); if !integrations::KINDS.contains(&kind) { return Err(bad(&format!("unknown kind, supported: {:?}", integrations::KINDS))); }
-    let config = body.get("config").cloned().unwrap_or(json!({})); let key = st.env_key(&eid).await?;
-    let iid = id(); st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(oc::encrypt_symmetric(&key, config.to_string().as_bytes())), json!(now())]).await.map_err(|e| bad(&e))?;
+    let config = body.get("config").cloned().unwrap_or(json!({}));
+    let iid = id();
+    let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")).unwrap_or_default();
+    let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, &config).await? }
+        else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
+    st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": iid}))) }
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let rows = st.db.query("SELECT id,env_id,kind,name,created_at FROM integrations WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -910,25 +1200,33 @@ async fn sync_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let msg = sync_one(&st, &iid, &uid).await?; Ok(j(json!({"ok": true, "detail": msg}))) }
 async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
-    let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?; let key = st.env_key(&eid).await?;
-    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
+    if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
+        enqueue_sync(&st, &eid, &iid, "test").await?;
+        return Ok(j(json!({"ok": true, "detail": "connection test queued for the customer runner"}))); }
+    let key = st.env_key(&eid).await?;
+    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, &iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
     if integrations::has_test(&kind) { let msg = integrations::test(&kind, &config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
 async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
-    let key = st.env_key(&eid).await?;
+    let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")).unwrap_or_default();
     if let Some(kind) = body.get("kind").and_then(|v| v.as_str()) {
         if !integrations::KINDS.contains(&kind) { return Err(bad(&format!("unknown kind, supported: {:?}", integrations::KINDS))); }
         st.db.exec("UPDATE integrations SET kind=? WHERE id=?", &[json!(kind), json!(&iid)]).await.map_err(|e| bad(&e))?; }
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) { st.db.exec("UPDATE integrations SET name=? WHERE id=?", &[json!(name), json!(&iid)]).await.map_err(|e| bad(&e))?; }
-    if let Some(config) = body.get("config") { st.db.exec("UPDATE integrations SET config_enc=? WHERE id=?", &[json!(oc::encrypt_symmetric(&key, config.to_string().as_bytes())), json!(&iid)]).await.map_err(|e| bad(&e))?; }
+    if let Some(config) = body.get("config") {
+        let enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, config).await? }
+            else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
+        st.db.exec("UPDATE integrations SET config_enc=? WHERE id=?", &[json!(enc), json!(&iid)]).await.map_err(|e| bad(&e))?; }
     st.audit(&org,&app,&eid,&uid,"integration.update",&iid).await; Ok(j(json!({"ok": true}))) }
 async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
     st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?;
+    let _ = st.db.exec("DELETE FROM sync_jobs WHERE integration_id=?", &[json!(&iid)]).await;
     st.db.exec("DELETE FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"integration.delete",&iid).await; Ok(j(json!({"deleted": iid}))) }
 async fn trigger_sync(st: &S, eid: &str, uid: &str) -> Vec<String> { trigger_sync_with(st, eid, uid, true).await }
@@ -949,8 +1247,11 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id");
     let (org, app) = if enforce { st.require_env(&eid, uid).await? } else { st.env_org_app(&eid).await? };
+    if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
+        enqueue_sync(st, &eid, iid, "sync").await?;
+        return Ok("queued for the customer runner".into()); }
     let key = st.env_key(&eid).await?;
-    let mut config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let mut config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
     if !manual && config.get("auto_sync").and_then(Value::as_bool) == Some(false) { return Ok(format!("{}: skipped (auto_sync is disabled)", kind)); }
     let env_name = st.db.one("SELECT name FROM envs WHERE id=?", &[json!(&eid)]).await.map(|r| r.map(|x| db::s(&x, "name")).unwrap_or_default()).unwrap_or_default();
@@ -1030,14 +1331,24 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
                 let new_ver = cur + 1;
                 let tomb = if was_deleted { 1 } else { 0 };
                 let tomb_at = if was_deleted { if del_at > 0 { del_at } else { now() } } else { 0 };
-                let fp = if db::s(&v,"secret_type") == "secret" {
-                    key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
-                        .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
-                } else { String::new() };
-                st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,tags=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
-                    &[json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(&fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(db::s(&v,"tags")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).await.map_err(|e| bad(&e))?;
+                let src_ver = db::n(&v, "version");
+                let (value_enc, comment_enc, fp, tags_plain, tags_enc) = match key {
+                    Some(key) => {
+                        let plain_value = decrypt_secret_value(&key, &eid, &sid, "value", src_ver, &db::s(&v,"value_enc")).map_err(|e| bad(&e))?;
+                        let plain_comment = decrypt_secret_value(&key, &eid, &sid, "comment", src_ver, &db::s(&v,"comment_enc")).map_err(|e| bad(&e))?;
+                        let fp = if db::s(&v,"secret_type") == "secret" { value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&plain_value)) } else { String::new() };
+                        (oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid,&sid,"value",new_ver), &plain_value),
+                         oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid,&sid,"comment",new_ver), &plain_comment),
+                         fp, String::new(),
+                         oc::encrypt_symmetric_aad(&key, &secret_aad(&eid,&sid,"tags"), db::s(&v,"tags").as_bytes()))
+                    }
+                    None => (db::s(&v,"value_enc"), db::s(&v,"comment_enc"), String::new(), db::s(&v,"tags"), String::new()),
+                };
+                let vpath = { let p = db::s(r,"path"); if p.is_empty() { let p = db::s(&v,"path"); if p.is_empty() { "/".to_string() } else { p } } else { p } };
+                st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,tags=?,tags_enc=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
+                    &[json!(db::s(&v,"key_enc")), json!(value_enc), json!(&fp), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).await.map_err(|e| bad(&e))?;
                 st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(db::s(r,"path")), json!(db::s(&v,"tags")), json!(now()), json!(&uid)]).await.map_err(|e| bad(&e))?;
+                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(&uid)]).await.map_err(|e| bad(&e))?;
                 if was_deleted { removed += 1 } else { restored += 1 }
             }
             None => {
@@ -1131,8 +1442,9 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let key_name = body.get("key").and_then(|v|v.as_str()).unwrap_or("");
     let path = body.get("path").and_then(|v|v.as_str()).unwrap_or("/");
     let new_val = body.get("value").and_then(|v|v.as_str()).map(|s|s.to_string()).unwrap_or_else(|| oc::random_token("rot"));
-    let key = st.env_key(&eid).await?; let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
-    let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
+    let key = st.env_key(&eid).await?; let kname = key_name.to_uppercase();
+    let khash = key_index(&key, path, &kname); let legacy = oc::hash_token(&format!("{}:{}", path, kname));
+    let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(&khash), json!(&legacy)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
     upsert_secret(&st,&eid,&org,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()}).await?;
     st.audit(&org,&app,&eid,&uid,"secret.rotate",key_name).await;
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
@@ -1207,26 +1519,29 @@ async fn create_e2e_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<Strin
     Ok(j(json!({"id": eid, "mode": "e2e", "server_generated": server_generated}))) }
 async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"mode")).unwrap_or_default();
-    if mode != "e2e" { return Err(bad("env is not in e2e mode")); }
+    if mode != "e2e" && mode != "delegated" { return Err(bad("env is not client-encrypted")); }
     if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::FORBIDDEN, "no wrapped env key for caller")); }
     let mut count = 0;
     for s in body.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""); let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
-        let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or(""); let path = s.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+        let key_hash = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
+        let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
+        // Legacy clients still send a plaintext path; console clients encrypt it.
+        let path = if path_enc.is_empty() { s.get("path").and_then(|v| v.as_str()).unwrap_or("/") } else { "" };
         if key_enc.is_empty() || key_hash.is_empty() { continue; }
-        if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).await.map_err(|e| bad(&e))? {
+        if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(key_hash), json!(key_hash)]).await.map_err(|e| bad(&e))? {
             let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
-            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
+            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,path=?,path_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(path), json!(path_enc), json!(key_hash), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(&path), json!(""), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
         } else { let sid = id();
-            st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secrets(id,env_id,path,path_enc,key_enc,key_hash,key_index,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(path_enc), json!(key_enc), json!(key_hash), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(&path), json!(""), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
         } count += 1;
     }
     st.audit(&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)).await; Ok(j(json!({"deployed": count}))) }
 async fn e2e_get(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let wrapped = st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::FORBIDDEN, "no wrapped env key for caller; ask a member to grant access"))?;
-    let rows = st.db.query("SELECT id,path,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,path,path_enc,key_hash,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"wrapped_key": db::s(&wrapped,"wrapped_key"), "secrets": rows.iter().map(db::obj).collect::<Vec<_>>()}))) }
 async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::FORBIDDEN, "caller has no env key to grant")); }
@@ -1239,13 +1554,110 @@ async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     Ok(j(json!({"ok": true}))) }
 async fn e2e_grants(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
-    let rows = st.db.query("SELECT k.user_id AS user_id, u.email AS email FROM env_keys k JOIN users u ON u.id=k.user_id WHERE k.env_id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT k.user_id AS user_id, u.email AS email, u.pubkey AS pubkey FROM env_keys k JOIN users u ON u.id=k.user_id WHERE k.env_id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+async fn e2e_meta(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let env = st.db.one("SELECT mode,runner_id FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("env not found"))?;
+    let runner = if db::s(&env, "runner_id").is_empty() { Value::Null } else {
+        st.db.one("SELECT id,pubkey FROM runners WHERE id=?", &[json!(db::s(&env, "runner_id"))]).await.ok().flatten()
+            .map(|r| json!({"id": db::s(&r,"id"), "public_key": db::s(&r,"pubkey")})).unwrap_or(Value::Null) };
+    Ok(j(json!({"mode": db::s(&env, "mode"), "runner": runner, "rekey_required": meta_get(&st, &format!("rekey_required:{}", eid)).await == "1"}))) }
+async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
+    let env = st.db.one("SELECT mode,runner_id FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("env not found"))?;
+    let mode = db::s(&env, "mode");
+    if mode != "e2e" && mode != "delegated" { return Err(bad("only client-encrypted environments can be rekeyed")); }
+    if st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(&eid), json!(&uid)]).await.map_err(|e| bad(&e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "caller has no grant for this environment")); }
+    let secrets = body.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if secrets.is_empty() { return Err(bad("secrets array required")); }
+    let mut current = std::collections::HashSet::new();
+    for r in st.db.query("SELECT key_hash FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(&eid)]).await.map_err(|e| bad(&e))? { current.insert(db::s(&r, "key_hash")); }
+    let mut incoming = std::collections::HashSet::new();
+    for s in &secrets {
+        let kh = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
+        if kh.is_empty() || s.get("key_enc").and_then(|v| v.as_str()).unwrap_or("").is_empty() || s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            return Err(bad("each secret needs key_hash, key_enc and value_enc")); }
+        incoming.insert(kh.to_string());
+    }
+    if incoming != current { return Err(bad("the rekey payload must cover exactly the environment's current secrets; refresh and retry")); }
+
+    let grants = body.get("grants").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if grants.is_empty() { return Err(bad("grants array required")); }
+    let current_grants: std::collections::HashSet<String> = st.db.query("SELECT user_id FROM env_keys WHERE env_id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?
+        .iter().map(|r| db::s(r, "user_id")).collect();
+    let mut ids = std::collections::HashSet::new();
+    for g in &grants {
+        let gid = g.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+        let wrapped = g.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
+        if gid.is_empty() || wrapped.is_empty() { return Err(bad("each grant needs user_id and wrapped_key")); }
+        if !current_grants.contains(gid) { return Err(bad("a rekey may remove grants but cannot add a grantee who does not already hold the key; grant access first")); }
+        if st.db.one("SELECT id FROM users WHERE id=?", &[json!(gid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("grant refers to an unknown user")); }
+        ids.insert(gid.to_string());
+    }
+    if !ids.contains(&uid) { return Err(bad("the new grants must include the caller, or the environment would become unreadable to them")); }
+    let remove_user = body.get("remove_user").and_then(|v| v.as_str()).unwrap_or("");
+    if !remove_user.is_empty() {
+        if remove_user == uid { return Err(bad("the caller cannot remove their own grant in a rekey")); }
+        if !current_grants.contains(remove_user) { return Err(bad("remove_user has no grant in this environment")); }
+        if ids.contains(remove_user) { return Err(bad("remove_user cannot also appear in the new grants")); }
+    }
+    let runner_wrapped = body.get("runner_wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
+    if mode == "delegated" {
+        if runner_wrapped.is_empty() { return Err(bad("runner_wrapped_key required for a delegated environment")); }
+        if st.db.one("SELECT 1 AS n FROM runner_env_keys WHERE runner_id=? AND env_id=?", &[json!(db::s(&env, "runner_id")), json!(&eid)]).await.map_err(|e| bad(&e))?.is_none() {
+            return Err(bad("this environment has no runner key grant to update")); }
+    }
+
+    let mut rekeyed = 0;
+    let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
+    for s in &secrets {
+        let kh = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
+        let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or("");
+        let value_enc = s.get("value_enc").and_then(|v| v.as_str()).unwrap_or("");
+        let path_enc = s.get("path_enc").and_then(|v| v.as_str()).unwrap_or("");
+        if path_enc.is_empty() { return Err(bad("path_enc is required in the rekey payload")); }
+        let path_val = "";
+        let existing = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0 AND e2e=1", &[json!(&eid), json!(kh)]).await.map_err(|e| bad(&e))?;
+        let (sid, ver) = match existing {
+            Some(r) => (db::s(&r, "id"), db::n(&r, "version") + 1),
+            None => { return Err(bad("rekey payload does not match the stored secrets")); }
+        };
+        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,path_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
+            vec![json!(key_enc), json!(value_enc), json!(path_val), json!(path_enc), json!(kh), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
+        // Old history is encrypted under the old key and cannot be read after
+        // the rotation; replace it rather than leave undecryptable rows.
+        stmts.push(("DELETE FROM secret_versions WHERE secret_id=?".into(), vec![json!(&sid)]));
+        stmts.push(("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)".into(),
+            vec![json!(id()), json!(&sid), json!(ver), json!(key_enc), json!(value_enc), json!(path_val), json!(""), json!(now()), json!(&uid)]));
+        rekeyed += 1;
+    }
+    stmts.push(("DELETE FROM env_keys WHERE env_id=?".into(), vec![json!(&eid)]));
+    for g in &grants {
+        let gid = g.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+        let wrapped = g.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
+        stmts.push(("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)".into(), vec![json!(&eid), json!(gid), json!(wrapped)]));
+    }
+    if mode == "delegated" {
+        stmts.push(("UPDATE runner_env_keys SET wrapped_key=? WHERE runner_id=? AND env_id=?".into(),
+            vec![json!(runner_wrapped), json!(db::s(&env, "runner_id")), json!(&eid)]));
+    }
+    // One transaction: a failed grant write must not leave the environment
+    // re-encrypted under a key nobody can unwrap.
+    st.db.batch(&stmts).await.map_err(|e| bad(&format!("rekey did not complete: {}", e)))?;
+    meta_set(&st, &format!("rekey_required:{}", eid), "0").await;
+    let detail = if remove_user.is_empty() { format!("{} secrets, {} grants", rekeyed, grants.len()) } else { format!("{} secrets, {} grants, removed {}", rekeyed, grants.len(), remove_user) };
+    st.audit(&org, &app, &eid, &uid, "e2e.rekey", &detail).await;
+    Ok(j(json!({"rekeyed": rekeyed, "grants": grants.len()}))) }
 async fn e2e_revoke(State(st): State<S>, h: HeaderMap, Path((eid, target)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     let deleted = st.db.exec("DELETE FROM env_keys WHERE env_id=? AND user_id=?", &[json!(&eid), json!(&target)]).await.map_err(|e| bad(&e))?;
     if deleted == 0 { return Err(err(StatusCode::NOT_FOUND, "no key grant for that user")); }
-    st.audit(&org,&app,&eid,&uid,"e2e.revoke",&target).await; Ok(j(json!({"revoked": target}))) }
+    // The removed member may have kept the old key; only a rekey makes the
+    // remaining ciphertext unreadable to them.
+    meta_set(&st, &format!("rekey_required:{}", eid), "1").await;
+    st.audit(&org,&app,&eid,&uid,"e2e.revoke",&target).await; Ok(j(json!({"revoked": target, "rekey_required": true}))) }
 async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?;
     let email = q.get("email").cloned().unwrap_or_default();
     // One response for "no such account" and "exists but shares no organisation"
@@ -1257,12 +1669,12 @@ async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<
     Ok(j(json!({"id": db::s(&row,"id"), "email": db::s(&row,"email"), "pubkey": db::s(&row,"pubkey")}))) }
 
 
-async fn meta_get(st: &S, k: &str) -> String { st.db.one("SELECT v FROM meta WHERE k=?", &[json!(k)]).await.ok().flatten().map(|r| db::s(&r,"v")).unwrap_or_default() }
+pub(crate) async fn meta_get(st: &S, k: &str) -> String { st.db.one("SELECT v FROM meta WHERE k=?", &[json!(k)]).await.ok().flatten().map(|r| db::s(&r,"v")).unwrap_or_default() }
 // One pass over pre-existing secrets. New writes compute their fingerprint
 // inline, so this only needs to run once per database.
 pub async fn backfill_value_fingerprints(st: &S) {
     if st.db.one("SELECT v FROM meta WHERE k='migration:value_fp'", &[]).await.ok().flatten().is_some() { return; }
-    let rows = match st.db.query("SELECT id,env_id,value_enc,secret_type,e2e FROM secrets WHERE value_fp='' AND deleted=0", &[]).await { Ok(rows) => rows, Err(_) => return };
+    let rows = match st.db.query("SELECT id,env_id,version,value_enc,secret_type,e2e FROM secrets WHERE value_fp='' AND deleted=0", &[]).await { Ok(rows) => rows, Err(_) => return };
     let mut keys: HashMap<String, [u8; 32]> = HashMap::new();
     let mut orgs: HashMap<String, String> = HashMap::new();
     let mut failed = false;
@@ -1277,7 +1689,7 @@ pub async fn backfill_value_fingerprints(st: &S) {
             Some(o) => o.clone(),
             None => match st.env_org_app(&eid).await { Ok((o, _)) => { orgs.insert(eid.clone(), o.clone()); o }, Err(_) => continue },
         };
-        let value = match oc::decrypt_symmetric(&key, &db::s(row, "value_enc")) { Ok(v) => v, Err(_) => continue };
+        let value = match decrypt_secret_value(&key, &eid, &db::s(row, "id"), "value", db::n(row, "version"), &db::s(row, "value_enc")) { Ok(v) => v, Err(_) => continue };
         if value.is_empty() { continue; }
         let fp = value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&value));
         // If a concurrent write replaced the ciphertext, keep the fingerprint
@@ -1359,6 +1771,8 @@ async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
 async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    // Per-workspace SSO is configured by that workspace's admins, so it is not
+    // governed by the instance-wide sign-in method switch.
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)).await; let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)).await; let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid)).await;
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)).await;
     let client_secret = oc::decrypt_symmetric(&st.master(), &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
@@ -1413,6 +1827,9 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
             return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
         } }
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, subject)).await;
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}&org={}", challenge, oid))); }
     let token = make_session(&st, &uid).await?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
 
@@ -1615,6 +2032,9 @@ async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, ax
     if !valid_email(&email) { return bad("SAML NameID must be an email address; configure the IdP NameID format").into_response(); }
     let uid = match provision_saml_user(&st, &oid, &db::s(&cfg,"idp_entity_id"), &name_id, &email).await { Ok(u) => u, Err(e) => return e.into_response() };
     let _ = st.db.exec("DELETE FROM saml_pending WHERE state=?", &[json!(form.get("RelayState").cloned().unwrap_or_default())]).await;
+    if mfa::required(&st, &uid).await {
+        let challenge = match mfa::new_challenge(&st, &uid).await { Ok(c) => c, Err(e) => return e.into_response() };
+        return axum::response::Redirect::temporary(&format!("/#mfa={}&org={}", challenge, oid)).into_response(); }
     let token = match make_session(&st, &uid).await { Ok(t) => t, Err(e) => return e.into_response() };
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     (hdr, axum::response::Redirect::to(&format!("/#org={}", oid))).into_response() }
@@ -1847,11 +2267,11 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
         }
     }
     st.audit(&org, "", "", &uid, "auth.ldap_credentials", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn))).await;
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" {
+    if mfa::required(&st, &uid).await {
         st.audit(&org, "", "", &uid, "auth.ldap_mfa_challenge", &audit_safe(&user.email)).await;
-        let challenge = oc::random_token("mfa");
-        st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(&challenge), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?;
-        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await})))); }
     let token = make_session(&st, &uid).await?;
     st.audit(&org, "", "", &uid, "auth.ldap_login", &format!("{} dn={}", audit_safe(&user.email), audit_safe(&user.dn))).await;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
@@ -1873,6 +2293,21 @@ async fn send_template(to: &str, kind: &str, vars: &[(&str, &str)]) {
         if !production() { eprintln!("{}", msg.text); }
         return; }
     if let Err(e) = mailer::send(&cfg, &msg).await { eprintln!("email delivery failed: {}", e); } }
+// Security codes need the delivery outcome, so they use the fallible variant.
+// Outside production a suppressed message still counts as delivered: the code
+// is written to the operator log, which is how the local walkthrough works.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn send_email_result(to: &str, subject: &str, text: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let cfg = mailer::MailConfig::from_env();
+    if !cfg.enabled() {
+        if production() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "email delivery is not configured on this instance")); }
+        eprintln!("email suppressed (no provider configured): {} -> {}\n{}", subject, to, text);
+        return Ok(());
+    }
+    let msg = mailer::MailMessage { to: to.to_string(), subject: subject.to_string(), text: text.to_string(),
+        html: format!("<p>{}</p>", esc(text).replace('\n', "<br>")) };
+    mailer::send(&cfg, &msg).await.map_err(|_| err(StatusCode::BAD_GATEWAY, "the email relay rejected the message"))
+}
 async fn test_email(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "instance owner required")); }
@@ -1905,6 +2340,7 @@ async fn verify_email(State(st): State<S>, Query(q): Query<HashMap<String,String
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP));
     r }
 async fn forgot_password(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<EmailReq>) -> Res {
+    if !auth_enabled(&st, "password").await { return Ok(j(json!({"ok": true, "note": "if that address has an account, a reset link is on its way"}))); }
     let key = format!("forgot:{}", addr);
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many reset requests; try again later")); }
     st.rate_fail(&key, 900).await;
@@ -1929,13 +2365,17 @@ async fn resend_verification(State(st): State<S>, PeerAddr(addr): PeerAddr, h: H
     }
     Ok(j(json!({"ok": true}))) }
 async fn reset_password(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ResetReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance")); }
     let key = format!("reset:{}", addr);
     if !st.rate_ok(&key, 10, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
     if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT user_id FROM auth_tokens WHERE token_hash=? AND kind='reset' AND used=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
     let uid = db::s(&row, "user_id");
-    let user = st.db.one("SELECT email,pubkey,email_verified FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    let user = st.db.one("SELECT email,pubkey,email_verified,auth_version FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    // A version 1 reset would install a real password hash on a version 2
+    // account and reopen the password endpoint; keep the account on v2.
+    if db::n(&user, "auth_version") == 2 { return Err(bad("this account uses client-derived sign-in; use the v2 reset endpoint")); }
     st.rate_fail(&key, 900).await;
     let kit = r.recovery_kit.trim().to_string();
     let (pubkey, wrapped, replaced) = if !kit.is_empty() {
@@ -1951,7 +2391,15 @@ async fn reset_password(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): 
     let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]).await;
     let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await;
     let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]).await;
+    mfa::note_password_login(&st, &uid).await;
     st.audit("", "", "", &uid, "auth.password_reset", if replaced { "key replaced" } else { "kit supplied" }).await;
+    // A reset link proves the mailbox, not the second factor. Changing the
+    // password must not be a way around an enrolled factor.
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await,
+            "e2e_key_replaced": replaced})))); }
     let session = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap());
     Ok((hdr, j(json!({"token": session, "user_id": uid, "e2e_key_replaced": replaced})))) }
@@ -1977,6 +2425,62 @@ async fn instance_owner(st: &S) -> Option<String> {
     let uid = st.db.one("SELECT id FROM users WHERE email_verified=1 ORDER BY created_at, id LIMIT 1", &[]).await.ok().flatten().map(|r| db::s(&r, "id"));
     if let Some(u) = &uid { claim_instance_owner(st, u).await; }
     uid }
+const AUTH_METHODS: &[&str] = &["password", "google", "microsoft", "apple", "github", "okta", "auth0", "gitlab", "atlassian", "slack", "salesforce", "openai", "x", "oidc"];
+fn auth_method_configured(method: &str) -> bool {
+    match method {
+        "password" => true,
+        _ => social_enabled(method) } }
+fn auth_env_lock() -> Option<Vec<String>> {
+    crate::envcfg::var("OPENWARP_AUTH_PROVIDERS").ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()) }
+// Operators can pin the method list with OPENWARP_AUTH_PROVIDERS. Otherwise the
+// instance owner's stored choice wins, defaulting to every configured method.
+async fn auth_enabled(st: &S, method: &str) -> bool {
+    if !auth_method_configured(method) { return false; }
+    if let Some(lock) = auth_env_lock() { return lock.iter().any(|m| m == method); }
+    let stored = meta_get(st, "auth_providers").await;
+    if stored.is_empty() { return true; }
+    serde_json::from_str::<Value>(&stored).ok()
+        .and_then(|v| v.get(method).and_then(|b| b.as_bool())).unwrap_or(true) }
+async fn auth_settings(st: &S) -> Value {
+    let mut out = serde_json::Map::new();
+    let mut enabled: Vec<&str> = Vec::new(); let mut configured: Vec<&str> = Vec::new();
+    for method in AUTH_METHODS {
+        if auth_method_configured(method) { configured.push(*method); }
+        let on = auth_enabled(st, method).await;
+        if on { enabled.push(*method); }
+        out.insert((*method).to_string(), json!(on));
+    }
+    out.insert("methods".into(), json!(enabled));
+    out.insert("configured".into(), json!(configured));
+    out.insert("env_locked".into(), json!(auth_env_lock().is_some()));
+    Value::Object(out) }
+pub fn validate_auth_env() -> Result<(), String> {
+    let Some(lock) = auth_env_lock() else { return Ok(()) };
+    if lock.is_empty() { return Err("OPENWARP_AUTH_PROVIDERS is set but names no sign-in method".into()); }
+    for m in &lock {
+        if !AUTH_METHODS.contains(&m.as_str()) { return Err(format!("OPENWARP_AUTH_PROVIDERS contains unknown method {:?}; use {:?}", m, AUTH_METHODS)); }
+        if !auth_method_configured(m) { return Err(format!("OPENWARP_AUTH_PROVIDERS enables {:?} but its credentials are not configured", m)); }
+    }
+    Ok(()) }
+async fn set_auth_providers(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change sign-in methods")); }
+    if auth_env_lock().is_some() { return Err(err(StatusCode::CONFLICT, "OPENWARP_AUTH_PROVIDERS controls sign-in methods on this instance")); }
+    let mut chosen: Vec<&str> = Vec::new();
+    for method in AUTH_METHODS {
+        let current = auth_enabled(&st, method).await;
+        let value = body.get(*method).and_then(|v| v.as_bool()).unwrap_or(current);
+        if value {
+            if !auth_method_configured(method) { return Err(bad(&format!("{} sign-in is not configured; set its client credentials first", method))); }
+            chosen.push(method);
+        }
+    }
+    if chosen.is_empty() { return Err(bad("at least one sign-in method must stay enabled, or nobody could sign in")); }
+    let cfg: serde_json::Map<String, Value> = AUTH_METHODS.iter().map(|m| ((*m).to_string(), json!(chosen.contains(m)))).collect();
+    meta_set(&st, "auth_providers", &Value::Object(cfg).to_string()).await;
+    st.audit("", "", "", &uid, "instance.auth_providers", &chosen.join(",")).await;
+    Ok(j(auth_settings(&st).await)) }
 fn env_nonempty(key: &str) -> String { crate::envcfg::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_default() }
 fn social_provider(provider: &str) -> Option<(String, String)> {
     // Any OIDC issuer this instance trusts. The secret is optional because a
@@ -2237,26 +2741,11 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email)).await;
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
-    let oidc = social_enabled("oidc");
-    Ok(j(json!({
-        "password": true,
-        "ldap": cfg!(feature = "ldap"),
-        "google": social_enabled("google"),
-        "github": social_enabled("github"),
-        "apple": social_enabled("apple"),
-        "openai": social_enabled("openai"),
-        "microsoft": social_enabled("microsoft"),
-        "okta": social_enabled("okta"),
-        "auth0": social_enabled("auth0"),
-        "gitlab": social_enabled("gitlab"),
-        "slack": social_enabled("slack"),
-        "salesforce": social_enabled("salesforce"),
-        "atlassian": social_enabled("atlassian"),
-        "x": social_enabled("x"),
-        "oidc": oidc,
-        "oidc_name": if oidc { oidc_custom_name() } else { String::new() },
-        "signups": if signups_open(&st).await { "open" } else { "invite" },
-    }))) }
+    let mut out = auth_settings(&st).await;
+    out["ldap"] = json!(cfg!(feature = "ldap"));
+    out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
+    out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
+    Ok(j(out)) }
 // Composed from discovery plus optional explicit endpoints, for IdPs that do not
 // publish usable metadata.
 async fn custom_oidc_metadata() -> Result<Value, (StatusCode, Json<Value>)> {
@@ -2274,6 +2763,7 @@ async fn custom_oidc_metadata() -> Result<Value, (StatusCode, Json<Value>)> {
         obj.entry("issuer").or_insert(json!(&issuer)); }
     Ok(disc) }
 async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, &provider).await { return Err(err(StatusCode::NOT_FOUND, "this sign-in provider is disabled on this instance")); }
     let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
     let state = oc::random_token("sst");
@@ -2304,6 +2794,7 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
     if !verifier.is_empty() { url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", pkce_challenge(&verifier))); }
     Ok(axum::response::Redirect::temporary(&url)) }
 async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, &provider).await { return Err(err(StatusCode::NOT_FOUND, "this sign-in provider is disabled on this instance")); }
     let (client_id, client_secret) = social_provider(&provider).filter(|_| social_enabled(&provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     // Apple answers with a form POST; every other provider uses the query string.
     let params = if q.contains_key("code") || q.contains_key("state") { q } else { form.ok().map(|axum::extract::Form(f)| f).unwrap_or_default() };
@@ -2330,28 +2821,34 @@ async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path
     // inherit the bindings of the previous one.
     let bound_provider = if provider == "oidc" { format!("oidc:{}", env_nonempty("OPENWARP_OIDC_ISSUER")) } else { provider.clone() };
     let uid = resolve_social(&st, &bound_provider, &subject, &email).await?;
+    // The provider proved the address, not possession of the account's second
+    // factor, so MFA still applies to social sign-in.
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}", challenge))); }
     let token = make_session(&st, &uid).await?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
-    Ok(j(json!({
-        "signups_open": signups_open(&st).await,
-        "signups_env_locked": crate::envcfg::var("OPENWARP_SIGNUPS").is_ok(),
-        "instance_owner": instance_owner(&st).await.as_deref() == Some(uid.as_str()),
-        "google": social_enabled("google"),
-        "github": social_enabled("github"),
-        "apple": social_enabled("apple"),
-        "openai": social_enabled("openai"),
-        "microsoft": social_enabled("microsoft"),
-        "okta": social_enabled("okta"),
-        "auth0": social_enabled("auth0"),
-        "gitlab": social_enabled("gitlab"),
-        "slack": social_enabled("slack"),
-        "salesforce": social_enabled("salesforce"),
-        "atlassian": social_enabled("atlassian"),
-        "x": social_enabled("x"),
-        "oidc": social_enabled("oidc"),
-    }))) }
+    let mut out = auth_settings(&st).await;
+    out["signups_open"] = json!(signups_open(&st).await);
+    out["signups_env_locked"] = json!(crate::envcfg::var("OPENWARP_SIGNUPS").is_ok());
+    out["instance_owner"] = json!(instance_owner(&st).await.as_deref() == Some(uid.as_str()));
+    out["mfa_email"] = json!(mfa::email_available());
+    out["google"] = json!(social_enabled("google"));
+    out["github"] = json!(social_enabled("github"));
+    out["apple"] = json!(social_enabled("apple"));
+    out["openai"] = json!(social_enabled("openai"));
+    out["microsoft"] = json!(social_enabled("microsoft"));
+    out["okta"] = json!(social_enabled("okta"));
+    out["auth0"] = json!(social_enabled("auth0"));
+    out["gitlab"] = json!(social_enabled("gitlab"));
+    out["slack"] = json!(social_enabled("slack"));
+    out["salesforce"] = json!(social_enabled("salesforce"));
+    out["atlassian"] = json!(social_enabled("atlassian"));
+    out["x"] = json!(social_enabled("x"));
+    out["oidc"] = json!(social_enabled("oidc"));
+    Ok(j(out)) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -2360,6 +2857,57 @@ async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>)
     meta_set(&st, "signups_open", if open { "1" } else { "0" }).await;
     st.audit("", "", "", &uid, "instance.signups", if open { "open" } else { "invite" }).await;
     Ok(j(json!({"signups_open": open}))) }
+async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rewrap environment keys")); }
+    let kms = st.kms().ok_or_else(|| bad("no KMS is configured; environment keys are wrapped by the instance master"))?;
+    let rows = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>''", &[]).await.map_err(|e| bad(&e))?;
+    let mut rewrapped = 0;
+    let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
+    for r in &rows {
+        let eid = db::s(r, "id");
+        // env_key unwraps both legacy and KMS rows, so this also migrates a
+        // deployment that enabled KMS after its data was created.
+        if let Ok(key) = st.env_key(&eid).await {
+            let wrapped = kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
+            stmts.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(&eid)]));
+            rewrapped += 1;
+        }
+    }
+    st.db.batch(&stmts).await.map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "instance.rewrap_keys", &format!("{} environments, key {}", rewrapped, kms.key_id())).await;
+    Ok(j(json!({"rewrapped": rewrapped, "key_id": kms.key_id()}))) }
+async fn encrypt_metadata(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can migrate secret metadata")); }
+    // Only managed environments have a server-side key; never touch E2E or
+    // delegated rows, whose client-owned metadata cannot be rewritten here.
+    let envs = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>'' AND mode='sse'", &[]).await.map_err(|e| bad(&e))?;
+    let mut updated = 0;
+    for e in &envs {
+        let eid = db::s(e, "id");
+        let key = match st.env_key(&eid).await { Ok(k) => k, Err(_) => continue };
+        let rows = st.db.query("SELECT id,path,tags,path_enc,tags_enc,key_enc FROM secrets WHERE env_id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
+        for r in &rows {
+            let sid = db::s(r, "id");
+            let path = if db::s(r, "path_enc").is_empty() { db::s(r, "path") }
+                else { oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "path"), &db::s(r, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(r, "path")) };
+            let path = if path.is_empty() { "/".to_string() } else { path };
+            let tags = if db::s(r, "tags_enc").is_empty() { db::s(r, "tags") }
+                else { oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "tags"), &db::s(r, "tags_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(r, "tags")) };
+            let Ok(kname) = oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "key"), &db::s(r, "key_enc")) else { continue };
+            let kname = String::from_utf8_lossy(&kname).into_owned();
+            if kname.is_empty() { continue; }
+            let kh = key_index(&key, &path, &kname);
+            let path_enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, "path"), path.as_bytes());
+            let tags_enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, "tags"), tags.as_bytes());
+            st.db.exec("UPDATE secrets SET path='',path_enc=?,tags='',tags_enc=?,key_hash=?,key_index=? WHERE id=?",
+                &[json!(path_enc), json!(tags_enc), json!(&kh), json!(&kh), json!(&sid)]).await.map_err(|e| bad(&e))?;
+            updated += 1;
+        }
+    }
+    st.audit("", "", "", &uid, "instance.encrypt_metadata", &format!("{} secrets", updated)).await;
+    Ok(j(json!({"updated": updated}))) }
 #[cfg(not(target_arch = "wasm32"))]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
@@ -2372,7 +2920,11 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
     let mut env_updates = Vec::new();
     for r in &envs {
-        let plain = oc::decrypt_symmetric(&old, &db::s(r, "env_key_wrapped"))
+        let wrapped = db::s(r, "env_key_wrapped");
+        // KMS-wrapped and client-encrypted environments do not depend on the
+        // local master key, so leave their blobs untouched.
+        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
+        let plain = oc::decrypt_symmetric(&old, &wrapped)
             .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
         env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
     }
@@ -2518,6 +3070,106 @@ async fn scim_deactivate(st: &S, org: &str, uid: &str, caller: &str) -> Result<(
     Ok(()) }
 
 
+// ---------- customer-run sync runners (delegated environments) ----------
+#[derive(Deserialize)] struct RunnerReq { name: String, public_key: String }
+async fn runner_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let token = bearer_token(h);
+    if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "runner token required")); }
+    let row = st.db.one("SELECT id,org_id FROM runners WHERE token_hash=?", &[json!(oc::hash_token(&token))]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid runner token"))?;
+    Ok((db::s(&row, "id"), db::s(&row, "org_id"))) }
+async fn runner_for_env(st: &S, eid: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let env = st.db.one("SELECT runner_id,mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("env not found"))?;
+    if db::s(&env, "mode") != "delegated" { return Err(bad("environment is not delegated")); }
+    let rid = db::s(&env, "runner_id");
+    let runner = st.db.one("SELECT pubkey FROM runners WHERE id=?", &[json!(&rid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("runner not found"))?;
+    Ok((rid, db::s(&runner, "pubkey"))) }
+async fn seal_to_runner(st: &S, eid: &str, iid: &str, config: &Value) -> Result<String, (StatusCode, Json<Value>)> {
+    let (rid, pubkey) = runner_for_env(st, eid).await?;
+    // The sealed box has no AAD, so bind the payload to its integration inside
+    // the plaintext and make the runner verify it before using the config.
+    let envelope = json!({"context": format!("ow-integration|{}|{}", eid, iid), "config": config}).to_string();
+    let sealed = oc::encrypt_to(&pubkey, envelope.as_bytes()).map_err(|e| bad(&e))?;
+    Ok(format!("owrunner:{}:{}", rid, sealed)) }
+async fn enqueue_sync(st: &S, eid: &str, iid: &str, job_kind: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let (rid, _) = runner_for_env(st, eid).await?;
+    if st.db.one("SELECT id FROM sync_jobs WHERE integration_id=? AND status IN ('pending','claimed') AND kind=?", &[json!(iid), json!(job_kind)]).await.map_err(|e| bad(&e))?.is_some() { return Ok(()); }
+    st.db.exec("INSERT INTO sync_jobs(id,env_id,integration_id,runner_id,kind,created_at) VALUES(?,?,?,?,?,?)",
+        &[json!(id()), json!(eid), json!(iid), json!(rid), json!(job_kind), json!(now())]).await.map_err(|e| bad(&e))?;
+    Ok(()) }
+async fn create_runner(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<RunnerReq>) -> Res {
+    let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    let name = r.name.trim();
+    if name.is_empty() { return Err(bad("runner name required")); }
+    let raw = oc::unb64(&r.public_key).map_err(|_| bad("public_key must be base64 X25519"))?;
+    if raw.len() != 32 { return Err(bad("public_key must decode to 32 bytes")); }
+    let rid = id(); let token = oc::random_token("run");
+    st.db.exec("INSERT INTO runners(id,org_id,name,pubkey,token_hash,created_at) VALUES(?,?,?,?,?,?)",
+        &[json!(&rid), json!(&oid), json!(name), json!(&r.public_key), json!(oc::hash_token(&token)), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.audit(&oid, "", "", &uid, "runner.create", name).await;
+    Ok(j(json!({"id": rid, "name": name, "public_key": r.public_key, "token": token, "note": "token shown once; store it with the runner"}))) }
+async fn list_runners(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    let rows = st.db.query("SELECT id,name,pubkey,created_at FROM runners WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+async fn delete_runner(State(st): State<S>, h: HeaderMap, Path((oid, rid)): Path<(String, String)>) -> Res {
+    let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    if st.db.one("SELECT id FROM envs WHERE runner_id=? AND mode='delegated' LIMIT 1", &[json!(&rid)]).await.map_err(|e| bad(&e))?.is_some() {
+        return Err(err(StatusCode::CONFLICT, "this runner still owns a delegated environment; remove or migrate those environments first")); }
+    let deleted = st.db.exec("DELETE FROM runners WHERE id=? AND org_id=?", &[json!(&rid), json!(&oid)]).await.map_err(|e| bad(&e))?;
+    if deleted == 0 { return Err(err(StatusCode::NOT_FOUND, "runner not found")); }
+    let _ = st.db.exec("DELETE FROM runner_env_keys WHERE runner_id=?", &[json!(&rid)]).await;
+    let _ = st.db.exec("DELETE FROM sync_jobs WHERE runner_id=?", &[json!(&rid)]).await;
+    st.audit(&oid, "", "", &uid, "runner.delete", &rid).await;
+    Ok(j(json!({"deleted": rid}))) }
+async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
+    let (rid, _) = runner_auth(&st, &h).await?;
+    // A runner that crashes after claiming a job must not strand it forever.
+    let stale = now() - 600;
+    let rows = st.db.query("SELECT * FROM sync_jobs WHERE runner_id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) ORDER BY created_at LIMIT 10", &[json!(&rid), json!(stale)]).await.map_err(|e| bad(&e))?;
+    let mut jobs = Vec::new();
+    for job in &rows {
+        let jid = db::s(job, "id"); let claim = oc::random_token("job"); let claimed_at = now();
+        if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=?,claim_id=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?))", &[json!(claimed_at), json!(&claim), json!(&jid), json!(stale)]).await.unwrap_or(0) == 0 { continue; }
+        let eid = db::s(job, "env_id"); let iid = db::s(job, "integration_id");
+        let fail = async |msg: &str| { let _ = st.db.exec("UPDATE sync_jobs SET status='failed',detail=? WHERE id=? AND claim_id=?", &[json!(msg), json!(&jid), json!(&claim)]).await; };
+        let env = match st.db.one("SELECT runner_id FROM envs WHERE id=?", &[json!(&eid)]).await { Ok(Some(e)) => e, _ => { fail("environment no longer exists").await; continue; } };
+        if db::s(&env, "runner_id") != rid { fail("runner does not own this environment").await; continue; }
+        let wrapped = match st.db.one("SELECT wrapped_key FROM runner_env_keys WHERE runner_id=? AND env_id=?", &[json!(&rid), json!(&eid)]).await { Ok(Some(w)) => db::s(&w, "wrapped_key"), _ => { fail("no wrapped environment key for this runner").await; continue; } };
+        let integ = match st.db.one("SELECT kind,config_enc FROM integrations WHERE id=?", &[json!(&iid)]).await { Ok(Some(i)) => i, _ => { fail("integration no longer exists").await; continue; } };
+        // Sealed values are never readable, so a runner job must never carry them.
+        let secrets = st.db.query("SELECT key_enc,value_enc,key_hash,path FROM secrets WHERE env_id=? AND deleted=0 AND secret_type<>'sealed'", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
+        let prev = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await.unwrap_or_default();
+        jobs.push(json!({
+            "id": jid, "claim": claim, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"),
+            "kind": db::s(&integ, "kind"), "config_enc": db::s(&integ, "config_enc"), "wrapped_key": wrapped,
+            "secrets": secrets.iter().map(db::obj).collect::<Vec<_>>(),
+            "previous": prev.iter().map(|r| db::s(r, "remote_name")).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(j(json!({"jobs": jobs}))) }
+#[derive(Deserialize)] struct ManagedSecret { name: String, #[serde(default)] value_hash: String }
+#[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] detail: String, #[serde(default)] managed: Vec<ManagedSecret>, #[serde(default)] claim: String }
+async fn runner_job_result(State(st): State<S>, h: HeaderMap, Path(jid): Path<String>, Json(r): Json<JobResultReq>) -> Res {
+    let (rid, _) = runner_auth(&st, &h).await?;
+    let job = st.db.one("SELECT * FROM sync_jobs WHERE id=? AND runner_id=?", &[json!(&jid), json!(&rid)]).await.map_err(|e| bad(&e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "job not found"))?;
+    if db::s(&job, "status") != "claimed" { return Err(err(StatusCode::CONFLICT, "job is not claimed by this runner")); }
+    // The claim id is the fencing token: a job reclaimed after the stale window
+    // rejects the old runner's late result.
+    let updated = st.db.exec("UPDATE sync_jobs SET status=?,detail=? WHERE id=? AND runner_id=? AND status='claimed' AND claim_id=?",
+        &[json!(if r.ok { "done" } else { "failed" }), json!(&r.detail), json!(&jid), json!(&rid), json!(&r.claim)]).await.map_err(|e| bad(&e))?;
+    if updated == 0 { return Err(err(StatusCode::CONFLICT, "this claim was superseded; refresh the job queue")); }
+    let eid = db::s(&job, "env_id"); let iid = db::s(&job, "integration_id");
+    if r.ok && db::s(&job, "kind") == "sync" && !r.managed.is_empty() {
+        let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await;
+        for m in &r.managed { let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(&iid), json!(&m.name), json!(&m.value_hash)]).await; }
+    }
+    if let Ok((org, app)) = st.env_org_app(&eid).await {
+        st.audit(&org, &app, &eid, "runner", if r.ok { "integration.sync" } else { "integration.sync_failed" }, &format!("{} {}", iid, r.detail)).await;
+    }
+    Ok(j(json!({"status": if r.ok { "done" } else { "failed" }}))) }
+
 // ---------- machine identities + Universal Auth (Infisical-inspired) ----------
 async fn create_identity(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     let caller_role = st.require_org(&oid, &uid).await?; st.check_admin(&oid, &uid).await?;
@@ -2561,7 +3213,8 @@ async fn universal_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
 // ---------- approval workflow: secret change proposals ----------
 async fn create_proposal(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "proposals:write").await?;
     let key = st.env_key(&eid).await?; let payload = serde_json::to_string(&r.secrets.iter().map(|s| json!({"key":s.key,"value":s.value,"path":s.path,"comment":s.comment,"tags":s.tags,"type":s.secret_type})).collect::<Vec<_>>()).unwrap();
-    let pid = id(); st.db.exec("INSERT INTO proposals(id,env_id,author,payload_enc,created_at) VALUES(?,?,?,?,?)", &[json!(pid), json!(eid), json!(uid), json!(oc::encrypt_symmetric(&key, payload.as_bytes())), json!(now())]).await.map_err(|e| bad(&e))?;
+    let pid = id();
+    st.db.exec("INSERT INTO proposals(id,env_id,author,payload_enc,created_at) VALUES(?,?,?,?,?)", &[json!(pid), json!(eid), json!(uid), json!(oc::encrypt_symmetric_aad(&key, &proposal_aad(&eid, &pid, "payload"), payload.as_bytes())), json!(now())]).await.map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"proposal.create",&pid).await; Ok(j(json!({"id": pid, "status": "pending"}))) }
 async fn list_proposals(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let rows = st.db.query("SELECT id,env_id,author,status,created_at,decided_by FROM proposals WHERE env_id=? ORDER BY created_at DESC", &[json!(eid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -2571,7 +3224,7 @@ async fn decide_proposal(State(st): State<S>, h: HeaderMap, Path((pid, action)):
     let eid = db::s(&row,"env_id"); let (org, app) = st.require_env(&eid, &uid).await?;
     st.check_admin(&org, &uid).await.map_err(|_| err(StatusCode::FORBIDDEN, "proposals need approval by an admin (not the author)"))?;
     if action == "approve" {
-        let key = st.env_key(&eid).await?; let plain = oc::decrypt_symmetric(&key, &db::s(&row,"payload_enc")).map_err(|e| bad(&e))?;
+        let key = st.env_key(&eid).await?; let plain = oc::decrypt_symmetric_compat(&key, &proposal_aad(&eid, &pid, "payload"), &db::s(&row,"payload_enc")).map_err(|e| bad(&e))?;
         let items: Vec<Value> = serde_json::from_slice(&plain).unwrap_or_default(); let mut count = 0;
         for it in &items { let s = SecretIn{ key: it["key"].as_str().unwrap_or("").into(), value: it["value"].as_str().unwrap_or("").into(), path: it["path"].as_str().unwrap_or("/").into(), comment: it["comment"].as_str().unwrap_or("").into(), tags: it["tags"].as_str().unwrap_or("").into(), secret_type: it["type"].as_str().unwrap_or("secret").into() };
             if !s.key.is_empty() { upsert_secret(&st, &eid, &org, &key, &uid, &s).await?; count += 1; } }
@@ -2611,14 +3264,14 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
         let password = oc::random_token("dyn");
         crate::pglease::create_role(&conn, &username, &password, now() + ttl).await.map_err(|e| bad(&e))?;
-        let config_enc = oc::encrypt_symmetric(&key, json!({"connection":conn,"type":"postgres"}).to_string().as_bytes());
-        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"connection":conn,"type":"postgres"}).to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"postgres"}))); }
     if typ == "aws_iam" {
         let config = body.get("config").cloned().unwrap_or(json!({}));
         let creds = integrations::sts_assume_role(&config).await.map_err(|e| bad(&e))?;
-        let config_enc = oc::encrypt_symmetric(&key, json!({"type":"aws_iam"}).to_string().as_bytes());
-        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, creds.to_string().as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"type":"aws_iam"}).to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), creds.to_string().as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
 	    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") {
@@ -2669,17 +3322,17 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
 	        if typ == "fireworks" { stored["account_id"] = json!(config.get("account_id").and_then(|v| v.as_str()).unwrap_or("")); stored["user_id"] = json!(config.get("user_id").and_then(|v| v.as_str()).unwrap_or("")); }
 	        if matches!(typ, "deepgram" | "gemini") { stored["project_id"] = json!(config.get(if typ == "deepgram" { "project_id" } else { "project" }).and_then(|v| v.as_str()).unwrap_or("")); }
 	        if typ == "elevenlabs" { stored["service_account_id"] = json!(config.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("")); }
-        let config_enc = oc::encrypt_symmetric(&key, stored.to_string().as_bytes());
-        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, secret.as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), stored.to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), secret.as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "value": secret, "remote_id": remote_id, "expires_at": now()+ttl, "type": typ})));
     }
     let value = oc::random_token("dyn");
-    st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, value.as_bytes())), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), value.as_bytes())), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": lid, "value": value, "expires_at": now()+ttl}))) }
 async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
     let eid = db::s(&row,"env_id"); let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "leases:write").await?; let key = st.env_key(&eid).await?;
-    if !db::s(&row,"config_enc").is_empty() { if let Ok(plain) = oc::decrypt_symmetric(&key, &db::s(&row,"config_enc")) { if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
+    if !db::s(&row,"config_enc").is_empty() { if let Ok(plain) = oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &lid, "config"), &db::s(&row,"config_enc")) { if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
         match cfg.get("type").and_then(|v| v.as_str()) {
             Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 let _ = crate::pglease::drop_role(&conn, &username).await; }
@@ -2945,44 +3598,57 @@ async fn list_roles(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 fn b32encode(data: &[u8]) -> String { let mut out = String::new(); let mut buf: u64 = 0; let mut bits = 0; for b in data { buf = (buf << 8) | *b as u64; bits += 8; while bits >= 5 { out.push(B32[((buf >> (bits - 5)) & 31) as usize] as char); bits -= 5; } } if bits > 0 { out.push(B32[((buf << (5 - bits)) & 31) as usize] as char); } out }
 fn b32decode(s: &str) -> Vec<u8> { let mut out = Vec::new(); let mut buf: u64 = 0; let mut bits = 0; for c in s.to_uppercase().chars() { if let Some(v) = B32.iter().position(|&x| x as char == c) { buf = (buf << 5) | v as u64; bits += 5; if bits >= 8 { out.push((buf >> (bits - 8)) as u8); bits -= 8; } } } out }
-fn totp_code(secret: &[u8], counter: u64) -> String { use sha1::Sha1; use hmac::{Hmac, Mac}; type H = Hmac<Sha1>;
+pub(crate) fn totp_code(secret: &[u8], counter: u64) -> String { use sha1::Sha1; use hmac::{Hmac, Mac}; type H = Hmac<Sha1>;
     let mut m = H::new_from_slice(secret).unwrap(); m.update(&counter.to_be_bytes()); let hash = m.finalize().into_bytes();
     let off = (hash[19] & 0x0f) as usize; let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off+1] as u32) << 16) | ((hash[off+2] as u32) << 8) | hash[off+3] as u32; format!("{:06}", code % 1_000_000) }
-async fn meta_set(st: &S, k: &str, v: &str) { if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k), json!(v)]).await.is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(k)]).await; } }
+async fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
+    if meta_get(st, &format!("totp_enabled:{}", uid)).await != "1" { return true; }
+    if code.is_empty() { return false; }
+    if let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) {
+        let counter = (now() / 30) as u64;
+        for c in [counter.wrapping_sub(1), counter, counter + 1] {
+            if totp_code(&secret, c) == code {
+                let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
+                if c <= last { return false; }
+                meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
+                return true;
+            }
+        }
+    }
+    let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await; let hash = oc::hash_token(code);
+    let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; return true; }
+    false }
+
+pub(crate) async fn meta_set(st: &S, k: &str, v: &str) { if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k), json!(v)]).await.is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(k)]).await; } }
 async fn totp_setup(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    // Re-enrolling is equivalent to removing the second factor, so it needs the
-    // password once MFA is already active.
-    if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" {
-        let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-        let row = st.db.one("SELECT pass_hash FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
-        if password.is_empty() || !oc::verify_password(password, &db::s(&row, "pass_hash")) { return Err(err(StatusCode::UNAUTHORIZED, "current password required to change two-factor settings")); } }
+    // Adding a factor to an account that already has one needs the password.
+    mfa::reauth_add(&st, &uid, &body).await?;
     let provided = body.get("secret").and_then(|v| v.as_str()).unwrap_or("");
     let secret_bytes: Vec<u8> = if provided.is_empty() { oc::random_key()[..20].to_vec() } else { let d = b32decode(provided); if d.len() < 10 { return Err(bad("provided TOTP secret must be base32, at least 10 bytes")); } d };
     let secret_b32 = b32encode(&secret_bytes);
-    meta_set(&st, &format!("totp_secret:{}", uid), &oc::encrypt_symmetric(&st.master(), &secret_bytes)).await;
-    meta_set(&st, &format!("totp_enabled:{}", uid), "0").await;
-    let codes: Vec<String> = (0..8).map(|_| oc::random_token("rc")).collect();
-    let hashed: Vec<String> = codes.iter().map(|c| oc::hash_token(c)).collect();
-    meta_set(&st, &format!("totp_recovery:{}", uid), &hashed.join(",")).await;
-    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).await.map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default(); let _ = &secret_bytes;
+    // Keep the new secret pending until a code proves it. A re-enrolment must
+    // not disable the factor that is already protecting the account.
+    meta_set(&st, &format!("totp_pending:{}", uid), &oc::encrypt_symmetric(&st.master(), &secret_bytes)).await;
+    let codes = if mfa::recovery_count(&st, &uid).await == 0 { mfa::issue_recovery_codes(&st, &uid).await } else { Vec::new() };
+    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).await.map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default();
     Ok(j(json!({"secret": secret_b32, "otpauth_url": format!("otpauth://totp/OpenWarp:{}?secret={}&issuer=OpenWarp", email, secret_b32), "recovery_codes": codes, "note": "call POST /api/me/totp/verify {code} with a current TOTP code to enable"}))) }
 async fn totp_verify(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    let enc = meta_get(&st, &format!("totp_secret:{}", uid)).await; let secret = oc::decrypt_symmetric(&st.master(), &enc).map_err(|_| bad("TOTP not set up"))?;
-    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or(""); let counter = (now() / 30) as u64;
-    if ![counter.wrapping_sub(1), counter, counter + 1].iter().any(|c| totp_code(&secret, *c) == code) { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
-    meta_set(&st, &format!("totp_enabled:{}", uid), "1").await; Ok(j(json!({"enabled": true}))) }
+    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    if !mfa::confirm_totp(&st, &uid, code).await { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
+    st.audit("", "", "", &uid, "auth.totp_enabled", "").await;
+    Ok(j(json!({"enabled": true}))) }
 async fn mfa_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(body): Json<Value>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let token = body.get("mfa_token").and_then(|v| v.as_str()).unwrap_or(""); let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let row = st.db.one("SELECT user_id,created_at FROM mfa_challenges WHERE token=?", &[json!(token)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid MFA challenge"))?;
-    if db::n(&row,"created_at") + 300 < now() { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired")); }
-    let uid = db::s(&row,"user_id");
+    let uid = mfa::challenge_user(&st, token).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or expired MFA challenge"))?;
     // The password was already accepted upstream, so this step guards the second
     // factor itself: cap guesses per address and account.
     let key = format!("mfa:{}:{}", addr, uid);
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
-    if !otp_ok(&st, &uid, code).await { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
+    if !mfa::second_factor_ok(&st, &uid, code).await { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
     st.rate_clear(&key).await;
-    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(token)]).await;
+    mfa::consume_challenge(&st, token).await;
+    st.audit("", "", "", &uid, "auth.mfa", "").await;
     let session = make_session(&st, &uid).await?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
 
@@ -3080,11 +3746,13 @@ pub async fn process_rotations(st: &S) {
         let claimed = st.db.exec("UPDATE rotation_schedules SET next_run=? WHERE id=? AND next_run=?", &[json!(now()+interval), json!(&id), json!(old_next)]).await.unwrap_or(0);
         if claimed == 0 { continue; }
         let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.ok().flatten().map(|x| db::s(&x,"mode")).unwrap_or_default();
-        if mode == "e2e" { continue; }
+        if mode == "e2e" || mode == "delegated" { continue; }
         let (org, _) = st.env_org_app(&eid).await.unwrap_or_default();
         let path = { let p = db::s(r,"path"); if p.is_empty() { "/".to_string() } else { p } };
-        let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
-        let existing = st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(&eid), json!(&khash)]).await.ok().flatten();
+        let Ok(index_key) = st.env_key(&eid).await else { continue };
+        let khash = key_index(&index_key, &path, &key_name.to_uppercase());
+        let legacy = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
+        let existing = st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(&eid), json!(&khash), json!(&legacy)]).await.ok().flatten();
         let stype = match existing {
             Some(row) if db::s(&row,"secret_type") == "sealed" => {
                 if let Ok((org, app)) = st.env_org_app(&eid).await { st.audit(&org,&app,&eid,"rotation-scheduler","rotation.skipped_sealed",&key_name).await; }
@@ -3149,7 +3817,7 @@ pub async fn process_rotations(st: &S) {
 
 
 // ---------- OAuth 2.1 authorization server (shared by CLI login + MCP) ----------
-fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
+pub(crate) fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
 async fn oauth_user(st: &S, h: &HeaderMap) -> Option<String> {
     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let bearer = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
@@ -3196,31 +3864,86 @@ async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<Hash
     let hidden = hidden_fields(&q);
     let client = esc(q.get("client_id").map(|s| s.as_str()).unwrap_or(""));
     let scope = esc(q.get("scope").map(|s| s.as_str()).unwrap_or(""));
-    if let Some(uid) = oauth_user(&st, &h).await {
-        let otp = if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" { "<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code><br>".to_string() } else { String::new() };
-        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden, otp));
+    if oauth_user(&st, &h).await.is_some() {
+        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden));
     }
-    html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><input name=otp placeholder=\"authenticator code (if enabled)\" autocomplete=one-time-code style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>", hidden))
+    html_csp_with(OAUTH_AUTH_CSP, format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form id=\"oauthlogin\" method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form>{}</body></html>", hidden, OAUTH_AUTH_JS))
+}
+fn consent_mfa_page(form: &HashMap<String, String>, token: &str) -> String {
+    format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input type=hidden name=\"mfa_token\" value=\"{}\"><input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(form), esc(token))
 }
 async fn oauth_decision(State(st): State<S>, h: HeaderMap, PeerAddr(addr): PeerAddr, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
     let (client_id, redirect, scope) = match authorize_params_ok(&st, &form).await { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
-    let uid = if let Some(u) = oauth_user(&st, &h).await { u } else {
+    let form_token = form.get("mfa_token").cloned().unwrap_or_default();
+    let uid = if !form_token.is_empty() {
+        let uid = match mfa::challenge_user(&st, &form_token).await { Some(u) => u, None => return (StatusCode::UNAUTHORIZED, "this two-factor challenge expired; sign in again").into_response() };
+        let key = format!("otp:{}:{}", addr, uid);
+        if !st.rate_ok(&key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
+        if !mfa::second_factor_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")).await {
+            st.rate_fail(&key, 900).await;
+            return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &form_token))).into_response(); }
+        st.rate_clear(&key).await;
+        mfa::consume_challenge(&st, &form_token).await;
+        uid }
+    else if let Some(u) = oauth_user(&st, &h).await {
+        // A session already passed the sign-in checks, but consent is a
+        // privileged action; require the second factor again.
+        if mfa::required(&st, &u).await {
+            let token = match mfa::new_challenge(&st, &u).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
+            return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
+        u }
+    else if !form.get("proof").cloned().unwrap_or_default().is_empty() {
+        let email = form.get("email").cloned().unwrap_or_default().trim().to_lowercase();
+        let cid = form.get("challenge_id").cloned().unwrap_or_default();
+        let proof = form.get("proof").cloned().unwrap_or_default();
+        let key = format!("oauth:{}:{}", addr, email);
+        if !st.rate_ok(&key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
+        let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.auth_key_enc AS auth_key_enc,u.kdf_salt AS kdf_salt,u.kdf_iterations AS kdf_iterations,u.kdf_algo AS kdf_algo FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&cid))]).await {
+            Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
+        if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2
+            || !valid_kdf(&db::s(&row,"kdf_salt"), db::n(&row,"kdf_iterations"), &db::s(&row,"kdf_algo")) {
+            st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
+        let uid = db::s(&row, "user_id");
+        let auth_key = match oc::decrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &db::s(&row, "auth_key_enc")) {
+            Ok(k) => k, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "authentication key is unavailable").into_response() };
+        if !verify_proof(&auth_key, &db::s(&row, "challenge"), &cid, &proof) {
+            st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
+        let consumed = st.db.exec("DELETE FROM auth_challenges WHERE id_hash=?", &[json!(oc::hash_token(&cid))]).await.unwrap_or(0);
+        if consumed == 0 { st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
+        st.rate_clear(&key).await;
+        if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
+        if db::n(&row, "email_verified") == 0 { return (StatusCode::FORBIDDEN, "verify your email address before signing in").into_response(); }
+        if mfa::required(&st, &uid).await {
+            let token = match mfa::new_challenge(&st, &uid).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
+            return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
+        uid }
+    else {
+        if !auth_enabled(&st, "password").await { return (StatusCode::FORBIDDEN, "password sign-in is disabled on this instance").into_response(); }
         let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr, email.to_lowercase());
         if !st.rate_ok(&key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
         let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]).await { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
         if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900).await; return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
-        db::s(&row, "id") };
+        st.rate_clear(&key).await;
+        let uid = db::s(&row, "id");
+        mfa::note_password_login(&st, &uid).await;
+        if mfa::required(&st, &uid).await {
+            let otp = form.get("otp").cloned().unwrap_or_default();
+            if !otp.is_empty() {
+                let otp_key = format!("otp:{}:{}", addr, uid);
+                if !st.rate_ok(&otp_key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
+                if !mfa::second_factor_ok(&st, &uid, &otp).await {
+                    st.rate_fail(&otp_key, 900).await;
+                    let token = match mfa::new_challenge(&st, &uid).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
+                    return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
+                st.rate_clear(&otp_key).await;
+            } else {
+                let token = match mfa::new_challenge(&st, &uid).await { Ok(t) => t, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "could not start two-factor verification").into_response() };
+                return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &token))).into_response(); }
+        }
+        uid };
     if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).await.ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
-    let otp_key = format!("otp:{}:{}", addr, uid);
-    if !st.rate_ok(&otp_key, 5, 900).await { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
-    if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")).await {
-        st.rate_fail(&otp_key, 900).await;
-        let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
-        return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
-    }
-    st.rate_clear(&otp_key).await;
     let state = form.get("state").cloned().unwrap_or_default();
     if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::to(&format!("{}?error=access_denied&state={}", redirect, urlencode(&state))).into_response(); }
     let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));
@@ -3431,7 +4154,7 @@ async fn mcp_call(st: &S, uid: &str, h: &HeaderMap, params: &Value) -> Result<Va
             let items = st.list_secrets_decrypted(&eid, uid).await.map_err(|_| "read failed".to_string())?; let sid = items.iter().find(|(k, _, _)| k == &arg("key").to_uppercase()).map(|(_, _, raw)| raw["id"].as_str().unwrap_or("").to_string()).ok_or("secret not found")?;
             st.db.exec("UPDATE secrets SET deleted=1,updated_at=? WHERE id=?", &[json!(now()), json!(sid)]).await?; mcp_env_audit(st, uid, &eid, "mcp.delete_secret", &arg("key")).await; Ok(text(json!({"ok": true}))) }
         "create_lease" => { let eid = arg("env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, _) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "leases:write").await.map_err(|_| "forbidden".to_string())?; let key = st.env_key(&eid).await.map_err(|_| "env key failed".to_string())?;
-            let value = oc::random_token("dyn"); let lid = id(); st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(arg("name")), json!(oc::encrypt_symmetric(&key, value.as_bytes())), json!(now()+3600), json!(now())]).await?;
+            let value = oc::random_token("dyn"); let lid = id(); st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(arg("name")), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), value.as_bytes())), json!(now()+3600), json!(now())]).await?;
             mcp_env_audit(st, uid, &eid, "mcp.create_lease", &lid).await; Ok(text(json!({"id": lid, "value": value, "expires_at": now()+3600}))) }
         "sync_integration" => { let iid = arg("integration_id"); let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|_| "lookup failed".to_string())?.ok_or("integration not found")?; let eid = db::s(&row, "env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, _) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "integrations:write").await.map_err(|_| "forbidden".to_string())?;
             let msg = sync_one(st, &iid, uid).await.map_err(|_| "sync failed".to_string())?; Ok(text(json!(msg))) }
@@ -3463,7 +4186,7 @@ out.innerHTML='';var pre=document.createElement('pre');pre.textContent=d.value!=
 async fn index() -> Response {
     let mut r = Html(ui::INDEX).into_response();
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
     r }
 #[cfg(not(target_arch = "wasm32"))]
 async fn peer_middleware(mut req: axum::extract::Request, next: Next) -> Response {
@@ -3522,26 +4245,30 @@ async fn metrics(State(st): State<S>, h: HeaderMap) -> Response {
 pub fn router(state: S) -> Router {
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
+        .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
+        .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
+        .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
+        .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
-        .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/v1/machine/auth/universal/login", post(universal_login))
+        .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))
-        .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/secrets/reuse-check", post(reuse_check)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
+        .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/secrets/reuse-check", post(reuse_check)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/meta", get(e2e_meta)).route("/api/envs/{eid}/e2e/rekey", post(e2e_rekey)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets)).route("/api/envs/{eid}/scan", get(scan_env)).route("/api/envs/{eid}/meta", get(env_meta))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
         .route("/api/envs/{eid}/dynamic", get(list_leases).post(create_lease_v2)).route("/api/leases/{lid}", delete(revoke_lease)).route("/api/leases/{lid}/renew", post(renew_lease)).route("/api/envs/{eid}/rotations", get(list_rotations).post(create_rotation)).route("/api/rotations/{rid}", delete(delete_rotation)).route("/api/envs/{eid}/rotate", post(rotate_secret)).route("/api/envs/{eid}/restore-point", post(pitr))
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable)).route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate)).route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable)).route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete)).route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send)).route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));

@@ -126,6 +126,39 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    /// Execute several statements in one transaction. A rotation that rewrites
+    /// ciphertext and grants must not leave a half-rekeyed environment behind.
+    pub async fn batch(&self, statements: &[(String, Vec<Value>)]) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                for (sql, params) in statements {
+                    if let Err(e) = exec_sqlite(&conn, sql, params) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+                }
+                conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let tx = client.transaction().await.map_err(|e| e.to_string())?;
+                for (sql, params) in statements {
+                    let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                    tx.execute(sql2.as_str(), &refs[..]).await.map_err(|e| e.to_string())?;
+                }
+                tx.commit().await.map_err(|e| e.to_string())
+            }
+            // A Durable Object handles one event at a time and the SQL handle is
+            // synchronous, so a sequential batch cannot interleave with another
+            // request the way two native connections could.
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(s) => {
+                for (sql, params) in statements { s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; }
+                Ok(())
+            }
+        }
+    }
     pub async fn version(&self) -> Result<i64, String> {
         Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
     async fn migrate(&self) -> Result<(), String> {
@@ -441,6 +474,33 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE IF NOT EXISTS step_up_challenges(challenge_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,need_totp BIGINT DEFAULT 0,need_email BIGINT DEFAULT 0,email_code_hash TEXT DEFAULT '',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS step_up_grants(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
     ]),
+    // Delegated environments, client-derived auth and second factors.
+    (16, &[
+        "ALTER TABLE envs ADD COLUMN runner_id TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN path_enc TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN tags_enc TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN key_index TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN auth_version BIGINT DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN kdf_salt TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN kdf_iterations BIGINT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN kdf_algo TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN auth_key_enc TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT DEFAULT '',credential_id TEXT NOT NULL,credential_json TEXT NOT NULL,sign_count BIGINT DEFAULT 0,created_at BIGINT NOT NULL,last_used_at BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS passkey_registrations(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS mfa_passkey_states(mfa_token TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS email_codes(user_id TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,attempts BIGINT DEFAULT 0,PRIMARY KEY(user_id,purpose))",
+        "CREATE TABLE IF NOT EXISTS runners(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,pubkey TEXT NOT NULL,token_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS runner_env_keys(runner_id TEXT NOT NULL,env_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(runner_id,env_id))",
+        "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0,claim_id TEXT DEFAULT '')",
+        "CREATE TABLE IF NOT EXISTS auth_challenges(id_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,challenge TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_secrets_key_index ON secrets(env_id,key_index)",
+        "CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_passkeys_credential ON passkeys(credential_id)",
+        "CREATE INDEX IF NOT EXISTS idx_runners_token ON runners(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_pending ON sync_jobs(status,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -474,9 +534,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 15, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 16, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 15, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 16, "each migration must be recorded exactly once");
     }
 }
