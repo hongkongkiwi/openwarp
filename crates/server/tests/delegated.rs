@@ -150,8 +150,19 @@ async fn a_delegated_environment_syncs_through_the_customer_runner() {
     let jobs = s.call(Method::GET, "/api/runner/jobs", Some(&runner_token), None).await;
     assert_eq!(jobs.status, 200, "{}", jobs.text);
     assert_eq!(jobs.body["jobs"].as_array().map(|a| a.len()), Some(1), "expected one queued job: {}", jobs.text);
-    // Put the claimed job back so the runner binary can pick it up.
-    conn.execute("UPDATE sync_jobs SET status='pending',claimed_at=0", []).unwrap();
+    let jid = jobs.body["jobs"][0]["id"].as_str().unwrap().to_string();
+    let first_claim = jobs.body["jobs"][0]["claim"].as_str().unwrap().to_string();
+    // Simulate the ten-minute stale window and claim the job again.
+    conn.execute("UPDATE sync_jobs SET claimed_at=0", []).unwrap();
+    let jobs = s.call(Method::GET, "/api/runner/jobs", Some(&runner_token), None).await;
+    let second_claim = jobs.body["jobs"][0]["claim"].as_str().unwrap().to_string();
+    assert_ne!(first_claim, second_claim, "the reclaim must fence the old runner");
+    let late = s.call(Method::POST, &format!("/api/runner/jobs/{}/result", jid), Some(&runner_token), Some(json!({"ok": true, "detail": "late", "managed": [], "claim": first_claim}))).await;
+    assert_eq!(late.status, 409, "a superseded claim must not complete: {} {}", late.status, late.text);
+    let current = s.call(Method::POST, &format!("/api/runner/jobs/{}/result", jid), Some(&runner_token), Some(json!({"ok": true, "detail": "current", "managed": [], "claim": second_claim}))).await;
+    assert_eq!(current.status, 200, "the current claim must complete: {} {}", current.status, current.text);
+    let r = s.call(Method::POST, &format!("/api/integrations/{}/sync", iid), Some(&token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "second sync did not queue: {} {}", r.status, r.text);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_openwarp-runner"))
         .env("OPENWARP_URL", &s.base)

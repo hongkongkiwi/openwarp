@@ -30,7 +30,18 @@ fn prepare(job: &Value, kp: &oc::Keypair) -> Result<Prepared, String> {
     let config_enc = job.get("config_enc").and_then(|v| v.as_str()).ok_or("job has no config")?;
     let rest = config_enc.strip_prefix("owrunner:").ok_or("integration config is not runner-sealed")?;
     let (_runner, sealed) = rest.split_once(':').ok_or("malformed runner config")?;
-    let config: Value = serde_json::from_slice(&kp.decrypt(sealed)?).map_err(|e| e.to_string())?;
+    let envelope: Value = serde_json::from_slice(&kp.decrypt(sealed)?).map_err(|e| e.to_string())?;
+    // The sealed box has no AAD; the context inside the plaintext proves this
+    // config belongs to the integration named by the job.
+    let config = match envelope.get("context").and_then(|v| v.as_str()) {
+        Some(ctx) => {
+            let eid = job.get("env_id").and_then(|v| v.as_str()).unwrap_or("");
+            let iid = job.get("integration_id").and_then(|v| v.as_str()).unwrap_or("");
+            if ctx != format!("ow-integration|{}|{}", eid, iid) { return Err("integration config context does not match this job".into()); }
+            envelope.get("config").cloned().unwrap_or(json!({}))
+        }
+        None => envelope,
+    };
     let mut pairs = Vec::new();
     for s in job.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let key = decrypt_secret(&env_key, s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""))?;
@@ -99,12 +110,13 @@ async fn main() {
                         }
                         Err(e) => Err(e),
                     };
+                    let claim = job.get("claim").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let body = match result {
                         Ok((detail, managed)) => {
                             let managed: Vec<Value> = managed.into_iter().map(|(name, value_hash)| json!({"name": name, "value_hash": value_hash})).collect();
-                            json!({"ok": true, "detail": detail, "managed": managed})
+                            json!({"ok": true, "detail": detail, "managed": managed, "claim": claim})
                         }
-                        Err(e) => json!({"ok": false, "detail": e}),
+                        Err(e) => json!({"ok": false, "detail": e, "claim": claim}),
                     };
                     if let Err(e) = send(&client, &base, &token, reqwest::Method::POST, &format!("/api/runner/jobs/{}/result", jid), Some(body)).await {
                         eprintln!("could not report job {}: {}", jid, e);

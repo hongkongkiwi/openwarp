@@ -226,6 +226,51 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
     assert_eq!(value, b"new-value");
     let meta = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&t), None).await;
     assert_eq!(meta.body["mode"], json!("e2e"), "{}", meta.text);
+
+    // A failing rekey must roll back completely. Duplicate grants violate the
+    // env_keys primary key after the secrets have been rewritten in the batch.
+    let bad_key = oc::random_key();
+    let bad_wrapped = oc::encrypt_to(&pubkey, &bad_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&bad_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&bad_key, b"bad-value"), "key_hash": key_hash, "path": "/"}],
+        "grants": [{"user_id": uid, "wrapped_key": bad_wrapped}, {"user_id": uid, "wrapped_key": bad_wrapped}]
+    }))).await;
+    assert!(r.status >= 400, "a broken rekey must fail: {} {}", r.status, r.text);
+    let d = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), None).await;
+    assert_eq!(d.status, 200, "the old grant must survive a rolled back rekey: {} {}", d.status, d.text);
+    let raw = oc::Keypair::from_secret_b64(u["recovery_kit"].as_str().unwrap()).unwrap().decrypt(d.body["wrapped_key"].as_str().unwrap()).unwrap();
+    let still: [u8;32] = raw.try_into().unwrap();
+    assert_eq!(still, rotated, "a failed rekey must not replace the wrapped key");
+    assert_eq!(oc::decrypt_symmetric(&still, d.body["secrets"][0]["value_enc"].as_str().unwrap()).unwrap(), b"new-value");
+}
+
+#[tokio::test]
+async fn secret_ciphertext_cannot_be_swapped_between_records() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "swap@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let envs = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&t), None).await;
+    let env = envs.body[0]["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(&t), Some(json!({"secrets": [
+        {"key": "ALPHA", "value": "one"}, {"key": "BETA", "value": "two"}
+    ]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let a: (String, String) = conn.query_row("SELECT id,value_enc FROM secrets WHERE env_id=? AND key_hash=?", [&env, &oc::hash_token("/:ALPHA")], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let b: (String, String) = conn.query_row("SELECT id,value_enc FROM secrets WHERE env_id=? AND key_hash=?", [&env, &oc::hash_token("/:BETA")], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![b.1, a.0]).unwrap();
+    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![a.1, b.0]).unwrap();
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    for s in r.body["secrets"].as_array().unwrap() {
+        assert_eq!(s["decrypt_error"], json!(true), "swapped ciphertext must fail the record binding: {}", r.text);
+        assert_eq!(s["value"], json!(""), "swapped ciphertext must not reveal the other value: {}", r.text);
+    }
 }
 
 #[tokio::test]

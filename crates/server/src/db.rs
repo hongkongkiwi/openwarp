@@ -66,6 +66,32 @@ impl Db {
         }
     }
     pub fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params)?.into_iter().next()) }
+    /// Execute several statements in one transaction. A rotation that rewrites
+    /// ciphertext and grants must not leave a half-rekeyed environment behind.
+    pub fn batch(&self, statements: &[(String, Vec<Value>)]) -> Result<(), String> {
+        match self {
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                for (sql, params) in statements {
+                    if let Err(e) = exec_sqlite(&conn, sql, params) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+                }
+                conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+            }
+            Db::Postgres(c) => {
+                let c = c.clone(); let statements = statements.to_vec();
+                std::thread::spawn(move || {
+                    let mut client = c.lock().unwrap();
+                    client.batch_execute("BEGIN").map_err(|e| e.to_string())?;
+                    for (sql, params) in &statements {
+                        let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                        if let Err(e) = client.execute(sql2.as_str(), &refs[..]) { let _ = client.batch_execute("ROLLBACK"); return Err(e.to_string()); }
+                    }
+                    client.batch_execute("COMMIT").map_err(|e| e.to_string())
+                }).join().map_err(|_| "pg thread panicked".to_string())?
+            }
+        }
+    }
     fn migrate(&self) -> Result<(), String> {
         for stmt in SCHEMA { self.exec(stmt, &[])?; }
         for alter in [
@@ -84,6 +110,7 @@ impl Db {
             "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
             "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
             "ALTER TABLE envs ADD COLUMN runner_id TEXT DEFAULT ''",
+            "ALTER TABLE sync_jobs ADD COLUMN claim_id TEXT DEFAULT ''",
         ] { let _ = self.exec(alter, &[]); }
         for idx in INDEXES { let _ = self.exec(idx, &[]); }
         // One-time backfill: environments that already had an allowlist keep it.
@@ -183,7 +210,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS email_codes(user_id TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,attempts BIGINT DEFAULT 0,PRIMARY KEY(user_id,purpose))",
     "CREATE TABLE IF NOT EXISTS runners(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,pubkey TEXT NOT NULL,token_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS runner_env_keys(runner_id TEXT NOT NULL,env_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(runner_id,env_id))",
-    "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0,claim_id TEXT DEFAULT '')",
 ];
 
 const INDEXES: &[&str] = &[

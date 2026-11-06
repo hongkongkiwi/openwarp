@@ -228,20 +228,20 @@ impl AppState {
         Err(err(StatusCode::FORBIDDEN, "no access to this environment"))
     }
     fn decrypt_secret(&self, key: &[u8;32], row: &Row, user: Option<&str>) -> Value {
-        let sid = db::s(row, "id"); let env = db::s(row, "env_id");
-        let (mut value, mut decrypt_error) = match oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "value"), &db::s(row, "value_enc")) {
+        let sid = db::s(row, "id"); let env = db::s(row, "env_id"); let version = db::n(row, "version");
+        let (mut value, mut decrypt_error) = match decrypt_secret_value(key, &env, &sid, "value", version, &db::s(row, "value_enc")) {
             Ok(b) => (String::from_utf8_lossy(&b).into_owned(), false),
             Err(_) => (String::new(), true) };
         if let Some(user) = user {
             if let Ok(Some(ov)) = self.db.one("SELECT value_enc FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(user)]) {
-                if let Ok(b) = oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, &format!("override:{}", user)), &db::s(&ov, "value_enc")) { value = String::from_utf8_lossy(&b).into_owned(); decrypt_error = false; }
+                if let Ok(b) = decrypt_secret_value(key, &env, &sid, &format!("override:{}", user), version, &db::s(&ov, "value_enc")) { value = String::from_utf8_lossy(&b).into_owned(); decrypt_error = false; }
             }
         }
         let stype = db::s(row, "secret_type");
         json!({"id": sid, "key": oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "key"), &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
             "value": if stype == "sealed" { Value::Null } else { json!(value) }, "decrypt_error": decrypt_error,
-            "path": db::s(row,"path"), "comment": oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "comment"), &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            "tags": db::s(row,"tags"), "type": stype, "version": db::n(row,"version"), "updated_at": db::n(row,"updated_at")})
+            "path": db::s(row,"path"), "comment": decrypt_secret_value(key, &env, &sid, "comment", version, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            "tags": db::s(row,"tags"), "type": stype, "version": version, "updated_at": db::n(row,"updated_at")})
     }
     #[allow(clippy::type_complexity)]
     fn list_secrets_with(&self, env_id: &str, user: Option<&str>) -> Result<Vec<(String, String, Value)>, (StatusCode, Json<Value>)> {
@@ -267,6 +267,19 @@ impl AppState {
 // included: restore and point-in-time recovery copy ciphertext into a new
 // version, and binding to the version would make that ciphertext unreadable.
 fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
+fn secret_aad_v(env: &str, sid: &str, field: &str, version: i64) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}|v{}", env, sid, field, version).into_bytes() }
+fn integration_aad(env: &str, iid: &str, field: &str) -> Vec<u8> { format!("ow-integration:v1|{}|{}|{}", env, iid, field).into_bytes() }
+fn lease_aad(env: &str, lid: &str, field: &str) -> Vec<u8> { format!("ow-lease:v1|{}|{}|{}", env, lid, field).into_bytes() }
+fn proposal_aad(env: &str, pid: &str, field: &str) -> Vec<u8> { format!("ow-proposal:v1|{}|{}|{}", env, pid, field).into_bytes() }
+// Version rows are bound to their version, but value and comment ciphertext
+// written before that binding (or by an earlier release) must stay readable.
+fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
+    if payload.starts_with("ow2:") {
+        if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad_v(env, sid, field, version), payload) { return Ok(v); }
+        if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad(env, sid, field), payload) { return Ok(v); }
+    }
+    oc::decrypt_symmetric(key, payload)
+}
 fn resolve_refs(v: &str, by_path: &HashMap<String, String>, by_key: &HashMap<String, String>) -> String {
     let mut out = String::new(); let mut rest = v;
     while let Some(start) = rest.find("${") { out.push_str(&rest[..start]); let tail = &rest[start + 2..];
@@ -571,14 +584,14 @@ fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> R
     let mut stype = if s.secret_type.is_empty() { "secret".to_string() } else { s.secret_type.clone() };
     if let Some(row) = &existing { if db::s(row, "secret_type") == "sealed" { if stype != "sealed" { return Err(bad("sealed secrets cannot change type; delete and recreate")); } stype = "sealed".to_string(); } }
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
-        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "value"), s.value.as_bytes());
-        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "comment"), s.comment.as_bytes());
+        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", ver), s.value.as_bytes());
+        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", ver), s.comment.as_bytes());
         st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(value_enc), json!(comment_enc), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes())), json!(value_enc), json!(comment_enc), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
-    } else { let sid = id();
+    } else { let sid = id(); let ver = 1;
         let key_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes());
-        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "value"), s.value.as_bytes());
-        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "comment"), s.comment.as_bytes());
+        let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", ver), s.value.as_bytes());
+        let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", ver), s.comment.as_bytes());
         st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,comment_enc,tags,secret_type,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)", &[json!(sid), json!(eid), json!(s.path), json!(key_enc), json!(khash), json!(value_enc), json!(comment_enc), json!(s.tags), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(comment_enc), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
     } Ok(()) }
@@ -593,14 +606,21 @@ async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> 
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let key = st.env_key(&eid)?; let sealed = st.db.one("SELECT secret_type FROM secrets WHERE id=?", &[json!(sid)]).map(|r| r.map(|x| db::s(&x,"secret_type") == "sealed").unwrap_or(false)).unwrap_or(false);
     let rows = st.db.query("SELECT * FROM secret_versions WHERE secret_id=? ORDER BY version DESC", &[json!(sid)]).map_err(|e| bad(&e))?;
-    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "value": if sealed { "[SEALED]".to_string() } else { oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "value"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
+    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "value": if sealed { "[SEALED]".to_string() } else { decrypt_secret_value(&key, &eid, &sid, "value", db::n(r,"version"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
     Ok(j(json!(items))) }
 async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(String, i64)>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:write")?;
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
     let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?; let new_ver = cur.map(|r| db::n(&r,"version")).unwrap_or(0) + 1;
-    st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+    let key = st.env_key(&eid)?;
+    // Version ciphertext is bound to its version, so restoring it under a new
+    // version means decrypting and re-binding rather than copying the blob.
+    let plain_value = decrypt_secret_value(&key, &eid, &sid, "value", ver, &db::s(&v,"value_enc")).map_err(|e| bad(&e))?;
+    let plain_comment = decrypt_secret_value(&key, &eid, &sid, "comment", ver, &db::s(&v,"comment_enc")).map_err(|e| bad(&e))?;
+    let value_enc = oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid, &sid, "value", new_ver), &plain_value);
+    let comment_enc = oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid, &sid, "comment", new_ver), &plain_comment);
+    st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(value_enc), json!(comment_enc), json!(new_ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)); Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.require_env(&eid,&uid)?;
@@ -661,15 +681,16 @@ async fn open_lockbox(State(st): State<S>, Path(lid): Path<String>, h: HeaderMap
     Ok(j(json!({"value": String::from_utf8_lossy(&val)}))) }
 async fn list_leases(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let key = st.env_key(&eid)?; let rows = st.db.query("SELECT * FROM leases WHERE env_id=? AND revoked=0 AND expires_at>?", &[json!(eid), json!(now())]).map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "value": oc::decrypt_symmetric(&key,&db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(), "expires_at": db::n(r,"expires_at")})).collect::<Vec<_>>()))) }
+    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "value": oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &db::s(r,"id"), "value"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(), "expires_at": db::n(r,"expires_at")})).collect::<Vec<_>>()))) }
 
 async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "integrations:write")?;
     let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or(""); if !integrations::KINDS.contains(&kind) { return Err(bad(&format!("unknown kind, supported: {:?}", integrations::KINDS))); }
     let config = body.get("config").cloned().unwrap_or(json!({}));
     let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")).unwrap_or_default();
-    let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, config.to_string().as_bytes())? }
-        else { oc::encrypt_symmetric(&st.env_key(&eid)?, config.to_string().as_bytes()) };
-    let iid = id(); st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).map_err(|e| bad(&e))?;
+    let iid = id();
+    let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, &config)? }
+        else { oc::encrypt_symmetric_aad(&st.env_key(&eid)?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
+    st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).map_err(|e| bad(&e))?;
     Ok(j(json!({"id": iid}))) }
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let rows = st.db.query("SELECT id,env_id,kind,name,created_at FROM integrations WHERE env_id=?", &[json!(eid)]).map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -685,7 +706,7 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
         return Ok(j(json!({"ok": true, "detail": "connection test queued for the customer runner"})));
     }
     let key = st.env_key(&eid)?;
-    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, &iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     if db::s(&row, "kind") == "trigger" { let msg = integrations::trigger_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     if db::s(&row, "kind") == "instabox" { let msg = integrations::instabox_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     if db::s(&row, "kind") == "boat" { let msg = integrations::boat_test(&config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
@@ -700,8 +721,8 @@ async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
         st.db.exec("UPDATE integrations SET kind=? WHERE id=?", &[json!(kind), json!(&iid)]).map_err(|e| bad(&e))?; }
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) { st.db.exec("UPDATE integrations SET name=? WHERE id=?", &[json!(name), json!(&iid)]).map_err(|e| bad(&e))?; }
     if let Some(config) = body.get("config") {
-        let enc = if mode == "delegated" { seal_to_runner(&st, &eid, config.to_string().as_bytes())? }
-            else { oc::encrypt_symmetric(&st.env_key(&eid)?, config.to_string().as_bytes()) };
+        let enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, config)? }
+            else { oc::encrypt_symmetric_aad(&st.env_key(&eid)?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
         st.db.exec("UPDATE integrations SET config_enc=? WHERE id=?", &[json!(enc), json!(&iid)]).map_err(|e| bad(&e))?; }
     st.audit(&org,&app,&eid,&uid,"integration.update",&iid); Ok(j(json!({"ok": true}))) }
 async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h)?;
@@ -734,7 +755,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool) -> Result<S
         return Ok("queued for the customer runner".into());
     }
     let key = st.env_key(&eid)?;
-    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
+    let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     // Sealed secrets are never readable, so they must never be pushed: an empty
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
@@ -781,6 +802,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
     // Restore the whole environment as it stood at ts: a secret created later
     // must disappear, and a secret deleted before ts must stay deleted.
     let rows = st.db.query("SELECT id,version,deleted_at FROM secrets WHERE env_id=?", &[json!(eid)]).map_err(|e| bad(&e))?;
+    let key = st.env_key(&eid)?;
     let mut restored = 0; let mut removed = 0;
     for r in &rows {
         let sid = db::s(r,"id"); let cur = db::n(r,"version"); let del_at = db::n(r,"deleted_at");
@@ -791,10 +813,15 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
                 let new_ver = cur + 1;
                 let tomb = if was_deleted { 1 } else { 0 };
                 let tomb_at = if was_deleted { if del_at > 0 { del_at } else { now() } } else { 0 };
+                let src_ver = db::n(&v, "version");
+                let plain_value = decrypt_secret_value(&key, &eid, &sid, "value", src_ver, &db::s(&v,"value_enc")).map_err(|e| bad(&e))?;
+                let plain_comment = decrypt_secret_value(&key, &eid, &sid, "comment", src_ver, &db::s(&v,"comment_enc")).map_err(|e| bad(&e))?;
+                let value_enc = oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid, &sid, "value", new_ver), &plain_value);
+                let comment_enc = oc::encrypt_symmetric_aad(&key, &secret_aad_v(&eid, &sid, "comment", new_ver), &plain_comment);
                 st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,comment_enc=?,secret_type=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
-                    &[json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).map_err(|e| bad(&e))?;
+                    &[json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).map_err(|e| bad(&e))?;
                 st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)",
-                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(&uid)]).map_err(|e| bad(&e))?;
+                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(now()), json!(&uid)]).map_err(|e| bad(&e))?;
                 if was_deleted { removed += 1 } else { restored += 1 }
             }
             None => {
@@ -991,19 +1018,27 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
 
     let grants = body.get("grants").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     if grants.is_empty() { return Err(bad("grants array required")); }
+    let current_grants: std::collections::HashSet<String> = st.db.query("SELECT user_id FROM env_keys WHERE env_id=?", &[json!(&eid)]).map_err(|e| bad(&e))?
+        .iter().map(|r| db::s(r, "user_id")).collect();
     let mut ids = std::collections::HashSet::new();
     for g in &grants {
         let gid = g.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
         let wrapped = g.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
         if gid.is_empty() || wrapped.is_empty() { return Err(bad("each grant needs user_id and wrapped_key")); }
+        if !current_grants.contains(gid) { return Err(bad("a rekey may remove grants but cannot add a grantee who does not already hold the key; grant access first")); }
         if st.db.one("SELECT id FROM users WHERE id=?", &[json!(gid)]).map_err(|e| bad(&e))?.is_none() { return Err(bad("grant refers to an unknown user")); }
         ids.insert(gid.to_string());
     }
     if !ids.contains(&uid) { return Err(bad("the new grants must include the caller, or the environment would become unreadable to them")); }
     let runner_wrapped = body.get("runner_wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
-    if mode == "delegated" && runner_wrapped.is_empty() { return Err(bad("runner_wrapped_key required for a delegated environment")); }
+    if mode == "delegated" {
+        if runner_wrapped.is_empty() { return Err(bad("runner_wrapped_key required for a delegated environment")); }
+        if st.db.one("SELECT 1 AS n FROM runner_env_keys WHERE runner_id=? AND env_id=?", &[json!(db::s(&env, "runner_id")), json!(&eid)]).map_err(|e| bad(&e))?.is_none() {
+            return Err(bad("this environment has no runner key grant to update")); }
+    }
 
     let mut rekeyed = 0;
+    let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
     for s in &secrets {
         let kh = s.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
         let key_enc = s.get("key_enc").and_then(|v| v.as_str()).unwrap_or("");
@@ -1015,25 +1050,28 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
             Some(r) => (db::s(&r, "id"), db::n(&r, "version") + 1),
             None => { return Err(bad("rekey payload does not match the stored secrets")); }
         };
-        st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,path=?,version=?,updated_at=?,updated_by=? WHERE id=?",
-            &[json!(key_enc), json!(value_enc), json!(path), json!(ver), json!(now()), json!(&uid), json!(&sid)]).map_err(|e| bad(&e))?;
+        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
+            vec![json!(key_enc), json!(value_enc), json!(path), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
         // Old history is encrypted under the old key and cannot be read after
         // the rotation; replace it rather than leave undecryptable rows.
-        st.db.exec("DELETE FROM secret_versions WHERE secret_id=?", &[json!(&sid)]).map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
-            &[json!(id()), json!(&sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(&uid)]).map_err(|e| bad(&e))?;
+        stmts.push(("DELETE FROM secret_versions WHERE secret_id=?".into(), vec![json!(&sid)]));
+        stmts.push(("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)".into(),
+            vec![json!(id()), json!(&sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(&uid)]));
         rekeyed += 1;
     }
-    st.db.exec("DELETE FROM env_keys WHERE env_id=?", &[json!(&eid)]).map_err(|e| bad(&e))?;
+    stmts.push(("DELETE FROM env_keys WHERE env_id=?".into(), vec![json!(&eid)]));
     for g in &grants {
         let gid = g.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
         let wrapped = g.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
-        st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(&eid), json!(gid), json!(wrapped)]).map_err(|e| bad(&e))?;
+        stmts.push(("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)".into(), vec![json!(&eid), json!(gid), json!(wrapped)]));
     }
     if mode == "delegated" {
-        st.db.exec("UPDATE runner_env_keys SET wrapped_key=? WHERE runner_id=? AND env_id=?",
-            &[json!(runner_wrapped), json!(db::s(&env, "runner_id")), json!(&eid)]).map_err(|e| bad(&e))?;
+        stmts.push(("UPDATE runner_env_keys SET wrapped_key=? WHERE runner_id=? AND env_id=?".into(),
+            vec![json!(runner_wrapped), json!(db::s(&env, "runner_id")), json!(&eid)]));
     }
+    // One transaction: a failed grant write must not leave the environment
+    // re-encrypted under a key nobody can unwrap.
+    st.db.batch(&stmts).map_err(|e| bad(&format!("rekey did not complete: {}", e)))?;
     meta_set(&st, &format!("rekey_required:{}", eid), "0");
     st.audit(&org, &app, &eid, &uid, "e2e.rekey", &format!("{} secrets, {} grants", rekeyed, grants.len()));
     Ok(j(json!({"rekeyed": rekeyed, "grants": grants.len()}))) }
@@ -1585,9 +1623,12 @@ fn runner_for_env(st: &S, eid: &str) -> Result<(String, String), (StatusCode, Js
     let rid = db::s(&env, "runner_id");
     let runner = st.db.one("SELECT pubkey FROM runners WHERE id=?", &[json!(&rid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("runner not found"))?;
     Ok((rid, db::s(&runner, "pubkey"))) }
-fn seal_to_runner(st: &S, eid: &str, plaintext: &[u8]) -> Result<String, (StatusCode, Json<Value>)> {
+fn seal_to_runner(st: &S, eid: &str, iid: &str, config: &Value) -> Result<String, (StatusCode, Json<Value>)> {
     let (rid, pubkey) = runner_for_env(st, eid)?;
-    let sealed = oc::encrypt_to(&pubkey, plaintext).map_err(|e| bad(&e))?;
+    // The sealed box has no AAD, so bind the payload to its integration inside
+    // the plaintext and make the runner verify it before using the config.
+    let envelope = json!({"context": format!("ow-integration|{}|{}", eid, iid), "config": config}).to_string();
+    let sealed = oc::encrypt_to(&pubkey, envelope.as_bytes()).map_err(|e| bad(&e))?;
     Ok(format!("owrunner:{}:{}", rid, sealed)) }
 fn enqueue_sync(st: &S, eid: &str, iid: &str, job_kind: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let (rid, _) = runner_for_env(st, eid)?;
@@ -1627,18 +1668,19 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
     let rows = st.db.query("SELECT * FROM sync_jobs WHERE runner_id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) ORDER BY created_at LIMIT 10", &[json!(&rid), json!(stale)]).map_err(|e| bad(&e))?;
     let mut jobs = Vec::new();
     for job in &rows {
-        let jid = db::s(job, "id");
-        if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?))", &[json!(now()), json!(&jid), json!(stale)]).unwrap_or(0) == 0 { continue; }
+        let jid = db::s(job, "id"); let claim = oc::random_token("job"); let claimed_at = now();
+        if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=?,claim_id=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?))", &[json!(claimed_at), json!(&claim), json!(&jid), json!(stale)]).unwrap_or(0) == 0 { continue; }
         let eid = db::s(job, "env_id"); let iid = db::s(job, "integration_id");
-        let fail = |msg: &str| { let _ = st.db.exec("UPDATE sync_jobs SET status='failed',detail=? WHERE id=?", &[json!(msg), json!(&jid)]); };
+        let fail = |msg: &str| { let _ = st.db.exec("UPDATE sync_jobs SET status='failed',detail=? WHERE id=? AND claim_id=?", &[json!(msg), json!(&jid), json!(&claim)]); };
         let env = match st.db.one("SELECT runner_id FROM envs WHERE id=?", &[json!(&eid)]) { Ok(Some(e)) => e, _ => { fail("environment no longer exists"); continue; } };
         if db::s(&env, "runner_id") != rid { fail("runner does not own this environment"); continue; }
         let wrapped = match st.db.one("SELECT wrapped_key FROM runner_env_keys WHERE runner_id=? AND env_id=?", &[json!(&rid), json!(&eid)]) { Ok(Some(w)) => db::s(&w, "wrapped_key"), _ => { fail("no wrapped environment key for this runner"); continue; } };
         let integ = match st.db.one("SELECT kind,config_enc FROM integrations WHERE id=?", &[json!(&iid)]) { Ok(Some(i)) => i, _ => { fail("integration no longer exists"); continue; } };
-        let secrets = st.db.query("SELECT key_enc,value_enc,key_hash,path FROM secrets WHERE env_id=? AND deleted=0", &[json!(&eid)]).map_err(|e| bad(&e))?;
+        // Sealed values are never readable, so a runner job must never carry them.
+        let secrets = st.db.query("SELECT key_enc,value_enc,key_hash,path FROM secrets WHERE env_id=? AND deleted=0 AND secret_type<>'sealed'", &[json!(&eid)]).map_err(|e| bad(&e))?;
         let prev = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).unwrap_or_default();
         jobs.push(json!({
-            "id": jid, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"),
+            "id": jid, "claim": claim, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"),
             "kind": db::s(&integ, "kind"), "config_enc": db::s(&integ, "config_enc"), "wrapped_key": wrapped,
             "secrets": secrets.iter().map(db::obj).collect::<Vec<_>>(),
             "previous": prev.iter().map(|r| db::s(r, "remote_name")).collect::<Vec<_>>(),
@@ -1646,13 +1688,17 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
     }
     Ok(j(json!({"jobs": jobs}))) }
 #[derive(Deserialize)] struct ManagedSecret { name: String, #[serde(default)] value_hash: String }
-#[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] detail: String, #[serde(default)] managed: Vec<ManagedSecret> }
+#[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] detail: String, #[serde(default)] managed: Vec<ManagedSecret>, #[serde(default)] claim: String }
 async fn runner_job_result(State(st): State<S>, h: HeaderMap, Path(jid): Path<String>, Json(r): Json<JobResultReq>) -> Res {
     let (rid, _) = runner_auth(&st, &h)?;
     let job = st.db.one("SELECT * FROM sync_jobs WHERE id=? AND runner_id=?", &[json!(&jid), json!(&rid)]).map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "job not found"))?;
     if db::s(&job, "status") != "claimed" { return Err(err(StatusCode::CONFLICT, "job is not claimed by this runner")); }
-    st.db.exec("UPDATE sync_jobs SET status=?,detail=? WHERE id=?", &[json!(if r.ok { "done" } else { "failed" }), json!(&r.detail), json!(&jid)]).map_err(|e| bad(&e))?;
+    // The claim timestamp is the fencing token: a job reclaimed after the stale
+    // window rejects the old runner's late result.
+    let updated = st.db.exec("UPDATE sync_jobs SET status=?,detail=? WHERE id=? AND runner_id=? AND status='claimed' AND claim_id=?",
+        &[json!(if r.ok { "done" } else { "failed" }), json!(&r.detail), json!(&jid), json!(&rid), json!(&r.claim)]).map_err(|e| bad(&e))?;
+    if updated == 0 { return Err(err(StatusCode::CONFLICT, "this claim was superseded; refresh the job queue")); }
     let eid = db::s(&job, "env_id"); let iid = db::s(&job, "integration_id");
     if r.ok && db::s(&job, "kind") == "sync" && !r.managed.is_empty() {
         let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]);
@@ -1703,7 +1749,8 @@ async fn universal_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
 // ---------- approval workflow: secret change proposals ----------
 async fn create_proposal(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h)?; let (org, app) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "proposals:write")?;
     let key = st.env_key(&eid)?; let payload = serde_json::to_string(&r.secrets.iter().map(|s| json!({"key":s.key,"value":s.value,"path":s.path,"comment":s.comment,"tags":s.tags,"type":s.secret_type})).collect::<Vec<_>>()).unwrap();
-    let pid = id(); st.db.exec("INSERT INTO proposals(id,env_id,author,payload_enc,created_at) VALUES(?,?,?,?,?)", &[json!(pid), json!(eid), json!(uid), json!(oc::encrypt_symmetric(&key, payload.as_bytes())), json!(now())]).map_err(|e| bad(&e))?;
+    let pid = id();
+    st.db.exec("INSERT INTO proposals(id,env_id,author,payload_enc,created_at) VALUES(?,?,?,?,?)", &[json!(pid), json!(eid), json!(uid), json!(oc::encrypt_symmetric_aad(&key, &proposal_aad(&eid, &pid, "payload"), payload.as_bytes())), json!(now())]).map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"proposal.create",&pid); Ok(j(json!({"id": pid, "status": "pending"}))) }
 async fn list_proposals(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; let (org, _) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:read")?;
     let rows = st.db.query("SELECT id,env_id,author,status,created_at,decided_by FROM proposals WHERE env_id=? ORDER BY created_at DESC", &[json!(eid)]).map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -1713,7 +1760,7 @@ async fn decide_proposal(State(st): State<S>, h: HeaderMap, Path((pid, action)):
     let eid = db::s(&row,"env_id"); let (org, app) = st.require_env(&eid, &uid)?;
     st.check_admin(&org, &uid).map_err(|_| err(StatusCode::FORBIDDEN, "proposals need approval by an admin (not the author)"))?;
     if action == "approve" {
-        let key = st.env_key(&eid)?; let plain = oc::decrypt_symmetric(&key, &db::s(&row,"payload_enc")).map_err(|e| bad(&e))?;
+        let key = st.env_key(&eid)?; let plain = oc::decrypt_symmetric_compat(&key, &proposal_aad(&eid, &pid, "payload"), &db::s(&row,"payload_enc")).map_err(|e| bad(&e))?;
         let items: Vec<Value> = serde_json::from_slice(&plain).unwrap_or_default(); let mut count = 0;
         for it in &items { let s = SecretIn{ key: it["key"].as_str().unwrap_or("").into(), value: it["value"].as_str().unwrap_or("").into(), path: it["path"].as_str().unwrap_or("/").into(), comment: it["comment"].as_str().unwrap_or("").into(), tags: it["tags"].as_str().unwrap_or("").into(), secret_type: it["type"].as_str().unwrap_or("secret").into() };
             if !s.key.is_empty() { upsert_secret(&st, &eid, &key, &uid, &s)?; count += 1; } }
@@ -1756,16 +1803,16 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         let res = std::thread::spawn(move || { let mut cl = postgres::Client::connect(&c2, postgres::NoTls).map_err(|e| e.to_string())?;
             cl.execute(&format!("CREATE ROLE \"{}\" LOGIN PASSWORD '{}'", u2, p2), &[]).map_err(|e| e.to_string())?; let _ = exp; Ok::<(),String>(()) }).join().map_err(|_| bad("pg thread panicked"))?;
         res.map_err(|e: String| bad(&e))?;
-        let config_enc = oc::encrypt_symmetric(&key, json!({"connection":conn,"type":"postgres"}).to_string().as_bytes());
-        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"connection":conn,"type":"postgres"}).to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"postgres"}))); }
     let value = oc::random_token("dyn");
-    st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, value.as_bytes())), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), value.as_bytes())), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
     Ok(j(json!({"id": lid, "value": value, "expires_at": now()+ttl}))) }
 async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(lid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
     let eid = db::s(&row,"env_id"); let (org, _) = st.require_env(&eid,&uid)?; st.check_perm(&org, &uid, "leases:write")?; let key = st.env_key(&eid)?;
-    if !db::s(&row,"config_enc").is_empty() { if let Ok(plain) = oc::decrypt_symmetric(&key, &db::s(&row,"config_enc")) { if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
+    if !db::s(&row,"config_enc").is_empty() { if let Ok(plain) = oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &lid, "config"), &db::s(&row,"config_enc")) { if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
         if cfg.get("type").and_then(|v| v.as_str()) == Some("postgres") { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
             let _ = std::thread::spawn(move || { if let Ok(mut cl) = postgres::Client::connect(&conn, postgres::NoTls) { let _ = cl.execute(&format!("DROP ROLE IF EXISTS \"{}\"", username), &[]); } }).join(); } } } }
     st.db.exec("UPDATE leases SET revoked=1 WHERE id=?", &[json!(lid)]).map_err(|e| bad(&e))?; Ok(j(json!({"revoked": lid}))) }
@@ -2468,13 +2515,17 @@ fn load_root(db: &Db) -> Result<([u8;32], Option<kms::Kms>), String> {
             let raw = kms.unwrap(&db::s(&r, "v"), "openwarp-root")?;
             return Ok((raw.try_into().map_err(|_| "kms_root is not 32 bytes".to_string())?, Some(kms)));
         }
-        // First KMS boot: adopt an existing local master when there is one so
-        // old data stays readable, otherwise generate a fresh root.
-        let master: [u8;32] = if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") {
-            oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string())?.try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string())?
-        } else if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='master'", &[]) {
-            oc::unb64(&db::s(&r, "v")).map_err(|_| "stored master key is not base64".to_string())?.try_into().map_err(|_| "stored master key is not 32 bytes".to_string())?
-        } else { oc::random_key() };
+        // First KMS boot: adopt the stored master when there is one so old data
+        // stays readable. If the environment also names a different master, stop
+        // instead of wrapping the wrong root and rewrapping legacy env keys.
+        let env_master: Option<[u8;32]> = match std::env::var("OPENWARP_MASTER_KEY") {
+            Ok(v) => Some(oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string())?.try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string())?),
+            Err(_) => None };
+        let stored_master: Option<[u8;32]> = match db.one("SELECT v FROM meta WHERE k='master'", &[]) {
+            Ok(Some(r)) => Some(oc::unb64(&db::s(&r, "v")).map_err(|_| "stored master key is not base64".to_string())?.try_into().map_err(|_| "stored master key is not 32 bytes".to_string())?),
+            _ => None };
+        if let (Some(a), Some(b)) = (env_master, stored_master) { if a != b { return Err("OPENWARP_MASTER_KEY does not match the master key stored in this database; refusing to wrap the wrong root under KMS".into()); } }
+        let master = env_master.or(stored_master).unwrap_or_else(oc::random_key);
         let wrapped = kms.wrap(&master, "openwarp-root")?;
         if db.exec("INSERT INTO meta(k,v) VALUES('kms_root',?)", &[json!(wrapped)]).is_err() {
             // Another replica won the race; read its root instead.

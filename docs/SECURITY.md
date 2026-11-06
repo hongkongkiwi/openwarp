@@ -36,8 +36,11 @@ and decrypts secrets to serve the API and to run integrations.
   `meta` table. This is suitable for development, not for a deployment where the
   operator must be excluded.
 - Secret ciphertext uses `ow2` framing: XChaCha20-Poly1305 with associated data
-  binding `env_id`, `secret_id` and field. Ciphertext cannot be moved between
-  records. Legacy rows without the `ow2` prefix remain readable.
+  binding `env_id`, `secret_id` and field. Value and comment rows are also bound
+  to their version. Integration configs, lease values and proposal payloads
+  carry their own record identifier in the associated data. Ciphertext cannot
+  be moved between those records. Legacy rows without the `ow2` prefix remain
+  readable.
 - **Operator can read.** This mode is for automation, dynamic leases, PKI and
   any feature that needs server-side plaintext.
 
@@ -97,12 +100,16 @@ authenticated data (GCP KMS), or the equivalent. `OPENWARP_KMS_KEY_ID` is stored
 with each wrapped value so a key rotation can still unwrap old data; run
 `POST /api/instance/rewrap` as the instance owner after switching key IDs.
 
-A fresh KMS deployment stores only `meta.kms_root`. An existing deployment that
-already has `meta.master` adopts that key under the KMS on first boot and keeps
-the legacy row so records encrypted outside the environment-key path remain
-readable. Delete the legacy root only after those records have been migrated;
-the current code does not re-encrypt TOTP secrets, OIDC client secrets, PKI keys
-or lockbox values.
+A fresh KMS deployment stores only `meta.kms_root`; the database then has no
+usable root key. An existing deployment that already has `meta.master` adopts
+that key under the KMS on first boot and keeps the legacy row so records
+encrypted outside the environment-key path remain readable. While that row
+exists, it is still a usable root for those records even though environment
+keys are KMS-wrapped. If `OPENWARP_MASTER_KEY` is also set and differs from the
+stored master, the server refuses to boot rather than wrapping the wrong root.
+Delete the legacy root only after TOTP secrets, OIDC client secrets, PKI keys
+and lockbox values have been migrated; the current code does not re-encrypt
+them.
 
 ## The honest limit on "we cannot read it"
 
@@ -136,7 +143,9 @@ server cannot obtain a user's key.
   `openwarp e2e rekey --env <ENV_ID>` with a current grant. It generates a new
   environment key, re-encrypts every secret, and rewraps the new key to every
   remaining grantee and the runner. Old history rows are replaced because they
-  are encrypted under the old key.
+  are encrypted under the old key. The rewrite runs in one database transaction;
+  a failed grant write rolls the whole rotation back. A rekey may remove
+  grantees but cannot add one: grant access first, then rotate.
 - A password reset does not bypass an enrolled second factor; it returns an MFA
   challenge instead of a session.
 
@@ -160,9 +169,14 @@ environment for sync.
 - It authenticates with a runner token shown once at creation.
 - It polls outbound. The server never initiates a connection into the customer
   network.
-- Provider credentials live in the sealed integration config, which only the
-  runner can open.
-- A crash after claiming a job leaves it reclaimable after ten minutes.
+- Provider credentials live in the sealed integration config. Only the holder
+  of the runner private key can open it, and the plaintext carries the
+  integration context that the runner verifies against the job.
+- A crash after claiming a job leaves it reclaimable after ten minutes. Each
+  claim carries a random fencing token, so a late result from the superseded
+  runner is rejected.
+- Sealed secrets are excluded from job payloads, matching the server-side sync
+  path.
 - Plaintext exists in the runner's memory while a sync runs. Treat the runner
   host as a secrets-bearing system: dedicated container, no core dumps, no
   debug logging of job payloads.
