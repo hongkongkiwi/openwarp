@@ -1,0 +1,205 @@
+// KMS-backed envelope encryption: the server stores an owkms-wrapped env key,
+// binds secret ciphertext to its record, survives a restart, and fails closed
+// when the KMS is unavailable. The mock KMS uses the same crate primitives the
+// server uses; only the transport and key custody are simulated.
+
+use openwarp_crypto as oc;
+use reqwest::redirect::Policy;
+use reqwest::{Client, Method};
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+static SEQ: AtomicU32 = AtomicU32::new(0);
+static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const KMS_KEY: [u8; 32] = [7u8; 32];
+
+struct Resp { status: u16, text: String, body: Value }
+struct Server { child: Child, base: String, dir: PathBuf, client: Client, keep: bool }
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if !self.keep { let _ = std::fs::remove_dir_all(&self.dir); }
+    }
+}
+fn free_port() -> u16 { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
+
+impl Server {
+    async fn start_env(extra: &[(&str, String)]) -> Server {
+        let dir = std::env::temp_dir().join(format!("openwarp-enc-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        Server::start_at(dir, extra).await
+    }
+    async fn start_at(dir: PathBuf, extra: &[(&str, String)]) -> Server {
+        let _start = START_LOCK.lock().await;
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = free_port();
+        let base = format!("http://127.0.0.1:{}", port);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
+        cmd.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
+            .env("ADDR", format!("127.0.0.1:{}", port))
+            .env("OPENWARP_PUBLIC_URL", &base)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .env_remove("OPENWARP_MASTER_KEY")
+            .env_remove("REDIS_URL")
+            .env_remove("OPENWARP_ENV")
+            .env_remove("OPENWARP_KMS_URL")
+            .env_remove("OPENWARP_KMS_TOKEN")
+            .env_remove("OPENWARP_KMS_KEY_ID")
+            .stdout(Stdio::null()).stderr(Stdio::null());
+        for (k, v) in extra { cmd.env(k, v); }
+        let child = cmd.spawn().expect("spawn server");
+        let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().unwrap();
+        let server = Server { child, base, dir, client, keep: false };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok(r) = server.client.get(server.url("/health")).send().await { if r.status().is_success() { return server; } }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("server did not become healthy");
+    }
+    fn url(&self, p: &str) -> String { format!("{}{}", self.base, p) }
+    async fn call(&self, m: Method, p: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let mut req = self.client.request(m, self.url(p));
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = body { req = req.json(&b); }
+        let r = req.send().await.expect("request");
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Resp { status, text, body }
+    }
+    fn kill(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
+    fn reuse(mut self) -> PathBuf { self.keep = true; self.kill(); self.dir.clone() }
+}
+
+struct Kms { url: String, fail: Arc<AtomicBool>, calls: Arc<AtomicUsize> }
+fn start_kms() -> Kms {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fail = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (f, c) = (fail.clone(), calls.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (mut head_end, mut len) = (0usize, 0usize);
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(pos) = find(&buf, b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                let body_len = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                if buf.len() >= pos + 4 + body_len { head_end = pos + 4; len = body_len; break; }
+            }
+            let first = String::from_utf8_lossy(&buf).lines().next().unwrap_or("").to_string();
+            let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+            let body = String::from_utf8_lossy(&buf[head_end..head_end + len.min(buf.len().saturating_sub(head_end))]).to_string();
+            c.fetch_add(1, Ordering::SeqCst);
+            let reply = if f.load(Ordering::SeqCst) {
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+            } else {
+                let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let ctx = v["context"].as_str().unwrap_or("");
+                if path.ends_with("/wrap") {
+                    let plain = oc::unb64(v["plaintext"].as_str().unwrap_or("")).unwrap_or_default();
+                    let wrapped = oc::encrypt_symmetric_aad(&KMS_KEY, ctx.as_bytes(), &plain);
+                    let out = json!({"wrapped": wrapped}).to_string();
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", out.len(), out)
+                } else {
+                    let plain = oc::decrypt_symmetric_aad(&KMS_KEY, ctx.as_bytes(), v["wrapped"].as_str().unwrap_or("")).unwrap_or_default();
+                    let out = json!({"plaintext": oc::b64(&plain)}).to_string();
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", out.len(), out)
+                }
+            };
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    Kms { url: format!("http://{}/kms", addr), fail, calls }
+}
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> { haystack.windows(needle.len()).position(|w| w == needle) }
+
+async fn register(s: &Server, email: &str) -> Value {
+    let r = s.call(Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": "correct-horse-battery"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    r.body
+}
+
+#[tokio::test]
+async fn kms_wraps_env_keys_and_secret_ciphertext_is_record_bound() {
+    let kms = start_kms();
+    let s = Server::start_env(&[
+        ("OPENWARP_KMS_URL", kms.url.clone()),
+        ("OPENWARP_KMS_TOKEN", "test-token".into()),
+        ("OPENWARP_KMS_KEY_ID", "test-key-1".into()),
+    ]).await;
+    let u = register(&s, "kms@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let envs = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&t), None).await;
+    let env = envs.body[0]["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(&t), Some(json!({"secrets": [{"key": "DATABASE_URL", "value": "postgres://secret"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["secrets"][0]["value"], json!("postgres://secret"));
+
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let wrapped: String = conn.query_row("SELECT env_key_wrapped FROM envs WHERE id=?", [&env], |row| row.get(0)).unwrap();
+    assert!(wrapped.starts_with("owkms:test-key-1:"), "env key is not KMS wrapped: {}", wrapped);
+    let value_enc: String = conn.query_row("SELECT value_enc FROM secrets WHERE env_id=? AND deleted=0", [&env], |row| row.get(0)).unwrap();
+    assert!(value_enc.starts_with("ow2:"), "secret ciphertext is not record-bound: {}", value_enc);
+    assert!(kms.calls.load(Ordering::SeqCst) > 0, "the server did not call the KMS");
+
+    // A restart must unwrap the same KMS root, not generate a new one.
+    let dir = s.reuse();
+    let s2 = Server::start_at(dir, &[
+        ("OPENWARP_KMS_URL", kms.url.clone()),
+        ("OPENWARP_KMS_TOKEN", "test-token".into()),
+        ("OPENWARP_KMS_KEY_ID", "test-key-1".into()),
+    ]).await;
+    let r = s2.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.status, 200, "data must survive a KMS-backed restart: {}", r.text);
+    assert_eq!(r.body["secrets"][0]["value"], json!("postgres://secret"));
+
+    // With the KMS down, a fresh read must fail rather than fall back to a
+    // local key. env_key unwraps per request, so this is deterministic.
+    kms.fail.store(true, Ordering::SeqCst);
+    let r = s2.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert!(r.status >= 400, "KMS outage must fail closed, got {} {}", r.status, r.text);
+    kms.fail.store(false, Ordering::SeqCst);
+
+    let r = s2.call(Method::POST, "/api/instance/rewrap", Some(&t), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "rewrap failed: {} {}", r.status, r.text);
+    assert_eq!(r.body["key_id"], json!("test-key-1"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn without_kms_the_existing_master_path_still_works() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "local@test.invalid").await;
+    let t = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap();
+    let envs = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(t), None).await;
+    let env = envs.body[0]["id"].as_str().unwrap();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(t), Some(json!({"secrets": [{"key": "A", "value": "b"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(t), None).await;
+    assert_eq!(r.body["secrets"][0]["value"], json!("b"));
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let value_enc: String = conn.query_row("SELECT value_enc FROM secrets WHERE env_id=? AND deleted=0", [env], |row| row.get(0)).unwrap();
+    assert!(value_enc.starts_with("ow2:"), "legacy master mode still writes bound ciphertext: {}", value_enc);
+}

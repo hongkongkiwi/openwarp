@@ -82,6 +82,29 @@ pub fn decrypt_symmetric(key: &[u8;32], payload: &str) -> Result<Vec<u8>, String
     let (nonce,ct)=raw.split_at(24); let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     cipher.decrypt(XNonce::from_slice(nonce), ct).map_err(|_| "decrypt failed".into())
 }
+/// Versioned AEAD that binds ciphertext to its record (environment, secret,
+/// field). The `ow2:` prefix distinguishes it from legacy unauthenticated-data
+/// ciphertext so both can be read during migration.
+pub fn encrypt_symmetric_aad(key: &[u8;32], aad: &[u8], plaintext: &[u8]) -> String {
+    use chacha20poly1305::aead::Payload;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce=[0u8;24]; OsRng.fill_bytes(&mut nonce);
+    let ct=cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad }).expect("encrypt");
+    let mut out=nonce.to_vec(); out.extend_from_slice(&ct);
+    format!("ow2:{}", b64(&out))
+}
+pub fn decrypt_symmetric_aad(key: &[u8;32], aad: &[u8], payload: &str) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::Payload;
+    let body = payload.strip_prefix("ow2:").ok_or("not an ow2 ciphertext")?;
+    let raw=unb64(body)?; if raw.len()<24 { return Err("too short".into()) }
+    let (nonce,ct)=raw.split_at(24); let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad }).map_err(|_| "decrypt failed".into())
+}
+/// Read either a bound `ow2:` ciphertext or a legacy one. New writes should use
+/// `encrypt_symmetric_aad`; this keeps existing rows readable.
+pub fn decrypt_symmetric_compat(key: &[u8;32], aad: &[u8], payload: &str) -> Result<Vec<u8>, String> {
+    if payload.starts_with("ow2:") { decrypt_symmetric_aad(key, aad, payload) } else { decrypt_symmetric(key, payload) }
+}
 /// libsodium sealed box (GitHub Actions): ephemeral X25519 + XSalsa20-Poly1305, nonce=BLAKE2b24(eph_pk||recipient_pk)
 pub fn seal_github(recipient_pub_b64_std: &str, plaintext: &[u8]) -> Result<String, String> {
     use crypto_box::{PublicKey as CbPublic, SecretKey as CbSecret, SalsaBox, aead::{Aead, generic_array::GenericArray}};
