@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use std::collections::{BTreeMap, HashMap};
 type HmacSha256 = Hmac<Sha256>;
 
-pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","keeper","oci_vault","bitwarden"];
+pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","azure_app_configuration","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","scaleway_secret_manager","vultr","hetzner","ssh","keeper","oci_vault","huggingface"];
 
 fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
@@ -57,7 +57,7 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
         "coolify" => { for (k, v) in secrets { req(client.post(format!("{}/api/v1/applications/{}/envs", base(config,"https://app.coolify.io"), cfg(config,"app_uuid"))).bearer_auth(cfg(config,"token")).json(&json!({"key":k,"value":v,"is_preview":false}))).await?; } Ok(format!("pushed {} secrets to Coolify", secrets.len())) }
         "cloudflare_pages" => { let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!({"value":v,"type":"secret_text"})); }
             req(client.put(format!("{}/client/v4/accounts/{}/pages/projects/{}/deployment_configs/production", base(config,"https://api.cloudflare.com"), cfg(config,"account_id"), cfg(config,"project"))).bearer_auth(cfg(config,"token")).json(&json!({"env_vars": Value::Object(m)}))).await?; Ok("pushed to Cloudflare Pages".into()) }
-        "webhook" => { req(client.post(cfg(config,"url")).json(&json!({"secrets": map_json(secrets)})).header("Authorization", format!("Bearer {}", cfg(config,"token")))).await?; Ok(format!("pushed {} secrets to webhook", secrets.len())) }
+        "webhook" => webhook_sync(config, secrets).await,
         "gitlab" => { let base = if cfg(config,"base_url").is_empty() { "https://gitlab.com/api/v4" } else { cfg(config,"base_url") };
             for (k, v) in secrets { let url = format!("{}/projects/{}/variables", base, cfg(config,"project_id"));
                 let r = client.post(&url).header("PRIVATE-TOKEN", cfg(config,"token")).json(&json!({"key":k,"value":v,"masked":true})).send().await.map_err(|e| e.to_string())?;
@@ -142,6 +142,9 @@ fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String,
     secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (desired_name(config, k), v.clone())).filter(|(n, _)| seen.insert(n.clone())).collect()
 }
 pub fn desired_names(config: &Value, secrets: &[(String, String)]) -> Vec<String> { trigger_desired(config, secrets).into_iter().map(|(n, _)| n).collect() }
+/// The sync caller hands over `(path, key, value)`. Every other adapter ignores
+/// the path; the SSH file adapter groups by it.
+pub fn secret_keys(secrets: &[(String, String, String)]) -> Vec<(String, String)> { secrets.iter().map(|(_, k, v)| (k.clone(), v.clone())).collect() }
 pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let client = http_client(); let base_url = base(config, "https://api.trigger.dev");
     let mode = { let m = cfg(config, "mode"); if m.is_empty() { "upsert" } else { m } };
@@ -411,6 +414,28 @@ async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(Strin
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> { let mut m = HmacSha256::new_from_slice(key).unwrap(); m.update(data); m.finalize().into_bytes().to_vec() }
+/// Same construction as the audit log streams: HMAC-SHA256 over `timestamp.body`,
+/// sent as `t=<unix>,v1=<hex>`. An empty secret keeps the unsigned bearer-only post.
+fn webhook_signature(secret: &str, timestamp: i64, body: &str) -> String {
+    format!("t={},v1={}", timestamp, hex(&hmac(secret.as_bytes(), format!("{}.{}", timestamp, body).as_bytes())))
+}
+pub async fn webhook_sync(config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
+    let url = cfg(config, "url").trim();
+    if url.is_empty() { return Err("webhook requires url".into()); }
+    let body = json!({"secrets": map_json(secrets)}).to_string();
+    let mut request = http_client().post(url).header("content-type", "application/json").body(body.clone());
+    let token = cfg(config, "token");
+    if !token.is_empty() { request = request.header("Authorization", format!("Bearer {}", token)); }
+    // `signing_secret` is the dedicated key; `secret` is accepted so a config
+    // copied from a log stream verifies with the same code.
+    let signing = { let s = cfg(config, "signing_secret"); if s.is_empty() { cfg(config, "secret") } else { s } };
+    if !signing.is_empty() {
+        let signed_at = unix_now();
+        request = request.header("X-OpenWarp-Timestamp", signed_at.to_string()).header("X-OpenWarp-Signature", webhook_signature(signing, signed_at, &body));
+    }
+    req(request).await?;
+    Ok(format!("pushed {} secrets to webhook{}", secrets.len(), if signing.is_empty() { "" } else { " (signed)" }))
+}
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).collect() }
 // ---------- Shared sync options ----------
 fn sync_mode<'a>(config: &'a Value, provider: &str) -> Result<&'a str, String> {
@@ -1768,6 +1793,164 @@ pub async fn humanitec_test(config: &Value) -> Result<String, String> {
     Ok(format!("Humanitec connection OK: {} value(s) visible", list.len()))
 }
 
+// ---------- Scaleway Secret Manager ----------
+// One opaque secret per key. Versions are immutable, so a changed value is a new
+// version and the previous one is disabled. `data` is base64 on the wire.
+fn scaleway_parts(config: &Value) -> Result<(String, String, String, String, String), String> {
+    let region = cfg(config, "region"); let token = cfg(config, "secret_key"); let project = cfg(config, "project_id");
+    if region.is_empty() || token.is_empty() || project.is_empty() { return Err("Scaleway Secret Manager requires region, secret_key and project_id".into()); }
+    if !matches!(region, "fr-par" | "nl-ams" | "pl-waw") { return Err(format!("Scaleway region must be fr-par, nl-ams or pl-waw (got {:?})", region)); }
+    Ok((base(config, "https://api.scaleway.com"), region.to_string(), token.to_string(), project.to_string(), cfg(config, "path").trim_matches('/').to_string()))
+}
+fn scaleway_root(base: &str, region: &str) -> String { format!("{}/secret-manager/v1beta1/regions/{}", base, region) }
+async fn scaleway_list(client: &reqwest::Client, root: &str, token: &str, project: &str, path: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new(); let mut page = 1i64;
+    loop {
+        let mut url = format!("{}/secrets?project_id={}&scheduled_for_deletion=false&page={}&page_size=100", root, enc(project), page);
+        if !path.is_empty() { url.push_str(&format!("&path={}", enc(path))); }
+        let text = req(client.get(url).header("X-Auth-Token", token)).await.map_err(|e| format!("Scaleway list failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid secret list: {}", e))?;
+        let items = value.get("secrets").and_then(Value::as_array).cloned().unwrap_or_default();
+        let count = items.len();
+        out.extend(items);
+        let total = value.get("total_count").and_then(Value::as_i64).unwrap_or(out.len() as i64);
+        if count == 0 || out.len() as i64 >= total { break; }
+        page += 1;
+        if page > 100 { return Err("Scaleway secret list did not terminate".into()); }
+    }
+    Ok(out)
+}
+async fn scaleway_latest(client: &reqwest::Client, root: &str, token: &str, id: &str) -> Result<Option<String>, String> {
+    match req(client.get(format!("{}/secrets/{}/versions/latest/access", root, enc(id))).header("X-Auth-Token", token)).await {
+        Ok(text) => { let value: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid version: {}", e))?;
+            let data = value.get("data").and_then(Value::as_str).unwrap_or("");
+            if data.is_empty() { return Ok(None); }
+            Ok(Some(String::from_utf8(openwarp_crypto::unb64(data).map_err(|e| format!("Scaleway secret data is not base64: {}", e))?).map_err(|_| "Scaleway secret data is not UTF-8".to_string())?)) }
+        Err(e) if e.contains("HTTP 404") => Ok(None),
+        Err(e) => Err(format!("Scaleway read version failed: {}", e)),
+    }
+}
+pub async fn scaleway_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (base, region, token, project, path) = scaleway_parts(config)?; let mode = sync_mode(config, "scaleway")?; let dry = is_dry(config);
+    let desired = trigger_desired(config, secrets);
+    let client = http_client(); let root = scaleway_root(&base, &region);
+    let remote = scaleway_list(&client, &root, &token, &project, &path).await?;
+    let by_name: HashMap<String, String> = remote.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v.get("id")?.as_str()?.to_string()))).collect();
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    if !dry {
+        for (name, value) in &desired {
+            let data = openwarp_crypto::b64(value.as_bytes());
+            if let Some(id) = by_name.get(name) {
+                match scaleway_latest(&client, &root, &token, id).await? {
+                    Some(old) if old == *value => unchanged += 1,
+                    _ => { req(client.post(format!("{}/secrets/{}/versions", root, enc(id))).header("X-Auth-Token", &token).json(&json!({"data": data, "disable_previous": true}))).await.map_err(|e| format!("Scaleway version {} failed: {}", name, e))?; updated += 1; }
+                }
+            } else {
+                let text = req(client.post(format!("{}/secrets", root)).header("X-Auth-Token", &token).json(&json!({"name": name, "project_id": project, "type": "opaque", "path": path}))).await.map_err(|e| format!("Scaleway create {} failed: {}", name, e))?;
+                let created_secret: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid create response: {}", e))?;
+                let id = created_secret.get("id").and_then(Value::as_str).ok_or_else(|| format!("Scaleway create response for {} has no id", name))?;
+                req(client.post(format!("{}/secrets/{}/versions", root, enc(id))).header("X-Auth-Token", &token).json(&json!({"data": data}))).await.map_err(|e| format!("Scaleway version {} failed: {}", name, e))?;
+                created += 1;
+            }
+        }
+        if mode == "mirror" { for name in previous_managed { if desired.iter().any(|(n, _)| n == name) { continue; }
+            if let Some(id) = by_name.get(name) { req(client.delete(format!("{}/secrets/{}", root, enc(id))).header("X-Auth-Token", &token)).await.map_err(|e| format!("Scaleway delete {} failed: {}", name, e))?; } } }
+    } else { for (name, value) in &desired { match by_name.get(name) { Some(id) => match scaleway_latest(&client, &root, &token, id).await? { Some(old) if old == *value => unchanged += 1, _ => updated += 1 }, None => created += 1 } } }
+    let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_name.contains_key(*n)).count();
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Scaleway Secret Manager sync{}: region={} created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, region, created, updated, unchanged, deleted), managed))
+}
+pub async fn scaleway_test(config: &Value) -> Result<String, String> {
+    let (base, region, token, project, path) = scaleway_parts(config)?;
+    let list = scaleway_list(&http_client(), &scaleway_root(&base, &region), &token, &project, &path).await?;
+    Ok(format!("Scaleway connection OK: {} secret(s) visible in {}", list.len(), region))
+}
+
+// ---------- Azure App Configuration ----------
+// Key-values addressed by key plus an optional label. Auth is the documented
+// HMAC-SHA256 scheme: the access key value is base64, and the signature covers
+// method, path+query and the x-ms-date, host and content hash.
+fn appconfig_parts(config: &Value) -> Result<(String, String, String, String), String> {
+    let endpoint = cfg(config, "endpoint").trim_end_matches('/').to_string();
+    let id = cfg(config, "id"); let secret = cfg(config, "secret");
+    if endpoint.is_empty() || id.is_empty() || secret.is_empty() { return Err("Azure App Configuration requires endpoint, id and secret".into()); }
+    let url = reqwest::Url::parse(&endpoint).map_err(|e| format!("Azure App Configuration endpoint is invalid: {}", e))?;
+    if url.scheme() != "https" && url.scheme() != "http" { return Err("Azure App Configuration endpoint must be http(s)".into()); }
+    let host = url.host_str().ok_or("Azure App Configuration endpoint has no host")?;
+    let host = match url.port() { Some(p) => format!("{}:{}", host, p), None => host.to_string() };
+    Ok((format!("{}://{}", url.scheme(), host), host, id.to_string(), secret.to_string()))
+}
+fn appconfig_label(config: &Value) -> String { cfg(config, "label").to_string() }
+fn appconfig_query(label: &str) -> String { if label.is_empty() { "api-version=1.0".into() } else { format!("label={}&api-version=1.0", enc(label)) } }
+fn appconfig_sign(method: &str, path_and_query: &str, host: &str, body: &str, id: &str, secret_b64: &str) -> Result<Vec<(String, String)>, String> {
+    let key = openwarp_crypto::unb64(secret_b64).map_err(|_| "Azure App Configuration secret must be the base64 access key value".to_string())?;
+    let date = http_date();
+    let content_hash = openwarp_crypto::b64(&Sha256::digest(body.as_bytes()));
+    let to_sign = format!("{}\n{}\n{};{};{}", method.to_ascii_uppercase(), path_and_query, date, host, content_hash);
+    let signature = openwarp_crypto::b64(&hmac(&key, to_sign.as_bytes()));
+    Ok(vec![
+        ("x-ms-date".into(), date),
+        ("x-ms-content-sha256".into(), content_hash),
+        ("Authorization".into(), format!("HMAC-SHA256 Credential={}&SignedHeaders=x-ms-date;host;x-ms-content-sha256&Signature={}", id, signature)),
+    ])
+}
+fn appconfig_request(client: &reqwest::Client, method: reqwest::Method, url: &str, host: &str, body: &str, id: &str, secret: &str) -> Result<reqwest::RequestBuilder, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    let path_and_query = match parsed.query() { Some(q) => format!("{}?{}", parsed.path(), q), None => parsed.path().to_string() };
+    let mut request = client.request(method.clone(), url);
+    for (name, value) in appconfig_sign(method.as_str(), &path_and_query, host, body, id, secret)? { request = request.header(name, value); }
+    if !body.is_empty() { request = request.header("Content-Type", "application/vnd.microsoft.appconfig.kv+json"); }
+    Ok(request.body(body.to_string()))
+}
+async fn appconfig_list(client: &reqwest::Client, endpoint: &str, host: &str, id: &str, secret: &str, label: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    let mut path = format!("/kv?key=*&label={}&api-version=1.0", if label.is_empty() { "%00".to_string() } else { enc(label) });
+    for _ in 0..100 {
+        let url = format!("{}{}", endpoint, path);
+        let text = req(appconfig_request(client, reqwest::Method::GET, &url, host, "", id, secret)?).await.map_err(|e| format!("Azure App Configuration list failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("Azure App Configuration invalid list: {}", e))?;
+        if let Some(items) = value.get("items").and_then(Value::as_array) { out.extend(items.iter().cloned()); }
+        let next = value.get("@nextLink").and_then(Value::as_str).unwrap_or("");
+        if next.is_empty() { break; }
+        path = if next.starts_with('/') { next.to_string() } else { reqwest::Url::parse(next).map(|u| match u.query() { Some(q) => format!("{}?{}", u.path(), q), None => u.path().to_string() }).unwrap_or_default() };
+        if path.is_empty() { break; }
+    }
+    Ok(out)
+}
+pub async fn azure_app_configuration_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (endpoint, host, id, secret) = appconfig_parts(config)?; let mode = sync_mode(config, "azure_app_configuration")?; let dry = is_dry(config);
+    let label = appconfig_label(config);
+    let desired = trigger_desired(config, secrets);
+    let client = http_client();
+    let remote = appconfig_list(&client, &endpoint, &host, &id, &secret, &label).await?;
+    let by_key: HashMap<String, String> = remote.iter().filter_map(|v| Some((v.get("key")?.as_str()?.to_string(), v.get("value").and_then(Value::as_str).unwrap_or("").to_string()))).collect();
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    if !dry {
+        for (name, value) in &desired {
+            match by_key.get(name) {
+                Some(old) if old == value => unchanged += 1,
+                other => {
+                    let url = format!("{}/kv/{}?{}", endpoint, enc(name), appconfig_query(&label));
+                    let body = json!({"value": value}).to_string();
+                    req(appconfig_request(&client, reqwest::Method::PUT, &url, &host, &body, &id, &secret)?).await.map_err(|e| format!("Azure App Configuration set {} failed: {}", name, e))?;
+                    if other.is_some() { updated += 1; } else { created += 1; }
+                }
+            }
+        }
+        if mode == "mirror" { for name in previous_managed { if desired.iter().any(|(n, _)| n == name) || !by_key.contains_key(name) { continue; }
+            let url = format!("{}/kv/{}?{}", endpoint, enc(name), appconfig_query(&label));
+            req(appconfig_request(&client, reqwest::Method::DELETE, &url, &host, "", &id, &secret)?).await.map_err(|e| format!("Azure App Configuration delete {} failed: {}", name, e))?; } }
+    } else { for (name, value) in &desired { match by_key.get(name) { Some(old) if old == value => unchanged += 1, Some(_) => updated += 1, None => created += 1 } } }
+    let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_key.contains_key(*n)).count();
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Azure App Configuration sync{}: created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, unchanged, deleted), managed))
+}
+pub async fn azure_app_configuration_test(config: &Value) -> Result<String, String> {
+    let (endpoint, host, id, secret) = appconfig_parts(config)?;
+    let list = appconfig_list(&http_client(), &endpoint, &host, &id, &secret, &appconfig_label(config)).await?;
+    Ok(format!("Azure App Configuration connection OK: {} key-value(s) visible", list.len()))
+}
+
 // ---------- OVHcloud KMS ----------
 fn ovh_kms_parts(config: &Value) -> Result<(String, String, String), String> {
     let domain = cfg(config, "okms_domain").trim_end_matches('/').to_string();
@@ -2003,67 +2186,327 @@ pub async fn oci_vault_test(config: &Value) -> Result<String, String> {
     Ok(format!("OCI Vault connection OK: {} active secret(s) visible", list.len()))
 }
 
-// ---------- Bitwarden Secrets Manager ----------
-fn bitwarden_parts(config: &Value) -> Result<(String, String, String, String, String), String> {
-    let api = { let a = cfg(config, "api_url"); if a.is_empty() { "https://api.bitwarden.com".to_string() } else { a.trim_end_matches('/').to_string() } };
-    let identity = { let i = cfg(config, "identity_url"); if i.is_empty() { "https://identity.bitwarden.com/connect/token".to_string() } else { i.to_string() } };
-    let (client_id, client_secret, org) = (cfg(config, "client_id"), cfg(config, "client_secret"), cfg(config, "organization_id"));
-    if client_id.is_empty() || client_secret.is_empty() || org.is_empty() { return Err("Bitwarden requires client_id, client_secret and organization_id".into()); }
-    Ok((api, identity, client_id.to_string(), client_secret.to_string(), org.to_string()))
+// ---------- Hugging Face Spaces ----------
+fn huggingface_space(config: &Value) -> Result<(String, String, String), String> {
+    let token = cfg(config, "token"); let namespace = cfg(config, "namespace"); let repo = cfg(config, "repo");
+    if token.is_empty() || namespace.is_empty() || repo.is_empty() { return Err("Hugging Face requires token, namespace and repo".into()); }
+    let kind = { let k = cfg(config, "target"); if k.is_empty() { "secrets" } else { k } };
+    if !matches!(kind, "secrets" | "variables") { return Err("Hugging Face target must be secrets or variables".into()); }
+    Ok((base(config, "https://huggingface.co"), token.to_string(), format!("/api/spaces/{}/{}/{}", enc(namespace), enc(repo), kind)))
 }
-async fn bitwarden_token(client: &reqwest::Client, config: &Value) -> Result<String, String> {
-    let (_, identity, client_id, client_secret, _) = bitwarden_parts(config)?;
-    let body = format!("grant_type=client_credentials&scope=api.secrets&client_id={}&client_secret={}", form_encode(&client_id), form_encode(&client_secret));
-    let text = req(client.post(identity).header("Content-Type", "application/x-www-form-urlencoded").body(body)).await.map_err(|e| format!("Bitwarden token exchange failed: {}", e))?;
-    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Bitwarden token response is invalid: {}", e))?;
-    value.get("access_token").and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("Bitwarden token response is missing access_token: {}", text.chars().take(300).collect::<String>()))
+fn huggingface_key_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 128 && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') }
+async fn huggingface_space_list(client: &reqwest::Client, base_url: &str, token: &str, path: &str) -> Result<HashMap<String, Option<String>>, String> {
+    let text = req(client.get(format!("{}{}", base_url, path)).bearer_auth(token)).await.map_err(|e| format!("Hugging Face list failed: {}", e))?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Hugging Face invalid list response: {}", e))?;
+    let object = value.as_object().ok_or("Hugging Face list response is not an object")?;
+    Ok(object.iter().map(|(k, v)| (k.clone(), v.get("value").and_then(Value::as_str).map(str::to_string))).collect())
 }
-async fn bitwarden_list(client: &reqwest::Client, api: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
-    let text = req(client.get(format!("{}/organizations/{}/secrets", api, enc(org))).bearer_auth(token)).await.map_err(|e| format!("Bitwarden list secrets failed: {}", e))?;
-    let value: Value = serde_json::from_str(&text).map_err(|e| format!("Bitwarden invalid secret list: {}", e))?;
-    Ok(value.get("secrets").and_then(Value::as_array).cloned().unwrap_or_default())
-}
-async fn bitwarden_get(client: &reqwest::Client, api: &str, token: &str, id: &str) -> Result<Value, String> {
-    let text = req(client.get(format!("{}/secrets/{}", api, enc(id))).bearer_auth(token)).await.map_err(|e| format!("Bitwarden read secret failed: {}", e))?;
-    serde_json::from_str(&text).map_err(|e| format!("Bitwarden invalid secret: {}", e))
-}
-pub async fn bitwarden_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
-    let (api, _, _, _, org) = bitwarden_parts(config)?;
-    let mode = sync_mode(config, "bitwarden")?; let dry = is_dry(config);
-    let project_ids = config.get("project_ids").cloned().unwrap_or(json!([]));
-    let default_note = { let n = cfg(config, "note"); if n.is_empty() { "Managed by OpenWarp" } else { n } };
+pub async fn huggingface_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let (base_url, token, path) = huggingface_space(config)?; let mode = sync_mode(config, "huggingface")?; let dry = is_dry(config);
     let desired = trigger_desired(config, secrets);
-    let client = http_client(); let token = bitwarden_token(&client, config).await?;
-    let remote = bitwarden_list(&client, &api, &token, &org).await?;
-    let by_key: HashMap<String, String> = remote.iter().filter_map(|v| Some((v.get("key")?.as_str()?.to_string(), v.get("id")?.as_str()?.to_string()))).collect();
+    if let Some((name, _)) = desired.iter().find(|(n, _)| !huggingface_key_ok(n)) { return Err(format!("Hugging Face names must match [A-Za-z][_A-Za-z0-9]*: {:?}", name)); }
+    let client = http_client(); let remote = huggingface_space_list(&client, &base_url, &token, &path).await?;
+    let readable = path.ends_with("/variables");
+    let (mut created, mut updated, mut unchanged) = (0, 0, 0);
+    for (name, value) in &desired {
+        match remote.get(name) {
+            Some(Some(current)) if current == value => unchanged += 1,
+            Some(_) => updated += 1,
+            None => created += 1,
+        }
+        if dry { continue; }
+        req(client.post(format!("{}{}", base_url, path)).bearer_auth(&token).json(&json!({"key": name, "value": value}))).await.map_err(|e| format!("Hugging Face set {} failed: {}", name, e))?;
+    }
+    let mut deleted = 0;
+    if mode == "mirror" { for name in previous_managed { if desired.iter().any(|(n, _)| n == name) || !remote.contains_key(name) { continue; }
+        deleted += 1;
+        if !dry { req(client.delete(format!("{}{}", base_url, path)).bearer_auth(&token).json(&json!({"key": name}))).await.map_err(|e| format!("Hugging Face delete {} failed: {}", name, e))?; } } }
+    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
+    let note = if readable { "" } else { " (secret values are write-only, so existing names are overwritten)" };
+    Ok((format!("Hugging Face sync{}: {} created={} updated={} unchanged={} deleted={}{}", if dry { " (dry-run)" } else { "" }, path.rsplit('/').next().unwrap_or(&path), created, updated, unchanged, deleted, note), managed))
+}
+pub async fn huggingface_test(config: &Value) -> Result<String, String> {
+    let (base_url, token, path) = huggingface_space(config)?;
+    let list = huggingface_space_list(&http_client(), &base_url, &token, &path).await?;
+    Ok(format!("Hugging Face connection OK: {} {} visible", list.len(), path.rsplit('/').next().unwrap_or("entries")))
+}
+
+// ---------- SSH file sync ----------
+// Writes selected secret folders to files on a host over SSH. This is a remote
+// env file, not an account SSH-key store: the host never learns a shell.
+fn ssh_shell_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
+struct SshTarget { host: String, port: u16, user: String, identity: String, known_hosts: String, password: String, askpass: String, timeout: u64 }
+fn ssh_target(config: &Value) -> Result<SshTarget, String> {
+    let host = cfg(config, "host").trim();
+    if host.is_empty() || host.contains([' ', '\n', '\t']) { return Err("ssh requires host".into()); }
+    let port = config_i64(config, "port").unwrap_or(22);
+    if !(1..=65535).contains(&port) { return Err("ssh port must be 1-65535".into()); }
+    let user = { let u = cfg(config, "user").trim(); if u.is_empty() { "root" } else { u } };
+    if user.contains([' ', '\n', '\t']) { return Err("ssh user must be a single token".into()); }
+    let identity = cfg(config, "identity_file").trim().to_string();
+    let private_key = cfg(config, "private_key").trim().to_string();
+    let password = cfg(config, "password").to_string();
+    if identity.is_empty() && private_key.is_empty() && password.is_empty() { return Err("ssh requires identity_file, private_key or password".into()); }
+    if !identity.is_empty() && identity.contains('\n') { return Err("ssh identity_file must be a path".into()); }
+    let known_hosts = cfg(config, "known_hosts").trim().to_string();
+    if known_hosts.is_empty() { return Err("ssh requires known_hosts (the host's public key, or a path to a known_hosts file) so the host is verified".into()); }
+    let timeout = config_i64(config, "timeout_secs").unwrap_or(20).clamp(1, 120) as u64;
+    Ok(SshTarget { host: host.to_string(), port: port as u16, user: user.to_string(), identity, known_hosts, password, askpass: private_key, timeout })
+}
+struct SshFile { path: String, format: String, folders: Vec<String>, owner: String, mode: String }
+fn ssh_files(config: &Value) -> Result<Vec<SshFile>, String> {
+    let mut out = Vec::new();
+    if let Some(items) = config.get("files").and_then(Value::as_array) {
+        for item in items {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let format = { let f = item.get("format").and_then(Value::as_str).unwrap_or(""); if f.is_empty() { "dotenv".to_string() } else { f.to_string() } };
+            let folders = item.get("folders").or_else(|| item.get("paths")).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+            let owner = item.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+            let mode = item.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
+            out.push(SshFile { path, format, folders, owner, mode });
+        }
+    }
+    if out.is_empty() {
+        let path = cfg(config, "path").trim().to_string();
+        let format = { let f = cfg(config, "format"); if f.is_empty() { "dotenv".to_string() } else { f.to_string() } };
+        out.push(SshFile { path, format, folders: Vec::new(), owner: cfg(config, "owner").to_string(), mode: cfg(config, "mode_bits").to_string() });
+    }
+    for file in &out {
+        if !ssh_remote_path_ok(&file.path) { return Err(format!("ssh file path must be absolute and contain no whitespace or quotes: {:?}", file.path)); }
+        if !matches!(file.format.as_str(), "dotenv" | "json" | "yaml" | "export") { return Err(format!("ssh format must be dotenv, json, yaml or export (got {:?})", file.format)); }
+        if !file.owner.is_empty() && !file.owner.bytes().all(|b| b.is_ascii_alphanumeric() || b":_-".contains(&b)) { return Err(format!("ssh owner must be user or user:group: {:?}", file.owner)); }
+        if !file.mode.is_empty() && (file.mode.len() > 4 || !file.mode.bytes().all(|b| (b'0'..=b'7').contains(&b))) { return Err(format!("ssh mode must be octal, for example 600: {:?}", file.mode)); }
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(dup) = out.iter().find(|f| !seen.insert(f.path.clone())) { return Err(format!("ssh files must have distinct paths: {:?}", dup.path)); }
+    Ok(out)
+}
+fn ssh_remote_path_ok(path: &str) -> bool { path.starts_with('/') && path.len() <= 512 && !path.contains('\0') && path.bytes().all(|b| !b.is_ascii_whitespace() && b != b'\'' && b != b'"' && b != b'`' && b != b'\\' && b != b'$') }
+fn ssh_folder_matches(folders: &[String], path: &str) -> bool {
+    if folders.is_empty() { return true; }
+    let path = if path.is_empty() { "/" } else { path };
+    folders.iter().any(|f| { let f = if f.is_empty() { "/" } else { f.as_str() }; path == f || path.starts_with(&format!("{}/", f.trim_end_matches('/'))) })
+}
+fn ssh_render(format: &str, pairs: &BTreeMap<String, String>) -> String {
+    match format {
+        "json" => { let mut m = serde_json::Map::new(); for (k, v) in pairs { m.insert(k.clone(), json!(v)); } Value::Object(m).to_string() + "\n" }
+        "yaml" => { let mut out = String::new(); for (k, v) in pairs { out.push_str(k); out.push_str(": "); out.push_str(&dotenv_quote(v)); out.push('\n'); } out }
+        "export" => pairs.iter().map(|(k, v)| format!("export {}={}\n", k, dotenv_quote(v))).collect(),
+        _ => dotenv_render(pairs),
+    }
+}
+fn ssh_parse(format: &str, text: &str) -> Result<BTreeMap<String, String>, String> {
+    match format {
+        "json" => { if text.trim().is_empty() { return Ok(BTreeMap::new()); } let value: Value = serde_json::from_str(text).map_err(|e| format!("remote file is not JSON: {}", e))?; let object = value.as_object().ok_or("remote file is not a JSON object")?; Ok(object.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect()) }
+        _ => Ok(dotenv_map(text).into_iter().collect()),
+    }
+}
+fn ssh_binary() -> String { std::env::var("OPENWARP_SSH_BIN").unwrap_or_else(|_| "ssh".to_string()) }
+/// Run one remote command. stdout is the file; a non-zero exit is an error
+/// carrying stderr, so a refused host key never looks like an empty file.
+fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(ssh_binary());
+    cmd.arg("-p").arg(target.port.to_string()).arg("-o").arg("BatchMode=yes").arg("-o").arg(format!("ConnectTimeout={}", target.timeout)).arg("-o").arg("StrictHostKeyChecking=yes");
+    let mut owned_key = None;
+    let mut owned_hosts = None;
+    if !target.identity.is_empty() { cmd.arg("-i").arg(&target.identity); }
+    else if !target.askpass.is_empty() {
+        let path = std::env::temp_dir().join(format!("openwarp-ssh-{}-{}", std::process::id(), openwarp_crypto::hash_token(&target.askpass).chars().take(12).collect::<String>()));
+        std::fs::write(&path, target.askpass.as_bytes()).map_err(|e| format!("ssh could not stage the private key: {}", e))?;
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)); }
+        cmd.arg("-i").arg(&path);
+        owned_key = Some(path);
+    }
+    if target.known_hosts.starts_with('/') { cmd.arg("-o").arg(format!("UserKnownHostsFile={}", target.known_hosts)); }
+    else {
+        let path = std::env::temp_dir().join(format!("openwarp-ssh-hosts-{}-{}", std::process::id(), openwarp_crypto::hash_token(&target.known_hosts).chars().take(12).collect::<String>()));
+        let line = if target.known_hosts.contains(' ') { target.known_hosts.clone() } else { format!("{} {}", target.host, target.known_hosts) };
+        std::fs::write(&path, format!("{}\n", line.trim())).map_err(|e| format!("ssh could not stage known_hosts: {}", e))?;
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={}", path.display()));
+        owned_hosts = Some(path);
+    }
+    if !target.password.is_empty() {
+        if std::process::Command::new("sshpass").arg("-V").output().is_err() { return Err("ssh password auth needs sshpass installed, or use identity_file / private_key".into()); }
+        cmd.env("SSHPASS", &target.password).env("DISPLAY", "").arg("-o").arg("PreferredAuthentications=password");
+    }
+    cmd.arg(format!("{}@{}", target.user, target.host)).arg(command);
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let spawned = cmd.spawn().map_err(|e| format!("ssh could not be started (is OpenSSH installed?): {}", e));
+    let mut child = match spawned { Ok(child) => child, Err(e) => { if let Some(path) = owned_key { let _ = std::fs::remove_file(path); } if let Some(path) = owned_hosts { let _ = std::fs::remove_file(path); } return Err(e); } };
+    if let Some(bytes) = stdin { use std::io::Write; if let Some(mut input) = child.stdin.take() { let _ = input.write_all(bytes); } }
+    let finished = child.wait_with_output();
+    if let Some(path) = owned_key { let _ = std::fs::remove_file(path); }
+    if let Some(path) = owned_hosts { let _ = std::fs::remove_file(path); }
+    let finished = finished.map_err(|e| format!("ssh wait failed: {}", e))?;
+    if !finished.status.success() { return Err(format!("ssh command failed ({}): {}", finished.status, String::from_utf8_lossy(&finished.stderr).chars().take(400).collect::<String>())); }
+    Ok(String::from_utf8_lossy(&finished.stdout).into_owned())
+}
+fn ssh_plan(config: &Value, secrets: &[(String, String, String)]) -> Result<Vec<(SshFile, BTreeMap<String, String>)>, String> {
+    let files = ssh_files(config)?;
+    let mut plans = Vec::new();
+    for file in files {
+        let mut pairs = BTreeMap::new();
+        for (path, key, value) in secrets {
+            if !ssh_folder_matches(&file.folders, path) { continue; }
+            let name = desired_name(config, key);
+            if pairs.insert(name.clone(), value.clone()).is_some() { return Err(format!("ssh file {} would contain {:?} twice; folders overlap or a name template collides", file.path, name)); }
+        }
+        plans.push((file, pairs));
+    }
+    Ok(plans)
+}
+pub async fn ssh_file_sync(config: &Value, secrets: &[(String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let target = ssh_target(config)?; let mode = sync_mode(config, "ssh")?; let dry = is_dry(config);
+    let plans = ssh_plan(config, secrets)?;
+    let mut managed = Vec::new(); let mut reports = Vec::new();
+    for (file, desired) in &plans {
+        let quoted = ssh_shell_quote(&file.path);
+        let probe = ssh_exec(&target, &format!("if [ -e {} ]; then echo present; else echo missing; fi", quoted), None)?;
+        let missing = probe.trim() == "missing";
+        let current_text = if missing { String::new() } else { ssh_exec(&target, &format!("cat {}", quoted), None)? };
+        let current = if missing { BTreeMap::new() } else { ssh_parse(&file.format, &current_text)? };
+        let current_map: HashMap<String, String> = current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let desired_pairs: Vec<(String, String)> = desired.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let (merged, created, updated, unchanged, deleted) = merge_pairs(&current_map, &desired_pairs, previous_managed, mode == "mirror");
+        if !dry && (created + updated + deleted > 0 || missing) {
+            let rendered = ssh_render(&file.format, &merged);
+            let mut command = format!("cat > {}", ssh_shell_quote(&file.path));
+            if !file.mode.is_empty() { command.push_str(&format!(" && chmod {} {}", file.mode, ssh_shell_quote(&file.path))); }
+            if !file.owner.is_empty() { command.push_str(&format!(" && chown {} {}", file.owner, ssh_shell_quote(&file.path))); }
+            ssh_exec(&target, &command, Some(rendered.as_bytes()))?;
+        }
+        for name in desired.keys() { if !managed.contains(name) { managed.push(name.clone()); } }
+        reports.push(format!("{}: created={} updated={} unchanged={} deleted={}", file.path, created, updated, unchanged, deleted));
+    }
+    Ok((format!("SSH sync{}: {}", if dry { " (dry-run)" } else { "" }, reports.join("; ")), managed))
+}
+pub async fn ssh_file_test(config: &Value) -> Result<String, String> {
+    let target = ssh_target(config)?;
+    let who = ssh_exec(&target, "whoami", None)?;
+    Ok(format!("SSH connection OK: {}@{}:{} as {}", target.user, target.host, target.port, who.trim()))
+}
+pub async fn ssh_file_pull(config: &Value) -> Result<Vec<(String, String)>, String> {
+    let target = ssh_target(config)?; let files = ssh_files(config)?;
+    let mut out = Vec::new();
+    for file in &files {
+        let text = ssh_exec(&target, &format!("cat {}", ssh_shell_quote(&file.path)), None)?;
+        for (k, v) in ssh_parse(&file.format, &text)? { out.push((strip_remote_prefix(config, &k, ""), v)); }
+    }
+    Ok(out)
+}
+
+// ---------- Account SSH keys ----------
+// Vultr and Hetzner have no updatable secret store. Both keep account SSH keys,
+// which is the one object a sync can maintain. A secret value must be a single
+// line public key; the secret name becomes the key name.
+fn ssh_public_key(name: &str, value: &str) -> Result<String, String> {
+    let key = value.trim();
+    let parts: Vec<&str> = key.split_whitespace().collect();
+    if parts.len() < 2 || !matches!(parts[0], "ssh-ed25519" | "ssh-rsa" | "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" | "sk-ssh-ed25519@openssh.com" | "sk-ecdsa-sha2-nistp256@openssh.com") {
+        return Err(format!("{:?} is not an OpenSSH public key (expected a single-line ssh-ed25519 or ssh-rsa key)", name));
+    }
+    Ok(key.to_string())
+}
+fn vultr_token(config: &Value) -> Result<String, String> {
+    let token = cfg(config, "api_key");
+    if token.is_empty() { return Err("Vultr requires api_key".into()); }
+    Ok(token.to_string())
+}
+async fn vultr_keys(client: &reqwest::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new(); let mut cursor = String::new();
+    for _ in 0..100 {
+        let url = format!("{}/ssh-keys?per_page=100{}", base, if cursor.is_empty() { String::new() } else { format!("&cursor={}", enc(&cursor)) });
+        let text = req(client.get(url).bearer_auth(token)).await.map_err(|e| format!("Vultr list SSH keys failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("Vultr invalid SSH key list: {}", e))?;
+        if let Some(items) = value.get("ssh_keys").and_then(Value::as_array) { out.extend(items.iter().cloned()); }
+        cursor = value.get("meta").and_then(|m| m.get("links")).and_then(|l| l.get("next")).and_then(Value::as_str).unwrap_or("").to_string();
+        if cursor.is_empty() { break; }
+    }
+    Ok(out)
+}
+pub async fn vultr_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let token = vultr_token(config)?; let mode = sync_mode(config, "vultr")?; let dry = is_dry(config);
+    let desired = trigger_desired(config, secrets);
+    let keys: Vec<(String, String)> = desired.iter().map(|(n, v)| ssh_public_key(n, v).map(|k| (n.clone(), k))).collect::<Result<_, _>>()?;
+    let client = http_client(); let root = format!("{}/ssh-keys", base(config, "https://api.vultr.com/v2"));
+    let remote = vultr_keys(&client, &base(config, "https://api.vultr.com/v2"), &token).await?;
+    let by_name: HashMap<String, (String, String)> = remote.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), (v.get("id")?.as_str()?.to_string(), v.get("ssh_key").and_then(Value::as_str).unwrap_or("").trim().to_string())))).collect();
     let (mut created, mut updated, mut unchanged) = (0, 0, 0);
     if !dry {
-        for (name, value) in &desired {
-            if let Some(id) = by_key.get(name) {
-                let detail = bitwarden_get(&client, &api, &token, id).await?;
-                if detail.get("value").and_then(Value::as_str) == Some(value.as_str()) { unchanged += 1; continue; }
-                let note = detail.get("note").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(default_note);
-                req(client.put(format!("{}/secrets/{}", api, enc(id))).bearer_auth(&token).json(&json!({"key": name, "value": value, "note": note, "projectIds": project_ids.clone(), "valueChanged": true}))).await.map_err(|e| format!("Bitwarden update {} failed: {}", name, e))?;
-                updated += 1;
-            } else {
-                req(client.post(format!("{}/organizations/{}/secrets", api, enc(&org))).bearer_auth(&token).json(&json!({"key": name, "value": value, "note": default_note, "projectIds": project_ids.clone()}))).await.map_err(|e| format!("Bitwarden create {} failed: {}", name, e))?;
-                created += 1;
+        for (name, key) in &keys {
+            match by_name.get(name) {
+                Some((_, current)) if current == key => unchanged += 1,
+                Some((id, _)) => { req(client.patch(format!("{}/{}", root, enc(id))).bearer_auth(&token).json(&json!({"ssh_key": key}))).await.map_err(|e| format!("Vultr update {} failed: {}", name, e))?; updated += 1; }
+                None => { req(client.post(&root).bearer_auth(&token).json(&json!({"name": name, "ssh_key": key}))).await.map_err(|e| format!("Vultr create {} failed: {}", name, e))?; created += 1; }
             }
         }
-        if mode == "mirror" {
-            let ids: Vec<Value> = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n)).filter_map(|n| by_key.get(n).map(|id| json!(id))).collect();
-            if !ids.is_empty() { req(client.post(format!("{}/secrets/delete", api)).bearer_auth(&token).json(&ids)).await.map_err(|e| format!("Bitwarden delete failed: {}", e))?; }
-        }
-    } else { for (name, _) in &desired { if by_key.contains_key(name) { updated += 1; } else { created += 1; } } }
-    let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_key.contains_key(*n)).count();
-    let managed = desired.iter().map(|(n, _)| n.clone()).collect();
-    Ok((format!("Bitwarden sync{}: created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, unchanged, deleted), managed))
+        if mode == "mirror" { for name in previous_managed { if keys.iter().any(|(n, _)| n == name) { continue; }
+            if let Some((id, _)) = by_name.get(name) { req(client.delete(format!("{}/{}", root, enc(id))).bearer_auth(&token)).await.map_err(|e| format!("Vultr delete {} failed: {}", name, e))?; } } }
+    } else { for (name, key) in &keys { match by_name.get(name) { Some((_, current)) if current == key => unchanged += 1, Some(_) => updated += 1, None => created += 1 } } }
+    let deleted = previous_managed.iter().filter(|n| !keys.iter().any(|(d, _)| d == *n) && by_name.contains_key(*n)).count();
+    let managed = keys.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Vultr sync{}: ssh keys created={} updated={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, created, updated, unchanged, deleted), managed))
 }
-pub async fn bitwarden_test(config: &Value) -> Result<String, String> {
-    let (api, _, _, _, org) = bitwarden_parts(config)?;
-    let client = http_client(); let token = bitwarden_token(&client, config).await?;
-    let list = bitwarden_list(&client, &api, &token, &org).await?;
-    Ok(format!("Bitwarden connection OK: {} secret(s) visible", list.len()))
+pub async fn vultr_test(config: &Value) -> Result<String, String> {
+    let token = vultr_token(config)?;
+    let list = vultr_keys(&http_client(), &base(config, "https://api.vultr.com/v2"), &token).await?;
+    Ok(format!("Vultr connection OK: {} SSH key(s) visible", list.len()))
+}
+fn hetzner_token(config: &Value) -> Result<String, String> {
+    let token = cfg(config, "token");
+    if token.is_empty() { return Err("Hetzner requires token".into()); }
+    Ok(token.to_string())
+}
+fn hetzner_id(value: &Value) -> Option<String> { value.get("id").and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string))).filter(|s| !s.is_empty()) }
+async fn hetzner_keys(client: &reqwest::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new(); let mut page = 1i64;
+    loop {
+        let text = req(client.get(format!("{}/ssh_keys?page={}&per_page=50", base, page)).bearer_auth(token)).await.map_err(|e| format!("Hetzner list SSH keys failed: {}", e))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("Hetzner invalid SSH key list: {}", e))?;
+        let items = value.get("ssh_keys").and_then(Value::as_array).cloned().unwrap_or_default();
+        let count = items.len();
+        out.extend(items);
+        let next = value.get("meta").and_then(|m| m.get("pagination")).and_then(|p| p.get("next_page")).and_then(Value::as_i64).unwrap_or(0);
+        if count == 0 || next == 0 { break; }
+        page = next;
+        if page > 100 { return Err("Hetzner SSH key list did not terminate".into()); }
+    }
+    Ok(out)
+}
+pub async fn hetzner_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let token = hetzner_token(config)?; let mode = sync_mode(config, "hetzner")?; let dry = is_dry(config);
+    let desired = trigger_desired(config, secrets);
+    let keys: Vec<(String, String)> = desired.iter().map(|(n, v)| ssh_public_key(n, v).map(|k| (n.clone(), k))).collect::<Result<_, _>>()?;
+    let client = http_client(); let root = format!("{}/ssh_keys", base(config, "https://api.hetzner.cloud/v1"));
+    let remote = hetzner_keys(&client, &base(config, "https://api.hetzner.cloud/v1"), &token).await?;
+    let by_name: HashMap<String, (String, String)> = remote.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), (hetzner_id(v)?, v.get("public_key").and_then(Value::as_str).unwrap_or("").trim().to_string())))).collect();
+    // The update call renames a key but cannot replace its material, so a changed
+    // key is deleted and created again. Its numeric id changes, and anything that
+    // referenced the old id loses it.
+    let (mut created, mut replaced, mut unchanged) = (0, 0, 0);
+    if !dry {
+        for (name, key) in &keys {
+            match by_name.get(name) {
+                Some((_, current)) if current == key => unchanged += 1,
+                Some((id, _)) => {
+                    req(client.delete(format!("{}/{}", root, enc(id))).bearer_auth(&token)).await.map_err(|e| format!("Hetzner replace {} failed while deleting the old key: {}", name, e))?;
+                    req(client.post(&root).bearer_auth(&token).json(&json!({"name": name, "public_key": key}))).await.map_err(|e| format!("Hetzner replace {} deleted the old key but the new one was rejected: {}", name, e))?;
+                    replaced += 1;
+                }
+                None => { req(client.post(&root).bearer_auth(&token).json(&json!({"name": name, "public_key": key}))).await.map_err(|e| format!("Hetzner create {} failed: {}", name, e))?; created += 1; }
+            }
+        }
+        if mode == "mirror" { for name in previous_managed { if keys.iter().any(|(n, _)| n == name) { continue; }
+            if let Some((id, _)) = by_name.get(name) { req(client.delete(format!("{}/{}", root, enc(id))).bearer_auth(&token)).await.map_err(|e| format!("Hetzner delete {} failed: {}", name, e))?; } } }
+    } else { for (name, key) in &keys { match by_name.get(name) { Some((_, current)) if current == key => unchanged += 1, Some(_) => replaced += 1, None => created += 1 } } }
+    let deleted = previous_managed.iter().filter(|n| !keys.iter().any(|(d, _)| d == *n) && by_name.contains_key(*n)).count();
+    let managed = keys.iter().map(|(n, _)| n.clone()).collect();
+    Ok((format!("Hetzner sync{}: ssh keys created={} replaced={} unchanged={} deleted={}", if dry { " (dry-run)" } else { "" }, created, replaced, unchanged, deleted), managed))
+}
+pub async fn hetzner_test(config: &Value) -> Result<String, String> {
+    let token = hetzner_token(config)?;
+    let list = hetzner_keys(&http_client(), &base(config, "https://api.hetzner.cloud/v1"), &token).await?;
+    Ok(format!("Hetzner connection OK: {} SSH key(s) visible", list.len()))
 }
 
 // ---------- Initial import ----------
@@ -2256,6 +2699,34 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             let list = humanitec_list(&http_client(), config).await?;
             Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("key")?.as_str()?, ""), v.get("value")?.as_str()?.to_string()))).collect())
         }
+        "scaleway_secret_manager" => {
+            let (base, region, token, project, path) = scaleway_parts(config)?;
+            let client = http_client(); let root = scaleway_root(&base, &region);
+            let mut out = Vec::new();
+            for secret in scaleway_list(&client, &root, &token, &project, &path).await? {
+                let name = secret.get("name").and_then(Value::as_str).unwrap_or("");
+                let id = secret.get("id").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() || id.is_empty() { continue; }
+                if let Some(value) = scaleway_latest(&client, &root, &token, id).await? { out.push((strip_remote_prefix(config, name, ""), value)); }
+            }
+            Ok(out)
+        }
+        "azure_app_configuration" => {
+            let (endpoint, host, id, secret) = appconfig_parts(config)?;
+            let list = appconfig_list(&http_client(), &endpoint, &host, &id, &secret, &appconfig_label(config)).await?;
+            Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("key")?.as_str()?, ""), v.get("value")?.as_str()?.to_string()))).collect())
+        }
+        "vultr" => {
+            let token = vultr_token(config)?;
+            let list = vultr_keys(&http_client(), &base(config, "https://api.vultr.com/v2"), &token).await?;
+            Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("name")?.as_str()?, ""), v.get("ssh_key")?.as_str()?.to_string()))).collect())
+        }
+        "hetzner" => {
+            let token = hetzner_token(config)?;
+            let list = hetzner_keys(&http_client(), &base(config, "https://api.hetzner.cloud/v1"), &token).await?;
+            Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("name")?.as_str()?, ""), v.get("public_key")?.as_str()?.to_string()))).collect())
+        }
+        "ssh" => ssh_file_pull(config).await,
         "ovh_kms" => {
             let client = ovh_kms_client(config)?;
             let (_, data, _) = ovh_kms_bundle(&client, config).await?;
@@ -2264,6 +2735,12 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
         "keeper" => {
             let records = keeper_records(config).await?;
             Ok(records.into_iter().map(|(title, (_, value))| (strip_remote_prefix(config, &title, ""), value)).collect())
+        }
+        "huggingface" => {
+            let (base_url, token, path) = huggingface_space(config)?;
+            if path.ends_with("/secrets") { return Err("Hugging Face Space secrets are write-only, so initial import is not possible; target variables instead".into()); }
+            let list = huggingface_space_list(&http_client(), &base_url, &token, &path).await?;
+            Ok(list.into_iter().filter_map(|(k, v)| Some((strip_remote_prefix(config, &k, ""), v?))).collect())
         }
         "oci_vault" => {
             let client = http_client(); let list = oci_list(&client, config).await?;
@@ -2276,20 +2753,6 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             }
             Ok(out)
         }
-        "bitwarden" => {
-            let (api, _, _, _, org) = bitwarden_parts(config)?;
-            let client = http_client(); let token = bitwarden_token(&client, config).await?;
-            let list = bitwarden_list(&client, &api, &token, &org).await?;
-            let mut out = Vec::new();
-            for item in list {
-                let name = item.get("key").and_then(Value::as_str).unwrap_or("");
-                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                if name.is_empty() || id.is_empty() { continue; }
-                let detail = bitwarden_get(&client, &api, &token, id).await?;
-                if let Some(value) = detail.get("value").and_then(Value::as_str) { out.push((strip_remote_prefix(config, name, ""), value.to_string())); }
-            }
-            Ok(out)
-        }
         "cursor" => Err("Cursor does not expose secret values, so initial import is not possible".into()),
         "devin" => Err("Devin does not expose secret values, so initial import is not possible".into()),
         "cloudflare_secrets_store" => Err("Cloudflare Secrets Store values are write-only, so initial import is not possible".into()),
@@ -2299,10 +2762,13 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
 }
 
 pub fn is_stateful(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault" | "bitwarden")
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "keeper" | "oci_vault" | "huggingface")
 }
 /// Stateful adapters return a report and the remote names they now own.
-pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
+pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
+    let located = secrets;
+    let flat = secret_keys(secrets);
+    let secrets = flat.as_slice();
     let result = match kind {
         "trigger" => trigger_sync(config, secrets, previous_managed).await,
         "instabox" => instabox_sync(config, secrets, previous_managed).await,
@@ -2333,17 +2799,22 @@ pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String
         "rundeck" => rundeck_sync(config, secrets, previous_managed).await,
         "cloud66" => cloud66_sync(config, secrets, previous_managed).await,
         "humanitec" => humanitec_sync(config, secrets, previous_managed).await,
+        "scaleway_secret_manager" => scaleway_sync(config, secrets, previous_managed).await,
+        "azure_app_configuration" => azure_app_configuration_sync(config, secrets, previous_managed).await,
+        "vultr" => vultr_sync(config, secrets, previous_managed).await,
+        "hetzner" => hetzner_sync(config, secrets, previous_managed).await,
+        "ssh" => ssh_file_sync(config, located, previous_managed).await,
         "ovh_kms" => ovh_kms_sync(config, secrets, previous_managed).await,
         "keeper" => keeper_sync(config, secrets, previous_managed).await,
         "oci_vault" => oci_vault_sync(config, secrets, previous_managed).await,
-        "bitwarden" => bitwarden_sync(config, secrets, previous_managed).await,
+        "huggingface" => huggingface_sync(config, secrets, previous_managed).await,
         _ => return None,
     };
     Some(result)
 }
 
 pub fn has_test(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "keeper" | "oci_vault" | "bitwarden")
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "ssh" | "keeper" | "oci_vault" | "huggingface")
 }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
     match kind {
@@ -2376,10 +2847,15 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "rundeck" => rundeck_test(config).await,
         "cloud66" => cloud66_test(config).await,
         "humanitec" => humanitec_test(config).await,
+        "scaleway_secret_manager" => scaleway_test(config).await,
+        "azure_app_configuration" => azure_app_configuration_test(config).await,
+        "vultr" => vultr_test(config).await,
+        "hetzner" => hetzner_test(config).await,
+        "ssh" => ssh_file_test(config).await,
         "ovh_kms" => ovh_kms_test(config).await,
         "keeper" => keeper_test(config).await,
         "oci_vault" => oci_vault_test(config).await,
-        "bitwarden" => bitwarden_test(config).await,
+        "huggingface" => huggingface_test(config).await,
         _ => Err(format!("connection test is not implemented for kind {}", kind)),
     }
 }
@@ -2553,6 +3029,43 @@ pub async fn openai_revoke_key(base_url: &str, admin_key: &str, project_id: &str
     let base = lease_base(&json!({"base_url": base_url}), "https://api.openai.com/v1")?;
     req(http_client().delete(format!("{}/organization/projects/{}/api_keys/{}", base, project_id, key_id)).bearer_auth(admin_key)).await
         .map_err(|e| format!("OpenAI key revocation failed: {}", e))?;
+    Ok(())
+}
+const HF_PERMISSIONS: &[&str] = &["repo.content.read","repo.contribute.write","repo.write","inference.serverless.write","inference.endpoints.infer.write","inference.endpoints.write","org.read","org.write","collection.read","collection.write","resourceGroup.write","job.write","org.serviceAccounts.read","org.serviceAccounts.write","org.auditLog.write"];
+/// Issue a fine-grained token for a Hugging Face organization service account.
+/// `POST /api/organizations/{org}/service-accounts/{id}/tokens` (Hub OpenAPI).
+pub async fn huggingface_create_token(config: &Value, name: &str) -> Result<Value, String> {
+    let token = cfg(config, "token");
+    let org = cfg(config, "org");
+    let service_account_id = cfg(config, "service_account_id");
+    if token.is_empty() || !key_ref_ok(org) || !key_ref_ok(service_account_id) {
+        return Err("huggingface lease requires config.token, org and service_account_id".into());
+    }
+    let display = if name.is_empty() { "openwarp" } else { name };
+    if display.len() > 100 { return Err("huggingface token name must be 1 to 100 characters".into()); }
+    let mut body = serde_json::Map::new();
+    body.insert("displayName".into(), json!(display));
+    if let Some(permissions) = config.get("permissions").and_then(|v| v.as_array()) {
+        if permissions.iter().any(|p| !HF_PERMISSIONS.contains(&p.as_str().unwrap_or(""))) {
+            return Err("huggingface permissions contain a value the Hub API does not accept".into());
+        }
+        body.insert("permissions".into(), json!(permissions));
+    }
+    let base = lease_base(config, "https://huggingface.co")?;
+    let url = format!("{}/api/organizations/{}/service-accounts/{}/tokens", base, org, service_account_id);
+    let text = req(http_client().post(url).bearer_auth(token).json(&Value::Object(body))).await
+        .map_err(|e| format!("Hugging Face token creation failed: {}", e))?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| format!("Hugging Face token response is not JSON: {}", e))?;
+    let secret = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let id = parsed.get("tokenInfo").and_then(|v| v.get("_id")).and_then(|v| v.as_str()).unwrap_or("");
+    if secret.is_empty() || !key_ref_ok(id) { return Err("Hugging Face token response is missing the token or its id".into()); }
+    Ok(json!({"token": secret, "id": id}))
+}
+pub async fn huggingface_revoke_token(base_url: &str, token: &str, org: &str, service_account_id: &str, token_id: &str) -> Result<(), String> {
+    if !key_ref_ok(org) || !key_ref_ok(service_account_id) || !key_ref_ok(token_id) { return Err("huggingface org, service account or token id is missing".into()); }
+    let base = lease_base(&json!({"base_url": base_url}), "https://huggingface.co")?;
+    req(http_client().delete(format!("{}/api/organizations/{}/service-accounts/{}/tokens/{}", base, org, service_account_id, token_id)).bearer_auth(token)).await
+        .map_err(|e| format!("Hugging Face token revocation failed: {}", e))?;
     Ok(())
 }
 fn chrono_now() -> String { chrono_now_at(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64) }
@@ -2865,6 +3378,24 @@ mod tests {
         assert_eq!(openai_body["expires_in_seconds"], 3600);
         assert_eq!(openai_body["scopes"][0], "api.responses.write");
         assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p == "/organization/projects/proj_1/api_keys/key_abc"));
+    }
+
+    #[tokio::test]
+    async fn huggingface_lease_creates_and_deletes_a_service_account_token() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /api/organizations/acme/service-accounts/sa_1/tokens", 201, r#"{"token":"hf_child","tokenInfo":{"_id":"tok_1","displayName":"lease","createdAt":"2026-01-01T00:00:00Z","repoIds":[],"repoPermissions":[],"endpointPatterns":[],"skipNetworkSecurity":false}}"#),
+            ("DELETE /api/organizations/acme/service-accounts/sa_1/tokens/tok_1", 204, ""),
+        ]));
+        let issued = huggingface_create_token(&json!({"token": "hf_admin", "org": "acme", "service_account_id": "sa_1", "permissions": ["repo.content.read"], "base_url": base}), "lease").await.expect("create");
+        assert_eq!(issued["token"], "hf_child");
+        huggingface_revoke_token(&base, "hf_admin", "acme", "sa_1", issued["id"].as_str().unwrap()).await.expect("revoke");
+        let calls = calls.lock().unwrap();
+        let body: Value = serde_json::from_str(&calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/tokens")).unwrap().3).unwrap();
+        assert_eq!(body["displayName"], "lease");
+        assert_eq!(body["permissions"][0], "repo.content.read");
+        assert!(calls.iter().any(|(m, p, h, _)| m == "DELETE" && p.ends_with("/tokens/tok_1") && h.contains("Bearer hf_admin")));
+        let err = huggingface_create_token(&json!({"token": "hf_admin", "org": "acme", "service_account_id": "sa_1", "permissions": ["not.a.permission"]}), "lease").await.unwrap_err();
+        assert!(err.contains("does not accept"), "{}", err);
     }
 
     #[tokio::test]
@@ -3503,29 +4034,204 @@ mod tests {
         assert_eq!(body["secretContent"]["content"], openwarp_crypto::b64(b"v1"));
         assert!(post.2.to_lowercase().contains("authorization: signature version=\"1\""), "{}", post.2);
     }
+
     #[tokio::test]
-    async fn bitwarden_creates_and_mirrors_secrets() {
+    async fn huggingface_space_sync_upserts_and_prunes_only_managed_names() {
         let (base, calls) = start_mock_routes(mock_routes(&[
-            ("POST /identity/connect/token", 200, "{\"access_token\":\"bw_token\"}"),
-            ("GET /organizations/org/secrets", 200, "{\"secrets\":[{\"id\":\"s1\",\"key\":\"OLD\"}],\"projects\":[]}"),
-            ("GET /secrets/s1", 200, "{\"id\":\"s1\",\"key\":\"OLD\",\"value\":\"1\",\"note\":\"old note\"}"),
-            ("POST /organizations/org/secrets", 200, "{\"id\":\"s2\",\"key\":\"API_KEY\"}"),
-            ("POST /secrets/delete", 200, "[]"),
+            ("GET /api/spaces/acme/app/secrets", 200, r#"{"KEEP":{"key":"KEEP","updatedAt":"2026-01-01T00:00:00.000Z"},"OLD":{"key":"OLD","updatedAt":"2026-01-01T00:00:00.000Z"}}"#),
+            ("POST /api/spaces/acme/app/secrets", 200, "{}"),
+            ("DELETE /api/spaces/acme/app/secrets", 200, "{}"),
         ]));
-        let config = json!({"api_url":base,"identity_url":format!("{}/identity/connect/token",base),"client_id":"user.abc","client_secret":"secret","organization_id":"org","mode":"mirror"});
-        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
-        let (report, _) = bitwarden_sync(&config, &secrets, &["OLD".to_string()]).await.expect("bitwarden sync");
-        assert!(report.contains("created=1"), "{}", report);
+        let config = json!({"token": "hf_admin", "namespace": "acme", "repo": "app", "base_url": base, "mode": "mirror"});
+        let secrets = vec![("KEEP".to_string(), "v1".to_string()), ("NEW_KEY".to_string(), "v2".to_string())];
+        let (report, managed) = huggingface_sync(&config, &secrets, &["OLD".to_string()]).await.expect("sync");
+        assert!(report.contains("created=1") && report.contains("updated=1") && report.contains("deleted=1"), "{}", report);
+        assert_eq!(managed, vec!["KEEP".to_string(), "NEW_KEY".to_string()]);
         let calls = calls.lock().unwrap();
-        let token = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/identity/connect/token").expect("token");
-        assert!(token.3.contains("grant_type=client_credentials"), "{}", token.3);
-        let create = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/organizations/org/secrets").expect("create");
-        let body: Value = serde_json::from_str(&create.3).expect("json");
-        assert_eq!(body["key"], "API_KEY");
-        assert_eq!(body["value"], "v1");
-        let delete = calls.iter().find(|(m,p,_,_)| m=="POST" && p=="/secrets/delete").expect("delete");
-        let ids: Value = serde_json::from_str(&delete.3).expect("json");
-        assert_eq!(ids[0], "s1");
+        assert!(calls.iter().any(|(m, _, _, b)| m == "DELETE" && b.contains("\"key\":\"OLD\"")));
+        assert!(!calls.iter().any(|(m, _, _, b)| m == "DELETE" && b.contains("NEW_KEY")));
+        let err = huggingface_sync(&json!({"token":"hf","namespace":"acme","repo":"app","base_url":base}), &[("bad-name".into(), "v".into())], &[]).await.unwrap_err();
+        assert!(err.contains("[A-Za-z]"), "{}", err);
     }
 
+    #[tokio::test]
+    async fn huggingface_variables_skip_an_unchanged_value() {
+        let (base, _) = start_mock_routes(mock_routes(&[
+            ("GET /api/spaces/acme/app/variables", 200, r#"{"KEEP":{"key":"KEEP","value":"same","updatedAt":"2026-01-01T00:00:00.000Z"}}"#),
+            ("POST /api/spaces/acme/app/variables", 200, "{}"),
+        ]));
+        let config = json!({"token": "hf_admin", "namespace": "acme", "repo": "app", "target": "variables", "base_url": base});
+        let (report, _) = huggingface_sync(&config, &[("KEEP".into(), "same".into())], &[]).await.expect("sync");
+        assert!(report.contains("unchanged=1"), "{}", report);
+        let imported = pull("huggingface", &config).await.expect("import");
+        assert_eq!(imported, vec![("KEEP".to_string(), "same".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn webhook_signs_the_body_with_the_log_stream_construction() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
+        let config = json!({"url": format!("{}/hook", base), "token": "bearer-token", "signing_secret": "hook-secret"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let report = webhook_sync(&config, &secrets).await.expect("webhook sync");
+        assert!(report.contains("signed"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
+        let body: Value = serde_json::from_str(&post.3).expect("json");
+        assert_eq!(body["secrets"]["API_KEY"], "v1");
+        let headers = post.2.to_lowercase();
+        assert!(headers.contains("authorization: bearer bearer-token"), "{}", post.2);
+        let timestamp = headers.lines().find_map(|l| l.strip_prefix("x-openwarp-timestamp:")).expect("timestamp header").trim();
+        let signature = headers.lines().find_map(|l| l.strip_prefix("x-openwarp-signature:")).expect("signature header").trim();
+        assert_eq!(signature, webhook_signature("hook-secret", timestamp.parse().unwrap(), &post.3));
+    }
+
+    #[tokio::test]
+    async fn webhook_without_a_signing_secret_stays_unsigned() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
+        let config = json!({"url": format!("{}/hook", base), "token": "bearer-token"});
+        webhook_sync(&config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("webhook sync");
+        let calls = calls.lock().unwrap();
+        let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
+        assert!(!post.2.to_lowercase().contains("x-openwarp-signature"), "no signature without a secret: {}", post.2);
+    }
+
+    #[tokio::test]
+    async fn scaleway_creates_a_secret_and_version_and_prunes_managed_names() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /secret-manager/v1beta1/regions/fr-par/secrets?", 200, "{\"secrets\":[{\"id\":\"sec-old\",\"name\":\"OLD\"}],\"total_count\":1}"),
+            ("POST /secret-manager/v1beta1/regions/fr-par/secrets HTTP", 200, "{\"id\":\"sec-new\",\"name\":\"API_KEY\"}"),
+            ("POST /secret-manager/v1beta1/regions/fr-par/secrets/sec-new/versions", 200, "{\"revision\":\"1\"}"),
+            ("DELETE /secret-manager/v1beta1/regions/fr-par/secrets/sec-old", 204, ""),
+        ]));
+        let config = json!({"base_url": base, "region": "fr-par", "secret_key": "scw_key", "project_id": "proj", "mode": "mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        let (report, _) = scaleway_sync(&config, &secrets, &["OLD".to_string()]).await.expect("scaleway sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert!(report.contains("deleted=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.split('?').next() == Some("/secret-manager/v1beta1/regions/fr-par/secrets")).expect("create");
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["name"], "API_KEY");
+        assert_eq!(body["project_id"], "proj");
+        assert_eq!(body["type"], "opaque");
+        let version = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/versions")).expect("version");
+        let version_body: Value = serde_json::from_str(&version.3).expect("json");
+        assert_eq!(version_body["data"], openwarp_crypto::b64(b"v1"));
+        assert!(calls.iter().any(|(m, _, h, _)| m == "GET" && h.to_lowercase().contains("x-auth-token: scw_key")));
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p.ends_with("/secrets/sec-old")));
+    }
+
+    #[tokio::test]
+    async fn scaleway_unchanged_value_adds_no_version() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /secret-manager/v1beta1/regions/fr-par/secrets?", 200, "{\"secrets\":[{\"id\":\"sec-1\",\"name\":\"API_KEY\"}],\"total_count\":1}"),
+            ("GET /secret-manager/v1beta1/regions/fr-par/secrets/sec-1/versions/latest/access", 200, &format!("{{\"data\":\"{}\"}}", openwarp_crypto::b64(b"v1"))),
+        ]));
+        let config = json!({"base_url": base, "region": "fr-par", "secret_key": "scw_key", "project_id": "proj"});
+        let (report, _) = scaleway_sync(&config, &[("API_KEY".to_string(), "v1".to_string())], &[]).await.expect("scaleway sync");
+        assert!(report.contains("unchanged=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().all(|(m, _, _, _)| m == "GET"), "an unchanged value must not write: {:?}", calls.iter().map(|(m, p, _, _)| format!("{} {}", m, p)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn azure_app_configuration_sets_a_key_and_prunes_managed_names() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /kv?key=*&label=%00&api-version=1.0", 200, "{\"items\":[{\"key\":\"OLD\",\"value\":\"1\"}]}"),
+            ("PUT /kv/API_KEY?api-version=1.0", 200, "{\"key\":\"API_KEY\",\"value\":\"v1\"}"),
+            ("DELETE /kv/OLD?api-version=1.0", 200, "{\"key\":\"OLD\"}"),
+        ]));
+        let key_id = format!("id-{}", "appconfig"); let key_secret = format!("secret-{}", "appconfig");
+        let config = json!({"endpoint": base, "id": key_id, "secret": openwarp_crypto::b64(key_secret.as_bytes()), "mode": "mirror"});
+        let (report, _) = azure_app_configuration_sync(&config, &[("API_KEY".to_string(), "v1".to_string())], &["OLD".to_string()]).await.expect("appconfig sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert!(report.contains("deleted=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(m, _, _, _)| m == "PUT").expect("put");
+        let body: Value = serde_json::from_str(&put.3).expect("json");
+        assert_eq!(body["value"], "v1");
+        let headers = &put.2;
+        assert!(headers.to_lowercase().contains(&format!("authorization: hmac-sha256 credential={}&signedheaders=x-ms-date;host;x-ms-content-sha256&signature=", key_id)), "{}", headers);
+        let date = headers.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-ms-date")).map(|(_, v)| v.trim().to_string())).expect("date");
+        let content_hash = headers.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-ms-content-sha256")).map(|(_, v)| v.trim().to_string())).expect("hash");
+        assert_eq!(content_hash, openwarp_crypto::b64(&Sha256::digest(put.3.as_bytes())));
+        let parsed = reqwest::Url::parse(&base).unwrap();
+        let host = match parsed.port() { Some(p) => format!("{}:{}", parsed.host_str().unwrap(), p), None => parsed.host_str().unwrap().to_string() };
+        let to_sign = format!("PUT\n/kv/API_KEY?api-version=1.0\n{};{};{}", date, host, content_hash);
+        let expected = openwarp_crypto::b64(&hmac(key_secret.as_bytes(), to_sign.as_bytes()));
+        assert!(headers.contains(&format!("Signature={}", expected)), "signature mismatch: {}", headers);
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p.starts_with("/kv/OLD?")));
+    }
+
+    const PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYQJZ7VR/OW5fqVOvmn+BRt5SLWDPx2UVO3ALmn21ZE openwarp-test";
+    const PUBKEY_NEW: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYQJZ7VR/OW5fqVOvmn+BRt5SLWDPx2UVO3ALmn21ZE replaced";
+
+    #[tokio::test]
+    async fn vultr_creates_and_patches_ssh_keys_and_prunes_managed_names() {
+        let listed = format!("{{\"ssh_keys\":[{{\"id\":\"key-old\",\"name\":\"OLD\",\"ssh_key\":\"{}\"}},{{\"id\":\"key-1\",\"name\":\"DEPLOY\",\"ssh_key\":\"{}\"}}],\"meta\":{{\"links\":{{\"next\":\"\"}}}}}}", PUBKEY, PUBKEY);
+        let (base, calls) = start_mock_routes(vec![
+            ("GET /ssh-keys?per_page=100".into(), 200, listed),
+            ("PATCH /ssh-keys/key-1".into(), 200, "{}".into()),
+            ("POST /ssh-keys".into(), 201, "{\"ssh_key\":{\"id\":\"key-2\"}}".into()),
+            ("DELETE /ssh-keys/key-old".into(), 204, String::new()),
+        ]);
+        let config = json!({"base_url": base, "api_key": "vultr-key", "mode": "mirror"});
+        let secrets = vec![("DEPLOY".to_string(), PUBKEY_NEW.to_string()), ("BUILD".to_string(), PUBKEY.to_string())];
+        let (report, _) = vultr_sync(&config, &secrets, &["OLD".to_string()]).await.expect("vultr sync");
+        assert!(report.contains("created=1"), "{}", report);
+        assert!(report.contains("updated=1"), "{}", report);
+        assert!(report.contains("deleted=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let patch = calls.iter().find(|(m, _, _, _)| m == "PATCH").expect("patch");
+        assert_eq!(serde_json::from_str::<Value>(&patch.3).unwrap()["ssh_key"], PUBKEY_NEW);
+        let post = calls.iter().find(|(m, p, _, _)| m == "POST" && p == "/ssh-keys").expect("create");
+        let body: Value = serde_json::from_str(&post.3).unwrap();
+        assert_eq!(body["name"], "BUILD");
+        assert_eq!(body["ssh_key"], PUBKEY);
+        assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p == "/ssh-keys/key-old"));
+    }
+
+    #[tokio::test]
+    async fn vultr_rejects_a_value_that_is_not_a_public_key() {
+        let (base, calls) = start_mock_routes(mock_routes(&[]));
+        let config = json!({"base_url": base, "api_key": "vultr-key"});
+        let err = vultr_sync(&config, &[("DEPLOY".to_string(), "not a key".to_string())], &[]).await.unwrap_err();
+        assert!(err.contains("not an OpenSSH public key"), "{}", err);
+        assert!(calls.lock().unwrap().is_empty(), "validation must fail before any request");
+    }
+
+    #[tokio::test]
+    async fn hetzner_replaces_a_changed_key_and_prunes_managed_names() {
+        let listed = format!("{{\"ssh_keys\":[{{\"id\":7,\"name\":\"OLD\",\"public_key\":\"{}\"}},{{\"id\":9,\"name\":\"DEPLOY\",\"public_key\":\"{}\"}}],\"meta\":{{\"pagination\":{{\"next_page\":null}}}}}}", PUBKEY, PUBKEY);
+        let (base, calls) = start_mock_routes(vec![
+            ("GET /ssh_keys?page=1&per_page=50".into(), 200, listed),
+            ("DELETE /ssh_keys/9".into(), 204, String::new()),
+            ("DELETE /ssh_keys/7".into(), 204, String::new()),
+            ("POST /ssh_keys".into(), 201, "{\"ssh_key\":{\"id\":11}}".into()),
+        ]);
+        let config = json!({"base_url": base, "token": "hetzner-token", "mode": "mirror"});
+        let (report, _) = hetzner_sync(&config, &[("DEPLOY".to_string(), PUBKEY_NEW.to_string())], &["OLD".to_string()]).await.expect("hetzner sync");
+        assert!(report.contains("replaced=1"), "{}", report);
+        assert!(report.contains("deleted=1"), "{}", report);
+        let calls = calls.lock().unwrap();
+        let order: Vec<String> = calls.iter().map(|(m, p, _, _)| format!("{} {}", m, p)).collect();
+        let replace_at = order.iter().position(|c| c == "DELETE /ssh_keys/9").expect("old key deleted");
+        let create_at = order.iter().position(|c| c == "POST /ssh_keys").expect("new key created");
+        assert!(replace_at < create_at, "the old key must be removed before the replacement: {:?}", order);
+        let post = calls.iter().find(|(m, _, _, _)| m == "POST").unwrap();
+        let body: Value = serde_json::from_str(&post.3).unwrap();
+        assert_eq!(body["name"], "DEPLOY");
+        assert_eq!(body["public_key"], PUBKEY_NEW);
+        assert!(order.iter().any(|c| c == "DELETE /ssh_keys/7"), "mirror should remove the managed key");
+    }
+
+    #[tokio::test]
+    async fn hetzner_unchanged_key_makes_no_writes() {
+        let listed = format!("{{\"ssh_keys\":[{{\"id\":9,\"name\":\"DEPLOY\",\"public_key\":\"{}\"}}],\"meta\":{{\"pagination\":{{\"next_page\":null}}}}}}", PUBKEY);
+        let (base, calls) = start_mock_routes(vec![("GET /ssh_keys?page=1&per_page=50".into(), 200, listed)]);
+        let config = json!({"base_url": base, "token": "hetzner-token"});
+        let (report, _) = hetzner_sync(&config, &[("DEPLOY".to_string(), format!("  {}\n", PUBKEY))], &[]).await.expect("hetzner sync");
+        assert!(report.contains("unchanged=1"), "{}", report);
+        assert!(calls.lock().unwrap().iter().all(|(m, _, _, _)| m == "GET"));
+    }
 }

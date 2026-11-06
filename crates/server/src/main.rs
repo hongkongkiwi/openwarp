@@ -794,11 +794,12 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid)?;
-    let pairs: Vec<(String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, _)| (k.clone(), v.clone())).collect();
+    let located: Vec<(String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone())).collect();
+    let pairs = integrations::secret_keys(&located);
     if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let result = integrations::sync_managed(&kind, &config, &pairs, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
+        let result = integrations::sync_managed(&kind, &config, &located, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
         let (msg, managed) = match result {
             Ok(x) => x,
             Err(e) => {
