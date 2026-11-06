@@ -103,11 +103,11 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
         let root = format!("{}/api/v1/projects/{}/envvars/{}", base_url, tg.project_ref, tg.env);
         let list_text = match req(client.get(&root).bearer_auth(&tg.token)).await { Ok(x) => x, Err(e) => { failures += 1; reports.push(format!("{}/{}: list failed: {}", tg.project_ref, tg.env, e)); continue; } };
         let remote_list: Vec<Value> = serde_json::from_str(&list_text).unwrap_or_default();
-        let remote: std::collections::HashMap<String, String> = remote_list.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v.get("value")?.as_str()?.to_string()))).collect();
+        let remote: std::collections::HashMap<String, Option<String>> = remote_list.iter().filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())))).collect();
         let (mut created, mut updated, mut unchanged, mut deleted) = (0, 0, 0, 0);
         if !dry {
             let mut bulk: Vec<Value> = Vec::new();
-            for (name, value) in &desired { match remote.get(name) { None => bulk.push(json!({"name":name,"value":value})), Some(old) if old != value => bulk.push(json!({"name":name,"value":value})), Some(_) => unchanged += 1 } }
+            for (name, value) in &desired { match remote.get(name) { None => bulk.push(json!({"name":name,"value":value})), Some(None) => bulk.push(json!({"name":name,"value":value})), Some(Some(old)) if old != value => bulk.push(json!({"name":name,"value":value})), Some(Some(_)) => unchanged += 1 } }
             created = bulk.iter().filter(|v| !remote.contains_key(v.get("name").and_then(|x| x.as_str()).unwrap_or(""))).count();
             updated = bulk.len() - created;
             if !bulk.is_empty() { if let Err(e) = req(client.post(format!("{}/import", root)).bearer_auth(&tg.token).json(&json!({"variables": bulk, "override": true}))).await { failures += 1; reports.push(format!("{}/{}: import failed: {}", tg.project_ref, tg.env, e)); continue; } }
@@ -115,7 +115,7 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
                 for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) {
                     match req(client.delete(format!("{}/{}", root, name)).bearer_auth(&tg.token)).await { Ok(_) => deleted += 1, Err(e) => delete_errors.push(format!("{}: {}", name, e)) } } }
                 if !delete_errors.is_empty() { failures += 1; reports.push(format!("{}/{}: delete failed: {}", tg.project_ref, tg.env, delete_errors.join("; "))); } }
-        } else { for (name, value) in &desired { match remote.get(name) { None => created += 1, Some(old) if old != value => updated += 1, Some(_) => unchanged += 1 } }
+        } else { for (name, value) in &desired { match remote.get(name) { None => created += 1, Some(None) => updated += 1, Some(Some(old)) if old != value => updated += 1, Some(Some(_)) => unchanged += 1 } }
             if mode == "mirror" { for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) { deleted += 1; } } } }
         for (n, _) in &desired { if !managed.contains(n) { managed.push(n.clone()); } }
         reports.push(format!("{}/{}: created={} updated={} unchanged={} deleted={}{}", tg.project_ref, tg.env, created, updated, unchanged, deleted, if dry { " (dry-run)" } else { "" }));
@@ -414,7 +414,9 @@ mod tests {
     fn header_end(buf: &[u8]) -> Option<usize> { buf.windows(4).position(|w| w == b"\r\n\r\n") }
     fn content_length(head: &str) -> usize { head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse().ok() } else { None } }).unwrap_or(0) }
 
-    fn start_mock() -> (String, Calls) {
+    fn start_mock() -> (String, Calls) { start_mock_with(None) }
+
+    fn start_mock_with(envvars: Option<Value>) -> (String, Calls) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
         let addr = listener.local_addr().expect("mock addr");
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -440,7 +442,9 @@ mod tests {
                 let len = content_length(&head);
                 let body = String::from_utf8_lossy(&buf[end + 4..(end + 4 + len).min(buf.len())]).to_string();
                 sink.lock().unwrap().push((method.clone(), path.clone(), body));
-                let (status, payload) = if method == "GET" && path.contains("/environments") {
+                let (status, payload) = if method == "GET" && path.contains("/envvars") {
+                        ("200 OK", envvars.clone().unwrap_or(json!([])).to_string())
+                    } else if method == "GET" && path.contains("/environments") {
                         ("200 OK", json!({"environments": [{"id": "env-1", "name": "base", "envContents": "OLD=1\n"}]}).to_string())
                     } else if method == "GET" && path.contains("/secret") {
                         ("200 OK", json!({"items": [{"id": "sec-1", "name": "OLD"}]}).to_string())
@@ -568,6 +572,16 @@ mod tests {
         let secrets = vec![("API_KEY".to_string(), "v".to_string())];
         let error = instabox_sync(&config, &secrets, &[]).await.expect_err("missing hosts");
         assert!(error.contains("allow_all_hosts"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn trigger_mirror_prunes_a_name_without_a_value() {
+        let (base, calls) = start_mock_with(Some(json!([{"name": "OLD", "value": "1"}, {"name": "NOVALUE"}])));
+        let config = json!({"token": "tr_pat_test", "project_ref": "proj", "target_env": "prod", "base_url": base, "mode": "mirror"});
+        let secrets = vec![("API_KEY".to_string(), "v".to_string())];
+        let (report, _) = trigger_sync(&config, &secrets, &["NOVALUE".to_string()]).await.expect("trigger sync");
+        assert!(report.contains("deleted=1"), "{}", report);
+        assert!(calls.lock().unwrap().iter().any(|(m, p, _)| m == "DELETE" && p.ends_with("/NOVALUE")), "a name without a value must still be pruned");
     }
 
     #[tokio::test]

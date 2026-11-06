@@ -33,9 +33,22 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
 
 fn config_path() -> std::path::PathBuf { let home = std::env::var("HOME").unwrap_or_else(|_| ".".into()); std::path::Path::new(&home).join(".openwarp").join("config.json") }
 fn load_config() -> Value { std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
-fn save_config(v: &Value) { let p = config_path(); if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
-    std::fs::write(&p, serde_json::to_string_pretty(v).unwrap()).expect("write config");
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)); } }
+fn save_config(v: &Value) {
+    let p = config_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)); }
+    }
+    let data = serde_json::to_string_pretty(v).expect("serialize config");
+    #[cfg(unix)] {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p).expect("write config");
+        f.write_all(data.as_bytes()).expect("write config");
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))] { std::fs::write(&p, data).expect("write config"); }
+}
 fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
 fn load_local_config() -> Value { std::fs::read_to_string(".openwarp.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
 fn pick(explicit: &str, local: &Value, key: &str, flag: &str) -> String {
