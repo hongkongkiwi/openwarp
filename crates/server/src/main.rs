@@ -963,12 +963,16 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { rate_fail(&key); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
         if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { rate_fail(&key); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
-        rate_clear(&key); db::s(&row, "id") };
+        db::s(&row, "id") };
     if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
+    let otp_key = format!("otp:{}:{}", addr.ip(), uid);
+    if !rate_allowed(&otp_key) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
     if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")) {
+        rate_fail(&otp_key);
         let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
         return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
     }
+    rate_clear(&otp_key);
     let state = form.get("state").cloned().unwrap_or_default();
     if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::temporary(&format!("{}?error=access_denied&state={}", redirect, urlencode(&state))).into_response(); }
     let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));
@@ -1130,10 +1134,10 @@ async fn main() {
 }
 fn load_master(db: &Db) -> Result<[u8;32], String> {
     if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") { if let Ok(b) = oc::unb64(&v) { if let Ok(k) = b.try_into() { return Ok(k); } } }
-    if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='master'", &[]) { if let Ok(b) = oc::unb64(&db::s(&r,"v")) { if let Ok(k) = b.try_into() { return Ok(k); } } }
     if std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) {
-        return Err("OPENWARP_MASTER_KEY is required in production; refusing to generate a key and store it in the application database".into());
+        return Err("OPENWARP_MASTER_KEY is required in production. If this database already has a generated key in the meta table, copy it into OPENWARP_MASTER_KEY, or start once with OPENWARP_ENV unset and set the key before going live.".into());
     }
+    if let Ok(Some(r)) = db.one("SELECT v FROM meta WHERE k='master'", &[]) { if let Ok(b) = oc::unb64(&db::s(&r,"v")) { if let Ok(k) = b.try_into() { return Ok(k); } } }
     let k = oc::random_key(); let _ = db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&k))]);
     eprintln!("warning: OPENWARP_MASTER_KEY is not set; a generated key was stored in the database. Set OPENWARP_MASTER_KEY before production use.");
     Ok(k)

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
+static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Resp {
     status: u16,
@@ -59,6 +60,7 @@ impl Server {
     }
 
     async fn start_with_public(public_url: Option<&str>) -> Server {
+        let _start = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-it-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -675,6 +677,42 @@ async fn allowlist_cannot_be_bypassed_through_another_organisation() {
     assert_eq!(r.status, 403, "a permissive second org must not unlock the first org's allowlist, got {} {}", r.status, r.text);
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs_b[0]), Some(token), None).await;
     assert_eq!(r.status, 200, "the allowing org should still work: {}", r.text);
+}
+
+#[tokio::test]
+async fn oauth_consent_limits_otp_guessing() {
+    let s = Server::start().await;
+    let victim = register(&s, "otp@test.invalid").await;
+    let token = victim["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/me/totp/setup", Some(&token), Some(json!({}))).await;
+    let secret = r.body["secret"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/me/totp/verify", Some(&token), Some(json!({"code": totp(&secret)}))).await;
+    assert_eq!(r.status, 200, "totp verify failed: {}", r.text);
+
+    let r = s.call(Method::POST, "/oauth/register", None, Some(json!({"redirect_uris": ["http://127.0.0.1:8917/callback"], "token_endpoint_auth_method": "none"}))).await;
+    let client_id = r.body["client_id"].as_str().unwrap().to_string();
+    let verifier = "integration-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
+    let challenge = { use sha2::{Digest, Sha256}; base64url(&Sha256::digest(verifier.as_bytes())) };
+    let form = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", client_id),
+        ("redirect_uri", "http://127.0.0.1:8917/callback".to_string()),
+        ("scope", "secrets:read".to_string()),
+        ("state", "s".to_string()),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256".to_string()),
+        ("email", "otp@test.invalid".to_string()),
+        ("password", "correct-horse-battery".to_string()),
+        ("otp", "000000".to_string()),
+        ("approve", "1".to_string()),
+    ];
+    let mut last = 0;
+    for _ in 0..8 {
+        let r = s.form("/oauth/authorize/decision", &form, None).await;
+        last = r.status;
+        if last == 429 { break; }
+    }
+    assert_eq!(last, 429, "repeated wrong OTP codes were not rate limited");
 }
 
 #[tokio::test]
