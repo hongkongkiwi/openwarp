@@ -43,20 +43,24 @@ const OAUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-act
 const OAUTH_MFA_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const OAUTH_AUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const OAUTH_AUTH_JS: &str = r#"<script src="/auth-v2.js"></script><script>
-document.getElementById('oauthlogin').addEventListener('submit', async function(e) {
+document.getElementById('oauthlogin').addEventListener('submit', function(e) {
+  e.preventDefault();
   var f = e.target;
-  try {
-    var kdf = await AuthV2.kdf(f.email.value);
-    if (kdf.version === 1) return;
-    e.preventDefault();
-    var keys = await AuthV2.deriveKeys(f.password.value, kdf.salt, kdf.iterations);
-    var ch = await AuthV2.challenge(f.email.value);
-    var proof = await AuthV2.proof(keys.auth, ch.challenge, ch.challenge_id);
-    f.password.value = '';
-    function add(name, value) { var i = document.createElement('input'); i.type = 'hidden'; i.name = name; i.value = value; f.appendChild(i); }
-    add('challenge_id', ch.challenge_id);
-    add('proof', proof);
-  } catch (err) { e.preventDefault(); alert(err.message || String(err)); }
+  (async function() {
+    try {
+      function add(name, value) { var i = document.createElement('input'); i.type = 'hidden'; i.name = name; i.value = value; f.appendChild(i); }
+      var kdf = await AuthV2.kdf(f.email.value);
+      if (kdf.version === 1) { add('approve', '1'); f.submit(); return; }
+      var keys = await AuthV2.deriveKeys(f.password.value, kdf.salt, kdf.iterations);
+      var ch = await AuthV2.challenge(f.email.value);
+      var proof = await AuthV2.proof(keys.auth, ch.challenge, ch.challenge_id);
+      f.password.value = '';
+      add('challenge_id', ch.challenge_id);
+      add('proof', proof);
+      add('approve', '1');
+      f.submit();
+    } catch (err) { alert(err.message || String(err)); }
+  })();
 });
 </script>"#;
 fn html_csp(body: String) -> Response { html_csp_with(OAUTH_CSP, body) }
@@ -390,6 +394,8 @@ async fn auth_kdf(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let email = q.get("email").cloned().unwrap_or_default().trim().to_lowercase();
     if let Some(r) = st.db.one("SELECT auth_version,kdf_salt,kdf_iterations,kdf_algo FROM users WHERE email=?", &[json!(&email)]).map_err(|e| bad(&e))? {
         if db::n(&r, "auth_version") == 2 {
+            if !valid_kdf(&db::s(&r,"kdf_salt"), db::n(&r,"kdf_iterations"), &db::s(&r,"kdf_algo")) {
+                return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "this account's sign-in parameters are invalid; reset your password")); }
             return Ok(j(json!({"version":2, "salt":db::s(&r,"kdf_salt"), "iterations":db::n(&r,"kdf_iterations"), "algo":db::s(&r,"kdf_algo")}))); }
         return Ok(j(json!({"version":1}))); }
     Ok(j(json!({"version":2, "salt":oc::b64(&oc::random_key()[..16]), "iterations":KDF_ITERATIONS, "algo":KDF_ALGO}))) }
@@ -445,9 +451,10 @@ async fn login_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let email = r.email.trim().to_lowercase();
     let key = format!("login:{}:{}", addr.ip(), email);
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
-    let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.pubkey AS pubkey,u.wrapped_privkey AS wrapped_privkey,u.auth_key_enc AS auth_key_enc FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]).map_err(|e| bad(&e))? {
+    let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.pubkey AS pubkey,u.wrapped_privkey AS wrapped_privkey,u.auth_key_enc AS auth_key_enc,u.kdf_salt AS kdf_salt,u.kdf_iterations AS kdf_iterations,u.kdf_algo AS kdf_algo FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&r.challenge_id))]).map_err(|e| bad(&e))? {
         Some(x) => x, None => { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
-    if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2 {
+    if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2
+        || !valid_kdf(&db::s(&row,"kdf_salt"), db::n(&row,"kdf_iterations"), &db::s(&row,"kdf_algo")) {
         st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
     let auth_key = oc::decrypt_symmetric_aad(&st.master, &auth_key_aad(&db::s(&row, "user_id")), &db::s(&row, "auth_key_enc")).map_err(|_| bad("authentication key is unavailable"))?;
     if !verify_proof(&auth_key, &db::s(&row, "challenge"), &r.challenge_id, &r.proof) {
@@ -462,7 +469,7 @@ async fn login_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     if verification_required() && db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.audit("", "", "", &uid, "auth.login_v2", "");
     login_outcome(&st, &uid, &db::s(&row, "pubkey"), Some(&db::s(&row, "wrapped_privkey"))) }
-#[derive(Deserialize, Default)] struct ResetV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
+#[derive(Deserialize, Default)] struct ResetV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String, #[serde(default)] discard_e2e_key: bool }
 async fn reset_password_v2(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<ResetV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance")); }
     let key = format!("reset:{}", addr.ip());
@@ -477,6 +484,11 @@ async fn reset_password_v2(State(st): State<S>, axum::extract::ConnectInfo(addr)
         .ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
     st.rate_fail(&key, 900);
     let uid = db::s(&row, "user_id");
+    let user = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("account not found"))?;
+    let stored_pub = db::s(&user, "pubkey");
+    let replaced = r.public_key != stored_pub;
+    if replaced && !r.discard_e2e_key {
+        return Err(bad("recovery kit does not match this account; pass discard_e2e_key=true to replace your key and lose end-to-end access")); }
     let auth_key_enc = oc::encrypt_symmetric_aad(&st.master, &auth_key_aad(&uid), &auth_key);
     let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
     st.db.exec("UPDATE users SET pass_hash=?,pubkey=?,wrapped_privkey=?,email_verified=1,auth_version=2,kdf_salt=?,kdf_iterations=?,kdf_algo=?,auth_key_enc=? WHERE id=?",
@@ -484,7 +496,7 @@ async fn reset_password_v2(State(st): State<S>, axum::extract::ConnectInfo(addr)
     let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]);
     let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]);
     let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]);
-    st.audit("", "", "", &uid, "auth.password_reset_v2", "");
+    st.audit("", "", "", &uid, "auth.password_reset_v2", if replaced { "key replaced" } else { "kit supplied" });
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)) }
 #[derive(Deserialize, Default)] struct ResetInfoReq { token: String }
 async fn reset_info(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<ResetInfoReq>) -> Res {
@@ -492,8 +504,8 @@ async fn reset_info(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
     if !st.rate_ok(&key, 20, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
     st.rate_fail(&key, 900);
     let hash = oc::hash_token(r.token.trim());
-    let row = st.db.one("SELECT u.public_key AS public_key,u.auth_version AS auth_version FROM auth_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.kind='reset' AND t.used=0 AND t.expires_at>?",
-        &[json!(&hash), json!(now())]).map_err(|e| bad(&e))?
+    let row = st.db.one("SELECT u.pubkey AS public_key,u.auth_version AS auth_version FROM auth_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.kind='reset' AND t.used=0 AND t.expires_at>?",
+        &[json!(&hash), json!(now())]).map_err(|_| bad("reset link is invalid, already used, or expired"))?
         .ok_or_else(|| bad("reset link is invalid, already used, or expired"))?;
     Ok(j(json!({"public_key": db::s(&row, "public_key"), "auth_version": db::n(&row, "auth_version")}))) }
 async fn me_auth(State(st): State<S>, h: HeaderMap) -> Res {
@@ -2462,9 +2474,10 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         let proof = form.get("proof").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr.ip(), email);
         if !st.rate_ok(&key, 5, 900) { return oauth_error_page(StatusCode::TOO_MANY_REQUESTS, "Too many failed sign-in attempts. Try again later."); }
-        let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.auth_key_enc AS auth_key_enc FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&cid))]) {
+        let row = match st.db.one("SELECT c.user_id AS user_id,c.challenge AS challenge,c.created_at AS created_at,u.email AS email,u.auth_version AS auth_version,u.active AS active,u.email_verified AS email_verified,u.auth_key_enc AS auth_key_enc,u.kdf_salt AS kdf_salt,u.kdf_iterations AS kdf_iterations,u.kdf_algo AS kdf_algo FROM auth_challenges c JOIN users u ON u.id=c.user_id WHERE c.id_hash=?", &[json!(oc::hash_token(&cid))]) {
             Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); } };
-        if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2 {
+        if db::n(&row, "created_at") + 120 < now() || db::s(&row, "email") != email || db::n(&row, "auth_version") != 2
+            || !valid_kdf(&db::s(&row,"kdf_salt"), db::n(&row,"kdf_iterations"), &db::s(&row,"kdf_algo")) {
             st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); }
         let auth_key = match oc::decrypt_symmetric_aad(&st.master, &auth_key_aad(&db::s(&row, "user_id")), &db::s(&row, "auth_key_enc")) {
             Ok(k) => k, Err(_) => return oauth_error_page(StatusCode::INTERNAL_SERVER_ERROR, "Authentication key is unavailable.") };
@@ -2667,7 +2680,7 @@ out.innerHTML='';var pre=document.createElement('pre');pre.textContent=d.value!=
 async fn index() -> Response {
     let mut r = Html(ui::INDEX).into_response();
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
     r }
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     let mut res = next.run(req).await;

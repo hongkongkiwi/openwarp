@@ -16,6 +16,7 @@ const AuthV2 = (() => {
   }
   function hex(bytes) { return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(''); }
   async function deriveKeys(password, saltB64, iterations) {
+    if (!Number.isFinite(Number(iterations)) || Number(iterations) < 600000) throw new Error('unsupported KDF parameters');
     const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
     const bits = new Uint8Array(await crypto.subtle.deriveBits(
       { name: 'PBKDF2', salt: b64dec(saltB64), iterations: Number(iterations), hash: 'SHA-256' }, base, 512));

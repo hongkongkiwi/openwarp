@@ -115,11 +115,11 @@ also upgrades a version 1 account.
 
 ## Upgrade
 
-`POST /api/me/upgrade-auth` accepts the same KDF fields and wrapped key for an
-authenticated version 1 account. The client must hold the private key, so it
-needs the recovery kit (browser Settings) or the current password (CLI, which
-can unwrap the version 1 blob locally). The server never sees the password or
-the wrapping key. Version 1 accounts that do not upgrade keep the old behaviour.
+Password reset is the supported upgrade path: a valid reset link plus the new
+KDF fields and wrapped key upgrades a version 1 account to version 2. An explicit
+`/api/me/upgrade-auth` endpoint is not exposed yet; a future one would need the
+recovery kit in the browser (or the current password in the CLI) to rewrap the
+private key. Version 1 accounts that do not reset keep the old behaviour.
 
 ## MFA and OAuth consent
 

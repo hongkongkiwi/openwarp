@@ -199,12 +199,12 @@ async function resetPassword(){try{
   if(password.length<8){toast('Password must be at least 8 characters',true);return}
   let info=await api('POST','/api/auth/reset-info',{token});
   let secret,pubkey;
-  if(kit){secret=AuthV2.b64dec(kit);pubkey=OW.b64enc(OW.x25519Pub(secret));if(info.public_key&&pubkey!==info.public_key){toast('The recovery kit does not match this account',true);return}}
+  if(kit){secret=AuthV2.b64dec(kit);pubkey=OW.b64enc(await OW.x25519Pub(secret));if(info.public_key&&pubkey!==info.public_key){toast('The recovery kit does not match this account',true);return}}
   else if($('rp-discard').checked){let kp=await OW.generateKeypair();secret=kp.secret;pubkey=kp.public}
   else{toast('Recovery kit required; tick the replacement box only if you accept losing end-to-end access',true);return}
   let salt=AuthV2.randomSalt();let keys=await AuthV2.deriveKeys(password,salt,600000);
   let wrapped=await AuthV2.wrapPrivate(keys.wrap,secret);
-  let d=await api('POST','/api/auth/reset-v2',{token,salt,iterations:600000,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:pubkey,wrapped_privkey:wrapped});
+  let d=await api('POST','/api/auth/reset-v2',{token,salt,iterations:600000,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:pubkey,wrapped_privkey:wrapped,discard_e2e_key:!!$('rp-discard').checked});
   AUTH_KEY=keys.auth;WRAP_KEY=keys.wrap;WRAPPED_PRIV=wrapped;E2E_KIT=OW.b64enc(secret);
   T='';history.replaceState(null,'',location.pathname);
   if(d.mfa_required){toast('Password set; verify your second factor');showMfa(d.mfa_token,d.methods,d.email_available);return}

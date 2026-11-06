@@ -174,20 +174,30 @@ async fn version_one_accounts_still_work_and_reset_upgrades_them() {
     let r = s.call(Method::POST, "/api/auth/register", None, Some(json!({"email": "legacy@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let uid = r.body["user_id"].as_str().unwrap().to_string();
+    let stored_pub = r.body["public_key"].as_str().unwrap().to_string();
     let old = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "legacy@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(old.status, 200, "v1 login must keep working: {} {}", old.status, old.text);
     let kdf = s.get("/api/auth/kdf?email=legacy@test.invalid").await;
     assert_eq!(kdf.body["version"], json!(1), "{}", kdf.text);
 
-    // A reset link can upgrade the account to client-derived auth.
+    // A reset link can upgrade the account to client-derived auth, but it cannot
+    // silently replace the account key without the explicit discard flag.
     let reset_token = "reset-token-for-test";
     let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
     conn.execute("INSERT INTO auth_tokens(token_hash,user_id,kind,created_at,expires_at,used) VALUES(?,?,?,?,?,0)",
         rusqlite::params![oc::hash_token(reset_token), uid, "reset", 0i64, 4_000_000_000i64]).unwrap();
+    let info = s.call(Method::POST, "/api/auth/reset-info", None, Some(json!({"token": reset_token}))).await;
+    assert_eq!(info.status, 200, "reset info failed: {} {}", info.status, info.text);
+    assert_eq!(info.body["public_key"].as_str().unwrap_or(""), stored_pub.as_str(), "{}", info.text);
     let kp = oc::Keypair::generate();
     let r = s.call(Method::POST, "/api/auth/reset-v2", None, Some(json!({
         "token": reset_token, "salt": oc::b64(&[2u8; 16]), "iterations": 600000, "algo": "pbkdf2-sha256",
         "auth_key": b64key(&AUTH_KEY), "public_key": kp.public, "wrapped_privkey": wrapped_private()
+    }))).await;
+    assert_eq!(r.status, 400, "a different key needs the discard flag: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, "/api/auth/reset-v2", None, Some(json!({
+        "token": reset_token, "salt": oc::b64(&[2u8; 16]), "iterations": 600000, "algo": "pbkdf2-sha256",
+        "auth_key": b64key(&AUTH_KEY), "public_key": stored_pub, "wrapped_privkey": wrapped_private()
     }))).await;
     assert_eq!(r.status, 200, "v2 reset failed: {} {}", r.status, r.text);
     let kdf = s.get("/api/auth/kdf?email=legacy@test.invalid").await;
@@ -196,6 +206,32 @@ async fn version_one_accounts_still_work_and_reset_upgrades_them() {
     assert_eq!(login.status, 200, "v2 login after reset failed: {} {}", login.status, login.text);
     let password = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "legacy@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(password.status, 401, "the old password must stop working after the upgrade");
+
+    let reset2 = "reset-token-2";
+    conn.execute("INSERT INTO auth_tokens(token_hash,user_id,kind,created_at,expires_at,used) VALUES(?,?,?,?,?,0)",
+        rusqlite::params![oc::hash_token(reset2), uid, "reset", 0i64, 4_000_000_000i64]).unwrap();
+    let r = s.call(Method::POST, "/api/auth/reset-v2", None, Some(json!({
+        "token": reset2, "salt": oc::b64(&[3u8; 16]), "iterations": 600000, "algo": "pbkdf2-sha256",
+        "auth_key": b64key(&AUTH_KEY), "public_key": kp.public, "wrapped_privkey": wrapped_private(), "discard_e2e_key": true
+    }))).await;
+    assert_eq!(r.status, 200, "an explicit discard must allow a new key: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn a_weak_stored_kdf_is_refused() {
+    let s = Server::start().await;
+    let reg = register_v2(&s, "weak-kdf@test.invalid").await;
+    assert_eq!(reg.status, 200, "{}", reg.text);
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    conn.execute("UPDATE users SET kdf_iterations=1 WHERE email=?", ["weak-kdf@test.invalid"]).unwrap();
+    let kdf = s.get("/api/auth/kdf?email=weak-kdf@test.invalid").await;
+    assert!(kdf.status >= 400, "a weak stored KDF must be refused: {} {}", kdf.status, kdf.text);
+    let ch = s.call(Method::POST, "/api/auth/challenge", None, Some(json!({"email": "weak-kdf@test.invalid"}))).await;
+    assert_eq!(ch.status, 200, "{}", ch.text);
+    let id = ch.body["challenge_id"].as_str().unwrap();
+    let challenge = ch.body["challenge"].as_str().unwrap();
+    let r = s.call(Method::POST, "/api/auth/login-v2", None, Some(json!({"email": "weak-kdf@test.invalid", "challenge_id": id, "proof": proof(&AUTH_KEY, challenge, id)}))).await;
+    assert_eq!(r.status, 401, "a weak KDF row must not authenticate: {} {}", r.status, r.text);
 }
 
 #[tokio::test]

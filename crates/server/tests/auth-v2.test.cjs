@@ -24,25 +24,26 @@ const AuthV2 = vm.runInContext('AuthV2', context);
 test('PBKDF2 output is split into the auth and wrapping halves', async () => {
   const salt = Buffer.alloc(16, 7);
   const saltB64 = Buffer.from(salt).toString('base64');
-  const expected = pbkdf2Sync('correct horse battery staple', salt, 100000, 64, 'sha256');
-  const keys = await AuthV2.deriveKeys('correct horse battery staple', saltB64, 100000);
+  const expected = pbkdf2Sync('correct horse battery staple', salt, 600000, 64, 'sha256');
+  const keys = await AuthV2.deriveKeys('correct horse battery staple', saltB64, 600000);
   assert.deepEqual(Buffer.from(keys.auth), expected.subarray(0, 32));
   assert.equal(keys.wrap.algorithm.name, 'AES-GCM');
+  await assert.rejects(AuthV2.deriveKeys('pw', saltB64, 1000));
 });
 
 test('the private key wraps and unwraps with the wrapping key', async () => {
-  const keys = await AuthV2.deriveKeys('pw', Buffer.alloc(16, 1).toString('base64'), 100000);
+  const keys = await AuthV2.deriveKeys('pw', Buffer.alloc(16, 1).toString('base64'), 600000);
   const secret = webcrypto.getRandomValues(new Uint8Array(32));
   const wrapped = await AuthV2.wrapPrivate(keys.wrap, secret);
   assert.match(wrapped, /^owv2:/);
   const back = await AuthV2.unwrapPrivate(keys.wrap, wrapped);
   assert.deepEqual(Buffer.from(back), Buffer.from(secret));
-  const other = await AuthV2.deriveKeys('other', Buffer.alloc(16, 1).toString('base64'), 100000);
+  const other = await AuthV2.deriveKeys('other', Buffer.alloc(16, 1).toString('base64'), 600000);
   await assert.rejects(AuthV2.unwrapPrivate(other.wrap, wrapped));
 });
 
 test('the challenge proof is deterministic and bound to the challenge id', async () => {
-  const keys = await AuthV2.deriveKeys('pw', Buffer.alloc(16, 2).toString('base64'), 100000);
+  const keys = await AuthV2.deriveKeys('pw', Buffer.alloc(16, 2).toString('base64'), 600000);
   const one = await AuthV2.proof(keys.auth, 'challenge', 'id-1');
   const two = await AuthV2.proof(keys.auth, 'challenge', 'id-1');
   const other = await AuthV2.proof(keys.auth, 'challenge', 'id-2');

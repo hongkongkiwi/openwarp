@@ -33,7 +33,7 @@ const vector = {
 test('the RFC 7748 public key matches', async () => {
   await sodium.ready;
   const secret = Uint8Array.from(Buffer.from('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a', 'hex'));
-  assert.equal(Buffer.from(OW.x25519Pub(secret)).toString('hex'), '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
+  assert.equal(Buffer.from(await OW.x25519Pub(secret)).toString('hex'), '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
 });
 
 test('libsodium decrypts Rust asymmetric and symmetric ciphertext', async () => {

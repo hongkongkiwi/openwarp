@@ -8,7 +8,7 @@ const OW = (() => {
   function cat(a, b) { const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out; }
   async function sessionKey(shared) { const prefix = new TextEncoder().encode('openwarp-session-v1'); return new Uint8Array(await crypto.subtle.digest('SHA-256', cat(prefix, shared))); }
   function x25519(secret, pub) { return S().crypto_scalarmult(secret, pub); }
-  function x25519Pub(secret) { return S().crypto_scalarmult_base(secret); }
+  async function x25519Pub(secret) { const s = S(); await s.ready; return s.crypto_scalarmult_base(secret); }
   async function decryptAsymmetric(privB64, payloadB64) {
     const s = S(); await s.ready;
     const raw = b64dec(payloadB64); if (raw.length < 56) throw new Error('ciphertext too short');
