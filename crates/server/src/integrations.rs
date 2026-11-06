@@ -4478,7 +4478,7 @@ mod tests {
         let sshd = sshd.trim();
         let sshd = if sshd.is_empty() { "/usr/sbin/sshd" } else { sshd };
         let mut cmd = std::process::Command::new(sshd);
-        cmd.args(["-f","/dev/null","-D","-e","-h"]).arg(dir.join("host")).args(["-o", &format!("Port={}", port), "-o", "ListenAddress=127.0.0.1", "-o", &format!("AuthorizedKeysFile={}", auth.display()), "-o", "PasswordAuthentication=no", "-o", "PubkeyAuthentication=yes", "-o", &format!("PidFile={}", dir.join("sshd.pid").display()), "-o", "UsePAM=no"]);
+        cmd.args(["-f","/dev/null","-D","-e","-h"]).arg(dir.join("host")).args(["-o", &format!("Port={}", port), "-o", "ListenAddress=127.0.0.1", "-o", &format!("AuthorizedKeysFile={}", auth.display()), "-o", "PasswordAuthentication=no", "-o", "PubkeyAuthentication=yes", "-o", "StrictModes=no", "-o", &format!("PidFile={}", dir.join("sshd.pid").display()), "-o", "UsePAM=no"]);
         drop(listener);
         cmd.stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().expect("sshd must be installed to run the ssh file sync test");
