@@ -190,6 +190,23 @@ if (process.env.OPENWARP_SMOKE_PG_URL) {
   console.log('SKIP postgres lease (set OPENWARP_SMOKE_PG_URL to exercise it)');
 }
 
+// Optional: a live MySQL/MariaDB lease through the Worker socket path, which
+// runs the hand-written protocol client rather than a library.
+if (process.env.OPENWARP_SMOKE_MYSQL_URL) {
+  const database = new URL(process.env.OPENWARP_SMOKE_MYSQL_URL).pathname.replace(/^\//, '') || 'mysql';
+  const lease = await call('POST', `/api/envs/${env.id}/dynamic`, token, {
+    name: 'mysql', type: 'mysql',
+    config: { connection: process.env.OPENWARP_SMOKE_MYSQL_URL, grants: [`SELECT ON ${database}.*`] },
+  });
+  check('mysql lease created through the Worker socket', lease.status === 200 && !!lease.json.username, `${lease.status} ${lease.text}`);
+  if (lease.json.id) {
+    const revoked = await call('DELETE', `/api/leases/${lease.json.id}`, token);
+    check('mysql lease revoked', revoked.status === 200, `${revoked.status} ${revoked.text}`);
+  }
+} else {
+  console.log('SKIP mysql lease (set OPENWARP_SMOKE_MYSQL_URL to exercise it)');
+}
+
 // Background and integration paths that only exist outside unit tests.
 const echo = process.env.OPENWARP_SMOKE_ECHO;
 if (echo) {

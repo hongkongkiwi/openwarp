@@ -216,7 +216,7 @@ ADDR=127.0.0.1:8080 \
   ./target/release/openwarp-server
 ```
 
-This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL, set `DATABASE_URL` to your database connection string instead. Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
+This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL or MySQL/MariaDB, set `DATABASE_URL` to your database connection string instead (`mysql://` or `mariadb://`). Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
 
 OpenWarp is a native service. Cloudflare Workers cannot run this binary as-is; the storage and networking layers would need a separate port.
 
@@ -269,8 +269,14 @@ production.
 What works on Workers: registration with emailed verification, password and
 GitHub sign-in, OIDC login (pure-Rust JWT verification), TOTP, SCIM, tokens,
 E2E and SSE secrets, approvals, log streams, audit webhooks, integrations,
-PKI CA and certificate issuance, dynamic PostgreSQL leases, and the rotation
-and delivery maintenance cron.
+PKI CA and certificate issuance, dynamic PostgreSQL, MySQL and MariaDB leases,
+and the rotation and delivery maintenance cron.
+
+The MySQL lease client is built into the Worker because no MySQL library
+compiles for wasm; it speaks the protocol directly over the socket and uses TLS
+when the lease URL sets `require_ssl=true`. MySQL is a lease target only on
+Workers: the deployment's own storage stays in the Durable Object, and a
+`DATABASE_URL` of `mysql://` is native-only.
 
 Answers 501 with a clear error on Workers: LDAP sign-in, SAML, SSH file sync,
 SMTP (use the HTTP relay), OCI Vault (RSA request signing), and the WebSocket

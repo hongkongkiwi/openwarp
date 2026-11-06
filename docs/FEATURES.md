@@ -76,9 +76,10 @@ key. It stores only ciphertext it cannot decrypt. Clients that omit
 
 ## Storage
 
-`DATABASE_URL=sqlite://file.db` (default, testing) or
-`postgres://...` (production). One portable SQL dialect layer translates
-`?` placeholders to `$n` for Postgres. `REDIS_URL` optionally caches session lookups (1h TTL, verified against a Redis-protocol server: SETEX on first auth, GET hits after); absent Redis, sessions live only in the DB.
+`DATABASE_URL=sqlite://file.db` (default, testing), `postgres://...`, or
+`mysql://...`/`mariadb://...` (production). One portable SQL dialect layer translates
+`?` placeholders to `$n` for Postgres and rewrites the DDL for MySQL/MariaDB.
+`REDIS_URL` optionally caches session lookups (1h TTL, verified against a Redis-protocol server: SETEX on first auth, GET hits after); absent Redis, sessions live only in the DB.
 
 ## Takeaways from Phase + Infisical source review (implemented)
 
@@ -104,12 +105,13 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
   retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
 - Machine identities with Universal Auth, secret-change proposals with
-  admin approval, access requests, dynamic Postgres leases (real roles,
-  dropped on revoke), and a basic PKI (CA, issue, revoke) came from the
-  Infisical feature set.
+  admin approval, access requests, dynamic database leases (real PostgreSQL
+  roles, MySQL and MariaDB accounts, dropped on revoke), and a basic PKI
+  (CA, issue, revoke) came from the Infisical feature set.
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
-secret-change proposals, and Postgres dynamic roles are not Phase features.
+secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
+Phase features.
 Deferred by design: CLI parity (separate effort), a Kubernetes operator (the
 Helm chart's External Secrets Operator bridge covers controller-driven delivery,
 see [Kubernetes](KUBERNETES.md)), SDKs, AWS-IAM dynamic secrets, Phase
