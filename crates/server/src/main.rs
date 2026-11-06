@@ -922,7 +922,6 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let pairs = integrations::secret_keys(&located);
     if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-        let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let result = integrations::sync_managed(&kind, &config, &located, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
         let (msg, managed) = match result {
             Ok(x) => x,
@@ -935,14 +934,14 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
                     if kind == "ssh" { names = integrations::ssh_owned_names(&config, &located).unwrap_or(names); }
                     for n in names { if !union.contains(&n) { union.push(n); } }
                     let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).await;
-                    for n in &union { let base = n.strip_prefix(&prefix).unwrap_or(n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await; }
+                    for n in &union { let base = integrations::local_name(&config, n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await; }
                 }
                 return Err(bad(&e));
             }
         };
         if !dry {
             st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).await.map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?;
-            for n in &managed { let base = n.strip_prefix(&prefix).unwrap_or(n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
+            for n in &managed { let base = integrations::local_name(&config, n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
                 st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await.map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?; }
         }
         st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; return Ok(msg); }

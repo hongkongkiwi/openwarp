@@ -8,7 +8,7 @@ Integrations push shared secrets from a standard SSE environment to another plat
 - Shared base values are the source. Personal overrides and sealed values are excluded.
 - E2E environments do not provide the server-readable values used by this workflow.
 - Provider operations can partially succeed. Inspect both the sync response and remote state before retrying.
-- Dry-run, prefix/filtering, and mirror behavior are provider-specific, not global options.
+- Key naming (`prefix`, `suffix`, `name_template`) applies to every adapter. Dry-run, key filters and mirror behavior depend on the adapter.
 
 The implementations live in [`integrations.rs`](../crates/server/src/integrations.rs). This guide describes OpenWarp's configured requests, not a guarantee that every provider API version or account plan accepts them. Validate with a non-production target before relying on a destination.
 
@@ -123,21 +123,31 @@ The `kubernetes` adapter pushes values to the cluster API. For pods that pull va
 
 ## Advanced sync options
 
-The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) share these options:
+### Key naming
+
+Naming is off by default and applies to every adapter. It renames a key on the way to the destination, and imports strip the same affixes so remote names map back to local keys. Values are never rewritten.
+
+| Field | Meaning |
+| --- | --- |
+| `prefix` | Prepended to every selected key; accepts `{{environment}}` |
+| `suffix` | Appended to every selected key; accepts `{{environment}}` |
+| `name_template` | Replaces prefix and suffix when set. Must contain `{{secretKey}}` exactly once, and may use `{{environment}}` |
+
+For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
+
+The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) also share these options:
 
 | Field | Meaning |
 | --- | --- |
 | `mode` | Use `upsert` by default; `mirror` can delete names previously managed by this integration |
 | `dry_run` | Boolean; inspect intended changes without remote mutations |
-| `prefix` | Prepended to selected secret names; accepts `{{environment}}` |
-| `name_template` | Replaces the prefix with a template supporting `{{secretKey}}` and `{{environment}}` |
 | `include_keys` | Array of source keys to include; empty means all |
 | `exclude_keys` | Array of source keys to omit |
 | `base_url` | Override the adapter's API base for a compatible service |
 | `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore; manual Sync still runs |
 | `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync |
 
-Filters apply before naming. Mirror uses persisted managed-name state, not blanket deletion of every name on the remote service. Changing targets, prefixes, templates or filters affects that state; review a dry run and remote inventory first. These options are not supported by every row in the provider table.
+Filters apply before naming. Mirror uses persisted managed-name state, not blanket deletion of every name on the remote service. Changing targets, prefixes, suffixes, templates or filters affects that state; review a dry run and remote inventory first. The remaining options are not supported by every row in the provider table.
 
 `initial_sync` is limited to adapters that can return values: AWS Secrets Manager, AWS Parameter Store, 1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps, OpenWarp, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and Hugging Face Space variables. CircleCI, Devin, Cloudflare Secrets Store, Cursor and Hugging Face Space secrets reject import because their APIs never return values.
 
@@ -149,8 +159,8 @@ The adapter signs its own SigV4 requests. It does not use an SDK credential chai
 
 Two mappings are available:
 
-- `mapping: "one_to_one"` (the default when `secret_id` is absent) writes one remote secret per key, named `prefix + key`. Missing names are created with `CreateSecret`; existing names receive a new version with `PutSecretValue`. Mirror deletes previously managed names with a seven-day recovery window unless `force_delete: true`.
-- `mapping: "many_to_one"` (the default when `secret_id` is set) writes every value into one JSON `SecretString` at `secret_id`, creating the secret when it does not exist. Mirror is rejected because keys are not separate remote objects.
+- `mapping: "one_to_one"` (the default when `secret_id` is absent) writes one remote secret per key, using the key naming options. Missing names are created with `CreateSecret`; existing names receive a new version with `PutSecretValue`. Mirror deletes previously managed names with a seven-day recovery window unless `force_delete: true`.
+- `mapping: "many_to_one"` (the default when `secret_id` is set) writes every value into one JSON `SecretString` at `secret_id`, creating the secret when it does not exist. Key naming and key filters apply to the JSON field names. Mirror is rejected because keys are not separate remote objects.
 
 `kms_key_id` applies only when a secret is created. `role_arn` makes the adapter assume that role first, using the supplied base credentials and optional `sts_endpoint`; the resulting temporary credentials sign the sync. `endpoint` overrides the regional endpoint. One-to-one names are validated against the Secrets Manager character set and 512-byte limit before any write.
 

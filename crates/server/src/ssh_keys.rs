@@ -37,13 +37,9 @@ pub fn only_ssh_keys(secrets: &[(String, String, String)]) -> Vec<(String, Strin
 fn named(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
     let include: Vec<String> = config.get("include_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let exclude: Vec<String> = config.get("exclude_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    let environment = cfg(config, "_environment");
-    let template = cfg(config, "name_template");
-    let prefix = cfg(config, "prefix").replace("{{environment}}", environment);
     let mut seen = std::collections::HashSet::new();
     secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| {
-        let name = if template.is_empty() { format!("{}{}", prefix, k) } else { template.replace("{{secretKey}}", k).replace("{{environment}}", environment) };
-        (name, v.clone())
+        (crate::integrations::desired_name(config, k), v.clone())
     }).filter(|(n, _)| seen.insert(n.clone())).collect()
 }
 
@@ -179,6 +175,13 @@ mod tests {
     }
 
     fn ssh_keys_only(items: &[(&str, &str, &str)]) -> Vec<(String, String)> { only_ssh_keys(&items.iter().map(|(k, v, t)| (k.to_string(), v.to_string(), t.to_string())).collect::<Vec<_>>()) }
+
+    #[test]
+    fn ssh_key_names_follow_the_shared_prefix_and_suffix() {
+        let config = json!({"_environment": "prod", "prefix": "APP_", "suffix": "_{{environment}}"});
+        let keys = ssh_keys_only(&[("DEPLOY", KEY, "ssh_key"), ("PLAIN", KEY, "secret")]);
+        assert_eq!(named(&config, &keys), vec![("APP_DEPLOY_prod".to_string(), KEY.to_string())]);
+    }
 
     #[tokio::test]
     async fn digitalocean_recreates_a_changed_account_key() {

@@ -49,6 +49,9 @@ async fn azure_access_token(config: &Value) -> Result<String, String> {
 }
 
 pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
+    validate_naming(config)?;
+    let named: Vec<(String, String)> = secrets.iter().map(|(k, v)| (desired_name(config, k), v.clone())).collect();
+    let secrets = named.as_slice();
     let client = http_client();
     match kind {
         "supabase" => { let items: Vec<Value> = secrets.iter().map(|(k,v)| json!({"name":k,"value":v})).collect();
@@ -251,15 +254,44 @@ pub fn trigger_targets(config: &Value) -> Vec<TriggerTarget> {
     let env = { let e = cfg(config, "target_env"); if e.is_empty() { cfg(config, "env") } else { e } };
     vec![TriggerTarget{ project_ref: cfg(config, "project_ref").to_string(), env: if env.is_empty() { "prod".to_string() } else { env.to_string() }, token: global_token }]
 }
-fn desired_name(config: &Value, key: &str) -> String {
+// Prefix and suffix wrap the key; name_template replaces both with a
+// {{secretKey}}/{{environment}} pattern (Infisical calls this a key schema).
+fn env_subst(value: &str, environment: &str) -> String { value.replace("{{environment}}", environment) }
+pub(crate) fn desired_name(config: &Value, key: &str) -> String {
     let environment = cfg(config, "_environment");
     let template = cfg(config, "name_template");
     if !template.is_empty() {
         template.replace("{{secretKey}}", key).replace("{{environment}}", environment)
     } else {
-        let prefix = cfg(config, "prefix").replace("{{environment}}", environment);
-        format!("{}{}", prefix, key)
+        format!("{}{}{}", env_subst(cfg(config, "prefix"), environment), key, env_subst(cfg(config, "suffix"), environment))
     }
+}
+/// Literal text the schema puts before and after the source key, so a remote
+/// name can be mapped back to the secret it came from.
+fn naming_affixes(config: &Value) -> (String, String) {
+    let environment = cfg(config, "_environment");
+    let template = cfg(config, "name_template");
+    if !template.is_empty() {
+        let resolved = env_subst(template, environment);
+        return match resolved.split_once("{{secretKey}}") { Some((before, after)) => (before.to_string(), after.to_string()), None => (String::new(), String::new()) };
+    }
+    (env_subst(cfg(config, "prefix"), environment), env_subst(cfg(config, "suffix"), environment))
+}
+pub fn local_name(config: &Value, remote: &str) -> String {
+    let path = cfg(config, "path_prefix").trim_end_matches('/');
+    let without_path = if path.is_empty() { remote } else { remote.strip_prefix(path).map(|s| s.trim_start_matches('/')).unwrap_or(remote) };
+    let (prefix, suffix) = naming_affixes(config);
+    let without_prefix = without_path.strip_prefix(&prefix).unwrap_or(without_path);
+    without_prefix.strip_suffix(&suffix).unwrap_or(without_prefix).to_string()
+}
+/// A template without exactly one `{{secretKey}}` would collapse every key into
+/// one remote name, so reject it before any adapter runs.
+pub fn validate_naming(config: &Value) -> Result<(), String> {
+    let template = cfg(config, "name_template");
+    if template.is_empty() { return Ok(()); }
+    let count = template.matches("{{secretKey}}").count();
+    if count != 1 { return Err(format!("name_template must contain {{{{secretKey}}}} exactly once (found {})", count)); }
+    Ok(())
 }
 fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
     let include: Vec<String> = config.get("include_keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
@@ -686,7 +718,8 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
         let secret_id = cfg(config, "secret_id");
         if secret_id.is_empty() { return Err("aws_secrets_manager many_to_one requires secret_id".into()); }
         if mode == "mirror" { return Err("aws_secrets_manager many_to_one cannot mirror keys; use mapping one_to_one".into()); }
-        let json_body = map_json(secrets).to_string();
+        let desired = trigger_desired(config, secrets);
+        let json_body = map_json(&desired).to_string();
         if !dry {
             let body = json!({"SecretId": secret_id, "SecretString": json_body});
             match aws_call(&client, config, "secretsmanager", region, ak, sk, "secretsmanager.UpdateSecret", &body).await {
@@ -699,7 +732,7 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
                 Err(e) => return Err(format!("update {} failed: {}", secret_id, e)),
             }
         }
-        return Ok((format!("AWS Secrets Manager sync{}: wrote {} keys into {}", if dry { " (dry-run)" } else { "" }, secrets.len(), secret_id), Vec::new()));
+        return Ok((format!("AWS Secrets Manager sync{}: wrote {} keys into {}", if dry { " (dry-run)" } else { "" }, desired.len(), secret_id), Vec::new()));
     }
     if mapping != "one_to_one" { return Err("aws_secrets_manager mapping must be one_to_one or many_to_one".into()); }
     let desired = trigger_desired(config, secrets);
@@ -2725,11 +2758,9 @@ pub async fn hetzner_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Initial import ----------
-fn resolved_prefix(config: &Value) -> String { cfg(config, "prefix").replace("{{environment}}", cfg(config, "_environment")) }
 fn strip_remote_prefix(config: &Value, name: &str, path_prefix: &str) -> String {
     let without_path = if path_prefix.is_empty() { name } else { name.strip_prefix(path_prefix).map(|s| s.trim_start_matches('/')).unwrap_or(name) };
-    let prefix = resolved_prefix(config);
-    without_path.strip_prefix(&prefix).unwrap_or(without_path).to_string()
+    local_name(config, without_path)
 }
 async fn aws_sm_value(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str) -> Result<Option<String>, String> {
     let value = aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.GetSecretValue", &json!({"SecretId": id})).await?;
@@ -2775,7 +2806,7 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
                 let text = aws_sm_value(&client, config, region, ak, sk, id).await?.ok_or("AWS secret has no SecretString")?;
                 let value: Value = serde_json::from_str(&text).map_err(|e| format!("AWS secret is not a JSON object: {}", e))?;
                 let object = value.as_object().ok_or("AWS secret is not a JSON object")?;
-                return Ok(object.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect());
+                return Ok(object.iter().map(|(k, v)| (local_name(config, k), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect());
             }
             let mut out = Vec::new();
             for name in aws_sm_list(&client, config, region, ak, sk).await? {
@@ -2983,6 +3014,7 @@ pub fn is_stateful(kind: &str) -> bool {
 }
 /// Stateful adapters return a report and the remote names they now own.
 pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
+    if let Err(e) = validate_naming(config) { return Some(Err(e)); }
     let flat = secret_keys(secrets);
     let pairs = flat.as_slice();
     // Account SSH key APIs reject anything that is not a public key, so they
@@ -3677,7 +3709,7 @@ mod tests {
             ("secretsmanager.UpdateSecret", 400, "{\"__type\":\"ResourceNotFoundException\",\"message\":\"not found\"}"),
             ("secretsmanager.CreateSecret", 200, "{}"),
         ]));
-        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod"});
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod","prefix":"APP_","suffix":"_V1"});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
         let (_report, managed) = aws_secrets_manager_sync(&config, &secrets, &[]).await.expect("aws sm sync");
         assert!(managed.is_empty());
@@ -3686,7 +3718,7 @@ mod tests {
         assert!(create.3.contains("\"Name\":\"app/prod\""), "{}", create.3);
         let body: Value = serde_json::from_str(&create.3).expect("json body");
         let nested: Value = serde_json::from_str(body["SecretString"].as_str().expect("secret string")).expect("nested json");
-        assert_eq!(nested["API_KEY"], "v1");
+        assert_eq!(nested["APP_API_KEY_V1"], "v1");
     }
 
     #[tokio::test]
@@ -3834,6 +3866,36 @@ mod tests {
         assert_eq!(trigger_desired(&config, &secrets), vec![("production/api_key".to_string(), "v1".to_string())]);
         let prefixed = json!({"_environment": "staging", "prefix": "{{environment}}/"});
         assert_eq!(trigger_desired(&prefixed, &secrets), vec![("staging/api_key".to_string(), "v1".to_string())]);
+        let suffixed = json!({"_environment": "staging", "suffix": "_{{environment}}"});
+        assert_eq!(trigger_desired(&suffixed, &secrets), vec![("api_key_staging".to_string(), "v1".to_string())]);
+    }
+
+    #[test]
+    fn naming_is_off_unless_configured_and_templates_win() {
+        let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
+        assert_eq!(trigger_desired(&json!({}), &secrets), secrets);
+        let both = json!({"prefix": "APP_", "suffix": "_V2", "name_template": "{{secretKey}}__{{environment}}"});
+        assert_eq!(desired_name(&both, "API_KEY"), "API_KEY__");
+    }
+
+    #[test]
+    fn local_name_reverses_prefix_suffix_and_template() {
+        let prefixed = json!({"_environment": "prod", "prefix": "APP_", "suffix": "_{{environment}}"});
+        assert_eq!(desired_name(&prefixed, "KEY"), "APP_KEY_prod");
+        assert_eq!(local_name(&prefixed, "APP_KEY_prod"), "KEY");
+        assert_eq!(local_name(&prefixed, "UNRELATED"), "UNRELATED");
+        let templated = json!({"_environment": "prod", "name_template": "{{environment}}/{{secretKey}}"});
+        assert_eq!(local_name(&templated, "prod/KEY"), "KEY");
+        let ssm = json!({"path_prefix": "/app/prod", "prefix": "APP_"});
+        assert_eq!(local_name(&ssm, "/app/prod/APP_KEY"), "KEY");
+    }
+
+    #[test]
+    fn name_template_needs_exactly_one_secret_key_placeholder() {
+        assert!(validate_naming(&json!({"name_template": "{{secretKey}}"})).is_ok());
+        assert!(validate_naming(&json!({})).is_ok());
+        assert!(validate_naming(&json!({"name_template": "static"})).is_err());
+        assert!(validate_naming(&json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
     }
 
     #[tokio::test]
@@ -3859,6 +3921,17 @@ mod tests {
             ("secretsmanager.GetSecretValue", 200, "{\"SecretString\":\"v1\"}"),
         ]));
         let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"mapping":"one_to_one","prefix":"app/"});
+        let values = pull("aws_secrets_manager", &config).await.expect("pull");
+        assert_eq!(values, vec![("API_KEY".to_string(), "v1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn pull_strips_a_configured_suffix() {
+        let (base, _calls) = start_mock_routes(mock_routes(&[
+            ("secretsmanager.ListSecrets", 200, "{\"SecretList\":[{\"Name\":\"APP_API_KEY_prod\"}]}"),
+            ("secretsmanager.GetSecretValue", 200, "{\"SecretString\":\"v1\"}"),
+        ]));
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"mapping":"one_to_one","prefix":"APP_","suffix":"_{{environment}}","_environment":"prod"});
         let values = pull("aws_secrets_manager", &config).await.expect("pull");
         assert_eq!(values, vec![("API_KEY".to_string(), "v1".to_string())]);
     }
@@ -4307,6 +4380,26 @@ mod tests {
         let timestamp = headers.lines().find_map(|l| l.strip_prefix("x-openwarp-timestamp:")).expect("timestamp header").trim();
         let signature = headers.lines().find_map(|l| l.strip_prefix("x-openwarp-signature:")).expect("signature header").trim();
         assert_eq!(signature, webhook_signature("hook-secret", timestamp.parse().unwrap(), &post.3));
+    }
+
+    #[tokio::test]
+    async fn sync_applies_naming_to_adapters_without_a_managed_name_list() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
+        let config = json!({"url": format!("{}/hook", base), "prefix": "APP_", "suffix": "_V1"});
+        sync("webhook", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("webhook sync");
+        let calls = calls.lock().unwrap();
+        let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
+        let body: Value = serde_json::from_str(&post.3).expect("json");
+        assert_eq!(body["secrets"]["APP_API_KEY_V1"], "v1");
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_a_template_that_collapses_every_key() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
+        let config = json!({"url": format!("{}/hook", base), "name_template": "STATIC"});
+        let err = sync("webhook", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect_err("template rejected");
+        assert!(err.contains("name_template"), "{}", err);
+        assert!(calls.lock().unwrap().is_empty(), "nothing should be posted");
     }
 
     #[tokio::test]

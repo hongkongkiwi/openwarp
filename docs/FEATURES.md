@@ -113,8 +113,9 @@ billing/licence code (never copied).
 
 ## Additional sync adapters (2026-11-06)
 
-The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`,
-`include_keys` and `exclude_keys` options, and expose a connection test:
+The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`,
+`prefix`, `suffix`, `include_keys` and `exclude_keys` options, and expose a
+connection test:
 
 - `1password` uses a 1Password Connect server (`connect_url`, `token`,
   `vault_id`, optional `value_label`). Each key becomes an item whose title is
@@ -153,8 +154,10 @@ The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`
 
 Shared behavioural options:
 
-- `name_template` supports `{{secretKey}}` and `{{environment}}`; `prefix` also
-  accepts `{{environment}}`.
+- Key naming is off by default and applies to every adapter: `prefix` and
+  `suffix` wrap each key and accept `{{environment}}`; `name_template`
+  replaces both and supports `{{secretKey}}` and `{{environment}}`, with
+  exactly one `{{secretKey}}`. Imports strip the same affixes.
 - `auto_sync: false` skips the integration on deploy, rotation, proposal,
   delete, restore and point-in-time restore; manual Sync still runs it.
 - `initial_sync` accepts `overwrite` (default), `import_local` (keep local
