@@ -41,8 +41,10 @@ alias), `dokploy`, `caprover`, `portainer`
 (stack environment variables), `docker_swarm` (Docker Engine secrets),
 `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`,
 `laravel_forge`, `openwarp` (instance-to-instance), `devin`,
-`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, and `cursor`
-(Cloud Agents environment or team secrets).
+`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`
+(Cloud Agents environment or team secrets), `northflank`, `spacelift`,
+`rundeck`, `cloud66`, `humanitec`, `ovh_kms` (OVHcloud KMS), `keeper`
+(Commander Service Mode), and `oci_vault`.
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -141,6 +143,18 @@ The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`
 - `azure_devops` updates a pipeline variable group.
 - `cursor` writes Cloud Agents environment or team secrets
   (`runtime_secret` or `environment_variable`).
+- `northflank` writes a project secret group's variables.
+- `spacelift` writes stack environment variables through GraphQL, using a JWT
+  from `token` or an `api_key_id`/`api_key_secret` exchange.
+- `rundeck` writes project key storage entries.
+- `cloud66` writes stack environment variables; read-only and generated
+  variables are never touched, and keys with hyphens are skipped.
+- `humanitec` writes application or environment values.
+- `ovh_kms` rewrites a versioned OVHcloud KMS secret bundle at `path`.
+- `keeper` manages login records in a shared folder through Commander Service
+  Mode (`instance_url`, `api_key`, `folder_uid`).
+- `oci_vault` writes one OCI Vault secret per key with RSA-signed requests;
+  deletions are scheduled seven days out.
 
 Shared behavioural options:
 
@@ -152,10 +166,15 @@ Shared behavioural options:
   values) or `import_remote` (remote values win). Import runs on the first
   stateful sync and is available for AWS Secrets Manager, AWS Parameter Store,
   1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
-  Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps and
-  OpenWarp. Adapters that never return values reject import explicitly.
+  Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps,
+  OpenWarp, Northflank, Spacelift, Rundeck, Cloud 66, Humanitec, OVHcloud KMS,
+  Keeper and OCI Vault. Adapters that never return values reject import
+  explicitly.
 - AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
   assumes the role and signs with the temporary credentials.
+- GCP Secret Manager accepts `service_account_json` and Azure Key Vault accepts
+  `tenant_id`, `client_id` and `client_secret`; both exchange them for a
+  short-lived access token when a static `token` is not supplied.
 
 Kamal has no server API or central secret store, so there is no `kamal` adapter.
 Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
@@ -164,13 +183,14 @@ Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
 Cursor Cloud Agents is supported because it documents environment and team
 secret endpoints. Grok Bot Vault and ChatGPT/Codex cloud environments document
 environment variables and secrets as UI settings, not as a public API. Keeper
-requires Commander in Service Mode. Pandacode's other providers are machine
-lifecycle APIs that accept environment variables or SSH keys only at creation;
-they are not secret-sync destinations.
+is supported through Commander Service Mode; it has no plain REST API.
+Pandacode's other providers are machine lifecycle APIs that accept environment
+variables or SSH keys only at creation; they are not secret-sync destinations.
 
-Still pending from the wider Infisical-style list: Spacelift, OCI Vault, OVH,
-Northflank, Rundeck, Cloud 66 and Humanitec. Each needs its own auth or API
-contract before it can be implemented without guessing.
+All of the listed Infisical-style adapters are implemented. Keeper uses
+Commander Service Mode, OCI Vault uses OCI request signing, and OVHcloud KMS
+uses a bearer token or client certificate. Machine provisioning remains out of
+scope: OpenWarp writes only to providers that already hold secrets.
 
 ## Trigger.dev sync
 
