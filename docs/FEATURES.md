@@ -21,7 +21,7 @@
 | Automated rotation | Pro | `POST /api/envs/:id/rotate {key}` (new random or given value) |
 | Audit logs + forwarding | Pro/Ent | per-org audit table, webhook forwarding via settings |
 | Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default) |
-| OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, RS256 `id_token` verified against provider JWKS, iss/aud/exp checked, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
+| OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, `id_token` verified against provider JWKS with RS/PS/ES signatures and iss/aud/exp/nonce checks, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. Instance-level sign-in with any OIDC provider is configured by `OPENWARP_OIDC_*` (PKCE, optional client secret, discovery or explicit endpoints; see [configuration](CONFIGURATION.md)). SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
 | External KMS | Enterprise | master key via `OPENWARP_MASTER_KEY` (BYO KMS/HSM wrapper point) |
 | Licence checks / seat limits | n/a | **none, by design** |
 
@@ -34,17 +34,18 @@ Config is stored encrypted under the env key. Secrets are pushed decrypted
 `vercel`, `netlify`, `cloudflare` (Workers secrets), `heroku`, `render`,
 `flyio`, `railway`, `digitalocean` (App Platform spec update),
 `aws_secrets_manager` + `aws_parameter_store` (SigV4 signed, per-key or
-one-JSON-secret modes), `gcp_secret_manager`, `azure_key_vault`, `kubernetes`
-(Opaque Secret), `hashicorp_vault`, `webhook` (generic JSON POST), `instabox`,
+one-JSON-secret modes), `gcp_secret_manager`, `azure_key_vault`,
+`azure_app_configuration` (HMAC signed key-values), `scaleway_secret_manager`
+(one opaque secret per key), `vultr` and `hetzner` (account SSH public keys), `kubernetes`
+(Opaque Secret), `hashicorp_vault`, `webhook` (generic JSON POST, optional
+HMAC signature), `instabox`,
 `boat`, `daytona`, `1password` (Connect; `onepassword` is accepted as an
 alias), `dokploy`, `caprover`, `portainer`
 (stack environment variables), `docker_swarm` (Docker Engine secrets),
 `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`,
 `laravel_forge`, `openwarp` (instance-to-instance), `devin`,
-`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`
-(Cloud Agents environment or team secrets), `northflank`, `spacelift`,
-`rundeck`, `cloud66`, `humanitec`, `ovh_kms` (OVHcloud KMS), `keeper`
-(Commander Service Mode), `oci_vault`, and `bitwarden` (Secrets Manager).
+`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, and `cursor`
+(Cloud Agents environment or team secrets).
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -101,8 +102,10 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
 secret-change proposals, and Postgres dynamic roles are not Phase features.
-Deferred by design: CLI parity (separate effort), Kubernetes operator,
-SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).
+Deferred by design: CLI parity (separate effort), a Kubernetes operator (the
+Helm chart's External Secrets Operator bridge covers controller-driven delivery,
+see [Kubernetes](KUBERNETES.md)), SDKs, AWS-IAM dynamic secrets, Phase
+billing/licence code (never copied).
 
 ## Additional sync adapters (2026-11-06)
 
@@ -143,21 +146,6 @@ The following kinds share the `mode` (`upsert` or `mirror`), `dry_run`, `prefix`
 - `azure_devops` updates a pipeline variable group.
 - `cursor` writes Cloud Agents environment or team secrets
   (`runtime_secret` or `environment_variable`).
-- `northflank` writes a project secret group's variables.
-- `spacelift` writes stack environment variables through GraphQL, using a JWT
-  from `token` or an `api_key_id`/`api_key_secret` exchange.
-- `rundeck` writes project key storage entries.
-- `cloud66` writes stack environment variables; read-only and generated
-  variables are never touched, and keys with hyphens are skipped.
-- `humanitec` writes application or environment values.
-- `ovh_kms` rewrites a versioned OVHcloud KMS secret bundle at `path`.
-- `keeper` manages login records in a shared folder through Commander Service
-  Mode (`instance_url`, `api_key`, `folder_uid`).
-- `oci_vault` writes one OCI Vault secret per key with RSA-signed requests;
-  deletions are scheduled seven days out.
-- `bitwarden` writes Secrets Manager secrets through a machine-account token.
-  `api_url` and `identity_url` cover cloud US/EU and self-hosted installations;
-  `project_ids` and `note` are optional.
 
 Shared behavioural options:
 
@@ -169,15 +157,10 @@ Shared behavioural options:
   values) or `import_remote` (remote values win). Import runs on the first
   stateful sync and is available for AWS Secrets Manager, AWS Parameter Store,
   1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
-  Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps,
-  OpenWarp, Northflank, Spacelift, Rundeck, Cloud 66, Humanitec, OVHcloud KMS,
-  Keeper, OCI Vault and Bitwarden. Adapters that never return values reject
-  import explicitly.
+  Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps and
+  OpenWarp. Adapters that never return values reject import explicitly.
 - AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
   assumes the role and signs with the temporary credentials.
-- GCP Secret Manager accepts `service_account_json` and Azure Key Vault accepts
-  `tenant_id`, `client_id` and `client_secret`; both exchange them for a
-  short-lived access token when a static `token` is not supplied.
 
 Kamal has no server API or central secret store, so there is no `kamal` adapter.
 Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
@@ -186,23 +169,13 @@ Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
 Cursor Cloud Agents is supported because it documents environment and team
 secret endpoints. Grok Bot Vault and ChatGPT/Codex cloud environments document
 environment variables and secrets as UI settings, not as a public API. Keeper
-is supported through Commander Service Mode; it has no plain REST API.
+requires Commander in Service Mode. Pandacode's other providers are machine
+lifecycle APIs that accept environment variables or SSH keys only at creation;
+they are not secret-sync destinations.
 
-Bitwarden Secrets Manager is supported as `bitwarden`, for cloud US/EU and
-self-hosted installations. Vaultwarden does not implement the Secrets Manager
-API, so it is not a `bitwarden` target. LastPass, Dashlane, NordPass and Proton
-Pass do not document a server-side secret API: LastPass's Enterprise API covers
-user and group provisioning, and its vault is reached through the CLI with the
-master password rather than a service API.
-
-Pandacode's other providers are machine lifecycle APIs that accept environment
-variables or SSH keys only at creation; they are not secret-sync destinations.
-
-All of the listed Infisical-style adapters are implemented, plus Bitwarden
-Secrets Manager. Keeper uses Commander Service Mode, OCI Vault uses OCI request
-signing, OVHcloud KMS uses a bearer token or client certificate, and Bitwarden
-uses a machine-account OAuth token. Machine provisioning remains out of scope:
-OpenWarp writes only to providers that already hold secrets.
+Still pending from the wider Infisical-style list: Spacelift, OCI Vault, OVH,
+Northflank, Rundeck, Cloud 66 and Humanitec. Each needs its own auth or API
+contract before it can be implemented without guessing.
 
 ## Trigger.dev sync
 
@@ -242,7 +215,7 @@ OAuth with PKCE and a loopback redirect (`login`), `login --token`, and
 machine Universal Auth (`login --client-id/--client-secret`). Credentials
 live in `~/.openwarp/config.json` (0600). Commands include `whoami`,
 `logout`, `init`, `orgs/apps/envs`, `secrets`, `get`, `set`, `delete`,
-`export --format dotenv|json|yaml|shell`, `import`, `run`,
+`export --format dotenv|json|yaml|shell [--base]`, `import`, `run`,
 `e2e-create/put/get/grant`, and `completion bash|zsh|fish|powershell`.
 
 ## Instabox org Secrets
@@ -432,9 +405,64 @@ certificate, with the issuer reconstructed from the stored serial.
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores
 the admin secret. Postgres lease host allowlisting remains in force.
+
+`type: "openrouter"`, `"resend"` and `"openai"` mint a child key from a parent
+management key and delete that child when the lease is revoked. OpenRouter takes
+`management_key` (optional `limit`, `limit_reset`, `workspace_id`) and sets the
+child `expires_at` from the lease TTL. Resend takes `api_key` and defaults the
+child to `sending_access`. OpenAI takes `admin_key`, `project_id` and
+`service_account_id`, and sets `expires_in_seconds` from the TTL. Hugging Face
+takes `token`, `org` and `service_account_id` (optional `permissions`) and
+creates a fine-grained service-account token; revoke deletes that token.
+
+The same lease covers the inference providers whose APIs both mint and delete a
+child credential:
+
+| type | parent credential | also required | revoke |
+| --- | --- | --- | --- |
+| `fireworks` | `api_key` | `account_id`, `user_id` | posts the key id to `apiKeys:delete` |
+| `mistral` | `admin_key` (Enterprise Admin API) | `workspace_id` | deletes `/v1/admin/api-keys/{id}` |
+| `perplexity` | `api_key` | | posts the child token to `/revoke_auth_token` |
+| `xai` | `management_key` | `team_id` | deletes `/auth/api-keys/{id}` |
+| `gemini` | `access_token` | `project` | deletes the API Keys resource |
+| `cloudflare` | `api_token` | `policies` | deletes `/user/tokens/{id}` |
+| `deepgram` | `api_key` | `project_id` | deletes `/v1/projects/{project}/keys/{id}` |
+| `elevenlabs` | `api_key` | `service_account_id` | deletes the service-account key |
+
+Fireworks, Mistral, Gemini, Cloudflare and Deepgram set a remote expiry from the
+lease TTL. Perplexity, xAI and ElevenLabs do not, so those children stay usable
+until revoked. Gemini's create call returns a long-running operation; the lease
+fails unless the key is already in the response. Cloudflare `policies` are sent
+as given, so the parent token's `API Tokens Write` permission is what bounds
+them. xAI defaults the child to every model and endpoint the team can use, and
+accepts `qps`, `qpm` and `tpm`. ElevenLabs defaults `permissions` to `"all"`.
+
+The parent credential is encrypted on the lease so revoke can authenticate; the
+response returns only the child secret. A failed remote delete leaves the lease
+active. Expiry does not revoke the remote key by itself: call revoke, or rely
+on the provider expiry where one was set at creation. Resend keys have no
+remote expiry. Anthropic's Admin API can list and deactivate keys but has no
+documented create call, so it is not a lease provider. Groq, Together, Cohere,
+DeepSeek, Cerebras, SambaNova, Voyage and AssemblyAI only mint keys from their
+dashboards, so they are not either. None of these providers publish an OAuth
+flow that yields an API credential, so there is no login-based fallback.
 Background jobs (rotation and cleanup) use an `instance_leases` row so one
 replica runs them; the HTTP layer itself is stateless and can run behind a
 load balancer with shared Postgres and optional Redis.
+
+`GET /api/live` upgrades to a WebSocket. The caller authenticates with the same
+session cookie or bearer token as the rest of the API, and each frame is an
+audit event (organisation, application, environment, action, detail, timestamp)
+for an organisation the caller belongs to. Secret values are not included. An
+environment event is dropped unless `require_env` admits the caller. Every
+replica polls the shared `live_events` table, so a socket held by one replica
+sees a change committed by another within about a second. Rows older than an
+hour are deleted by the background loop. Reconnect with `?since=<id>` using the
+last id received: the server sends up to 500 matching events from the past hour
+before resuming the live stream, and skips any the catch-up already delivered.
+The server sends a ping every 30 seconds, which keeps the socket inside
+Cloudflare's idle timeout. The five-minute handler deadline does not apply to
+this route.
 
 ### Clients and deployment
 
