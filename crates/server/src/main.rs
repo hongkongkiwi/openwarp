@@ -607,6 +607,7 @@ fn scim_deactivate(st: &S, org: &str, uid: &str, caller: &str) -> Result<(), (St
     st.db.exec("DELETE FROM team_members WHERE user_id=? AND team_id IN (SELECT id FROM teams WHERE org_id=?)", &[json!(uid), json!(org)]).map_err(|e| bad(&e))?;
     if let Ok(rows) = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(uid)]) { if rows.is_empty() {
         let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(uid)]);
+        let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(uid)]);
         let _ = st.db.exec("UPDATE users SET active=0 WHERE id=?", &[json!(uid)]); } }
     Ok(()) }
 
