@@ -288,9 +288,18 @@ create the sandbox with `env` and replace it.
   empty password is rejected before any bind, because many servers treat it as
   an unauthenticated bind that succeeds for any DN. `{username}` is escaped per
   RFC 4515, a first login for an existing email is refused instead of linked,
-  and a group mapping never demotes an owner. The `ldap` cargo feature is on by
-  default for native builds and absent from a Workers/WASM build, where the
-  routes and the console entry do not exist.
+  and only an owner may map a role that carries `*` or `org:admin`. Changing
+  the directory URL or deleting the configuration discards the stored
+  bindings, so a new endpoint cannot assert an existing member's DN. Group
+  membership is reconciled on every sign-in: joining a mapped group applies
+  its role and leaving it returns the account to `default_role`, unless a human
+  changed the role in the meantime. Login attempts are counted before the
+  directory is contacted, so concurrent guesses cannot outrun the rate limit.
+  The `ldap` cargo feature is on by default for native builds and absent from a
+  Workers/WASM port, where the routes and the console entry do not exist.
+  A configured directory is trusted with process availability: malformed BER
+  from it can crash the parser in the LDAP client library, so restrict who can
+  edit the workspace directory settings.
 - OAuth consent enforces TOTP when the account has it enabled, rejects
   deactivated accounts, rate-limits password attempts, escapes every
   parameter and serves a restrictive Content-Security-Policy.

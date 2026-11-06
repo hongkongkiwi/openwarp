@@ -1428,6 +1428,11 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     if !group_attr.is_empty() && !ldap::valid_attr(&group_attr) { return Err(bad("group_attr must be an LDAP attribute name")); }
     let group_roles = ldap_field(&body, existing.as_ref(), "group_roles");
     if !ldap::valid_mapping(&group_roles) { return Err(bad("group_roles must be Group=role pairs separated by semicolons")); }
+    // A mapping to a role that does not exist yet would pass the permission
+    // check below with an empty permission set and start granting privileges
+    // the moment an admin creates that role.
+    if group_roles.split(';').filter_map(|p| p.rsplit_once('=')).any(|(_, r)| !role_known(&st, &oid, r.trim())) {
+        return Err(bad("group_roles may only reference roles that exist in this organisation; create the role first")); }
     let default_role = ldap_field(&body, existing.as_ref(), "default_role");
     let default_role = if default_role.is_empty() { "developer".to_string() } else { default_role };
     if !role_known(&st, &oid, &default_role) { return Err(bad("default_role must be owner, admin, developer or a custom role in this organisation")); }
@@ -1450,6 +1455,7 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         return Err(bad("LDAP configuration value is too long")); }
     let auto = body.get("auto_provision").and_then(|v| v.as_bool())
         .unwrap_or_else(|| existing.as_ref().map(|r| db::n(r, "auto_provision") == 1).unwrap_or(false));
+    let url_changed = existing.as_ref().map(|r| db::s(r, "url") != url).unwrap_or(false);
     let supplied = body.get("bind_password").and_then(|v| v.as_str()).unwrap_or("");
     let stored = existing.as_ref().map(|r| db::s(r, "bind_password_enc")).unwrap_or_default();
     let password_enc = if supplied.is_empty() { stored } else { oc::encrypt_symmetric(&st.master(), supplied.as_bytes()) };
@@ -1461,12 +1467,17 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         st.db.exec("INSERT INTO ldap_configs(org_id,url,bind_dn,bind_password_enc,base_dn,user_filter,email_attr,name_attr,group_attr,group_roles,default_role,auto_provision,allowed_domains,ca_cert_pem,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             &[json!(&oid), json!(&url), json!(&bind_dn), json!(&password_enc), json!(&base_dn), json!(&user_filter), json!(&email_attr), json!(&name_attr), json!(&group_attr), json!(&group_roles), json!(&default_role), json!(if auto {1} else {0}), json!(&allowed_domains), json!(&ca_cert_pem), json!(now())]).map_err(|e| bad(&e))?;
     }
-    st.audit(&oid, "", "", &uid, "ldap.configure", &url);
+    // Bindings belong to the directory that was configured when they were
+    // created. A new endpoint must not inherit them, or an admin could point
+    // the URL at a directory that asserts an existing member's DN.
+    if url_changed { let _ = st.db.exec("DELETE FROM ldap_subjects WHERE org_id=?", &[json!(&oid)]); }
+    st.audit(&oid, "", "", &uid, "ldap.configure", &format!("{} url_changed={}", url, url_changed));
     Ok(j(json!({"ok": true}))) }
 #[cfg(feature = "ldap")]
 async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
     st.db.exec("DELETE FROM ldap_configs WHERE org_id=?", &[json!(&oid)]).map_err(|e| bad(&e))?;
+    let _ = st.db.exec("DELETE FROM ldap_subjects WHERE org_id=?", &[json!(&oid)]);
     st.audit(&oid, "", "", &uid, "ldap.delete", "");
     Ok(j(json!({"ok": true}))) }
 #[cfg(feature = "ldap")]
@@ -1481,6 +1492,9 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
     if !st.rate_ok(&ip_key, 30, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many directory sign-in attempts from this address; try again later")); }
     let key = format!("ldap:{}:{}:{}", addr.ip(), org, username.to_lowercase());
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed directory sign-in attempts; try again later")); }
+    // Count before contacting the directory: a read-then-write check lets
+    // concurrent guesses all pass while no failure has been recorded yet.
+    st.rate_fail(&key, 900); st.rate_fail(&ip_key, 900);
     if org.is_empty() { return Err(bad("org_id is required")); }
     let Some(row) = ldap_row(&st, &org)? else { return Err(bad("LDAP sign-in is not configured for this workspace; ask an administrator to set it up")); };
     let cfg = ldap_config_from_row(&st, &row)?;
@@ -1493,7 +1507,6 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
         // An ambiguous match reveals directory structure, so it gets the same
         // answer as a wrong password.
         Ok(Err(ldap::DirectoryError::Denied)) | Ok(Err(ldap::DirectoryError::Ambiguous)) => {
-            st.rate_fail(&key, 900); st.rate_fail(&ip_key, 900);
             return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
         Ok(Err(ldap::DirectoryError::Unavailable(e))) => {
             eprintln!("LDAP directory error: {}", e);
@@ -1505,7 +1518,8 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
     let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&user.email), json!(&org), json!(now())]).map_err(|e| bad(&e))?;
     let domain = user.email.rsplit_once('@').map(|(_, d)| d).unwrap_or("").to_string();
     let domain_ok = cfg.allowed_domains.is_empty() || cfg.allowed_domains.split(',').any(|d| d.trim().eq_ignore_ascii_case(&domain));
-    let bound = st.db.one("SELECT user_id FROM ldap_subjects WHERE org_id=? AND dn=?", &[json!(&org), json!(&user.dn)]).map_err(|e| bad(&e))?;
+    let bound = st.db.one("SELECT user_id,role FROM ldap_subjects WHERE org_id=? AND dn=?", &[json!(&org), json!(&user.dn)]).map_err(|e| bad(&e))?;
+    let stored_role = bound.as_ref().map(|b| db::s(b, "role")).unwrap_or_default();
     let uid = if let Some(b) = &bound {
         let uid = db::s(b, "user_id");
         if !st.principal_active(&uid) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
@@ -1536,12 +1550,27 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
         let role = mapped.clone().or_else(|| pending.as_ref().map(|p| db::s(p, "role"))).unwrap_or_else(|| db::s(&row, "default_role"));
         st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(role)]).map_err(|e| bad(&e))?;
         if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]); }
-    } else if let Some(role) = &mapped {
-        // The directory's group mapping stays authoritative, except that it
-        // never demotes an owner: a group change must not lock out the only one.
+        // Record a role that came from the group map, so leaving the group can
+        // revoke it later. Invite and default roles are not directory-derived.
+        let mapped_role = if mapped.is_some() { role } else { String::new() };
+        let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]);
+    } else {
         let current = st.org_role(&org, &uid).unwrap_or_default();
-        if &current != role && current != "owner" {
-            st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&org), json!(&uid)]).map_err(|e| bad(&e))?;
+        if let Some(role) = &mapped {
+            // The directory's group mapping stays authoritative, except that it
+            // never demotes an owner: a group change must not lock out the only one.
+            if &current != role && current != "owner" {
+                st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&org), json!(&uid)]).map_err(|e| bad(&e))?;
+            }
+            if current != "owner" {
+                let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(role), json!(&org), json!(&user.dn)]);
+            }
+        } else if !stored_role.is_empty() && current == stored_role && current != "owner" {
+            // The user left the mapped group: revoke a directory-granted role,
+            // unless a human has changed it since.
+            let fallback = db::s(&row, "default_role");
+            st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(&fallback), json!(&org), json!(&uid)]).map_err(|e| bad(&e))?;
+            let _ = st.db.exec("UPDATE ldap_subjects SET role='' WHERE org_id=? AND dn=?", &[json!(&org), json!(&user.dn)]);
         }
     }
     st.audit(&org, "", "", &uid, "auth.ldap_credentials", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn)));

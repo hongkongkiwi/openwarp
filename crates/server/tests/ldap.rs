@@ -35,6 +35,15 @@ struct Stub {
     ca_pem: String,
     filters: Arc<Mutex<Vec<String>>>,
     binds: Arc<Mutex<Vec<(String, String)>>>,
+    users: Arc<Mutex<Vec<DirectoryUser>>>,
+}
+
+impl Stub {
+    fn set_groups(&self, username: &str, groups: Vec<String>) {
+        if let Some(user) = self.users.lock().unwrap().iter_mut().find(|u| u.username == username) {
+            user.groups = groups;
+        }
+    }
 }
 
 fn start_directory(users: Vec<DirectoryUser>) -> Stub {
@@ -62,15 +71,16 @@ fn start_directory(users: Vec<DirectoryUser>) -> Stub {
     let port = listener.local_addr().expect("stub addr").port();
     let filters = Arc::new(Mutex::new(Vec::new()));
     let binds = Arc::new(Mutex::new(Vec::new()));
-    let users = Arc::new(users);
+    let users = Arc::new(Mutex::new(users));
     let seen_filters = filters.clone();
     let seen_binds = binds.clone();
+    let live_users = users.clone();
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let config = config.clone();
-            let users = users.clone();
+            let users = live_users.clone();
             let filters = seen_filters.clone();
             let binds = seen_binds.clone();
             std::thread::spawn(move || {
@@ -82,13 +92,13 @@ fn start_directory(users: Vec<DirectoryUser>) -> Stub {
         }
     });
 
-    Stub { port, ca_pem: ca.pem(), filters, binds }
+    Stub { port, ca_pem: ca.pem(), filters, binds, users }
 }
 
 const SERVICE_DN: &str = "cn=openwarp,ou=services,dc=example,dc=com";
 const SERVICE_PASSWORD: &str = "service-secret";
 
-fn serve(mut tls: impl Read + Write, users: &[DirectoryUser], filters: &Mutex<Vec<String>>, binds: &Mutex<Vec<(String, String)>>) {
+fn serve(mut tls: impl Read + Write, users: &Mutex<Vec<DirectoryUser>>, filters: &Mutex<Vec<String>>, binds: &Mutex<Vec<(String, String)>>) {
     let mut service_bound = false;
     while let Some(frame) = read_frame(&mut tls) {
         let Some((msgid, op, content)) = ldap_message(&frame) else { return };
@@ -101,7 +111,7 @@ fn serve(mut tls: impl Read + Write, users: &[DirectoryUser], filters: &Mutex<Ve
                 binds.lock().unwrap().push((name.clone(), password.clone()));
                 let ok = !password.is_empty()
                     && ((name == SERVICE_DN && password == SERVICE_PASSWORD)
-                        || users.iter().any(|u| u.dn == name && u.password == password));
+                        || users.lock().unwrap().iter().any(|u| u.dn == name && u.password == password));
                 service_bound = ok && name == SERVICE_DN;
                 if write_all(&mut tls, &bind_response(msgid, if ok { 0 } else { 49 })).is_err() {
                     return;
@@ -116,11 +126,11 @@ fn serve(mut tls: impl Read + Write, users: &[DirectoryUser], filters: &Mutex<Ve
                     filters.lock().unwrap().push(v.clone());
                 }
                 let matched = if service_bound && values.len() == 1 {
-                    users.iter().find(|u| u.username == values[0])
+                    users.lock().unwrap().iter().find(|u| u.username == values[0]).cloned()
                 } else {
                     None
                 };
-                if let Some(u) = matched {
+                if let Some(u) = &matched {
                     if write_all(&mut tls, &search_entry(msgid, u)).is_err() {
                         return;
                     }
@@ -677,6 +687,70 @@ async fn ldap_sign_in_stops_after_the_configuration_is_removed() {
 }
 
 #[tokio::test]
+async fn changing_the_directory_url_invalidates_existing_bindings() {
+    let first_dir = start_directory(vec![user("bob", "bob@example.com")]);
+    let s = Server::start().await;
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    assert_eq!(s.put_ldap(&owner, &org, &first_dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.ldap_login(&org, "bob", "user-secret").await.status, 200);
+
+    // A second directory that accepts anything for the same DN must not inherit
+    // the binding created against the first one.
+    let second_dir = start_directory(vec![user("bob", "bob@example.com")]);
+    assert_eq!(s.put_ldap(&owner, &org, &second_dir, json!({"auto_provision": true})).await.status, 200);
+    let after = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(after.status, 409, "a binding survived a directory URL change: {}", after.text);
+}
+
+#[tokio::test]
+async fn leaving_a_mapped_group_revokes_the_mapped_role() {
+    let mut bob = user("bob", "bob@example.com");
+    bob.groups = vec!["CN=Admins,OU=Groups,DC=example,DC=com".to_string()];
+    let dir = start_directory(vec![bob]);
+    let s = Server::start().await;
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    let saved = s.put_ldap(&owner, &org, &dir,
+        json!({"group_roles": "Admins=admin", "auto_provision": true, "default_role": "developer"})).await;
+    assert_eq!(saved.status, 200, "config failed: {}", saved.text);
+
+    let first = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(first.status, 200, "provisioning login failed: {}", first.text);
+    let admin_token = first.body["token"].as_str().expect("token").to_string();
+    assert_eq!(org_role(&s, &admin_token, &org).await, "admin");
+
+    dir.set_groups("bob", vec![]);
+    let second = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(second.status, 200, "login failed after the group change: {}", second.text);
+    let token = second.body["token"].as_str().expect("token").to_string();
+    assert_eq!(org_role(&s, &token, &org).await, "developer",
+        "leaving the mapped group kept the mapped role");
+}
+
+#[tokio::test]
+async fn failed_attempts_are_counted_before_the_directory_answers() {
+    let dir = start_directory(vec![user("bob", "bob@example.com")]);
+    let s = Server::start().await;
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+
+    for attempt in 0..5 {
+        let r = s.ldap_login(&org, "bob", "wrong-password").await;
+        assert_eq!(r.status, 401, "attempt {}: {}", attempt, r.text);
+    }
+    let blocked = s.ldap_login(&org, "bob", "wrong-password").await;
+    assert_eq!(blocked.status, 429, "the account budget was not enforced: {}", blocked.text);
+}
+
+async fn org_role(s: &Server, token: &str, org: &str) -> String {
+    let r = s.call(reqwest::Method::GET, "/api/orgs", Some(token), None).await;
+    r.body.as_array()
+        .and_then(|orgs| orgs.iter().find(|o| o["id"] == json!(org)))
+        .and_then(|o| o["role"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
 async fn ldap_providers_are_advertised_to_the_console() {
     let s = Server::start().await;
     let r = s.call(reqwest::Method::GET, "/api/auth/providers", None, None).await;
@@ -696,6 +770,9 @@ async fn only_an_owner_can_map_the_owner_or_admin_role() {
 
     let owner_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=owner"})).await;
     assert_eq!(owner_mapping.status, 403, "an admin mapped owner through LDAP: {}", owner_mapping.text);
+
+    let unknown = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=not_a_role"})).await;
+    assert_eq!(unknown.status, 400, "a mapping to a nonexistent role was accepted: {}", unknown.text);
 
     let owner_default = s.put_ldap(&admin_token, &org, &dir, json!({"default_role": "admin"})).await;
     assert_eq!(owner_default.status, 403, "an admin set default_role admin through LDAP: {}", owner_default.text);

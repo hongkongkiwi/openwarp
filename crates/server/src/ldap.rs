@@ -135,12 +135,11 @@ fn group_matches(pattern: &str, value: &str) -> bool {
     if pattern.eq_ignore_ascii_case(value) {
         return true;
     }
-    // Escaped commas inside an RDN are rare in group DNs; splitting on `,`
-    // only over-generates candidate names, which is safe for matching.
-    value.split(',').any(|rdn| {
-        let name = rdn.split_once('=').map(|(_, v)| v.trim().trim_matches('"')).unwrap_or_else(|| rdn.trim());
-        !name.is_empty() && pattern.eq_ignore_ascii_case(name)
-    })
+    // Only the entry's own RDN names the group. Matching parent OUs would give
+    // `Admins=admin` to every member of a OU=Admins subtree.
+    let rdn = value.split(',').next().unwrap_or(value);
+    let name = rdn.split_once('=').map(|(_, v)| v.trim().trim_matches('"')).unwrap_or_else(|| rdn.trim());
+    !name.is_empty() && pattern.eq_ignore_ascii_case(name)
 }
 
 pub async fn authenticate(cfg: &DirectoryConfig, username: &str, password: &str) -> Result<DirectoryUser, DirectoryError> {
@@ -173,18 +172,27 @@ pub async fn authenticate(cfg: &DirectoryConfig, username: &str, password: &str)
         .filter(|a| !a.is_empty())
         .cloned()
         .collect();
-    // Two matches already mean ambiguity, so make the directory stop after two
-    // entries instead of buffering a broad filter's whole result set.
+    // Two matches already mean ambiguity. Ask the directory to stop after two
+    // entries and stop reading after two regardless, so a directory that
+    // ignores the limit cannot make this process buffer a whole result set.
     ldap.with_search_options(ldap3::SearchOptions::new().sizelimit(2).timelimit(10));
-    let found = ldap
-        .search(&cfg.base_dn, Scope::Subtree, &filter, attrs)
+    let mut stream = ldap
+        .streaming_search(&cfg.base_dn, Scope::Subtree, &filter, attrs)
         .await
         .map_err(|e| DirectoryError::Unavailable(format!("directory search failed: {}", e)))?;
-    let _ = ldap.unbind().await;
-    if found.1.rc != 0 {
-        return Err(DirectoryError::Unavailable(format!("directory search failed (result code {})", found.1.rc)));
+    let mut entries = Vec::new();
+    while entries.len() < 2 {
+        match stream.next().await {
+            Ok(Some(entry)) => entries.push(entry),
+            Ok(None) => break,
+            Err(e) => return Err(DirectoryError::Unavailable(format!("directory search failed: {}", e))),
+        }
     }
-    let entries = found.0;
+    let result = stream.finish().await;
+    let _ = ldap.unbind().await;
+    if result.rc != 0 {
+        return Err(DirectoryError::Unavailable(format!("directory search failed (result code {})", result.rc)));
+    }
     if entries.len() > 1 {
         return Err(DirectoryError::Ambiguous);
     }
@@ -295,5 +303,8 @@ mod tests {
             Some("developer")
         );
         assert!(mapping_role("Developers=developer", &groups).is_none());
+        // Parent OUs must not name the group.
+        let nested = vec!["CN=Readers,OU=Admins,DC=example,DC=com".to_string()];
+        assert!(mapping_role("Admins=admin", &nested).is_none());
     }
 }
