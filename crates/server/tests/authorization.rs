@@ -585,6 +585,41 @@ async fn pkce_rejects_an_empty_verifier() {
 }
 
 #[tokio::test]
+async fn restricted_environments_require_a_grant() {
+    let s = Server::start().await;
+    let owner = register(&s, "restrict-owner@test.invalid").await;
+    let member = register(&s, "restrict-member@test.invalid").await;
+    let other = register(&s, "restrict-other@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    set_secret(&s, ot, &envs[0], "RESTRICTED_KEY", "v1").await;
+    invite(&s, ot, org, "restrict-member@test.invalid", "developer").await;
+    invite(&s, ot, org, "restrict-other@test.invalid", "developer").await;
+    let mt = member["token"].as_str().unwrap();
+    let xt = other["token"].as_str().unwrap();
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 200, "an unrestricted env is open to org members: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"restricted": true}))).await;
+    assert_eq!(r.status, 200, "policy change failed: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 403, "a restricted env must deny non-members, got {} {}", r.status, r.text);
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/access-requests", envs[0]), Some(mt), Some(json!({"reason": "need it"}))).await;
+    assert_eq!(r.status, 200, "access request failed: {}", r.text);
+    let rid = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/access-requests/{}/approve", rid), Some(ot), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "approval failed: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 200, "an approved member must get access: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(xt), None).await;
+    assert_eq!(r.status, 403, "approving one member must not open the env to others, got {} {}", r.status, r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(mt), Some(json!({"restricted": false}))).await;
+    assert_eq!(r.status, 403, "only an admin may change env policy, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
 async fn clients_cannot_request_scopes_they_did_not_register() {
     let s = Server::start().await;
     let u = register(&s, "scopes@test.invalid").await;

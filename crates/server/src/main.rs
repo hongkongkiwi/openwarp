@@ -176,13 +176,11 @@ impl AppState {
         let granted = |table: &str, col: &str, id: &str| -> Result<bool, (StatusCode, Json<Value>)> {
             let rows = self.db.query(&format!("SELECT user_id FROM {} WHERE {}=?", table, col), &[json!(id)]).map_err(|e| bad(&e))?;
             Ok(rows.iter().any(|r| db::s(r, "user_id") == user)) };
+        // A member list only restricts an environment an admin marked as
+        // restricted or approval-gated; otherwise org-wide access stands, so
+        // approving one access request cannot lock everyone else out.
+        if !restricted && !require_approval { return Ok((org, app)); }
         let in_env = granted("env_members", "env_id", env_id)?;
-        // Unrestricted environments keep the historic org-wide default, but an
-        // existing grant list still narrows them for backwards compatibility.
-        if !restricted && !in_env {
-            let has_grants = !self.db.query("SELECT user_id FROM env_members WHERE env_id=?", &[json!(env_id)]).map_err(|e| bad(&e))?.is_empty();
-            if !has_grants { return Ok((org, app)); }
-        }
         if in_env { return Ok((org, app)); }
         if granted("app_members", "app_id", &app)? { return Ok((org, app)); }
         if require_approval {
@@ -316,12 +314,34 @@ async fn create_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, 
     let eid = create_env_inner(&st, &aid, &r.name)?; Ok(j(json!({"id": eid}))) }
 async fn list_envs(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res { let uid = st.token_user(&h)?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; st.require_org(&db::s(&app,"org_id"), &uid)?;
-    let rows = st.db.query("SELECT id,app_id,name,created_at FROM envs WHERE app_id=? ORDER BY created_at", &[json!(aid)]).map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,app_id,name,mode,restricted,require_approval,created_at FROM envs WHERE app_id=? ORDER BY created_at", &[json!(aid)]).map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h)?; let (org, app) = st.require_env(&eid, &uid)?;
     st.check_admin(&org, &uid)?;
-    st.db.exec("DELETE FROM secrets WHERE env_id=?", &[json!(eid)]).map_err(|e| bad(&e))?; st.db.exec("DELETE FROM envs WHERE id=?", &[json!(eid)]).map_err(|e| bad(&e))?;
+    for sql in [
+        "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
+        "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
+        "DELETE FROM secrets WHERE env_id=?",
+        "DELETE FROM env_keys WHERE env_id=?",
+        "DELETE FROM leases WHERE env_id=?",
+        "DELETE FROM integrations WHERE env_id=?",
+        "DELETE FROM proposals WHERE env_id=?",
+        "DELETE FROM access_requests WHERE env_id=?",
+        "DELETE FROM rotation_schedules WHERE env_id=?",
+        "DELETE FROM env_members WHERE env_id=?",
+        "DELETE FROM envs WHERE id=?",
+    ] { st.db.exec(sql, &[json!(eid)]).map_err(|e| bad(&e))?; }
     st.audit(&org, &app, &eid, &uid, "env.delete", ""); Ok(j(json!({"ok": true}))) }
+async fn set_env_policy(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
+    let (org, app) = st.require_env(&eid, &uid)?; st.check_admin(&org, &uid)?;
+    let mut changed = Vec::new();
+    for field in ["restricted", "require_approval"] {
+        if let Some(v) = body.get(field).and_then(|v| v.as_bool()) {
+            st.db.exec(&format!("UPDATE envs SET {}=? WHERE id=?", field), &[json!(if v { 1 } else { 0 }), json!(&eid)]).map_err(|e| bad(&e))?;
+            changed.push(format!("{}={}", field, v)); } }
+    if changed.is_empty() { return Err(bad("restricted or require_approval (boolean) required")); }
+    st.audit(&org, &app, &eid, &uid, "env.policy", &changed.join(","));
+    Ok(j(json!({"ok": true, "policy": changed}))) }
 async fn list_members(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?; st.require_org(&oid, &uid)?;
     let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -502,7 +522,10 @@ async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, J
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, uid)?;
     let key = st.env_key(&eid)?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric(&key, &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
-    let items = st.list_secrets_decrypted(&eid, uid)?; let pairs: Vec<(String, String)> = items.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+    // Sealed secrets are never readable, so they must never be pushed: an empty
+    // string would overwrite the value on the remote side.
+    let items = st.list_secrets_decrypted(&eid, uid)?;
+    let pairs: Vec<(String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, _)| (k.clone(), v.clone())).collect();
     let kind = db::s(&row, "kind");
     if matches!(kind.as_str(), "trigger" | "instabox" | "boat" | "daytona") {
         let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).map_err(|e| bad(&e))?;
@@ -1495,6 +1518,23 @@ async fn mcp_call(st: &S, uid: &str, h: &HeaderMap, params: &Value) -> Result<Va
     } }
 
 async fn health() -> impl IntoResponse { Json(json!({"ok": true, "service": "openwarp"})) }
+// One-time share page: the decryption key rides in the fragment and is sent only
+// to the API as a header, never in a request line or a server log.
+const LOCKBOX_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
+async fn lockbox_page() -> Response {
+    let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenWarp lockbox</title><style>body{margin:0;background:#08080c;color:#eceaf8;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh}
+main{width:620px;max-width:92vw;background:#12121b;border:1px solid #23233a;border-radius:14px;padding:24px}pre{white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace}</style></head>
+<body><main><h2>OpenWarp lockbox</h2><p id="out">Loading…</p></main><script>
+(function(){var out=document.getElementById('out');var id=decodeURIComponent(location.pathname.split('/').pop());var key=location.hash.slice(1);
+if(!key){out.textContent='This link is missing its decryption key.';return}
+fetch('/api/lockbox/'+encodeURIComponent(id),{headers:{'x-lockbox-key':key}}).then(function(r){return r.json()}).then(function(d){
+out.innerHTML='';var pre=document.createElement('pre');pre.textContent=d.value!==undefined?d.value:(d.error||'Not found');out.replaceWith(pre)
+}).catch(function(e){out.textContent='Error: '+e})})();
+</script></body></html>"#;
+    let mut r = Html(body).into_response();
+    r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(LOCKBOX_CSP));
+    r }
 async fn index() -> Response {
     let mut r = Html(ui::INDEX).into_response();
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(
@@ -1561,7 +1601,7 @@ async fn main() {
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; process_rotations(&st2); } }); }
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups))
@@ -1571,7 +1611,7 @@ async fn main() {
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", put(org_settings)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/v1/machine/auth/universal/login", post(universal_login))
-        .route("/api/envs/{eid}", delete(delete_env).patch(update_env))
+        .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy))
         .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
