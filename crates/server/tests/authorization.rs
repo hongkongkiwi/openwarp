@@ -1671,3 +1671,76 @@ async fn reuse_check_requires_target_environment_access() {
     let r = reuse_check(&s, xt, &envs[0], json!([{"key": "NEW_PASSWORD", "value": "x", "type": "secret"}]), json!([])).await;
     assert_eq!(r.status, 403, "a non-member must not probe another workspace: {}", r.text);
 }
+
+async fn put_secret(s: &Server, token: &str, env: &str, key: &str, value: &str, tags: &str) {
+    let r = s
+        .call(
+            Method::PUT,
+            &format!("/api/envs/{}/secrets", env),
+            Some(token),
+            Some(json!({"secrets": [{"key": key, "value": value, "tags": tags}]})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "put {} failed: {}", key, r.text);
+}
+
+#[tokio::test]
+async fn pitr_restores_creates_deletes_and_tags() {
+    let s = Server::start().await;
+    let u = register(&s, "pitr@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let env = envs[0].clone();
+
+    put_secret(&s, token, &env, "ALPHA", "v1", "team=a").await;
+    put_secret(&s, token, &env, "BRAVO", "b1", "team=b").await;
+    let reference = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    put_secret(&s, token, &env, "ALPHA", "v2", "team=changed").await;
+    let bravo = secret_id(&s, token, &env, "BRAVO").await;
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{}", bravo), Some(token), None).await;
+    assert_eq!(r.status, 200, "delete failed: {}", r.text);
+    put_secret(&s, token, &env, "CHARLIE", "c1", "").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let r = s
+        .call(Method::POST, &format!("/api/envs/{}/restore-point", env), Some(token), Some(json!({"timestamp": reference})))
+        .await;
+    assert_eq!(r.status, 200, "restore-point failed: {}", r.text);
+    assert!(r.body["restored"].as_i64().unwrap_or(0) >= 1, "at least one secret restored: {}", r.text);
+
+    let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
+    let secrets = list.body["secrets"].as_array().expect("secrets");
+    let alpha = secrets.iter().find(|x| x["key"] == "ALPHA").expect("ALPHA");
+    assert_eq!(alpha["value"], json!("v1"), "the value at the reference time must return");
+    assert_eq!(alpha["tags"], json!("team=a"), "tags recorded with the version must return");
+    assert!(secrets.iter().any(|x| x["key"] == "BRAVO"), "a secret deleted after the reference time must return");
+    assert!(!secrets.iter().any(|x| x["key"] == "CHARLIE"), "a secret created after the reference time must disappear");
+
+    // A later restore must not resurrect CHARLIE (deleted by the first restore)
+    // and must keep BRAVO (its deleted_at was cleared when it was restored).
+    let later = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let r = s
+        .call(Method::POST, &format!("/api/envs/{}/restore-point", env), Some(token), Some(json!({"timestamp": later})))
+        .await;
+    assert_eq!(r.status, 200, "second restore-point failed: {}", r.text);
+    let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
+    let secrets = list.body["secrets"].as_array().expect("secrets");
+    assert!(secrets.iter().any(|x| x["key"] == "BRAVO"), "a restored secret must survive a later restore: {}", list.text);
+    assert!(!secrets.iter().any(|x| x["key"] == "CHARLIE"), "a removed secret must stay removed: {}", list.text);
+
+    // The explicit version restore must also clear the tombstone.
+    let bravo = secret_id(&s, token, &env, "BRAVO").await;
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{}", bravo), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/secrets/{}/restore/1", bravo), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "version restore failed: {}", r.text);
+    let r = s
+        .call(Method::POST, &format!("/api/envs/{}/restore-point", env), Some(token), Some(json!({"timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64})))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
+    assert!(list.body["secrets"].as_array().expect("secrets").iter().any(|x| x["key"] == "BRAVO"), "a manually restored secret must survive a point-in-time restore: {}", list.text);
+}

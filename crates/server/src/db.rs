@@ -79,6 +79,8 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    pub async fn version(&self) -> Result<i64, String> {
+        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
     async fn migrate(&self) -> Result<(), String> {
         for stmt in SCHEMA { self.exec(stmt, &[]).await?; }
         for alter in [
@@ -174,7 +176,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS envs(id TEXT PRIMARY KEY,app_id TEXT NOT NULL,name TEXT NOT NULL,env_key_wrapped TEXT NOT NULL,restricted BIGINT DEFAULT 0,require_approval BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS env_members(env_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
     "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,deleted_at BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',path TEXT DEFAULT '/',tags TEXT DEFAULT '',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
     "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,scopes TEXT DEFAULT '',last_used_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
@@ -264,6 +266,10 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE secrets ADD COLUMN value_fp TEXT DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS idx_secrets_fp ON secrets(value_fp)",
     ]),
+    (13, &[
+        "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'",
+        "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -294,5 +300,12 @@ mod tests {
         assert_eq!(s(&rows[0], "name"), "Acme");
         // placeholder translation used by Postgres backend
         assert_eq!(pg_sql("SELECT * FROM t WHERE a=? AND b=?"), "SELECT * FROM t WHERE a=$1 AND b=$2");
+    }
+    #[tokio::test] async fn migrations_are_recorded_once() {
+        let db = Db::open_memory().await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 13, "a fresh database lands on the current version");
+        db.migrate().await.unwrap();
+        let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
+        assert_eq!(n(&row, "n"), 13, "each migration must be recorded exactly once");
     }
 }

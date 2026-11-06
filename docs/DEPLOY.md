@@ -59,6 +59,21 @@ docker compose ps
 docker compose logs --tail=100 server
 ```
 
+## Schema migrations
+
+Migrations are numbered and recorded in `schema_migrations`. The server applies
+them at boot, or a deploy job can run them without starting the listener or
+needing the master key:
+
+```bash
+DATABASE_URL=... openwarp-server --migrate   # prints the current version and exits
+```
+
+Existing databases created before the ledger are baselined at version 1 and
+upgraded in place. Take a backup first; see [BACKUP.md](BACKUP.md).
+
+## Operational checks
+
 Treat rendered Compose configuration and logs as sensitive: they can include credentials or connection strings. The source Compose file binds port 8080 on host interfaces. Restrict it with firewall or binding configuration before exposing the host. If a reverse proxy runs in another container, its address is not necessarily loopback.
 
 ## HTTPS and reverse proxies

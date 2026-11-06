@@ -62,6 +62,36 @@ openwarp run -- ./your-app
 
 Replace `APP_ID` and `ENV_ID` with IDs from your instance. `init` saves project defaults in `.openwarp.json`; `run` supplies secrets as environment variables to the child process. See [getting started](docs/GETTING_STARTED.md) for a complete walkthrough and the [CLI reference](docs/CLI.md) for authentication and command options.
 
+## API, SDKs and schema
+
+The public REST contract is [`openapi.json`](openapi.json): 56 paths and 72
+operations covering authentication, organisations, members, apps,
+environments, secrets, service tokens, integrations, leases, rotations,
+machine identities, sharing and search. Browser and protocol surfaces (OAuth
+authorization, MCP, SCIM, PKI, E2E envelopes) are deliberately outside it.
+
+Clients live under `sdks/`. Both are dependency free, cover the contract, and
+are tested against a real server binary:
+
+```bash
+cargo build -p openwarp-server
+OPENWARP_BIN=target/debug/openwarp-server node --test sdks/typescript/sdk.test.ts
+OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest discover -s sdks/python -p 'test_*.py'
+```
+
+`python3 scripts/check-openapi.py` fails when the spec documents a path or
+method the server does not serve, or when a schema reference or path parameter
+is missing, so the contract cannot drift silently.
+
+Schema changes are numbered migrations in `crates/server/src/db.rs`, recorded in
+`schema_migrations` and applied once. The server applies them at boot;
+`openwarp-server --migrate` reports the version and exits without needing a
+master key or a listener, which is the right hook for a deploy job. Existing
+databases are baselined and upgraded in place.
+
+A Terraform provider under [`terraform-provider/`](terraform-provider/) is
+built on the same contract.
+
 ### Self-host with Compose
 
 The included Compose stack runs OpenWarp with PostgreSQL 17 and Redis 7. It requires a master key and database password:

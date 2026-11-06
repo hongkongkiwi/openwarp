@@ -621,10 +621,10 @@ async fn upsert_secret(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &str, s
     let fp = if stype == "secret" && !s.value.is_empty() { value_fingerprint(&st.master(), org, &s.value) } else { String::new() };
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
         st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(&fp), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     } else { let sid = id();
         st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,value_fp,comment_enc,tags,secret_type,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)", &[json!(sid), json!(eid), json!(s.path), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(khash), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(&fp), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
-        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(s.path), json!(s.tags), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     } Ok(()) }
 fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pending_comment = String::new();
     for line in text.lines() { let l = line.trim(); if l.is_empty() { continue; } else if l.starts_with('#') { pending_comment = l.trim_start_matches('#').trim().to_string(); continue; }
@@ -637,7 +637,7 @@ async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> 
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let key = st.env_key(&eid).await?; let sealed = st.db.one("SELECT secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map(|r| r.map(|x| db::s(&x,"secret_type") == "sealed").unwrap_or(false)).unwrap_or(false);
     let rows = st.db.query("SELECT * FROM secret_versions WHERE secret_id=? ORDER BY version DESC", &[json!(sid)]).await.map_err(|e| bad(&e))?;
-    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "value": if sealed { "[SEALED]".to_string() } else { oc::decrypt_symmetric(&key,&db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
+    let items: Vec<Value> = rows.iter().map(|r| json!({"version": db::n(r,"version"), "path": db::s(r,"path"), "tags": db::s(r,"tags"), "value": if sealed { "[SEALED]".to_string() } else { oc::decrypt_symmetric(&key,&db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
     Ok(j(json!(items))) }
 async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(String, i64)>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
@@ -645,13 +645,16 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
-    let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?; let new_ver = cur.map(|r| db::n(&r,"version")).unwrap_or(0) + 1;
+    let cur = st.db.one("SELECT version,path FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?;
+    let new_ver = cur.as_ref().map(|r| db::n(r,"version")).unwrap_or(0) + 1;
+    let cur_path = cur.as_ref().map(|r| db::s(r,"path")).unwrap_or_else(|| db::s(&v,"path"));
+    let vpath = { let p = db::s(&v,"path"); if p.is_empty() { cur_path } else { p } };
     let restored_fp = if db::s(&v,"secret_type") == "secret" {
         key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
             .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
     } else { String::new() };
-    st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(&restored_fp), json!(db::s(&v,"comment_enc")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(&restored_fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"tags")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)).await; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.require_env(&eid,&uid).await?;
@@ -954,7 +957,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
     let ts = body.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(now);
     // Restore the whole environment as it stood at ts: a secret created later
     // must disappear, and a secret deleted before ts must stay deleted.
-    let rows = st.db.query("SELECT id,version,deleted_at FROM secrets WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,version,deleted_at,path FROM secrets WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
     let mut restored = 0; let mut removed = 0;
     for r in &rows {
         let sid = db::s(r,"id"); let cur = db::n(r,"version"); let del_at = db::n(r,"deleted_at");
@@ -969,10 +972,10 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
                     key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
                         .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
                 } else { String::new() };
-                st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
-                    &[json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(&fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).await.map_err(|e| bad(&e))?;
-                st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)",
-                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(&uid)]).await.map_err(|e| bad(&e))?;
+                st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,tags=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
+                    &[json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(&fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(db::s(&v,"tags")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).await.map_err(|e| bad(&e))?;
+                st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(db::s(r,"path")), json!(db::s(&v,"tags")), json!(now()), json!(&uid)]).await.map_err(|e| bad(&e))?;
                 if was_deleted { removed += 1 } else { restored += 1 }
             }
             None => {
@@ -1152,10 +1155,10 @@ async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Jso
         if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).await.map_err(|e| bad(&e))? {
             let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
             st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
-            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(&path), json!(""), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
         } else { let sid = id();
             st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
-            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,1,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(&path), json!(""), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
         } count += 1;
     }
     st.audit(&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)).await; Ok(j(json!({"deployed": count}))) }
@@ -3398,6 +3401,11 @@ async fn shutdown_signal() {
 async fn main() {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openwarp.db".into());
     let db = Db::open(&db_url).await.expect("open database (sqlite://file.db or postgres://...)");
+    // Migration-only entry point for deploy jobs: no master key or listener.
+    if std::env::args().any(|a| a == "--migrate") {
+        match db.version().await { Ok(v) => println!("schema version {}", v), Err(e) => { eprintln!("{}", e); std::process::exit(1); } }
+        return;
+    }
     let master = load_master(&db).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
     if !mailer::MailConfig::from_env().enabled() {
         if production() {
