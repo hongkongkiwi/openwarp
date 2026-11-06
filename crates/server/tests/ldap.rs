@@ -1,3 +1,4 @@
+#![cfg(feature = "ldap")]
 // LDAP suite: the real server binary against a private database and an
 // in-process LDAPS directory. The stub speaks just enough BER for bind and
 // search, and records the filters and bind attempts the server sends.
@@ -681,4 +682,47 @@ async fn ldap_providers_are_advertised_to_the_console() {
     let r = s.call(reqwest::Method::GET, "/api/auth/providers", None, None).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.body["ldap"], json!(true), "native build should advertise LDAP");
+}
+
+#[tokio::test]
+async fn only_an_owner_can_map_the_owner_or_admin_role() {
+    let s = Server::start().await;
+    let dir = start_directory(vec![]);
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    let (admin_token, _) = s.register("admin@example.com", "password123").await;
+    let promoted = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/members", org), Some(&owner),
+        Some(json!({"email": "admin@example.com", "role": "admin"}))).await;
+    assert_eq!(promoted.status, 200, "promotion failed: {}", promoted.text);
+
+    let owner_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=owner"})).await;
+    assert_eq!(owner_mapping.status, 403, "an admin mapped owner through LDAP: {}", owner_mapping.text);
+
+    let owner_default = s.put_ldap(&admin_token, &org, &dir, json!({"default_role": "admin"})).await;
+    assert_eq!(owner_default.status, 403, "an admin set default_role admin through LDAP: {}", owner_default.text);
+
+    let by_owner = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin"})).await;
+    assert_eq!(by_owner.status, 200, "the owner was refused: {}", by_owner.text);
+}
+
+#[tokio::test]
+async fn a_removed_member_cannot_sign_back_in_without_a_new_invite() {
+    let s = Server::start().await;
+    let dir = start_directory(vec![user("bob", "bob@example.com")]);
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+
+    let first = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(first.status, 200, "provisioning login failed: {}", first.text);
+    let uid = first.body["user_id"].as_str().expect("user id").to_string();
+
+    let removed = s.call(reqwest::Method::DELETE, &format!("/api/orgs/{}/members/{}", org, uid), Some(&owner), None).await;
+    assert_eq!(removed.status, 200, "removal failed: {}", removed.text);
+    let back = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(back.status, 403, "a removed member signed back in: {}", back.text);
+
+    let invite = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/members", org), Some(&owner),
+        Some(json!({"email": "bob@example.com", "role": "developer"}))).await;
+    assert_eq!(invite.status, 200, "re-invite failed: {}", invite.text);
+    let again = s.ldap_login(&org, "bob", "user-secret").await;
+    assert_eq!(again.status, 200, "re-invited member refused: {}", again.text);
 }

@@ -26,12 +26,15 @@ docker compose up -d --build
 
 ## Platform limits
 
-OpenWarp is a native service. A Cloudflare Workers or other WASM build cannot
-open raw TCP/TLS sockets, so it must be built with `--no-default-features`:
-the `ldap` feature is then off, the LDAP routes are not registered, and
-`/api/auth/providers` reports `ldap: false`, which hides the console entry.
-Directories that publish OIDC (Entra ID, Keycloak, Authentik, Dex) still work
-on that target through the OIDC flow.
+OpenWarp is a native service. A Cloudflare Workers or other WASM port, which is
+not part of this repository, cannot open raw TCP/TLS sockets and cannot offer
+LDAP. The `ldap` cargo feature is what carries the directory client, its routes
+and its console entry: building with `--no-default-features` produces a binary
+with no LDAP code at all, `/api/auth/providers` reports `ldap: false`, and the
+console hides the directory card and sign-in button. The rest of the server
+still needs its database driver and OS networking, so that build is not a
+Workers deployment by itself. Directories that publish OIDC (Entra ID, Keycloak,
+Authentik, Dex) remain reachable through the OIDC flow on any target.
 
 On a native deployment the directory is usually on a private network. Add its
 CA to the host trust store, or paste the CA PEM into the directory settings.
