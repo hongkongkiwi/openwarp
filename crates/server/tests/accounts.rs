@@ -84,6 +84,14 @@ impl Server {
             .env_remove("OPENWARP_GITHUB_CLIENT_ID")
             .env_remove("OPENWARP_APPLE_CLIENT_ID")
             .env_remove("OPENWARP_OPENAI_CLIENT_ID")
+            .env_remove("OPENWARP_MICROSOFT_CLIENT_ID")
+            .env_remove("OPENWARP_OKTA_CLIENT_ID")
+            .env_remove("OPENWARP_AUTH0_CLIENT_ID")
+            .env_remove("OPENWARP_GITLAB_CLIENT_ID")
+            .env_remove("OPENWARP_SLACK_CLIENT_ID")
+            .env_remove("OPENWARP_SALESFORCE_CLIENT_ID")
+            .env_remove("OPENWARP_ATLASSIAN_CLIENT_ID")
+            .env_remove("OPENWARP_X_CLIENT_ID")
             .env_remove("OPENWARP_OIDC_ISSUER")
             .env_remove("OPENWARP_OIDC_CLIENT_ID")
             .env_remove("OPENWARP_OIDC_CLIENT_SECRET")
@@ -190,21 +198,29 @@ zx/UpPmCIb8/3cJ8IR+QpA==
 -----END PRIVATE KEY-----"#;
 const TEST_N: &str = "uTt-NHHm3ZFrMRYklTgNMQpbuY5FXX5P09Yen7BB6hyQ0S7cUYiXr2jAa-5ipW6eHej0FkOsnRc7IeoG-CKhO_1DjSjYavmSv0qSmmNA4qKxaV-1C36HPUb2W_9M8AbhYuI-JJtgQ2n9PVrxCHf0G4osxPaNBL9WEJMqnJO3c9bediZxOLSNGjs-owL8HHleUH5T7Bpimvj4iZ1xH2Yp-1UU4vyEEV757ULSA5OAjJdqk-Vf3BjSjbaR4vtfc2veqrdISKYbA_z8DGDfQM9QWfP5coE0542SH3KzJ2RG1TUn2U7QGtrc4LngJVMfgiZhBOidTH1VugBhxr-0kel1Yw";
 
-struct MockIdp { base: String, issuer: String, token_forms: Arc<Mutex<Vec<String>>> }
+struct MockIdp { base: String, issuer: String, token_forms: Arc<Mutex<Vec<String>>>, nonce: Arc<Mutex<String>> }
 
 /// Mock identity provider: discovery, JWKS, and a token endpoint that signs an
 /// id_token for the requested email. Also serves the GitHub endpoints.
-fn start_mock(email: &'static str, client_id: &'static str) -> MockIdp { start_mock_at(email, client_id, "") }
+fn start_mock(email: &'static str, client_id: &'static str) -> MockIdp { start_mock_full(email, client_id, "", None, false) }
 /// A non-empty suffix makes the issuer include a path that serves no discovery
 /// document, which exercises the explicit endpoint overrides.
-fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static str) -> MockIdp {
+fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static str) -> MockIdp { start_mock_full(email, client_id, suffix, None, false) }
+/// Microsoft mode publishes a templated issuer and returns the UPN instead of email.
+fn start_mock_tenant(email: &'static str, client_id: &'static str, tenant: &'static str) -> MockIdp {
+    start_mock_full(email, client_id, "", Some(tenant), true) }
+fn start_mock_full(email: &'static str, client_id: &'static str, suffix: &'static str, tenant: Option<&'static str>, upn_only: bool) -> MockIdp {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
     let addr = listener.local_addr().expect("mock addr");
     let base = format!("http://{}", addr);
     let issuer = format!("{}{}", base, suffix);
     let thread_issuer = issuer.clone();
+    let discovery_issuer = match tenant { Some(_) => format!("{}/{{tenantid}}/v2.0", issuer), None => issuer.clone() };
+    let claim_issuer = match tenant { Some(t) => format!("{}/{}/v2.0", issuer, t), None => issuer.clone() };
     let token_forms = Arc::new(Mutex::new(Vec::new()));
     let captured = token_forms.clone();
+    let nonce_slot = Arc::new(Mutex::new(String::new()));
+    let issued_nonce = nonce_slot.clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
@@ -221,18 +237,27 @@ fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static 
             let head = String::from_utf8_lossy(&buf).to_string();
             let first = head.lines().next().unwrap_or("").to_string();
             let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
-            if path.starts_with("/token") {
+            if path.starts_with("/token") || path.starts_with("/2/oauth2/token") {
                 captured.lock().unwrap().push(head.split("\r\n\r\n").nth(1).unwrap_or("").to_string());
             }
             let payload = if path.starts_with("/.well-known/openid-configuration") {
-                json!({"issuer": thread_issuer, "authorization_endpoint": format!("{}/authorize", thread_issuer),
+                json!({"issuer": discovery_issuer, "authorization_endpoint": format!("{}/authorize", thread_issuer),
                        "token_endpoint": format!("{}/token", thread_issuer), "jwks_uri": format!("{}/jwks", thread_issuer)}).to_string()
             } else if path.starts_with("/jwks") {
                 json!({"keys": [{"kty": "RSA", "kid": "t1", "use": "sig", "alg": "RS256", "n": TEST_N, "e": "AQAB"}]}).to_string()
+            } else if path.starts_with("/2/oauth2/token") {
+                json!({"access_token": "x-token", "token_type": "bearer"}).to_string()
+            } else if path.starts_with("/2/users/me") {
+                json!({"data": {"id": "x-user-1", "confirmed_email": email}}).to_string()
             } else if path.starts_with("/token") {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let header = jsonwebtoken::Header { alg: jsonwebtoken::Algorithm::RS256, kid: Some("t1".into()), ..Default::default() };
-                let claims = json!({"iss": thread_issuer, "aud": client_id, "sub": "google-subject-1", "email": email, "email_verified": true, "iat": now, "exp": now + 300});
+                let mut claims = json!({"iss": claim_issuer, "aud": client_id, "sub": "mock-subject-1", "iat": now, "exp": now + 300});
+                let nonce = issued_nonce.lock().unwrap().clone();
+                if !nonce.is_empty() { claims["nonce"] = json!(nonce); }
+                if let Some(t) = tenant { claims["tid"] = json!(t); }
+                if upn_only { claims["preferred_username"] = json!(email); }
+                else { claims["email"] = json!(email); claims["email_verified"] = json!(true); }
                 let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_PEM.as_bytes()).expect("rsa pem");
                 let id_token = jsonwebtoken::encode(&header, &claims, &key).expect("sign id token");
                 json!({"access_token": "x", "id_token": id_token, "token_type": "Bearer"}).to_string()
@@ -248,7 +273,12 @@ fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static 
             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes());
         }
     });
-    MockIdp { base, issuer, token_forms }
+    MockIdp { base, issuer, token_forms, nonce: nonce_slot }
+}
+/// The strict nonce check requires the mock to echo the value from the start
+/// redirect; every OIDC callback test sets it before answering.
+fn set_expected_nonce(idp: &MockIdp, location: &str) {
+    *idp.nonce.lock().unwrap() = query_param(location, "nonce");
 }
 
 #[tokio::test]
@@ -301,6 +331,14 @@ async fn providers_are_hidden_when_not_configured() {
     assert_eq!(r.body["github"], json!(false), "{}", r.text);
     assert_eq!(r.body["apple"], json!(false), "{}", r.text);
     assert_eq!(r.body["openai"], json!(false), "{}", r.text);
+    assert_eq!(r.body["microsoft"], json!(false), "{}", r.text);
+    assert_eq!(r.body["okta"], json!(false), "{}", r.text);
+    assert_eq!(r.body["auth0"], json!(false), "{}", r.text);
+    assert_eq!(r.body["gitlab"], json!(false), "{}", r.text);
+    assert_eq!(r.body["slack"], json!(false), "{}", r.text);
+    assert_eq!(r.body["salesforce"], json!(false), "{}", r.text);
+    assert_eq!(r.body["atlassian"], json!(false), "{}", r.text);
+    assert_eq!(r.body["x"], json!(false), "{}", r.text);
     assert_eq!(r.body["oidc"], json!(false), "{}", r.text);
     assert_eq!(r.body["signups"], json!("open"), "{}", r.text);
     let r = s.get("/api/auth/social/google/start").await;
@@ -309,6 +347,8 @@ async fn providers_are_hidden_when_not_configured() {
     assert_eq!(r.status, 404, "an unconfigured Apple flow must be refused, got {} {}", r.status, r.text);
     let r = s.get("/api/auth/social/openai/start").await;
     assert_eq!(r.status, 404, "an unconfigured OpenAI flow must be refused, got {} {}", r.status, r.text);
+    let r = s.get("/api/auth/social/x/start").await;
+    assert_eq!(r.status, 404, "an unconfigured X flow must be refused, got {} {}", r.status, r.text);
     let r = s.get("/api/auth/social/oidc/start").await;
     assert_eq!(r.status, 404, "an unconfigured custom OIDC flow must be refused, got {} {}", r.status, r.text);
 }
@@ -326,6 +366,7 @@ async fn google_login_provisions_a_user() {
 
     let r = s.get("/api/auth/social/google/start").await;
     assert_eq!(r.status, 307, "google start failed: {} {}", r.status, r.text);
+    set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     assert!(!state.is_empty(), "no state in {}", r.header("location"));
 
@@ -379,6 +420,7 @@ async fn apple_login_uses_form_post_and_trusts_the_provider_email() {
     let start = s.get("/api/auth/social/apple/start").await;
     assert_eq!(start.status, 307, "apple start failed: {} {}", start.status, start.text);
     let location = start.header("location");
+    set_expected_nonce(&idp, &location);
     assert!(location.contains("response_mode=form_post"), "Apple requires a form POST response: {}", location);
     assert!(location.contains("scope=openid%20email"), "Apple only supports its advertised scopes: {}", location);
     let state = query_param(&location, "state");
@@ -407,6 +449,7 @@ async fn openai_login_sends_pkce_and_trusts_the_provider_email() {
     let start = s.get("/api/auth/social/openai/start").await;
     assert_eq!(start.status, 307, "openai start failed: {} {}", start.status, start.text);
     let location = start.header("location");
+    set_expected_nonce(&idp, &location);
     assert!(location.contains("code_challenge="), "OpenAI sign-in must use PKCE: {}", location);
     assert!(location.contains("code_challenge_method=S256"), "{}", location);
     let state = query_param(&location, "state");
@@ -421,6 +464,113 @@ async fn openai_login_sends_pkce_and_trusts_the_provider_email() {
     let forms = idp.token_forms.lock().unwrap();
     assert!(forms.iter().any(|f| f.contains("code_verifier=")), "the PKCE verifier must reach the token endpoint: {:?}", *forms);
     assert!(forms.iter().any(|f| f.contains("client_secret=test-openai-secret")), "the client secret must reach the token endpoint: {:?}", *forms);
+}
+
+/// Shared OIDC flow for the branded providers that only differ by env names.
+async fn oidc_provider_login(provider: &'static str, email: &'static str, client_id: &'static str,
+    id_key: &'static str, secret_key: &'static str, issuer_key: &'static str) {
+    let idp = start_mock(email, client_id);
+    let s = Server::start_env(&[
+        (id_key, client_id.to_string()),
+        (secret_key, "test-secret".to_string()),
+        (issuer_key, idp.issuer.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body[provider], json!(true), "{} must be advertised: {}", provider, r.text);
+    let start = s.get(&format!("/api/auth/social/{}/start", provider)).await;
+    assert_eq!(start.status, 307, "{} start failed: {} {}", provider, start.status, start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    assert!(!state.is_empty(), "{} start has no state", provider);
+    let r = s.get(&format!("/api/auth/social/{}/callback?code=abc&state={}", provider, state)).await;
+    assert_eq!(r.status, 307, "{} callback failed: {} {}", provider, r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    assert!(!token.is_empty(), "{} issued no session: {}", provider, r.header("location"));
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.status, 200, "{} provider email must be trusted: {} {}", provider, me.status, me.text);
+    assert_eq!(me.body["email"], json!(email), "{}", me.text);
+}
+
+#[tokio::test]
+async fn okta_login_provisions_a_user() {
+    oidc_provider_login("okta", "okta-user@test.invalid", "test-okta", "OPENWARP_OKTA_CLIENT_ID", "OPENWARP_OKTA_CLIENT_SECRET", "OPENWARP_OKTA_ISSUER").await;
+}
+
+#[tokio::test]
+async fn auth0_login_provisions_a_user() {
+    oidc_provider_login("auth0", "auth0-user@test.invalid", "test-auth0", "OPENWARP_AUTH0_CLIENT_ID", "OPENWARP_AUTH0_CLIENT_SECRET", "OPENWARP_AUTH0_ISSUER").await;
+}
+
+#[tokio::test]
+async fn gitlab_login_provisions_a_user() {
+    oidc_provider_login("gitlab", "gitlab-user@test.invalid", "test-gitlab", "OPENWARP_GITLAB_CLIENT_ID", "OPENWARP_GITLAB_CLIENT_SECRET", "OPENWARP_GITLAB_ISSUER").await;
+}
+
+#[tokio::test]
+async fn slack_login_provisions_a_user() {
+    oidc_provider_login("slack", "slack-user@test.invalid", "test-slack", "OPENWARP_SLACK_CLIENT_ID", "OPENWARP_SLACK_CLIENT_SECRET", "OPENWARP_SLACK_ISSUER").await;
+}
+
+#[tokio::test]
+async fn salesforce_login_provisions_a_user() {
+    oidc_provider_login("salesforce", "salesforce-user@test.invalid", "test-salesforce", "OPENWARP_SALESFORCE_CLIENT_ID", "OPENWARP_SALESFORCE_CLIENT_SECRET", "OPENWARP_SALESFORCE_ISSUER").await;
+}
+
+#[tokio::test]
+async fn atlassian_login_provisions_a_user() {
+    oidc_provider_login("atlassian", "atlassian-user@test.invalid", "test-atlassian", "OPENWARP_ATLASSIAN_CLIENT_ID", "OPENWARP_ATLASSIAN_CLIENT_SECRET", "OPENWARP_ATLASSIAN_ISSUER").await;
+}
+
+#[tokio::test]
+async fn microsoft_login_provisions_a_user() {
+    oidc_provider_login("microsoft", "microsoft-user@test.invalid", "test-microsoft", "OPENWARP_MICROSOFT_CLIENT_ID", "OPENWARP_MICROSOFT_CLIENT_SECRET", "OPENWARP_MICROSOFT_ISSUER").await;
+}
+
+#[tokio::test]
+async fn microsoft_login_handles_a_templated_tenant_issuer_and_upn_email() {
+    let idp = start_mock_tenant("microsoft-upn@test.invalid", "test-microsoft", "11111111-1111-1111-1111-111111111111");
+    let s = Server::start_env(&[
+        ("OPENWARP_MICROSOFT_CLIENT_ID", "test-microsoft".to_string()),
+        ("OPENWARP_MICROSOFT_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_MICROSOFT_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let start = s.get("/api/auth/social/microsoft/start").await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/microsoft/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "the templated tenant issuer must validate: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.status, 200, "{}", me.text);
+    assert_eq!(me.body["email"], json!("microsoft-upn@test.invalid"), "the UPN fallback must supply the email: {}", me.text);
+}
+
+#[tokio::test]
+async fn x_login_uses_pkce_and_the_confirmed_email() {
+    let idp = start_mock("x-user@test.invalid", "test-x");
+    let s = Server::start_env(&[
+        ("OPENWARP_X_CLIENT_ID", "test-x".to_string()),
+        ("OPENWARP_X_WEB", idp.issuer.clone()),
+        ("OPENWARP_X_API", idp.issuer.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["x"], json!(true), "{}", r.text);
+    let start = s.get("/api/auth/social/x/start").await;
+    assert_eq!(start.status, 307, "x start failed: {} {}", start.status, start.text);
+    let location = start.header("location");
+    assert!(location.contains("code_challenge="), "X sign-in must use PKCE: {}", location);
+    assert!(location.contains("users.email"), "X needs the users.email scope: {}", location);
+    let state = query_param(&location, "state");
+    let r = s.get(&format!("/api/auth/social/x/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "x callback failed: {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.status, 200, "{}", me.text);
+    assert_eq!(me.body["email"], json!("x-user@test.invalid"), "{}", me.text);
+    let forms = idp.token_forms.lock().unwrap();
+    assert!(forms.iter().any(|f| f.contains("code_verifier=")), "the PKCE verifier must reach the X token endpoint: {:?}", *forms);
+    assert!(forms.iter().any(|f| f.contains("client_id=test-x")), "a public X client sends its id in the form: {:?}", *forms);
 }
 
 #[tokio::test]
@@ -440,6 +590,7 @@ async fn custom_oidc_login_uses_pkce_and_provisions_a_user() {
     let start = s.get("/api/auth/social/oidc/start").await;
     assert_eq!(start.status, 307, "custom OIDC start failed: {} {}", start.status, start.text);
     let location = start.header("location");
+    set_expected_nonce(&idp, &location);
     assert!(location.contains("code_challenge=") && location.contains("code_challenge_method=S256"), "custom OIDC must use PKCE: {}", location);
     assert!(location.contains("scope=openid%20email%20profile"), "openid must be added when an operator scope list omits it: {}", location);
     let state = query_param(&location, "state");
@@ -470,6 +621,7 @@ async fn custom_oidc_accepts_explicit_endpoints_without_discovery() {
     let start = s.get("/api/auth/social/oidc/start").await;
     assert_eq!(start.status, 307, "custom OIDC start failed without discovery: {} {}", start.status, start.text);
     let location = start.header("location");
+    set_expected_nonce(&idp, &location);
     assert!(location.starts_with(&auth_ep), "the explicit authorization endpoint must be used: {}", location);
     let state = query_param(&location, "state");
 
@@ -491,6 +643,7 @@ async fn custom_oidc_public_client_needs_no_secret() {
     let r = s.get("/api/auth/providers").await;
     assert_eq!(r.body["oidc"], json!(true), "a client id and issuer are enough to advertise the provider: {}", r.text);
     let start = s.get("/api/auth/social/oidc/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
     let state = query_param(&start.header("location"), "state");
 
     let r = s.get(&format!("/api/auth/social/oidc/callback?code=abc&state={}", state)).await;
@@ -502,6 +655,21 @@ async fn custom_oidc_public_client_needs_no_secret() {
     let forms = idp.token_forms.lock().unwrap();
     assert!(forms.iter().any(|f| f.contains("code_verifier=")), "PKCE is required without a client secret: {:?}", *forms);
     assert!(!forms.iter().any(|f| f.contains("client_secret=")), "a public client must not send a client secret: {:?}", *forms);
+}
+
+#[tokio::test]
+async fn custom_oidc_rejects_an_id_token_without_the_flow_nonce() {
+    let idp = start_mock("no-nonce@test.invalid", "test-oidc");
+    let s = Server::start_env(&[
+        ("OPENWARP_OIDC_ISSUER", idp.issuer.clone()),
+        ("OPENWARP_OIDC_CLIENT_ID", "test-oidc".to_string()),
+        ("OPENWARP_OIDC_CLIENT_SECRET", "test-oidc-secret".to_string()),
+    ]).await;
+    let start = s.get("/api/auth/social/oidc/start").await;
+    let state = query_param(&start.header("location"), "state");
+
+    let r = s.get(&format!("/api/auth/social/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 400, "a token that omits the flow nonce must be refused, got {} {}", r.status, r.text);
 }
 
 #[tokio::test]
@@ -524,6 +692,7 @@ async fn org_sso_requires_an_invite_when_signups_are_closed() {
     assert_eq!(r.status, 200, "{}", r.text);
 
     let r = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 403, "org SSO must not join an uninvited account while signups are closed, got {} {}", r.status, r.text);
@@ -533,6 +702,7 @@ async fn org_sso_requires_an_invite_when_signups_are_closed() {
         .await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
     let r = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 307, "an invited SSO user must be admitted, got {} {}", r.status, r.text);
@@ -557,6 +727,7 @@ async fn social_login_requires_an_invite_when_signups_are_closed() {
     assert_eq!(r.status, 200, "{}", r.text);
 
     let r = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 403, "social signup must be refused while signups are closed, got {} {}", r.status, r.text);
@@ -566,6 +737,7 @@ async fn social_login_requires_an_invite_when_signups_are_closed() {
         .await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 307, "a pending invite must admit the social user, got {} {}", r.status, r.text);

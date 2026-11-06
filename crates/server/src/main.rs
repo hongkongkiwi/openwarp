@@ -1573,7 +1573,7 @@ fn jwk_decoding_key(jwk: &Value, alg: jsonwebtoken::Algorithm) -> Result<jsonweb
         _ => Err(format!("unsupported id_token signature algorithm: {:?}", alg)) } }
 fn b64url_json(segment: &str) -> Option<Value> {
     let mut s = segment.replace('-', "+").replace('_', "/");
-    while s.len() % 4 != 0 { s.push('='); }
+    while !s.len().is_multiple_of(4) { s.push('='); }
     serde_json::from_slice(&oc::unb64(&s).ok()?).ok() }
 // Microsoft publishes a templated issuer for multi-tenant apps. The tid claim
 // selects the concrete tenant; the signature and audience are still checked.
