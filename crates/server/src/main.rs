@@ -1359,12 +1359,19 @@ async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, ax
 // login's rate limits, MFA challenge and audit trail. It is compiled out when
 // the `ldap` feature is off (a Workers/WASM build has no raw TCP sockets).
 #[cfg(feature = "ldap")]
-fn ldap_row(st: &S, org: &str) -> Option<Row> {
-    st.db.one("SELECT * FROM ldap_configs WHERE org_id=?", &[json!(org)]).ok().flatten() }
+fn ldap_row(st: &S, org: &str) -> Result<Option<Row>, (StatusCode, Json<Value>)> {
+    st.db.one("SELECT * FROM ldap_configs WHERE org_id=?", &[json!(org)]).map_err(|e| bad(&e)) }
 #[cfg(feature = "ldap")]
 fn role_known(st: &S, org: &str, role: &str) -> bool {
     matches!(role, "owner" | "admin" | "developer")
         || st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(org), json!(role)]).ok().flatten().is_some() }
+#[cfg(feature = "ldap")]
+const DIR_UNAVAILABLE: &str = "directory sign-in is unavailable; ask an administrator to check the workspace LDAP configuration";
+// Display names and DNs come from the directory; control characters would let
+// a directory entry forge lines in plain-text audit consumers.
+#[cfg(feature = "ldap")]
+fn audit_safe(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).take(200).collect() }
 #[cfg(feature = "ldap")]
 fn ldap_config_from_row(st: &S, row: &Row) -> Result<ldap::DirectoryConfig, (StatusCode, Json<Value>)> {
     let enc = db::s(row, "bind_password_enc");
@@ -1379,7 +1386,7 @@ fn ldap_config_from_row(st: &S, row: &Row) -> Result<ldap::DirectoryConfig, (Sta
 #[cfg(feature = "ldap")]
 async fn get_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
-    let Some(row) = ldap_row(&st, &oid) else { return Ok(j(json!({"configured": false}))) };
+    let Some(row) = ldap_row(&st, &oid)? else { return Ok(j(json!({"configured": false}))) };
     Ok(j(json!({
         "configured": !db::s(&row, "url").is_empty(),
         "url": db::s(&row, "url"), "bind_dn": db::s(&row, "bind_dn"),
@@ -1399,7 +1406,7 @@ fn ldap_field(body: &Value, row: Option<&Row>, key: &str) -> String {
 #[cfg(feature = "ldap")]
 async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?; st.check_admin(&oid, &uid)?;
-    let existing = ldap_row(&st, &oid);
+    let existing = ldap_row(&st, &oid)?;
     let url = ldap_field(&body, existing.as_ref(), "url");
     if !ldap::url_ok(&url) { return Err(bad("LDAP URL must be ldaps:// (TLS is required); ldap:// and STARTTLS are not accepted")); }
     if !egress_allowed(&url) { return Err(bad("LDAP URL resolves to a private or loopback address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted directory")); }
@@ -1424,6 +1431,12 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let default_role = ldap_field(&body, existing.as_ref(), "default_role");
     let default_role = if default_role.is_empty() { "developer".to_string() } else { default_role };
     if !role_known(&st, &oid, &default_role) { return Err(bad("default_role must be owner, admin, developer or a custom role in this organisation")); }
+    // The membership API lets only an owner grant owner or admin; a directory
+    // mapping must not become the side door around that rule.
+    let privileged = matches!(default_role.as_str(), "owner" | "admin")
+        || group_roles.split(';').filter_map(|p| p.rsplit_once('=')).any(|(_, r)| matches!(r.trim(), "owner" | "admin"));
+    if privileged && st.require_org(&oid, &uid)? != "owner" {
+        return Err(err(StatusCode::FORBIDDEN, "only an owner can map the owner or admin role through LDAP")); }
     let allowed_domains = ldap_field(&body, existing.as_ref(), "allowed_domains");
     if !valid_domain_list(&allowed_domains) { return Err(bad("allowed_domains must be comma-separated DNS domains")); }
     let ca_cert_pem = ldap_field(&body, existing.as_ref(), "ca_cert_pem");
@@ -1465,17 +1478,22 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
     let key = format!("ldap:{}:{}:{}", addr.ip(), org, username.to_lowercase());
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed directory sign-in attempts; try again later")); }
     if org.is_empty() { return Err(bad("org_id is required")); }
-    let Some(row) = ldap_row(&st, &org) else { return Err(bad("LDAP sign-in is not configured for this workspace; ask an administrator to set it up")); };
+    let Some(row) = ldap_row(&st, &org)? else { return Err(bad("LDAP sign-in is not configured for this workspace; ask an administrator to set it up")); };
     let cfg = ldap_config_from_row(&st, &row)?;
+    if !ldap::url_ok(&cfg.url) { return Err(bad("the stored LDAP URL is not ldaps://; an administrator must correct the workspace LDAP configuration")); }
     if !egress_allowed(&cfg.url) { return Err(bad("LDAP URL is on a private or loopback address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted directory")); }
+    if username.len() > 256 || r.password.len() > 1024 { return Err(bad("username or password is too long")); }
     let attempt = tokio::time::timeout(std::time::Duration::from_secs(20), ldap::authenticate(&cfg, &username, &r.password)).await;
     let user = match attempt {
-        Err(_) => return Err(err(StatusCode::SERVICE_UNAVAILABLE, "the directory did not answer in time")),
-        Ok(Err(ldap::DirectoryError::Denied)) => {
+        Err(_) => return Err(err(StatusCode::SERVICE_UNAVAILABLE, DIR_UNAVAILABLE)),
+        // An ambiguous match reveals directory structure, so it gets the same
+        // answer as a wrong password.
+        Ok(Err(ldap::DirectoryError::Denied)) | Ok(Err(ldap::DirectoryError::Ambiguous)) => {
             st.rate_fail(&key, 900); st.rate_fail(&ip_key, 900);
             return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
-        Ok(Err(ldap::DirectoryError::Ambiguous)) => return Err(bad("this username matches more than one directory entry; narrow user_filter")),
-        Ok(Err(ldap::DirectoryError::Unavailable(e))) => return Err(err(StatusCode::SERVICE_UNAVAILABLE, &format!("directory unavailable: {}", e))),
+        Ok(Err(ldap::DirectoryError::Unavailable(e))) => {
+            eprintln!("LDAP directory error: {}", e);
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, DIR_UNAVAILABLE)); }
         Ok(Ok(u)) => u };
     st.rate_clear(&key);
     if !ldap::valid_email(&user.email) { return Err(bad("the directory entry has no usable email attribute; check email_attr")); }
@@ -1503,9 +1521,14 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
         st.db.exec("INSERT INTO ldap_subjects(org_id,dn,user_id,created_at) VALUES(?,?,?,?)",
             &[json!(&org), json!(&user.dn), json!(&nid), json!(now())]).map_err(|e| bad(&e))?;
         claim_instance_owner(&st, &nid);
-        st.audit(&org, "", "", &nid, "auth.ldap_provision", &format!("{} {} dn={}", user.email, user.name, user.dn));
+        st.audit(&org, "", "", &nid, "auth.ldap_provision", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn)));
         nid };
     if st.org_role(&org, &uid).is_none() {
+        // A bound directory user is re-admitted only through a fresh invite;
+        // otherwise removing a member would be undone by their next sign-in.
+        if bound.is_some() && pending.is_none() {
+            return Err(err(StatusCode::FORBIDDEN, "this account is no longer a member of this organisation; ask an administrator to invite you again"));
+        }
         let role = mapped.clone().or_else(|| pending.as_ref().map(|p| db::s(p, "role"))).unwrap_or_else(|| db::s(&row, "default_role"));
         st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(role)]).map_err(|e| bad(&e))?;
         if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]); }
@@ -1517,12 +1540,14 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
             st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&org), json!(&uid)]).map_err(|e| bad(&e))?;
         }
     }
-    st.audit(&org, "", "", &uid, "auth.ldap_login", &format!("{} {} dn={}", user.email, user.name, user.dn));
+    st.audit(&org, "", "", &uid, "auth.ldap_credentials", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn)));
     if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" {
+        st.audit(&org, "", "", &uid, "auth.ldap_mfa_challenge", &audit_safe(&user.email));
         let challenge = oc::random_token("mfa");
         st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(&challenge), json!(&uid), json!(now())]).map_err(|e| bad(&e))?;
         return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
     let token = make_session(&st, &uid)?;
+    st.audit(&org, "", "", &uid, "auth.ldap_login", &format!("{} dn={}", audit_safe(&user.email), audit_safe(&user.dn)));
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     let pubkey = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "pubkey")).unwrap_or_default();
     Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": pubkey})))) }

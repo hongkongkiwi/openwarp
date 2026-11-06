@@ -173,6 +173,9 @@ pub async fn authenticate(cfg: &DirectoryConfig, username: &str, password: &str)
         .filter(|a| !a.is_empty())
         .cloned()
         .collect();
+    // Two matches already mean ambiguity, so make the directory stop after two
+    // entries instead of buffering a broad filter's whole result set.
+    ldap.with_search_options(ldap3::SearchOptions::new().sizelimit(2).timelimit(10));
     let found = ldap
         .search(&cfg.base_dn, Scope::Subtree, &filter, attrs)
         .await
