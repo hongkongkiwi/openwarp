@@ -1744,3 +1744,39 @@ async fn pitr_restores_creates_deletes_and_tags() {
     let list = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
     assert!(list.body["secrets"].as_array().expect("secrets").iter().any(|x| x["key"] == "BRAVO"), "a manually restored secret must survive a point-in-time restore: {}", list.text);
 }
+
+#[tokio::test]
+async fn secret_metadata_is_encrypted_and_record_bound() {
+    let s = Server::start().await;
+    let u = register(&s, "metadata@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "ALPHA", "alpha-value").await;
+    set_secret(&s, token, &envs[0], "BRAVO", "bravo-value").await;
+    let alpha = secret_id(&s, token, &envs[0], "ALPHA").await;
+    let bravo = secret_id(&s, token, &envs[0], "BRAVO").await;
+
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).expect("db");
+    let (path, path_enc, key_hash, key_index, value_enc): (String, String, String, String, String) = conn
+        .query_row("SELECT path,path_enc,key_hash,key_index,value_enc FROM secrets WHERE id=?", [&alpha],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .expect("secret row");
+    assert_eq!(path, "", "the plaintext path must not be stored");
+    assert!(path_enc.starts_with("ow2:"), "the path must be bound ciphertext: {}", path_enc);
+    assert!(value_enc.starts_with("ow2:"), "the value must be bound ciphertext: {}", value_enc);
+    assert_eq!(key_hash, key_index, "the blind index replaces the legacy hash");
+    assert_ne!(key_index, openwarp_crypto::hash_token("/:ALPHA"), "a bare SHA-256 must not be the lookup index");
+    drop(conn);
+
+    // Moving ciphertext to another record must fail the AAD check.
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).expect("db");
+    conn.execute("UPDATE secrets SET value_enc=(SELECT value_enc FROM secrets WHERE id=?) WHERE id=?",
+        rusqlite::params![&bravo, &alpha]).expect("swap ciphertext");
+    drop(conn);
+    let listed = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
+    assert_eq!(listed.status, 200, "{}", listed.text);
+    let row = listed.body["secrets"].as_array().expect("secrets").iter().find(|r| r["id"] == json!(&alpha)).expect("alpha row");
+    assert_eq!(row["decrypt_error"], json!(true), "swapped ciphertext must not decrypt: {}", listed.text);
+    assert_ne!(row["value"], json!("alpha-value"), "swapped ciphertext must not yield the old value: {}", listed.text);
+}
