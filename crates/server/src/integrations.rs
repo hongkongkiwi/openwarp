@@ -49,7 +49,7 @@ async fn azure_access_token(config: &Value) -> Result<String, String> {
 }
 
 pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
-    validate_naming(config)?;
+    validate_sync_config(config)?;
     let named: Vec<(String, String)> = secrets.iter().map(|(k, v)| (desired_name(config, k), v.clone())).collect();
     let secrets = named.as_slice();
     let client = http_client();
@@ -69,9 +69,20 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
         "github" => { // GitHub requires libsodium sealed-box; done by CLI-side helper if configured via `gh` compatible endpoint is not plain REST.
             // We fetch the repo key and encrypt with openwarp sealed box helper (see server note in README).
             github_sync(&client, config, secrets).await }
-        "vercel" => { let team = cfg(config,"team_id"); let q = if team.is_empty() { String::new() } else { format!("?teamId={}", team) };
-            for (k, v) in secrets { req(client.post(format!("{}/v10/projects/{}/env{}", base(config,"https://api.vercel.com"), cfg(config,"project_id"), q)).bearer_auth(cfg(config,"token")).json(&json!({"key":k,"value":v,"type":"encrypted","target":["production","preview","development"]}))).await?; }
-            Ok(format!("pushed {} secrets to Vercel", secrets.len())) }
+        "vercel" => {
+            let team = cfg(config,"team_id"); let q = if team.is_empty() { String::new() } else { format!("?teamId={}", team) };
+            let target = match config.get("target") {
+                None => json!(["production","preview","development"]),
+                Some(Value::String(value)) if value == "all" || value.is_empty() => json!(["production","preview","development"]),
+                Some(Value::String(value)) => json!([value]),
+                Some(Value::Array(items)) if !items.is_empty() && items.iter().all(Value::is_string) => json!(items),
+                Some(_) => return Err("vercel target must be all, a target name, or a non-empty array of target names".into()),
+            };
+            let secret_type = { let t = cfg(config,"type"); if t.is_empty() { "encrypted" } else { t } };
+            if !matches!(secret_type, "plain" | "encrypted" | "sensitive") { return Err("vercel type must be plain, encrypted or sensitive".into()); }
+            let label = target.as_array().map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
+            for (k, v) in secrets { req(client.post(format!("{}/v10/projects/{}/env{}", base(config,"https://api.vercel.com"), cfg(config,"project_id"), q)).bearer_auth(cfg(config,"token")).json(&json!({"key":k,"value":v,"type":secret_type,"target":target.clone()}))).await?; }
+            Ok(format!("pushed {} secrets to Vercel ({})", secrets.len(), label)) }
         "netlify" => { for (k, v) in secrets { req(client.put(format!("{}/api/v1/sites/{}/env/{}?context=all", base(config,"https://api.netlify.com"), cfg(config,"site_id"), k)).bearer_auth(cfg(config,"token")).json(&json!({"values":[{"value":v,"context":"all"}]}))).await?; } Ok(format!("pushed {} secrets to Netlify", secrets.len())) }
         "cloudflare" => { for (k, v) in secrets { req(client.put(format!("{}/client/v4/accounts/{}/workers/scripts/{}/secrets", base(config,"https://api.cloudflare.com"), cfg(config,"account_id"), cfg(config,"script_name"))).bearer_auth(cfg(config,"token")).json(&json!({"name":k,"text":v,"type":"secret_text"}))).await?; } Ok(format!("pushed {} secrets to Cloudflare Workers", secrets.len())) }
         "heroku" => { let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!(v)); }
@@ -85,9 +96,20 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
                 let _ = client.post(format!("{}/v1/projects/{}/secrets?secretId={}", base(config,"https://secretmanager.googleapis.com"), project, name)).bearer_auth(&token).json(&json!({"replication":{"automatic":{}}})).send().await;
                 req(client.post(format!("{}/v1/projects/{}/secrets/{}:addVersion", base(config,"https://secretmanager.googleapis.com"), project, name)).bearer_auth(&token).json(&json!({"payload":{"data": openwarp_crypto::b64(v.as_bytes())}}))).await?; }
             Ok(format!("pushed {} secrets to GCP Secret Manager", secrets.len())) }
-        "azure_key_vault" => { let token = azure_access_token(config).await?; for (k, v) in secrets { let name = k.to_lowercase().replace('_',"-");
-                req(client.put(format!("{}/secrets/{}?api-version=7.4", if cfg(config,"base_url").is_empty() { format!("https://{}.vault.azure.net", cfg(config,"vault")) } else { base(config,"") }, name)).bearer_auth(&token).json(&json!({"value":v}))).await?; }
-            Ok(format!("pushed {} secrets to Azure Key Vault", secrets.len())) }
+        "azure_key_vault" => {
+            let token = azure_access_token(config).await?;
+            let root = if cfg(config,"base_url").is_empty() { format!("https://{}.vault.azure.net", cfg(config,"vault")) } else { base(config,"") };
+            let mapping = { let m = cfg(config,"mapping"); if !m.is_empty() { m } else if !cfg(config,"secret_name").is_empty() { "many_to_one" } else { "one_to_one" } };
+            match mapping {
+                "one_to_one" => { for (k, v) in secrets { let name = k.to_lowercase().replace('_',"-");
+                    req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&json!({"value":v}))).await?; }
+                    Ok(format!("pushed {} secrets to Azure Key Vault", secrets.len())) }
+                "many_to_one" => {
+                    let name = cfg(config,"secret_name"); if name.is_empty() { return Err("azure_key_vault many_to_one requires secret_name".into()); }
+                    req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&json!({"value": map_json(secrets).to_string()}))).await?;
+                    Ok(format!("pushed {} keys into Azure Key Vault secret {}", secrets.len(), name)) }
+                other => Err(format!("azure_key_vault mapping must be one_to_one or many_to_one (got {:?})", other)),
+            } }
         "kubernetes" => { let server = cfg(config,"api_server").trim_end_matches('/'); let ns = cfg(config,"namespace");
             let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!(openwarp_crypto::b64(v.as_bytes()))); }
             let body = json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":cfg(config,"secret_name"),"namespace":ns},"type":"Opaque","data":Value::Object(m)});
@@ -261,10 +283,16 @@ fn env_subst(value: &str, environment: &str) -> String { value.replace("{{enviro
 fn cased_key(config: &Value, key: &str) -> String {
     match cfg(config, "case") { "upper" => key.to_uppercase(), "lower" => key.to_lowercase(), _ => key.to_string() }
 }
+/// Infisical calls this a Key Schema; accept either spelling, with
+/// `name_template` winning when both are present.
+fn name_template(config: &Value) -> &str {
+    let template = cfg(config, "name_template");
+    if template.is_empty() { cfg(config, "key_schema") } else { template }
+}
 pub(crate) fn desired_name(config: &Value, key: &str) -> String {
     let environment = cfg(config, "_environment");
     let key = cased_key(config, key);
-    let template = cfg(config, "name_template");
+    let template = name_template(config);
     if !template.is_empty() {
         template.replace("{{secretKey}}", &key).replace("{{environment}}", environment)
     } else {
@@ -275,7 +303,7 @@ pub(crate) fn desired_name(config: &Value, key: &str) -> String {
 /// name can be mapped back to the secret it came from.
 fn naming_affixes(config: &Value) -> (String, String) {
     let environment = cfg(config, "_environment");
-    let template = cfg(config, "name_template");
+    let template = name_template(config);
     if !template.is_empty() {
         let resolved = env_subst(template, environment);
         return match resolved.split_once("{{secretKey}}") { Some((before, after)) => (before.to_string(), after.to_string()), None => (String::new(), String::new()) };
@@ -289,15 +317,35 @@ pub fn local_name(config: &Value, remote: &str) -> String {
     let without_prefix = without_path.strip_prefix(&prefix).unwrap_or(without_path);
     without_prefix.strip_suffix(&suffix).unwrap_or(without_prefix).to_string()
 }
+/// Source path filter. Empty `paths` selects every path, `include_subfolders`
+/// extends each selection to its descendants, and the root selects everything.
+pub fn path_selected(config: &Value, path: &str) -> bool {
+    let paths: Vec<&str> = config.get("paths").and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if paths.is_empty() { return true; }
+    let include_subfolders = config.get("include_subfolders").and_then(Value::as_bool).unwrap_or(false);
+    let path = path.trim_matches('/');
+    paths.iter().any(|selected| {
+        let selected = selected.trim_matches('/');
+        path == selected || (include_subfolders && (selected.is_empty() || path.starts_with(&format!("{}/", selected))))
+    })
+}
 /// A template without exactly one `{{secretKey}}` would collapse every key into
 /// one remote name, so reject it before any adapter runs.
-pub fn validate_naming(config: &Value) -> Result<(), String> {
+pub fn validate_sync_config(config: &Value) -> Result<(), String> {
     let case = cfg(config, "case");
     if !case.is_empty() && case != "upper" && case != "lower" { return Err(format!("case must be upper or lower (got {:?})", case)); }
-    let template = cfg(config, "name_template");
-    if template.is_empty() { return Ok(()); }
-    let count = template.matches("{{secretKey}}").count();
-    if count != 1 { return Err(format!("name_template must contain {{{{secretKey}}}} exactly once (found {})", count)); }
+    let template = name_template(config);
+    if !template.is_empty() {
+        let count = template.matches("{{secretKey}}").count();
+        if count != 1 { return Err(format!("key naming template must contain {{{{secretKey}}}} exactly once (found {})", count)); }
+    }
+    if let Some(value) = config.get("paths") {
+        let items = value.as_array().ok_or("paths must be an array of strings")?;
+        if let Some(bad) = items.iter().find(|v| !v.is_string()) { return Err(format!("paths entries must be strings (got {})", bad)); }
+    }
+    for key in ["include_subfolders", "disable_secret_deletion"] {
+        if let Some(value) = config.get(key) { if !value.is_boolean() { return Err(format!("{} must be a boolean", key)); } }
+    }
     Ok(())
 }
 fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
@@ -698,6 +746,19 @@ fn ssm_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 1011 && !name.contains(' ') && !name.contains("//") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
 }
 
+/// Infisical-style static tags applied to every secret this sync writes.
+fn aws_sm_tags(config: &Value) -> Result<Vec<(String, String)>, String> {
+    match config.get("tags") {
+        None => Ok(Vec::new()),
+        Some(Value::Object(map)) => map.iter().map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())).ok_or_else(|| format!("AWS Secrets Manager tag {:?} must have a string value", key))).collect(),
+        Some(_) => Err("AWS Secrets Manager tags must be an object of string values".into()),
+    }
+}
+async fn aws_sm_tag(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str, tags: &[(String, String)]) -> Result<(), String> {
+    if tags.is_empty() { return Ok(()); }
+    let list: Vec<Value> = tags.iter().map(|(key, value)| json!({"Key": key, "Value": value})).collect();
+    aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.TagResource", &json!({"SecretId": id, "Tags": list})).await.map(|_| ())
+}
 async fn aws_sm_list(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new(); let mut token = String::new();
     loop {
@@ -720,6 +781,7 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
     let mode = sync_mode(config, "aws_secrets_manager")?;
     let dry = is_dry(config);
     let mapping = { let m = cfg(config, "mapping"); if !m.is_empty() { m } else if !cfg(config, "secret_id").is_empty() { "many_to_one" } else { "one_to_one" } };
+    let tags = aws_sm_tags(config)?;
     let client = http_client();
     if mapping == "many_to_one" {
         let secret_id = cfg(config, "secret_id");
@@ -738,6 +800,7 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
                 }
                 Err(e) => return Err(format!("update {} failed: {}", secret_id, e)),
             }
+            aws_sm_tag(&client, config, region, ak, sk, secret_id, &tags).await?;
         }
         return Ok((format!("AWS Secrets Manager sync{}: wrote {} keys into {}", if dry { " (dry-run)" } else { "" }, desired.len(), secret_id), Vec::new()));
     }
@@ -760,6 +823,7 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
                 }
                 Err(e) => return Err(format!("update {} failed: {}", name, e)),
             }
+            aws_sm_tag(&client, config, region, ak, sk, name, &tags).await?;
         }
         if mode == "mirror" {
             for name in previous_managed {
@@ -3021,7 +3085,9 @@ pub fn is_stateful(kind: &str) -> bool {
 }
 /// Stateful adapters return a report and the remote names they now own.
 pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
-    if let Err(e) = validate_naming(config) { return Some(Err(e)); }
+    if let Err(e) = validate_sync_config(config) { return Some(Err(e)); }
+    // Infisical's "disable secret deletion": keep managing names but never prune.
+    let previous_managed: &[String] = if config.get("disable_secret_deletion").and_then(Value::as_bool).unwrap_or(false) { &[] } else { previous_managed };
     let flat = secret_keys(secrets);
     let pairs = flat.as_slice();
     // Account SSH key APIs reject anything that is not a public key, so they
@@ -3152,8 +3218,10 @@ pub async fn sts_assume_role(config: &Value) -> Result<Value, String> {
         let host_header = match u.port() { Some(p) => format!("{}:{}", host, p), None => host.to_string() };
         (endpoint.trim_end_matches('/').to_string(), host_header, if u.path().is_empty() { "/".into() } else { u.path().to_string() })
     };
-    let body = format!("Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={}&DurationSeconds={}",
+    let mut body = format!("Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={}&DurationSeconds={}",
         form_encode(role_arn), form_encode(session), duration);
+    let external_id = cfg(config, "external_id");
+    if !external_id.is_empty() { body.push_str(&format!("&ExternalId={}", form_encode(external_id))); }
     let amzdate = chrono_now(); let date = amzdate[..8].to_string();
     let content_type = "application/x-www-form-urlencoded; charset=utf-8";
     let payload_hash = hex(&Sha256::digest(body.as_bytes()));
@@ -3576,7 +3644,7 @@ mod tests {
         let (base, calls) = start_mock();
         let config = json!({
             "region": "us-east-1", "access_key_id": "AKIAEXAMPLEKEY00000", "secret_access_key": "secret",
-            "role_arn": "arn:aws:iam::123456789012:role/openwarp", "session_name": "test", "endpoint": base
+            "role_arn": "arn:aws:iam::123456789012:role/openwarp", "session_name": "test", "external_id": "phase-ext", "endpoint": base
         });
         let creds = sts_assume_role(&config).await.expect("assume role");
         assert_eq!(creds["access_key_id"], "ASIAEXAMPLE");
@@ -3586,6 +3654,7 @@ mod tests {
         let call = calls.iter().find(|(m, p, _)| m == "POST" && p == "/").expect("STS call");
         assert!(call.2.contains("Action=AssumeRole"), "{}", call.2);
         assert!(call.2.contains("RoleArn=arn%3Aaws%3Aiam"), "{}", call.2);
+        assert!(call.2.contains("ExternalId=phase-ext"), "{}", call.2);
     }
 
     #[tokio::test]
@@ -3715,8 +3784,9 @@ mod tests {
         let (base, calls) = start_mock_routes(mock_routes(&[
             ("secretsmanager.UpdateSecret", 400, "{\"__type\":\"ResourceNotFoundException\",\"message\":\"not found\"}"),
             ("secretsmanager.CreateSecret", 200, "{}"),
+            ("secretsmanager.TagResource", 200, "{}"),
         ]));
-        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod","prefix":"APP_","suffix":"_V1"});
+        let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod","prefix":"APP_","suffix":"_V1","tags":{"team":"platform"}});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
         let (_report, managed) = aws_secrets_manager_sync(&config, &secrets, &[]).await.expect("aws sm sync");
         assert!(managed.is_empty());
@@ -3726,6 +3796,8 @@ mod tests {
         let body: Value = serde_json::from_str(&create.3).expect("json body");
         let nested: Value = serde_json::from_str(body["SecretString"].as_str().expect("secret string")).expect("nested json");
         assert_eq!(nested["APP_API_KEY_V1"], "v1");
+        let tag = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.TagResource")).expect("tag call");
+        assert!(tag.3.contains("\"Key\":\"team\"") && tag.3.contains("\"Value\":\"platform\""), "{}", tag.3);
     }
 
     #[tokio::test]
@@ -3909,12 +3981,40 @@ mod tests {
 
     #[test]
     fn name_template_needs_exactly_one_secret_key_placeholder() {
-        assert!(validate_naming(&json!({"name_template": "{{secretKey}}"})).is_ok());
-        assert!(validate_naming(&json!({})).is_ok());
-        assert!(validate_naming(&json!({"name_template": "static"})).is_err());
-        assert!(validate_naming(&json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
-        assert!(validate_naming(&json!({"case": "upper"})).is_ok());
-        assert!(validate_naming(&json!({"case": "title"})).is_err());
+        assert!(validate_sync_config(&json!({"name_template": "{{secretKey}}"})).is_ok());
+        assert!(validate_sync_config(&json!({})).is_ok());
+        assert!(validate_sync_config(&json!({"name_template": "static"})).is_err());
+        assert!(validate_sync_config(&json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
+        assert!(validate_sync_config(&json!({"case": "upper"})).is_ok());
+        assert!(validate_sync_config(&json!({"case": "title"})).is_err());
+    }
+
+    #[test]
+    fn key_schema_is_accepted_as_an_alias_for_name_template() {
+        let schema = json!({"_environment": "prod", "key_schema": "SF_{{secretKey}}_{{environment}}"});
+        assert_eq!(desired_name(&schema, "API_KEY"), "SF_API_KEY_prod");
+        let both = json!({"key_schema": "SCHEMA_{{secretKey}}", "name_template": "TEMPLATE_{{secretKey}}"});
+        assert_eq!(desired_name(&both, "API_KEY"), "TEMPLATE_API_KEY");
+        assert!(validate_sync_config(&json!({"key_schema": "{{secretKey}}_{{secretKey}}"})).is_err());
+    }
+
+    #[test]
+    fn paths_filter_selects_exact_folders_or_descendants() {
+        assert!(path_selected(&json!({}), "/anything"));
+        let exact = json!({"paths": ["/app/prod"]});
+        assert!(path_selected(&exact, "/app/prod"));
+        assert!(!path_selected(&exact, "/app/prod/db"));
+        assert!(!path_selected(&exact, "/app"));
+        let deep = json!({"paths": ["/app/prod"], "include_subfolders": true});
+        assert!(path_selected(&deep, "/app/prod/db"));
+        assert!(!path_selected(&deep, "/app/production"));
+        let root = json!({"paths": ["/"], "include_subfolders": true});
+        assert!(path_selected(&root, "/anywhere"));
+        assert!(!path_selected(&json!({"paths": ["/"]}), "/anywhere"));
+        assert!(validate_sync_config(&json!({"paths": "app"})).is_err());
+        assert!(validate_sync_config(&json!({"paths": [1]})).is_err());
+        assert!(validate_sync_config(&json!({"include_subfolders": "yes"})).is_err());
+        assert!(validate_sync_config(&json!({"disable_secret_deletion": "yes"})).is_err());
     }
 
     #[tokio::test]
@@ -3984,6 +4084,52 @@ mod tests {
         assert_eq!(body["key"], "API_KEY");
         assert_eq!(body["secured"], true);
         assert!(calls.iter().any(|(m, p, _, _)| m == "DELETE" && p.ends_with("/variables/old-id")));
+    }
+
+    #[tokio::test]
+    async fn disable_secret_deletion_keeps_previously_managed_names() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("GET /2.0/repositories/ws/repo/pipelines_config/variables/", 200, "{\"values\":[{\"uuid\":\"old-id\",\"key\":\"OLD\",\"value\":\"1\"}]}"),
+            ("POST /2.0/repositories/ws/repo/pipelines_config/variables/", 200, "{}"),
+            ("DELETE /2.0/repositories/ws/repo/pipelines_config/variables/old-id", 204, ""),
+        ]));
+        let config = json!({"base_url":format!("{}/2.0", base),"workspace":"ws","repo_slug":"repo","token":"tok","mode":"mirror","disable_secret_deletion":true});
+        let secrets = vec![("/".to_string(), "API_KEY".to_string(), "v1".to_string(), "secret".to_string())];
+        let (report, _) = sync_managed("bitbucket", &config, &secrets, &["OLD".to_string()]).await.expect("managed").expect("bitbucket sync");
+        assert!(report.contains("deleted=0"), "{}", report);
+        assert!(!calls.lock().unwrap().iter().any(|(m, _, _, _)| m == "DELETE"), "disable_secret_deletion must suppress pruning");
+    }
+
+    #[tokio::test]
+    async fn vercel_targets_and_secret_type_are_configurable() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("POST /v10/projects/proj/env", 200, "{}")]));
+        let config = json!({"base_url": base, "token": "vercel-token", "project_id": "proj", "target": "staging", "type": "sensitive"});
+        sync("vercel", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("vercel sync");
+        {
+            let calls = calls.lock().unwrap();
+            let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
+            let body: Value = serde_json::from_str(&post.3).expect("json");
+            assert_eq!(body["target"], json!(["staging"]));
+            assert_eq!(body["type"], "sensitive");
+        }
+        let bad_type = json!({"base_url": base, "token": "t", "project_id": "proj", "type": "sealed"});
+        assert!(sync("vercel", &bad_type, &[]).await.unwrap_err().contains("vercel type"));
+    }
+
+    #[tokio::test]
+    async fn azure_key_vault_can_write_one_json_blob() {
+        let (base, calls) = start_mock_routes(mock_routes(&[("PUT /secrets/app-config", 200, "{}")]));
+        let config = json!({"base_url": base, "token": "azure-token", "mapping": "many_to_one", "secret_name": "app-config"});
+        sync("azure_key_vault", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("azure sync");
+        {
+            let calls = calls.lock().unwrap();
+            let put = calls.iter().find(|(m, _, _, _)| m == "PUT").expect("put");
+            let body: Value = serde_json::from_str(&put.3).expect("json");
+            let nested: Value = serde_json::from_str(body["value"].as_str().expect("JSON blob")).expect("nested");
+            assert_eq!(nested["API_KEY"], "v1");
+        }
+        let missing = json!({"token": "t", "mapping": "many_to_one"});
+        assert!(sync("azure_key_vault", &missing, &[]).await.unwrap_err().contains("secret_name"));
     }
 
     #[tokio::test]
@@ -4417,7 +4563,7 @@ mod tests {
         let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
         let config = json!({"url": format!("{}/hook", base), "name_template": "STATIC"});
         let err = sync("webhook", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect_err("template rejected");
-        assert!(err.contains("name_template"), "{}", err);
+        assert!(err.contains("exactly once"), "{}", err);
         assert!(calls.lock().unwrap().is_empty(), "nothing should be posted");
     }
 

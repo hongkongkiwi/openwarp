@@ -155,9 +155,17 @@ Shared behavioural options:
 
 - Key naming is off by default and applies to every adapter: `prefix` and
   `suffix` wrap each key and accept `{{environment}}`; `case` rewrites the
-  key to `upper` or `lower` before wrapping; `name_template` replaces both and
-  supports `{{secretKey}}` and `{{environment}}`, with exactly one
-  `{{secretKey}}`. Imports strip the same affixes.
+  key to `upper` or `lower` before wrapping; `name_template` (or Infisical's
+  `key_schema`) replaces both and supports `{{secretKey}}` and
+  `{{environment}}`, with exactly one `{{secretKey}}`. Imports strip the same
+  affixes.
+- `paths` and `include_subfolders` restrict a sync to selected secret folders;
+  empty `paths` means every path.
+- `disable_secret_deletion` stops `mirror` from pruning names this integration
+  previously managed.
+- Provider-specific parity: Vercel accepts `target` and `type`, Azure Key Vault
+  accepts `mapping` / `secret_name` for a JSON blob, and AWS accepts `tags` and
+  `external_id` on top of `role_arn`.
 - `auto_sync: false` skips the integration on deploy, rotation, proposal,
   delete, restore and point-in-time restore; manual Sync still runs it.
 - `initial_sync` accepts `overwrite` (default), `import_local` (keep local

@@ -65,7 +65,7 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | --- | --- | --- |
 | `github` | `token`, `owner`, `repo` | Repository Actions secrets, encrypted with the repository public key |
 | `gitlab` | `token`, `project_id` | Project variables; optional `base_url` includes the API prefix |
-| `vercel` | `token`, `project_id`; optional `team_id` | Encrypted variables targeting production, preview, and development |
+| `vercel` | `token`, `project_id`; optional `team_id`, `target` (a target name, `all`, or an array), `type` (`plain`, `encrypted` or `sensitive`) | Variables default to `encrypted` across production, preview and development |
 | `netlify` | `token`, `site_id` | Site variables with all-context requests |
 | `cloudflare` | `token`, `account_id`, `script_name` | Worker secret bindings |
 | `cloudflare_pages` | `token`, `account_id`, `project` | Production deployment configuration variables |
@@ -106,7 +106,7 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | `linode` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. A changed key is deleted and created again, so its id changes |
 | `digitalocean_ssh` | `token` | Account SSH keys at `/v2/account/keys`, taken only from secrets of type `ssh_key`. Distinct from `digitalocean`, which updates an App Platform spec. A changed key is deleted and created again |
 | `gcp_secret_manager` | `token`, `project` | Creates/versions secrets; lowercases names and replaces underscores with hyphens |
-| `azure_key_vault` | `token`, `vault` (or `base_url`) | Writes secret versions; lowercases names and replaces underscores with hyphens |
+| `azure_key_vault` | `token`, `vault` (or `base_url`); optional `mapping` (`one_to_one` or `many_to_one`) and `secret_name` | One secret per key by default, or every key as one JSON blob in `secret_name`. Names are lowercased with underscores turned into hyphens |
 | `kubernetes` | `token`, `api_server`, `namespace`, `secret_name` | Writes an Opaque Secret; creates it after a not-found response |
 | `hashicorp_vault` | `token`, `addr`, `path` | Sends a `{data: ...}` payload to the configured Vault API path |
 | `webhook` | `url`; optional `token`, `signing_secret` (or `secret`) | POSTs `{secrets: {NAME: value}}`. `token` is sent as a bearer header. A signing secret adds `X-OpenWarp-Timestamp` and `X-OpenWarp-Signature: t=<unix>,v1=<hex>`, the HMAC-SHA256 of `timestamp.body` |
@@ -123,6 +123,15 @@ The `kubernetes` adapter pushes values to the cluster API. For pods that pull va
 
 ## Advanced sync options
 
+### Source selection
+
+| Field | Meaning |
+| --- | --- |
+| `paths` | Array of secret paths to sync; empty or absent means every path |
+| `include_subfolders` | Boolean; each selected path also matches its descendants. Selecting `/` with this enabled matches every path |
+
+Paths are compared after trimming leading and trailing slashes, so `/app/prod` and `app/prod/` are the same folder. This is Phase's environment plus path selection, and Infisical's folder plus "Include secrets from all subfolders".
+
 ### Key naming
 
 Naming is off by default and applies to every adapter. It renames a key on the way to the destination, and imports strip the same affixes so remote names map back to local keys. Values are never rewritten.
@@ -133,6 +142,7 @@ Naming is off by default and applies to every adapter. It renames a key on the w
 | `suffix` | Appended to every selected key; accepts `{{environment}}` |
 | `case` | `upper` or `lower`; rewrites the source key before prefix, suffix or template substitution. Defaults to preserving case |
 | `name_template` | Replaces prefix and suffix when set. Must contain `{{secretKey}}` exactly once, and may use `{{environment}}` |
+| `key_schema` | Infisical's name for `name_template`. Either is accepted; `name_template` wins when both are set |
 
 For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. For Terraform-style names, `"prefix": "TF_VAR_", "case": "upper"` writes `db_host` as `TF_VAR_DB_HOST`; `case` applies to the key only, so the prefix keeps its spelling. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
 
@@ -147,8 +157,28 @@ The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS
 | `base_url` | Override the adapter's API base for a compatible service |
 | `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore; manual Sync still runs |
 | `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync |
+| `disable_secret_deletion` | Boolean. Keeps `mirror` from pruning names this integration previously managed. The default `upsert` mode already never deletes |
 
 Filters apply before naming. Mirror uses persisted managed-name state, not blanket deletion of every name on the remote service. Changing targets, prefixes, suffixes, templates or filters affects that state; review a dry run and remote inventory first. The remaining options are not supported by every row in the provider table.
+
+### Compared with Infisical and Phase
+
+| Their option | OpenWarp equivalent |
+| --- | --- |
+| Infisical Key Schema | `prefix`, `suffix`, `case`, or `name_template` / `key_schema` |
+| Infisical source folder and "Include secrets from all subfolders" | `paths` and `include_subfolders` |
+| Infisical initial sync import behavior | `initial_sync: import_local` or `import_remote`; their "overwrite destination" also removes extras, which is `mode: mirror` here |
+| Infisical Disable Secret Deletion | `disable_secret_deletion`, or the default `upsert` mode |
+| Infisical Auto-Sync | `auto_sync` |
+| Infisical AWS mapping, secret name, KMS key, tags | `mapping`, `secret_id`, `kms_key_id`, `tags` |
+| Phase environment and path | the integration's environment plus `paths` |
+| Phase individual secrets vs JSON blob | `mapping: one_to_one` or `many_to_one` (AWS Secrets Manager, Azure Key Vault) |
+| Phase source of truth | `mode: mirror`; OpenWarp defaults to the safer `upsert` |
+| Phase pause syncing | `auto_sync: false` |
+| Phase assume role with external ID | `role_arn` and `external_id` |
+| Phase Vercel target and secret type | `target` and `type` |
+
+Two options are deliberately not replicated. Infisical's "sync secret metadata as tags" would need tags in the adapter payload, which currently carries only path, key, value and type. Phase disables destination secrets that are absent from the source; OpenWarp only deletes previously managed names, and only in `mirror` mode.
 
 `initial_sync` is limited to adapters that can return values: AWS Secrets Manager, AWS Parameter Store, 1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps, OpenWarp, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and Hugging Face Space variables. CircleCI, Devin, Cloudflare Secrets Store, Cursor and Hugging Face Space secrets reject import because their APIs never return values.
 
@@ -163,7 +193,7 @@ Two mappings are available:
 - `mapping: "one_to_one"` (the default when `secret_id` is absent) writes one remote secret per key, using the key naming options. Missing names are created with `CreateSecret`; existing names receive a new version with `PutSecretValue`. Mirror deletes previously managed names with a seven-day recovery window unless `force_delete: true`.
 - `mapping: "many_to_one"` (the default when `secret_id` is set) writes every value into one JSON `SecretString` at `secret_id`, creating the secret when it does not exist. Key naming and key filters apply to the JSON field names. Mirror is rejected because keys are not separate remote objects.
 
-`kms_key_id` applies only when a secret is created. `role_arn` makes the adapter assume that role first, using the supplied base credentials and optional `sts_endpoint`; the resulting temporary credentials sign the sync. `endpoint` overrides the regional endpoint. One-to-one names are validated against the Secrets Manager character set and 512-byte limit before any write.
+`kms_key_id` applies only when a secret is created. `tags` adds static tags to every secret this sync writes, as an object of string values. `role_arn` makes the adapter assume that role first, using the supplied base credentials, optional `external_id` and optional `sts_endpoint`; the resulting temporary credentials sign the sync. `endpoint` overrides the regional endpoint. One-to-one names are validated against the Secrets Manager character set and 512-byte limit before any write.
 
 ```json
 {
