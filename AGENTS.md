@@ -73,7 +73,7 @@ scripts/worktree.sh remove <name> [--force]      # refuses a dirty tree without 
 scripts/worktree.sh prune
 ```
 
-Older worktrees created before this rule still live in `/Volumes/Storage/Development/.worktrees/hongkongkiwi/`. Relocate one with `move` once its lane is idle; never create a new one there.
+Worktrees created before this rule may still live in `/Volumes/Storage/Development/.worktrees/hongkongkiwi/`. Relocate each with `move` once its lane is idle; never create a new one there.
 
 - `git worktree list` shows every checkout; entries under `.worktrees/` are the only legitimate ones for this repo.
 - One writer per worktree. Assume the main checkout is shared: stage explicit paths, never `git add -A`, and never commit another session's work in progress.
