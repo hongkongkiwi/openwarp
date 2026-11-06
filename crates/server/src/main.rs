@@ -2646,17 +2646,39 @@ async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(
 // The socket stays on the replica that accepted it. That replica's single poll
 // reads the shared table and fans matching events out, so a write on any
 // replica shows up here within a second. Frames carry audit fields only.
-async fn live_ws(State(st): State<S>, h: HeaderMap, ws: WebSocketUpgrade) -> Response {
+async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, ws: WebSocketUpgrade) -> Response {
     let uid = match st.token_user(&h) { Ok(u) => u, Err(e) => return e.into_response() };
     let mut orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(&uid)]).unwrap_or_default().iter().map(|r| db::s(r, "org_id")).collect::<Vec<_>>();
     if let Ok(rows) = st.db.query("SELECT org_id FROM identities WHERE id=?", &[json!(&uid)]) {
         for r in rows { let org = db::s(&r, "org_id"); if !orgs.contains(&org) { orgs.push(org); } } }
+    // Reconnect with the last id the client saw. Capped at an hour and 500 rows:
+    // the table is pruned at an hour, and a wider catch-up belongs to the audit log.
+    let since = q.get("since").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    // One placeholder per organisation, capped: a caller in more orgs than this
+    // gets the first 32 and relies on the live stream for the rest.
+    let missed = if since > 0 && !orgs.is_empty() {
+        let scope: Vec<&String> = orgs.iter().take(32).collect();
+        let marks = scope.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut params = vec![json!(since), json!(now() - 3600)];
+        params.extend(scope.iter().map(|o| json!(o.as_str())));
+        st.db.query(&format!("SELECT id,org_id,app_id,env_id,action,detail,created_at FROM live_events WHERE id>? AND created_at>=? AND org_id IN ({}) ORDER BY id LIMIT 500", marks), &params).unwrap_or_default()
+    } else { Vec::new() };
     // Subscribing before the upgrade means the poll is already running when the
     // first frame could be missed, and a slow client is dropped rather than blocking.
     let rx = st.live.subscribe();
-    ws.on_upgrade(move |socket| live_socket(st, uid, orgs, rx, socket)) }
-async fn live_socket(st: S, uid: String, orgs: Vec<String>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
+    ws.on_upgrade(move |socket| live_socket(st, uid, orgs, missed, rx, socket)) }
+async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
     if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
+    // Rows already in the table are sent before the live subscription, and the
+    // subscription may repeat the newest of them. The client dedupes on id.
+    let mut sent = 0i64;
+    for r in &missed {
+        let env = db::s(r, "env_id");
+        if !env.is_empty() && st.require_env(&env, &uid).is_err() { continue; }
+        sent = db::n(r, "id");
+        let ev = json!({"type":"event","id":sent,"org":db::s(r,"org_id"),"app":db::s(r,"app_id"),"env":env,"action":db::s(r,"action"),"detail":db::s(r,"detail"),"ts":db::n(r,"created_at")});
+        if socket.send(Message::Text(ev.to_string().into())).await.is_err() { return; }
+    }
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -2666,9 +2688,15 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, mut rx: broadcast::R
                     _ => {}
                 }
             }
+            // Cloudflare's edge closes a WebSocket after about 100 seconds with no
+            // frames. A ping is a frame, so a quiet console survives the proxy.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() { break; }
+            }
             ev = rx.recv() => {
                 let raw = match ev { Ok(v) => v, Err(_) => break };
                 let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
+                if v.get("id").and_then(|x| x.as_i64()).unwrap_or(0) <= sent { continue; }
                 let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
                 if !orgs.iter().any(|o| o == org) { continue; }
                 let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
@@ -2853,7 +2881,6 @@ async fn main() {
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
-        .route("/api/live", get(live_ws))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
@@ -2878,7 +2905,16 @@ async fn main() {
         .layer(axum::middleware::from_fn(metrics_middleware))
         .layer(axum::middleware::from_fn(timeout_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+        .with_state(state.clone());
+    // The five-minute handler deadline would close a socket that is behaving
+    // correctly. Auth and the IP allowlist still apply; only the deadline does not.
+    let live = Router::new().route("/api/live", get(live_ws))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
+        .layer(axum::middleware::from_fn(security_headers))
+        .layer(axum::middleware::from_fn(metrics_middleware))
         .with_state(state);
+    let app = live.merge(app);
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     println!("openwarp listening on {} db={}", addr, db_url);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
