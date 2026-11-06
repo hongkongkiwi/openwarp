@@ -21,7 +21,7 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 
 ## Gates
 
-Run from the repository root, serially — never two builds or suites at once. CI runs clippy, the Rust tests, the console test, and a container build that polls `/health` and runs `openwarp --help` inside the image.
+Run from the repository root, serially. Never run two builds or suites at once. CI runs clippy, the Rust tests, the console test, and a container build that polls `/health` and runs `openwarp --help` inside the image.
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
@@ -51,7 +51,7 @@ Run the stack with `DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo 
 - **E2E environments keep the key on the client.** The server stores ciphertext and per-user wrapped keys. Do not add a server-side plaintext path, and do not describe the compatibility creation path (which generates the key server-side) as server-blind.
 - **Egress guards are deliberate.** `url_ok` / `egress_allowed` reject private and loopback targets for OIDC, webhooks and integrations. `OPENWARP_ALLOW_PRIVATE_EGRESS=1` is an operator override, not a way to make a test pass; dynamic database leases additionally require `OPENWARP_ALLOWED_DB_HOSTS`.
 - **Provider sync is not transactional with local writes.** A local deploy can succeed while a remote write fails. Report per-integration results instead of assuming both landed, and keep provider-specific mirror-deletion behaviour intact.
-- **Production needs `OPENWARP_MASTER_KEY`** (base64, exactly 32 bytes). Outside `OPENWARP_ENV=production` a missing key is generated and stored in the database — acceptable locally, never for a real deployment.
+- **Production needs `OPENWARP_MASTER_KEY`** (base64, exactly 32 bytes). Outside `OPENWARP_ENV=production` a missing key is generated and stored in the database. That is acceptable locally, never for a real deployment.
 - **Keep the docs honest.** Changing a flag, environment variable, route or provider config means updating the matching page under `docs/`; state what you executed and what you only inspected.
 
 ## Tests and evidence
