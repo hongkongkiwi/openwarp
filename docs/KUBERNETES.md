@@ -27,6 +27,8 @@ Two behaviours matter when the token is used for deployment:
 - The token acts as the account that created it. Its organisation role decides which permissions apply, and the environment scope narrows it to one environment. Revoking the token, or deactivating the creator, stops new reads immediately.
 - Personal overrides are applied unless you ask for canonical values. `openwarp export --base` and the bridge's `base=1` request skip the token owner's overrides, so a Deployment never runs with an individual's stand-in credentials. Use the base form in automation.
 
+The environment scope also decides how you address the environment. A token created with `env_id` may only call `/api/envs/{that id}/...`; OpenWarp refuses it elsewhere, including the workspace and application listings. Such a token must address its environment by ID. Name references (`APP/ENV` and `WORKSPACE/APP/ENV`) need a token created without `env_id`, which the API accepts anywhere the owning account is allowed. Prefer the scoped token with an ID: it is the narrower credential.
+
 Two kinds of secret cannot be materialised on the server:
 
 - Sealed secrets have no server-side value. Neither the CLI nor the bridge can turn one into an environment variable.
@@ -193,24 +195,24 @@ spec:
     creationPolicy: Owner
   dataFrom:
     - extract:
-        key: Acme/api/Production
+        key: ENV_ID
 ```
 
 The reference in `key` is one of:
 
-| Form | Example | Notes |
+| Form | Example | Token needed |
 | --- | --- | --- |
-| `WORKSPACE/APP/ENV` | `Acme/api/Production` | Unambiguous, use this in shared clusters |
-| `APP/ENV` | `api/Production` | Must match exactly one environment across the token owner's workspaces |
-| `ENV_ID` | `k3n8...` | Opaque identifier, no lookup |
+| `ENV_ID` | `k3n8...` | The environment-scoped token from the secret above |
+| `APP/ENV` | `api/Production` | A token created without `env_id`; must match exactly one environment across the account's workspaces |
+| `WORKSPACE/APP/ENV` | `Acme/api/Production` | A token created without `env_id`; unambiguous |
 
-All three are resolved with the caller's token, so a reference to an environment outside its scope fails with the same 403 the API returns.
+Name references call the workspace and application listings, which an environment-scoped token cannot reach, so the bridge answers with `name_resolution_forbidden` and says to use the ID. The ID is on the environment's settings page in the console.
 
 Use `extract`. The webhook provider implements whole-object reads (`dataFrom.extract`); per-key selection through `remoteRef.property` is resolved inside provider implementations, and this provider does not implement it. One `ExternalSecret` per environment is also cheaper: one HTTP call instead of one per key.
 
 Behaviour worth knowing:
 
-- A 404 from the bridge means the environment no longer resolves. ESO then applies the target's `deletionPolicy`, which is `Retain` unless you set `Delete`.
+- A 404 from the bridge means the environment no longer resolves. ESO then applies the target's `deletionPolicy`, which is `Retain` unless you set `Delete`. An environment-scoped token cannot produce that 404: asking for any other id, including a deleted environment, returns 403. It also means ESO keeps retrying instead of deleting the `Secret`, so alert on failing `ExternalSecret` objects if you rely on removal.
 - 401 and 403 pass through, so a revoked token shows up as a failing `ExternalSecret` rather than an empty `Secret`.
 - A 5xx from OpenWarp becomes a 502, which ESO treats as a retryable error.
 - The bridge is stateless. Raise `eso.replicas` freely; each replica resolves names through the API per request.

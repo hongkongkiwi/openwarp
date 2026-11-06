@@ -63,7 +63,15 @@ async fn resolve(cfg: &Config, token: &str, target: &Target) -> Result<String, A
     let (workspace, app, env) = match target {
         Target::EnvId(id) => return Ok(id.clone()),
         Target::Names { workspace, app, env } => (workspace, app, env) };
-    let orgs = get_json(cfg, token, "/api/orgs").await?;
+    // OpenWarp only lets an environment-scoped token call /api/envs/{its own id}.
+    // Listing workspaces and apps is refused, so names need an unscoped token.
+    let orgs = get_json(cfg, token, "/api/orgs").await.map_err(|(status, Json(body))| {
+        if status != StatusCode::FORBIDDEN { return (status, Json(body)) }
+        let upstream = body.get("error").and_then(Value::as_str).unwrap_or("forbidden");
+        (StatusCode::FORBIDDEN, Json(json!({
+            "error": format!("this token cannot resolve names ({upstream}); use the environment id as the ref"),
+            "code": "name_resolution_forbidden" })))
+    })?;
     let mut matches = Vec::new();
     for org in orgs.as_array().cloned().unwrap_or_default() {
         if let Some(wanted) = workspace {
@@ -261,5 +269,20 @@ mod tests {
         let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=e1"))
             .bearer_auth("t").send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // An environment-scoped token cannot list workspaces, so a name reference has
+    // to say what to do instead of surfacing the upstream message alone.
+    #[tokio::test]
+    async fn scoped_token_gets_a_clear_name_resolution_error() {
+        let upstream = serve(Router::new().route("/api/orgs", get(|| async {
+            (StatusCode::FORBIDDEN, Json(v!({"error": "this token is scoped to a different environment"}))) }))).await;
+        let bridge = serve(router(config(&upstream))).await;
+        let response = reqwest::Client::new().get(format!("{bridge}/v1/export?ref=api/Production"))
+            .bearer_auth("t").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "name_resolution_forbidden");
+        assert!(body["error"].as_str().unwrap().contains("environment id"));
     }
 }
