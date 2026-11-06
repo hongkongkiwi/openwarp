@@ -188,6 +188,7 @@ async function consoleUI(secrets = [saved]) {
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
+    '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -503,4 +504,17 @@ test('saved-secret history and deletion retain their existing server routes', as
   ui.confirm = true;
   await ui.click(ui.button(ui.row(saved.key), /^Delete$/));
   assert.deepEqual(ui.writes().map(c => [c.method, c.url]), [['DELETE', '/api/secrets/saved-secret']]);
+});
+
+test('the reset view asks for the kit and an explicit key replacement', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("showReset('reset-token-1')");
+  assert.equal(ui.el('auth').style.display, 'grid', 'the reset view belongs on the auth screen');
+  assert.equal(ui.el('authform').dataset.reset, 'reset-token-1', 'the token must be carried into the form');
+  for (const id of ['rp-pw', 'rp-kit', 'rp-discard']) assert.ok(ui.document.getElementById(id), `missing #${id}`);
+  for (const id of ['rp-pw', 'rp-kit']) {
+    const label = ui.el('authform').querySelectorAll('label').find(l => l.getAttribute('for') === id);
+    assert.ok(label && label.textContent.trim(), `#${id} needs a programmatic label`);
+  }
+  assert.match(ui.el('authform').textContent, /lose end-to-end access/i, 'replacing the key must state its cost');
 });

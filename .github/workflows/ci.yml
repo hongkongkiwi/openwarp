@@ -26,3 +26,18 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: openwarp:ci
+      # Building is not enough: a build-base/runtime glibc mismatch only shows
+      # up when the binaries actually start.
+      - name: Smoke the image
+        run: |
+          docker run -d --name openwarp-ci -p 8080:8080 \
+            -e OPENWARP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)" openwarp:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health
+          docker exec openwarp-ci openwarp --help >/dev/null
+          docker stop openwarp-ci
