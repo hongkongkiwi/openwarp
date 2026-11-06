@@ -3,6 +3,8 @@
 | Phase feature | Tier in Phase | OpenWarp |
 |---|---|---|
 | Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
+| OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
 | Apps + readme | Free | yes |
 | Environments | 3 / 10 / unlimited | **unlimited custom envs**, name `^[a-zA-Z0-9-_]{1,32}$` |
 | Secrets: secret/sealed/config types | Free | yes; sealed never read back |

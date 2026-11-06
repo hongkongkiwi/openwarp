@@ -13,6 +13,7 @@ pub mod mailer;
 pub mod mysqllease;
 pub mod pglease;
 pub mod pki;
+pub mod social_extra;
 pub mod ssh_ca;
 pub mod ssh_keys;
 pub mod ui;

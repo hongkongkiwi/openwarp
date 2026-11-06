@@ -14,7 +14,7 @@ pub enum Db {
     #[cfg(not(target_arch = "wasm32"))]
     Postgres(deadpool_postgres::Pool),
     #[cfg(target_arch = "wasm32")]
-    DoSqlite(std::rc::Rc<worker::SqlStorage>),
+    DoSqlite(std::rc::Rc<worker::SqlStorage>, std::rc::Rc<worker::Storage>),
     #[cfg(not(target_arch = "wasm32"))]
     Mysql(mysql_async::Pool),
 }
@@ -80,12 +80,12 @@ impl Db {
     }
     /// Wrap the Durable Object SQLite handle used by the Workers deployment.
     #[cfg(target_arch = "wasm32")]
-    pub async fn from_do_sql(storage: worker::SqlStorage) -> Result<Self, String> {
-        let db = Db::DoSqlite(std::rc::Rc::new(storage)); db.migrate().await?; Ok(db)
+    pub async fn from_do_sql(storage: worker::Storage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage.sql()), std::rc::Rc::new(storage)); db.migrate().await?; Ok(db)
     }
     /// Cheap clone of the Durable Object SQL handle for deferred work.
     #[cfg(target_arch = "wasm32")]
-    pub fn clone_handle(&self) -> Db { match self { Db::DoSqlite(s) => Db::DoSqlite(s.clone()) } }
+    pub fn clone_handle(&self) -> Db { match self { Db::DoSqlite(s, storage) => Db::DoSqlite(s.clone(), storage.clone()) } }
     #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_memory() -> Result<Self, String> {
@@ -103,7 +103,7 @@ impl Db {
                 client.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)
             }
             #[cfg(target_arch = "wasm32")]
-            Db::DoSqlite(s) => {
+            Db::DoSqlite(s, _) => {
                 let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 Ok(cursor.rows_written() as u64)
             }
@@ -148,7 +148,7 @@ impl Db {
                 Ok(out)
             }
             #[cfg(target_arch = "wasm32")]
-            Db::DoSqlite(s) => {
+            Db::DoSqlite(s, _) => {
                 let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
@@ -178,49 +178,81 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
-    /// Execute several statements in one transaction. A rotation that rewrites
-    /// ciphertext and grants must not leave a half-rekeyed environment behind.
+    /// Execute several statements atomically, optionally requiring one affected row.
     pub async fn batch(&self, statements: &[(String, Vec<Value>)]) -> Result<(), String> {
+        self.batch_checked(statements, &[]).await
+    }
+    pub async fn batch_checked(&self, statements: &[(String, Vec<Value>)], require_one: &[usize]) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let checked = |index: usize, rows: u64| {
+            if require_one.contains(&index) && rows != 1 { Err("version conflict: concurrent secret change".to_string()) } else { Ok(()) }
+        };
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Db::Sqlite(c) => {
-                let conn = c.lock().unwrap();
-                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
-                for (sql, params) in statements {
-                    if let Err(e) = exec_sqlite(&conn, sql, params) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+                let mut conn = c.lock().unwrap();
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                for (index, (sql, params)) in statements.iter().enumerate() {
+                    checked(index, exec_sqlite(&tx, sql, params)?)?;
                 }
-                conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+                // rusqlite rolls back on drop, including a failed commit.
+                tx.commit().map_err(|e| e.to_string())
             }
             #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
                 let mut client = pool.get().await.map_err(|e| e.to_string())?;
-                let tx = client.transaction().await.map_err(|e| e.to_string())?;
-                for (sql, params) in statements {
-                    let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
-                    tx.execute(sql2.as_str(), &refs[..]).await.map_err(|e| e.to_string())?;
-                }
-                tx.commit().await.map_err(|e| e.to_string())
+                let result = async {
+                    let tx = client.transaction().await.map_err(|e| e.to_string())?;
+                    for (index, (sql, params)) in statements.iter().enumerate() {
+                        let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                        checked(index, tx.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)?)?;
+                    }
+                    tx.commit().await.map_err(pg_err)
+                }.await;
+                if result.is_err() { let _ = client.batch_execute("ROLLBACK").await; }
+                result
             }
             #[cfg(not(target_arch = "wasm32"))]
             Db::Mysql(pool) => {
                 let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
-                client.query_drop("START TRANSACTION").await.map_err(|e| e.to_string())?;
-                for (sql, params) in statements {
+                let mut tx = client.start_transaction(mysql_async::TxOpts::default()).await.map_err(|e| e.to_string())?;
+                for (index, (sql, params)) in statements.iter().enumerate() {
                     let sql2 = mysql_sql(sql);
-                    if let Err(e) = client.exec_drop(sql2.as_str(), mysql_params(params)).await {
-                        let _ = client.query_drop("ROLLBACK").await;
-                        return Err(e.to_string());
-                    }
+                    let result = async {
+                        tx.exec_drop(sql2.as_str(), mysql_params(params)).await.map_err(|e| e.to_string())?;
+                        checked(index, tx.affected_rows())
+                    }.await;
+                    if let Err(e) = result { let _ = tx.rollback().await; return Err(e); }
                 }
-                client.query_drop("COMMIT").await.map_err(|e| e.to_string())
+                let result = tx.commit().await.map_err(|e| e.to_string());
+                if result.is_err() { let _ = client.query_drop("ROLLBACK").await; }
+                result
             }
-            // A Durable Object handles one event at a time and the SQL handle is
-            // synchronous, so a sequential batch cannot interleave with another
-            // request the way two native connections could.
             #[cfg(target_arch = "wasm32")]
-            Db::DoSqlite(s) => {
-                for (sql, params) in statements { s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; }
-                Ok(())
+            Db::DoSqlite(s, storage) => {
+                use worker::wasm_bindgen::{closure::Closure, JsCast, JsValue};
+                let raw: &JsValue = storage.as_raw().as_ref();
+                let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync"))
+                    .map_err(|e| worker::Error::from(e).to_string())?
+                    .dyn_into::<js_sys::Function>().map_err(|_| "Durable Object transactionSync is unavailable".to_string())?;
+                let sql = s.clone(); let statements = statements.to_vec(); let require_one = require_one.to_vec();
+                // Returning Err throws into transactionSync so the runtime rolls back SQL writes.
+                let callback = Closure::wrap(Box::new(move || -> Result<JsValue, JsValue> {
+                    for (index, (statement, params)) in statements.iter().enumerate() {
+                        let cursor = sql.exec(statement, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                        for row in cursor.raw() { row.map_err(|e| JsValue::from_str(&e.to_string()))?; }
+                        if require_one.contains(&index) {
+                            // rowsWritten includes index writes; changes() counts affected table rows.
+                            let changes: Value = sql.exec("SELECT changes() AS affected", None).map_err(|e| JsValue::from_str(&e.to_string()))?
+                                .one().map_err(|e| JsValue::from_str(&e.to_string()))?;
+                            if changes["affected"].as_u64() != Some(1) {
+                                return Err(JsValue::from_str("version conflict: concurrent secret change"));
+                            }
+                        }
+                    }
+                    Ok(JsValue::UNDEFINED)
+                }) as Box<dyn FnMut() -> Result<JsValue, JsValue>>);
+                transaction.call1(raw, callback.as_ref()).map(|_| ()).map_err(|e| worker::Error::from(e).to_string())
             }
         }
     }
@@ -274,19 +306,19 @@ impl Db {
 impl Db {
     /// Constructor for the Durable Object. Migrations run synchronously because
     /// the object constructor cannot await, and the SQL handle never yields.
-    pub fn from_do_sql_now(storage: worker::SqlStorage) -> Result<Self, String> {
-        let db = Db::DoSqlite(std::rc::Rc::new(storage));
+    pub fn from_do_sql_now(storage: worker::Storage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage.sql()), std::rc::Rc::new(storage));
         db.migrate_now()?;
         Ok(db)
     }
     fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::DoSqlite(s) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
+            Db::DoSqlite(s, _) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
         }
     }
     fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
-            Db::DoSqlite(s) => {
+            Db::DoSqlite(s, _) => {
                 let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
