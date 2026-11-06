@@ -11,6 +11,10 @@
 | Secret referencing `${KEY}`, `${/path/KEY}` | Free | resolved server-side, 5-deep |
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
+| Sign-in methods and second factors | n/a | password, ten social providers, workspace OIDC/SAML and LDAP; TOTP, WebAuthn passkeys and emailed codes; instance switches with `OPENWARP_AUTH_PROVIDERS` |
+| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console still uses v1 |
+| Encryption modes and KMS | n/a | SSE per-environment keys, external KMS bridge, client-held keys for delegated and E2E environments, `ow2` record-bound ciphertext |
+| Customer-run sync runner | n/a | outbound job queue, runner-sealed provider configs, claim fencing and stale-job recovery |
 | Global search | Free | `GET /api/search?q=` across orgs/apps/envs |
 | Lockbox one-time sharing | Free | `POST /api/lockbox` (key in URL fragment), one view, 24h |
 | `.env` import/export | Free | `POST /api/envs/:id/import`, `GET .../export` |

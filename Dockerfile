@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /src/target/release/openwarp-server /usr/local/bin/
 COPY --from=build /src/target/release/openwarp /usr/local/bin/
 COPY --from=build /src/target/release/openwarp-eso /usr/local/bin/
+COPY --from=build /src/target/release/openwarp-runner /usr/local/bin/
 ENV ADDR=0.0.0.0:8080 DATABASE_URL=sqlite:///data/openwarp.db OPENWARP_ENV=production
 WORKDIR /data
 USER 10001

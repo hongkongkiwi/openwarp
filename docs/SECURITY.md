@@ -12,7 +12,9 @@ OpenWarp stores credentials and secret material. Deployment choices, access poli
 | Normal CLI `run` and provider sync | Available subject to access policy | Not the normal SSE workflow; use the E2E commands |
 | Recovery requirements | Database and matching master key | Database and the user's original private key, or another authorised key holder who can grant access |
 
-SSE is the default. A per-environment key encrypts secret names, values, comments, and integration configuration. The instance master key wraps these environment keys. A server operator with the database and master key can decrypt SSE secrets.
+SSE is the default. A per-environment key encrypts secret names, values, comments, paths, tags, and integration configuration, with associated data binding each ciphertext to its record. The instance master key wraps these environment keys; with a KMS configured, the root and environment keys are wrapped externally instead. A server operator with the database and master key can decrypt SSE secrets.
+
+The [encryption modes and key custody](ENCRYPTION.md) page adds the delegated mode, the KMS bridge contract, the metadata and runner boundaries, and the client-derived auth caveats.
 
 For true E2E creation, the client must supply `wrapped_key` to the E2E creation endpoint. The compatibility path that omits it lets the server generate a key and returns `server_generated: true`. That path does not keep the key unknown to the server. Prefer the CLI's `e2e-create` command.
 

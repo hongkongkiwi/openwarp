@@ -62,7 +62,30 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) { return None; }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect() }
 const OAUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
-fn html_csp(body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP)); r }
+const OAUTH_AUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const OAUTH_AUTH_JS: &str = r#"<script src="/auth-v2.js"></script><script>
+document.getElementById('oauthlogin').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var f = e.target;
+  (async function() {
+    try {
+      function add(name, value) { var i = document.createElement('input'); i.type = 'hidden'; i.name = name; i.value = value; f.appendChild(i); }
+      var kdf = await AuthV2.kdf(f.email.value);
+      if (kdf.version === 1) { add('approve', '1'); f.submit(); return; }
+      var keys = await AuthV2.deriveKeys(f.password.value, kdf.salt, kdf.iterations);
+      var ch = await AuthV2.challenge(f.email.value);
+      var proof = await AuthV2.proof(keys.auth, ch.challenge, ch.challenge_id);
+      f.password.value = '';
+      add('challenge_id', ch.challenge_id);
+      add('proof', proof);
+      add('approve', '1');
+      f.submit();
+    } catch (err) { alert(err.message || String(err)); }
+  })();
+});
+</script>"#;
+fn html_csp(body: String) -> Response { html_csp_with(OAUTH_CSP, body) }
+fn html_csp_with(csp: &'static str, body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(csp)); r }
 // Only authorization parameters may survive a failed attempt. Passwords,
 // proofs and one-time codes must never be echoed back into the page.
 fn hidden_fields(form: &HashMap<String, String>) -> String {
@@ -3687,7 +3710,7 @@ async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<Hash
         let otp = if meta_get(&st, &format!("totp_enabled:{}", uid)).await == "1" { "<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code><br>".to_string() } else { String::new() };
         return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden, otp));
     }
-    html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><input name=otp placeholder=\"authenticator code (if enabled)\" autocomplete=one-time-code style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>", hidden))
+    html_csp_with(OAUTH_AUTH_CSP, format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form id=\"oauthlogin\" method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form>{}</body></html>", hidden, OAUTH_AUTH_JS))
 }
 fn consent_mfa_page(form: &HashMap<String, String>, token: &str) -> String {
     format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input type=hidden name=\"mfa_token\" value=\"{}\"><input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(form), esc(token))
