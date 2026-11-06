@@ -7,7 +7,7 @@
 | Environments | 3 / 10 / unlimited | **unlimited custom envs**, name `^[a-zA-Z0-9-_]{1,32}$` |
 | Secrets: secret/sealed/config types | Free | yes; sealed never read back |
 | Folders/paths, tags, comments | Free | yes (key unique per env+path) |
-| Versioning, history diff, one-click restore | Free | `GET /api/secrets/:id/history`, `POST .../restore/:ver` |
+| Versioning, history diff, one-click restore | Free | `GET /api/secrets/:id/history`, `POST .../restore/:ver`, plus check-and-set writes, `max_versions` retention and permanent destroy |
 | Secret referencing `${KEY}`, `${/path/KEY}` | Free | resolved server-side, 5-deep |
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
@@ -24,8 +24,8 @@
 | Network policies | Pro | `PUT /api/orgs/:id/settings {ip_allowlist}` stored per org |
 | Point-in-time recovery | Pro | `POST /api/envs/:id/restore-point {timestamp}` |
 | Automated rotation | Pro | `POST /api/envs/:id/rotate {key}` (new random or given value) |
-| Audit logs + forwarding | Pro/Ent | per-org audit table, webhook forwarding via settings |
-| Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default) |
+| Audit logs + forwarding | Pro/Ent | per-org audit table with a hash chain and `GET /api/orgs/:id/audit/verify`, webhook forwarding via settings |
+| Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default); expiry revokes the remote credential |
 | OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, `id_token` verified against provider JWKS with RS/PS/ES signatures and iss/aud/exp/nonce checks, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. Instance-level sign-in with any OIDC provider is configured by `OPENWARP_OIDC_*` (PKCE, optional client secret, discovery or explicit endpoints; see [configuration](CONFIGURATION.md)). SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
 | LDAP directory sign-in | Enterprise | **Per-org LDAPS directory**: admin `GET/PUT/DELETE /api/orgs/:id/ldap` stores the URL, service bind DN and encrypted password, base DN, user filter, attribute names and group map; `POST /api/auth/ldap {org_id, username, password}` searches with the service account (RFC 4515 escaping), then binds as the found entry. Only `ldaps://` is accepted, so no password crosses the wire unencrypted. Invite or auto-provision plus allowed-domain gating, `Group=role` mapping, TOTP parity and audit entries. Absent from builds without the `ldap` cargo feature (Workers/WASM) |
 | External KMS | Enterprise | master key via `OPENWARP_MASTER_KEY` (BYO KMS/HSM wrapper point) |
@@ -543,8 +543,8 @@ accepts `qps`, `qpm` and `tpm`. ElevenLabs defaults `permissions` to `"all"`.
 
 The parent credential is encrypted on the lease so revoke can authenticate; the
 response returns only the child secret. A failed remote delete leaves the lease
-active. Expiry does not revoke the remote key by itself: call revoke, or rely
-on the provider expiry where one was set at creation. Resend keys have no
+active and retries after a minute. The background lease sweeper revokes expired
+remote credentials through the same path as manual revoke. Resend keys have no
 remote expiry. Anthropic's Admin API can list and deactivate keys but has no
 documented create call, so it is not a lease provider. Groq, Together, Cohere,
 DeepSeek, Cerebras, SambaNova, Voyage and AssemblyAI only mint keys from their
@@ -581,6 +581,15 @@ this route.
 
 CI compiles the TypeScript, Rust and Terraform deliverables and runs their
 live-server tests against the built binary.
+
+### Vault-style secret and lease semantics (2026-11-06)
+
+- Check-and-set writes: a secret accepts `expected_version` (`0` = create only, `n` = the version the caller last saw). A stale write returns 409 with the current version instead of overwriting.
+- Version retention: `PUT /api/envs/:id/policy {"max_versions": n}` keeps the newest `n` versions per secret (0 = unlimited, maximum 1000). Older rows are pruned on write and restore.
+- `POST /api/secrets/:id/undelete` reverses the recoverable delete tombstone. `POST /api/secrets/:id/destroy` removes the value, its history and personal overrides permanently; point-in-time recovery cannot bring it back.
+- Response wrapping: `POST /api/envs/:id/wrap {"ttl_secs":300,"keys":["API_KEY"]}` returns a single-use `owwrap_...` Bearer token. Redeem it once at `POST /api/unwrap`; `GET /api/unwrap` looks it up without consuming it. The token is not an API credential and works only on `/api/unwrap`. Sealed and client-encrypted values are excluded.
+- Lease expiry revokes: the background leader sweeps expired leases and performs the same remote revoke as `DELETE /api/leases/:id`. A failed remote delete leaves the lease active, audits `lease.expire_failed`, and retries after a minute. `GET /api/leases/:id` reports type, expiry, revocation and renewability without returning the value.
+- Audit chain: audit rows carry `seq`, `prev_hash` and `hash`; `GET /api/orgs/:id/audit/verify` recomputes the chain and reports `first_bad`. Rows written before migration 17 report as `unchained`.
 
 ### Still not implemented
 
