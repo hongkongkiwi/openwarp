@@ -162,9 +162,13 @@ Shared behavioural options:
 - `paths` and `include_subfolders` restrict a sync to selected secret folders;
   empty `paths` means every path.
 - `disable_secret_deletion` stops `mirror` from pruning names this integration
-  previously managed.
+  previously managed, and suppresses `absent: disable` on Azure Key Vault.
+- Adapters declare capabilities. AWS Secrets Manager, Azure Key Vault and GCP
+  Secret Manager sync static and per-secret metadata tags (AWS tags, Azure
+  tags, GCP labels); Azure Key Vault alone supports `absent: disable` for names
+  that leave the source. Options an adapter does not support fail validation.
 - Provider-specific parity: Vercel accepts `target` and `type`, Azure Key Vault
-  accepts `mapping` / `secret_name` for a JSON blob, and AWS accepts `tags` and
+  accepts `mapping` / `secret_name` for a JSON blob, and AWS accepts
   `external_id` on top of `role_arn`.
 - `auto_sync: false` skips the integration on deploy, rotation, proposal,
   delete, restore and point-in-time restore; manual Sync still runs it.

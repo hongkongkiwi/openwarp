@@ -77,7 +77,7 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | `supabase` | `token`, `project_ref` | Project secrets |
 | `nomad` | `token`; optional `base_url` | Nomad variable at `openwarp/default`; default server is local port 4646 |
 | `coolify` | `token`, `app_uuid` | Application environment variables, not preview variables |
-| `aws_secrets_manager` | `region`, `access_key_id`, `secret_access_key`; optional `session_token`, `role_arn`, `sts_endpoint`, `endpoint`, `kms_key_id`, `prefix`, `secret_id`, `mapping`, `force_delete` | One secret per key by default, or one JSON secret when `secret_id` is set (many-to-one). Mirror prunes managed names. |
+| `aws_secrets_manager` | `region`, `access_key_id`, `secret_access_key`; optional `session_token`, `role_arn`, `external_id`, `sts_endpoint`, `endpoint`, `kms_key_id`, `prefix`, `secret_id`, `mapping`, `force_delete`, `tags` | One secret per key by default, or one JSON secret when `secret_id` is set (many-to-one). Static and per-secret metadata tags are applied. Mirror prunes managed names. |
 | `aws_parameter_store` | `region`, `access_key_id`, `secret_access_key`, `path_prefix`; optional `session_token`, `role_arn`, `sts_endpoint`, `endpoint`, `type`, `tier`, `kms_key_id` | One SecureString parameter per key under the path. Mirror prunes managed names. |
 | `1password` | `connect_url`, `token` (or `access_token`), `vault_id` (or `vault`); optional `value_label`, `category` | One 1Password item per key through a Connect server; the item title is the key and the value goes into the labelled concealed field. `onepassword` is accepted as an alias. |
 | `dokploy` | `base_url`, `api_key`, plus exactly one of `application_id` or `compose_id`; optional `redeploy` | Merges values into the application or compose env string and optionally redeploys |
@@ -105,8 +105,8 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | `hetzner` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. The API cannot replace key material, so a changed key is deleted and created again and its numeric id changes |
 | `linode` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. A changed key is deleted and created again, so its id changes |
 | `digitalocean_ssh` | `token` | Account SSH keys at `/v2/account/keys`, taken only from secrets of type `ssh_key`. Distinct from `digitalocean`, which updates an App Platform spec. A changed key is deleted and created again |
-| `gcp_secret_manager` | `token`, `project` | Creates/versions secrets; lowercases names and replaces underscores with hyphens |
-| `azure_key_vault` | `token`, `vault` (or `base_url`); optional `mapping` (`one_to_one` or `many_to_one`) and `secret_name` | One secret per key by default, or every key as one JSON blob in `secret_name`. Names are lowercased with underscores turned into hyphens |
+| `gcp_secret_manager` | `token`, `project`; optional `tags` | Creates/versions secrets; lowercases names and replaces underscores with hyphens. Metadata and static tags become labels |
+| `azure_key_vault` | `token`, `vault` (or `base_url`); optional `mapping` (`one_to_one` or `many_to_one`), `secret_name`, `absent`, `tags` | One secret per key by default, or every key as one JSON blob in `secret_name`. `absent: disable` disables previously managed keys that leave the source. Names are lowercased with underscores turned into hyphens |
 | `kubernetes` | `token`, `api_server`, `namespace`, `secret_name` | Writes an Opaque Secret; creates it after a not-found response |
 | `hashicorp_vault` | `token`, `addr`, `path` | Sends a `{data: ...}` payload to the configured Vault API path |
 | `webhook` | `url`; optional `token`, `signing_secret` (or `secret`) | POSTs `{secrets: {NAME: value}}`. `token` is sent as a bearer header. A signing secret adds `X-OpenWarp-Timestamp` and `X-OpenWarp-Signature: t=<unix>,v1=<hex>`, the HMAC-SHA256 of `timestamp.body` |
@@ -146,7 +146,17 @@ Naming is off by default and applies to every adapter. It renames a key on the w
 
 For example, `"prefix": "APP_"` and `"suffix": "_{{environment}}"` write `API_KEY` as `APP_API_KEY_production`. The equivalent template is `"name_template": "APP_{{secretKey}}_{{environment}}"`. For Terraform-style names, `"prefix": "TF_VAR_", "case": "upper"` writes `db_host` as `TF_VAR_DB_HOST`; `case` applies to the key only, so the prefix keeps its spelling. This is the same idea as Infisical's Key Schema: choose a pattern that only matches the keys this integration should own. A mirror sync deletes only names it previously managed, so unrelated destination keys are left alone.
 
-The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) also share these options:
+### Metadata tags
+
+`aws_secrets_manager`, `azure_key_vault` and `gcp_secret_manager` declare tag support. OpenWarp stores tags as a comma-separated string: `owner=platform` becomes a key/value tag, and a bare `platform` becomes a tag with an empty value. The sync-level `tags` object adds static tags, and a static tag wins when both define the same key.
+
+- AWS Secrets Manager calls `TagResource` for every secret it writes. `mapping: many_to_one` uses static tags only, because one secret cannot carry per-key metadata.
+- Azure Key Vault writes tags with each secret version. `many_to_one` uses static tags only.
+- GCP Secret Manager writes labels on create and patches them on existing secrets. Label names and values are lowercased, unsupported characters become underscores, and a name that does not start with a letter is prefixed with `tag_`.
+
+Tags are stored unencrypted, so do not put credentials in them. Configuring `tags` for any other kind fails validation instead of being ignored.
+
+The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Azure Key Vault, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) also share these options:
 
 | Field | Meaning |
 | --- | --- |
@@ -157,7 +167,7 @@ The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS
 | `base_url` | Override the adapter's API base for a compatible service |
 | `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore; manual Sync still runs |
 | `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync |
-| `disable_secret_deletion` | Boolean. Keeps `mirror` from pruning names this integration previously managed. The default `upsert` mode already never deletes |
+| `disable_secret_deletion` | Boolean. Keeps `mirror` from pruning names this integration previously managed, and suppresses `absent: disable` on Azure Key Vault. The default `upsert` mode already never deletes |
 
 Filters apply before naming. Mirror uses persisted managed-name state, not blanket deletion of every name on the remote service. Changing targets, prefixes, suffixes, templates or filters affects that state; review a dry run and remote inventory first. The remaining options are not supported by every row in the provider table.
 
@@ -170,15 +180,17 @@ Filters apply before naming. Mirror uses persisted managed-name state, not blank
 | Infisical initial sync import behavior | `initial_sync: import_local` or `import_remote`; their "overwrite destination" also removes extras, which is `mode: mirror` here |
 | Infisical Disable Secret Deletion | `disable_secret_deletion`, or the default `upsert` mode |
 | Infisical Auto-Sync | `auto_sync` |
-| Infisical AWS mapping, secret name, KMS key, tags | `mapping`, `secret_id`, `kms_key_id`, `tags` |
+| Infisical AWS mapping, secret name, KMS key, static tags | `mapping`, `secret_id`, `kms_key_id`, `tags` |
+| Infisical "Sync secret metadata as tags" | per-secret tags become AWS tags, Azure tags and GCP labels |
 | Phase environment and path | the integration's environment plus `paths` |
 | Phase individual secrets vs JSON blob | `mapping: one_to_one` or `many_to_one` (AWS Secrets Manager, Azure Key Vault) |
 | Phase source of truth | `mode: mirror`; OpenWarp defaults to the safer `upsert` |
 | Phase pause syncing | `auto_sync: false` |
 | Phase assume role with external ID | `role_arn` and `external_id` |
 | Phase Vercel target and secret type | `target` and `type` |
+| Phase disabling destination secrets absent from the source | Azure Key Vault `absent: disable`; other adapters have no disable operation |
 
-Two options are deliberately not replicated. Infisical's "sync secret metadata as tags" would need tags in the adapter payload, which currently carries only path, key, value and type. Phase disables destination secrets that are absent from the source; OpenWarp only deletes previously managed names, and only in `mirror` mode.
+Remaining limits: tags are merged, not replaced, so removing a tag in OpenWarp leaves the destination tag in place; `many_to_one` mappings carry static tags only; and `absent: disable` exists only for Azure Key Vault, because AWS Secrets Manager, Vercel, Cloudflare and most CI providers have no disable operation.
 
 `initial_sync` is limited to adapters that can return values: AWS Secrets Manager, AWS Parameter Store, 1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps, OpenWarp, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and Hugging Face Space variables. CircleCI, Devin, Cloudflare Secrets Store, Cursor and Hugging Face Space secrets reject import because their APIs never return values.
 
@@ -193,7 +205,7 @@ Two mappings are available:
 - `mapping: "one_to_one"` (the default when `secret_id` is absent) writes one remote secret per key, using the key naming options. Missing names are created with `CreateSecret`; existing names receive a new version with `PutSecretValue`. Mirror deletes previously managed names with a seven-day recovery window unless `force_delete: true`.
 - `mapping: "many_to_one"` (the default when `secret_id` is set) writes every value into one JSON `SecretString` at `secret_id`, creating the secret when it does not exist. Key naming and key filters apply to the JSON field names. Mirror is rejected because keys are not separate remote objects.
 
-`kms_key_id` applies only when a secret is created. `tags` adds static tags to every secret this sync writes, as an object of string values. `role_arn` makes the adapter assume that role first, using the supplied base credentials, optional `external_id` and optional `sts_endpoint`; the resulting temporary credentials sign the sync. `endpoint` overrides the regional endpoint. One-to-one names are validated against the Secrets Manager character set and 512-byte limit before any write.
+`kms_key_id` applies only when a secret is created. `tags` adds static tags to every secret this sync writes, as an object of string values; per-secret metadata tags are merged on top, with static values winning. `role_arn` makes the adapter assume that role first, using the supplied base credentials, optional `external_id` and optional `sts_endpoint`; the resulting temporary credentials sign the sync. `endpoint` overrides the regional endpoint. One-to-one names are validated against the Secrets Manager character set and 512-byte limit before any write.
 
 ```json
 {
@@ -206,6 +218,14 @@ Two mappings are available:
   "dry_run": true
 }
 ```
+
+## Azure Key Vault
+
+Supply `token`, or `tenant_id`, `client_id` and `client_secret`, plus `vault` or `base_url`.
+
+`mapping: one_to_one` (the default) writes one secret per key and lowercases names with underscores turned into hyphens. `mapping: many_to_one` with `secret_name` writes every key as one JSON blob, accepts static tags only, and rejects mirror and `absent: disable`. Switching an existing one-to-one sync to many-to-one releases its managed names.
+
+`absent: "disable"` makes the adapter stateful: a name it previously managed that no longer appears in the source is disabled with a `PATCH` instead of deleted, and stays owned so it is re-enabled when the key returns. `mode: mirror` deletes previously managed names instead. `disable_secret_deletion` suppresses both the deletes and the disables. Initial import is not implemented for this adapter, so keep `initial_sync` as `overwrite`.
 
 ## AWS Parameter Store
 

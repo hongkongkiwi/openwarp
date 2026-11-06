@@ -48,9 +48,10 @@ async fn azure_access_token(config: &Value) -> Result<String, String> {
     value.get("access_token").and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("Azure token response is missing access_token: {}", text.chars().take(300).collect::<String>()))
 }
 
-pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
-    validate_sync_config(config)?;
-    let named: Vec<(String, String)> = secrets.iter().map(|(k, v)| (desired_name(config, k), v.clone())).collect();
+pub async fn sync(kind: &str, config: &Value, secrets: &[SyncSecret]) -> Result<String, String> {
+    validate_sync_config(kind, config)?;
+    let named: Vec<(String, String)> = secrets.iter().map(|s| (desired_name(config, &s.key), s.value.clone())).collect();
+    let tags_by_name = secret_tags(config, secrets);
     let secrets = named.as_slice();
     let client = http_client();
     match kind {
@@ -92,24 +93,21 @@ pub async fn sync(kind: &str, config: &Value, secrets: &[(String, String)]) -> R
             req(client.post(format!("{}/v1/apps/{}/secrets", base(config,"https://api.machines.dev"), cfg(config,"app"))).bearer_auth(cfg(config,"token")).json(&json!({"values": Value::Object(m)}))).await.map_err(|_| "Fly.io secrets API rejected request; check app/token".to_string())?; Ok("pushed to Fly.io".into()) }
         "railway" => { let query = format!("mutation {{ variableCollectionUpsert(input: {{ projectId: \"{}\", environmentId: \"{}\", serviceId: \"{}\", variables: {} }}) }}", cfg(config,"project_id"), cfg(config,"environment_id"), cfg(config,"service_id"), map_json(secrets));
             req(client.post(format!("{}/graphql/v2", base(config,"https://backboard.railway.app"))).bearer_auth(cfg(config,"token")).json(&json!({"query": query}))).await?; Ok("pushed to Railway".into()) }
-        "gcp_secret_manager" => { let project = cfg(config,"project"); let token = gcp_access_token(config).await?; for (k, v) in secrets { let name = k.to_lowercase().replace('_',"-");
-                let _ = client.post(format!("{}/v1/projects/{}/secrets?secretId={}", base(config,"https://secretmanager.googleapis.com"), project, name)).bearer_auth(&token).json(&json!({"replication":{"automatic":{}}})).send().await;
-                req(client.post(format!("{}/v1/projects/{}/secrets/{}:addVersion", base(config,"https://secretmanager.googleapis.com"), project, name)).bearer_auth(&token).json(&json!({"payload":{"data": openwarp_crypto::b64(v.as_bytes())}}))).await?; }
-            Ok(format!("pushed {} secrets to GCP Secret Manager", secrets.len())) }
-        "azure_key_vault" => {
-            let token = azure_access_token(config).await?;
-            let root = if cfg(config,"base_url").is_empty() { format!("https://{}.vault.azure.net", cfg(config,"vault")) } else { base(config,"") };
-            let mapping = { let m = cfg(config,"mapping"); if !m.is_empty() { m } else if !cfg(config,"secret_name").is_empty() { "many_to_one" } else { "one_to_one" } };
-            match mapping {
-                "one_to_one" => { for (k, v) in secrets { let name = k.to_lowercase().replace('_',"-");
-                    req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&json!({"value":v}))).await?; }
-                    Ok(format!("pushed {} secrets to Azure Key Vault", secrets.len())) }
-                "many_to_one" => {
-                    let name = cfg(config,"secret_name"); if name.is_empty() { return Err("azure_key_vault many_to_one requires secret_name".into()); }
-                    req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&json!({"value": map_json(secrets).to_string()}))).await?;
-                    Ok(format!("pushed {} keys into Azure Key Vault secret {}", secrets.len(), name)) }
-                other => Err(format!("azure_key_vault mapping must be one_to_one or many_to_one (got {:?})", other)),
-            } }
+        "gcp_secret_manager" => {
+            let project = cfg(config,"project"); let token = gcp_access_token(config).await?;
+            let root = base(config,"https://secretmanager.googleapis.com");
+            let mut label_failures = 0;
+            for (k, v) in secrets {
+                let name = k.to_lowercase().replace('_',"-");
+                let labels = gcp_labels(&merged_tags(config, tags_by_name.get(k).map(String::as_str).unwrap_or(""))?);
+                let mut create = json!({"replication":{"automatic":{}}});
+                if !labels.is_empty() { create["labels"] = Value::Object(labels.clone()); }
+                let existing = matches!(client.post(format!("{}/v1/projects/{}/secrets?secretId={}", root, project, name)).bearer_auth(&token).json(&create).send().await, Ok(response) if response.status().as_u16() == 409);
+                if existing && !labels.is_empty() && req(client.patch(format!("{}/v1/projects/{}/secrets/{}?updateMask=labels", root, project, name)).bearer_auth(&token).json(&json!({"labels": labels}))).await.is_err() { label_failures += 1; }
+                req(client.post(format!("{}/v1/projects/{}/secrets/{}:addVersion", root, project, name)).bearer_auth(&token).json(&json!({"payload":{"data": openwarp_crypto::b64(v.as_bytes())}}))).await?;
+            }
+            let note = if label_failures > 0 { format!("; labels could not be updated on {} secret(s)", label_failures) } else { String::new() };
+            Ok(format!("pushed {} secrets to GCP Secret Manager{}", secrets.len(), note)) }
         "kubernetes" => { let server = cfg(config,"api_server").trim_end_matches('/'); let ns = cfg(config,"namespace");
             let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!(openwarp_crypto::b64(v.as_bytes()))); }
             let body = json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":cfg(config,"secret_name"),"namespace":ns},"type":"Opaque","data":Value::Object(m)});
@@ -317,6 +315,51 @@ pub fn local_name(config: &Value, remote: &str) -> String {
     let without_prefix = without_path.strip_prefix(&prefix).unwrap_or(without_path);
     without_prefix.strip_suffix(&suffix).unwrap_or(without_prefix).to_string()
 }
+/// OpenWarp stores tags as a comma-separated string. `k=v` entries become
+/// key/value tags; a bare entry becomes a tag with an empty value.
+pub fn parse_tags(tags: &str) -> Vec<(String, String)> {
+    tags.split(',').filter_map(|raw| {
+        let entry = raw.trim();
+        if entry.is_empty() { return None; }
+        match entry.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() => Some((key.trim().to_string(), value.trim().to_string())),
+            Some(_) => None,
+            None => Some((entry.to_string(), String::new())),
+        }
+    }).collect()
+}
+fn config_tags(config: &Value) -> Result<Vec<(String, String)>, String> {
+    match config.get("tags") {
+        None => Ok(Vec::new()),
+        Some(Value::Object(map)) => map.iter().map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())).ok_or_else(|| format!("sync tag {:?} must have a string value", key))).collect(),
+        Some(_) => Err("sync tags must be an object of string values".into()),
+    }
+}
+/// Static sync tags override metadata tags with the same key, matching Infisical.
+fn merge_tags(metadata: &str, static_tags: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = parse_tags(metadata);
+    for (key, value) in static_tags {
+        if let Some(existing) = out.iter_mut().find(|(k, _)| k == key) { existing.1 = value.clone(); } else { out.push((key.clone(), value.clone())); }
+    }
+    out
+}
+fn merged_tags(config: &Value, metadata: &str) -> Result<Vec<(String, String)>, String> { Ok(merge_tags(metadata, &config_tags(config)?)) }
+fn tags_object(tags: &[(String, String)]) -> Value { Value::Object(tags.iter().map(|(k, v)| (k.clone(), json!(v))).collect()) }
+/// GCP labels allow lowercase letters, digits, underscores and hyphens only, so
+/// metadata tags are sanitized rather than rejected. Empty values stay empty.
+fn gcp_label(raw: &str) -> String {
+    if raw.is_empty() { return String::new(); }
+    let mut out: String = raw.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+    if !out.starts_with(|c: char| c.is_ascii_lowercase()) { out.insert_str(0, "tag_"); }
+    out.truncate(63);
+    out
+}
+fn gcp_labels(tags: &[(String, String)]) -> serde_json::Map<String, Value> {
+    tags.iter().map(|(key, value)| (gcp_label(key), json!(gcp_label(value)))).collect()
+}
+fn secret_tags(config: &Value, secrets: &[SyncSecret]) -> std::collections::HashMap<String, String> {
+    secrets.iter().map(|s| (desired_name(config, &s.key), s.tags.clone())).collect()
+}
 /// Source path filter. Empty `paths` selects every path, `include_subfolders`
 /// extends each selection to its descendants, and the root selects everything.
 pub fn path_selected(config: &Value, path: &str) -> bool {
@@ -331,7 +374,7 @@ pub fn path_selected(config: &Value, path: &str) -> bool {
 }
 /// A template without exactly one `{{secretKey}}` would collapse every key into
 /// one remote name, so reject it before any adapter runs.
-pub fn validate_sync_config(config: &Value) -> Result<(), String> {
+pub fn validate_sync_config(kind: &str, config: &Value) -> Result<(), String> {
     let case = cfg(config, "case");
     if !case.is_empty() && case != "upper" && case != "lower" { return Err(format!("case must be upper or lower (got {:?})", case)); }
     let template = name_template(config);
@@ -346,6 +389,14 @@ pub fn validate_sync_config(config: &Value) -> Result<(), String> {
     for key in ["include_subfolders", "disable_secret_deletion"] {
         if let Some(value) = config.get(key) { if !value.is_boolean() { return Err(format!("{} must be a boolean", key)); } }
     }
+    let capabilities = capabilities(kind);
+    if config.get("tags").is_some() && !capabilities.metadata_tags { return Err(format!("{} does not support sync tags", kind)); }
+    let absent = cfg(config, "absent");
+    if !absent.is_empty() {
+        if absent != "keep" && absent != "disable" { return Err(format!("absent must be keep or disable (got {:?})", absent)); }
+        if absent == "disable" && !capabilities.disable_absent { return Err(format!("{} does not support absent: disable", kind)); }
+        if absent == "disable" && cfg(config, "mode") == "mirror" { return Err("absent: disable cannot be combined with mode: mirror".into()); }
+    }
     Ok(())
 }
 fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String, String)> {
@@ -355,9 +406,22 @@ fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String,
     secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (desired_name(config, k), v.clone())).filter(|(n, _)| seen.insert(n.clone())).collect()
 }
 pub fn desired_names(config: &Value, secrets: &[(String, String)]) -> Vec<String> { trigger_desired(config, secrets).into_iter().map(|(n, _)| n).collect() }
-/// The sync caller hands over `(path, key, value, type)`. Every other adapter
-/// ignores the path and the type; the SSH file adapter groups by path.
-pub fn secret_keys(secrets: &[(String, String, String, String)]) -> Vec<(String, String)> { secrets.iter().map(|(_, k, v, _)| (k.clone(), v.clone())).collect() }
+/// One source secret as the adapters receive it. Most adapters read only key
+/// and value; SSH file sync groups by path, and tag-capable adapters read tags.
+#[derive(Clone, Debug)]
+pub struct SyncSecret {
+    pub path: String,
+    pub key: String,
+    pub value: String,
+    pub secret_type: String,
+    pub tags: String,
+}
+impl SyncSecret {
+    pub fn new(path: &str, key: &str, value: &str, secret_type: &str, tags: &str) -> Self {
+        Self { path: path.into(), key: key.into(), value: value.into(), secret_type: secret_type.into(), tags: tags.into() }
+    }
+}
+pub fn secret_keys(secrets: &[SyncSecret]) -> Vec<(String, String)> { secrets.iter().map(|s| (s.key.clone(), s.value.clone())).collect() }
 pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let client = http_client(); let base_url = base(config, "https://api.trigger.dev");
     let mode = { let m = cfg(config, "mode"); if m.is_empty() { "upsert" } else { m } };
@@ -746,14 +810,6 @@ fn ssm_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 1011 && !name.contains(' ') && !name.contains("//") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
 }
 
-/// Infisical-style static tags applied to every secret this sync writes.
-fn aws_sm_tags(config: &Value) -> Result<Vec<(String, String)>, String> {
-    match config.get("tags") {
-        None => Ok(Vec::new()),
-        Some(Value::Object(map)) => map.iter().map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())).ok_or_else(|| format!("AWS Secrets Manager tag {:?} must have a string value", key))).collect(),
-        Some(_) => Err("AWS Secrets Manager tags must be an object of string values".into()),
-    }
-}
 async fn aws_sm_tag(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str, tags: &[(String, String)]) -> Result<(), String> {
     if tags.is_empty() { return Ok(()); }
     let list: Vec<Value> = tags.iter().map(|(key, value)| json!({"Key": key, "Value": value})).collect();
@@ -774,14 +830,14 @@ async fn aws_sm_list(client: &reqwest::Client, config: &Value, region: &str, ak:
     Ok(out)
 }
 
-pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String)], tags_by_name: &std::collections::HashMap<String, String>, previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let effective = aws_effective_config(config).await?;
     let config = &effective;
     let (region, ak, sk) = aws_creds(config)?;
     let mode = sync_mode(config, "aws_secrets_manager")?;
     let dry = is_dry(config);
     let mapping = { let m = cfg(config, "mapping"); if !m.is_empty() { m } else if !cfg(config, "secret_id").is_empty() { "many_to_one" } else { "one_to_one" } };
-    let tags = aws_sm_tags(config)?;
+    let tags = config_tags(config)?;
     let client = http_client();
     if mapping == "many_to_one" {
         let secret_id = cfg(config, "secret_id");
@@ -823,7 +879,7 @@ pub async fn aws_secrets_manager_sync(config: &Value, secrets: &[(String, String
                 }
                 Err(e) => return Err(format!("update {} failed: {}", name, e)),
             }
-            aws_sm_tag(&client, config, region, ak, sk, name, &tags).await?;
+            aws_sm_tag(&client, config, region, ak, sk, name, &merge_tags(tags_by_name.get(name).map(String::as_str).unwrap_or(""), &tags)).await?;
         }
         if mode == "mirror" {
             for name in previous_managed {
@@ -916,6 +972,74 @@ pub async fn aws_parameter_store_test(config: &Value) -> Result<String, String> 
     let value = aws_call(&http_client(), config, "ssm", region, ak, sk, "AmazonSSM.DescribeParameters", &json!({"MaxResults": 1})).await?;
     let count = value.get("Parameters").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
     Ok(format!("AWS Parameter Store connection OK: region {} returned a parameter list ({} item(s))", region, count))
+}
+
+// ---------- Azure Key Vault ----------
+fn azure_secret_name(name: &str) -> String { name.to_lowercase().replace('_', "-") }
+/// Key Vault keeps per-secret tags and an enabled flag, so this adapter is
+/// stateful: `absent: disable` disables names it previously managed instead of
+/// deleting them, and re-enables a name when it returns to the source.
+pub async fn azure_key_vault_sync(config: &Value, secrets: &[(String, String)], tags_by_name: &std::collections::HashMap<String, String>, previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+    let token = azure_access_token(config).await?;
+    let root = if cfg(config,"base_url").is_empty() { format!("https://{}.vault.azure.net", cfg(config,"vault")) } else { base(config,"") };
+    let mode = sync_mode(config, "azure_key_vault")?;
+    let absent = { let a = cfg(config,"absent"); if a.is_empty() { "keep" } else { a } };
+    if mode == "mirror" && absent == "disable" { return Err("azure_key_vault cannot combine mode mirror with absent disable".into()); }
+    let dry = is_dry(config);
+    let static_tags = config_tags(config)?;
+    let mapping = { let m = cfg(config,"mapping"); if !m.is_empty() { m } else if !cfg(config,"secret_name").is_empty() { "many_to_one" } else { "one_to_one" } };
+    let desired = trigger_desired(config, secrets);
+    let client = http_client();
+    if mapping == "many_to_one" {
+        let name = cfg(config,"secret_name");
+        if name.is_empty() { return Err("azure_key_vault many_to_one requires secret_name".into()); }
+        if mode == "mirror" || absent == "disable" { return Err("azure_key_vault many_to_one cannot track individual keys; use mapping one_to_one".into()); }
+        if !dry {
+            let mut body = json!({"value": map_json(&desired).to_string()});
+            if !static_tags.is_empty() { body["tags"] = tags_object(&static_tags); }
+            req(client.put(format!("{}/secrets/{}?api-version=7.4", root, name)).bearer_auth(&token).json(&body)).await?;
+        }
+        return Ok((format!("Azure Key Vault sync{}: wrote {} keys into {}", if dry { " (dry-run)" } else { "" }, desired.len(), name), Vec::new()));
+    }
+    if mapping != "one_to_one" { return Err("azure_key_vault mapping must be one_to_one or many_to_one".into()); }
+    let mut managed: Vec<String> = Vec::new();
+    let (mut deleted, mut disabled) = (0, 0);
+    for (name, value) in &desired {
+        let target = azure_secret_name(name);
+        let tag_list = merge_tags(tags_by_name.get(name).map(String::as_str).unwrap_or(""), &static_tags);
+        if !dry {
+            let mut body = json!({"value": value});
+            if !tag_list.is_empty() { body["tags"] = tags_object(&tag_list); }
+            req(client.put(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&body)).await?;
+            if absent == "disable" {
+                req(client.patch(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&json!({"attributes":{"enabled":true}}))).await?;
+            }
+        }
+        managed.push(name.clone());
+    }
+    if !dry {
+        for name in previous_managed {
+            if desired.iter().any(|(n, _)| n == name) { continue; }
+            let target = azure_secret_name(name);
+            if absent == "disable" {
+                match req(client.patch(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token).json(&json!({"attributes":{"enabled":false}}))).await {
+                    Ok(_) => { disabled += 1; managed.push(name.clone()); }
+                    Err(e) if e.contains("404") => {}
+                    Err(e) => return Err(format!("disable {} failed: {}", name, e)),
+                }
+            } else if mode == "mirror" {
+                match req(client.delete(format!("{}/secrets/{}?api-version=7.4", root, target)).bearer_auth(&token)).await {
+                    Ok(_) => deleted += 1,
+                    Err(e) if e.contains("404") => {}
+                    Err(e) => return Err(format!("delete {} failed: {}", name, e)),
+                }
+            }
+        }
+    }
+    let mut report = format!("Azure Key Vault sync{}: pushed={}", if dry { " (dry-run)" } else { "" }, desired.len());
+    if absent == "disable" { report.push_str(&format!(" disabled={}", disabled)); }
+    if mode == "mirror" && absent != "disable" { report.push_str(&format!(" deleted={}", deleted)); }
+    Ok((report, managed))
 }
 
 // ---------- 1Password Connect ----------
@@ -2630,7 +2754,7 @@ fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<S
     Ok(String::from_utf8_lossy(&finished.stdout).into_owned())
 }
 type SshPlan = Vec<(SshFile, BTreeMap<String, String>)>;
-fn ssh_plan(config: &Value, secrets: &[(String, String, String, String)]) -> Result<SshPlan, String> {
+fn ssh_plan(config: &Value, secrets: &[SyncSecret]) -> Result<SshPlan, String> {
     let files = ssh_files(config)?;
     let include: Vec<String> = config.get("include_keys").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let exclude: Vec<String> = config.get("exclude_keys").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -2638,12 +2762,12 @@ fn ssh_plan(config: &Value, secrets: &[(String, String, String, String)]) -> Res
     let mut plans = Vec::new();
     for file in files {
         let mut pairs = BTreeMap::new();
-        for (path, key, value, _) in secrets {
-            if (!include.is_empty() && !include.contains(key)) || exclude.contains(key) { continue; }
-            if !ssh_folder_matches(&file.folders, path) { continue; }
-            let name = desired_name(config, key);
+        for secret in secrets {
+            if (!include.is_empty() && !include.contains(&secret.key)) || exclude.contains(&secret.key) { continue; }
+            if !ssh_folder_matches(&file.folders, &secret.path) { continue; }
+            let name = desired_name(config, &secret.key);
             if let Some(earlier) = claimed.insert(name.clone(), file.path.clone()) { return Err(format!("ssh name {:?} is claimed by both {} and {}; a key can feed one file", name, earlier, file.path)); }
-            pairs.insert(name, value.clone());
+            pairs.insert(name, secret.value.clone());
         }
         plans.push((file, pairs));
     }
@@ -2651,17 +2775,17 @@ fn ssh_plan(config: &Value, secrets: &[(String, String, String, String)]) -> Res
 }
 /// Remote names this sync would own, stamped with the file so a failed run can
 /// still be pruned later. Empty when the config itself is invalid.
-pub fn ssh_owned_names(config: &Value, secrets: &[(String, String, String, String)]) -> Result<Vec<String>, String> {
+pub fn ssh_owned_names(config: &Value, secrets: &[SyncSecret]) -> Result<Vec<String>, String> {
     let plans = ssh_plan(config, secrets)?;
     let mut out = Vec::new();
     for (file, pairs) in &plans { for name in pairs.keys() { out.push(format!("{}|{}", file.path, name)); } }
     Ok(out)
 }
-pub async fn ssh_file_sync(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+pub async fn ssh_file_sync(config: &Value, secrets: &[SyncSecret], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let config = config.clone(); let secrets = secrets.to_vec(); let previous_managed = previous_managed.to_vec();
     tokio::task::spawn_blocking(move || ssh_file_sync_blocking(&config, &secrets, &previous_managed)).await.map_err(|e| format!("ssh sync task failed: {}", e))?
 }
-fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
+fn ssh_file_sync_blocking(config: &Value, secrets: &[SyncSecret], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let target = ssh_target(config)?; let mode = sync_mode(config, "ssh")?; let dry = is_dry(config);
     let plans = ssh_plan(config, secrets)?;
     let mut managed = Vec::new(); let mut reports = Vec::new();
@@ -3076,23 +3200,38 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
         "devin" => Err("Devin does not expose secret values, so initial import is not possible".into()),
         "cloudflare_secrets_store" => Err("Cloudflare Secrets Store values are write-only, so initial import is not possible".into()),
         "circleci" => Err("CircleCI does not expose environment variable values, so initial import is not possible".into()),
+        "azure_key_vault" => Err("Azure Key Vault import is not implemented; keep initial_sync as overwrite".into()),
         _ => Err(format!("initial import is not supported for kind {}", kind)),
     }
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncCapabilities { pub metadata_tags: bool, pub disable_absent: bool }
+/// What an adapter supports beyond pushing values. Options are validated
+/// centrally against this table, so an unsupported option fails with the kind
+/// named instead of being silently ignored.
+pub fn capabilities(kind: &str) -> SyncCapabilities {
+    match kind {
+        "aws_secrets_manager" => SyncCapabilities { metadata_tags: true, disable_absent: false },
+        "azure_key_vault" => SyncCapabilities { metadata_tags: true, disable_absent: true },
+        "gcp_secret_manager" => SyncCapabilities { metadata_tags: true, disable_absent: false },
+        _ => SyncCapabilities::default(),
+    }
+}
 pub fn is_stateful(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "linode" | "digitalocean_ssh" | "ssh" | "keeper" | "oci_vault" | "huggingface")
+    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "1password" | "onepassword" | "aws_secrets_manager" | "aws_parameter_store" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "linode" | "digitalocean_ssh" | "ssh" | "keeper" | "oci_vault" | "huggingface" | "azure_key_vault")
 }
 /// Stateful adapters return a report and the remote names they now own.
-pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
-    if let Err(e) = validate_sync_config(config) { return Some(Err(e)); }
+pub async fn sync_managed(kind: &str, config: &Value, secrets: &[SyncSecret], previous_managed: &[String]) -> Option<Result<(String, Vec<String>), String>> {
+    if let Err(e) = validate_sync_config(kind, config) { return Some(Err(e)); }
     // Infisical's "disable secret deletion": keep managing names but never prune.
     let previous_managed: &[String] = if config.get("disable_secret_deletion").and_then(Value::as_bool).unwrap_or(false) { &[] } else { previous_managed };
     let flat = secret_keys(secrets);
     let pairs = flat.as_slice();
+    let tags_by_name = secret_tags(config, secrets);
     // Account SSH key APIs reject anything that is not a public key, so they
     // only receive secrets the caller marked as one.
-    let ssh_only = super::ssh_keys::only_ssh_keys(&secrets.iter().map(|(_, k, v, t)| (k.clone(), v.clone(), t.clone())).collect::<Vec<_>>());
+    let ssh_only = super::ssh_keys::only_ssh_keys(&secrets.iter().map(|s| (s.key.clone(), s.value.clone(), s.secret_type.clone())).collect::<Vec<_>>());
     let ssh_pairs = ssh_only.as_slice();
     let result = match kind {
         "trigger" => trigger_sync(config, pairs, previous_managed).await,
@@ -3100,7 +3239,8 @@ pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String
         "boat" => boat_sync(config, pairs, previous_managed).await,
         "daytona" => daytona_sync(config, pairs, previous_managed).await,
         "1password" | "onepassword" => onepassword_sync(config, pairs, previous_managed).await,
-        "aws_secrets_manager" => aws_secrets_manager_sync(config, pairs, previous_managed).await,
+        "aws_secrets_manager" => aws_secrets_manager_sync(config, pairs, &tags_by_name, previous_managed).await,
+        "azure_key_vault" => azure_key_vault_sync(config, pairs, &tags_by_name, previous_managed).await,
         "aws_parameter_store" => aws_parameter_store_sync(config, pairs, previous_managed).await,
         "dokploy" => dokploy_sync(config, pairs, previous_managed).await,
         "caprover" => caprover_sync(config, pairs, previous_managed).await,
@@ -3768,7 +3908,8 @@ mod tests {
         ]));
         let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","session_token":"session-token","endpoint":base,"mapping":"one_to_one","mode":"mirror"});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
-        let (report, managed) = aws_secrets_manager_sync(&config, &secrets, &["OLD".to_string()]).await.expect("aws sm sync");
+        let tags = std::collections::HashMap::from([("API_KEY".to_string(), "owner=platform".to_string())]);
+        let (report, managed) = aws_secrets_manager_sync(&config, &secrets, &tags, &["OLD".to_string()]).await.expect("aws sm sync");
         assert!(report.contains("created=1"), "{}", report);
         assert_eq!(managed, vec!["API_KEY".to_string()]);
         let calls = calls.lock().unwrap();
@@ -3777,6 +3918,8 @@ mod tests {
         assert!(put.3.contains("\"SecretId\":\"API_KEY\""), "{}", put.3);
         let del = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.DeleteSecret")).expect("delete call");
         assert!(del.3.contains("\"SecretId\":\"OLD\""), "{}", del.3);
+        let tag = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.TagResource")).expect("metadata tag call");
+        assert!(tag.3.contains("\"Key\":\"owner\"") && tag.3.contains("\"Value\":\"platform\""), "{}", tag.3);
     }
 
     #[tokio::test]
@@ -3788,7 +3931,7 @@ mod tests {
         ]));
         let config = json!({"region":"us-east-1","access_key_id":"AKIA","secret_access_key":"secret","endpoint":base,"secret_id":"app/prod","prefix":"APP_","suffix":"_V1","tags":{"team":"platform"}});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
-        let (_report, managed) = aws_secrets_manager_sync(&config, &secrets, &[]).await.expect("aws sm sync");
+        let (_report, managed) = aws_secrets_manager_sync(&config, &secrets, &std::collections::HashMap::new(), &[]).await.expect("aws sm sync");
         assert!(managed.is_empty());
         let calls = calls.lock().unwrap();
         let create = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.CreateSecret")).expect("create call");
@@ -3981,12 +4124,12 @@ mod tests {
 
     #[test]
     fn name_template_needs_exactly_one_secret_key_placeholder() {
-        assert!(validate_sync_config(&json!({"name_template": "{{secretKey}}"})).is_ok());
-        assert!(validate_sync_config(&json!({})).is_ok());
-        assert!(validate_sync_config(&json!({"name_template": "static"})).is_err());
-        assert!(validate_sync_config(&json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
-        assert!(validate_sync_config(&json!({"case": "upper"})).is_ok());
-        assert!(validate_sync_config(&json!({"case": "title"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"name_template": "{{secretKey}}"})).is_ok());
+        assert!(validate_sync_config("webhook", &json!({})).is_ok());
+        assert!(validate_sync_config("webhook", &json!({"name_template": "static"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"name_template": "{{secretKey}}_{{secretKey}}"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"case": "upper"})).is_ok());
+        assert!(validate_sync_config("webhook", &json!({"case": "title"})).is_err());
     }
 
     #[test]
@@ -3995,7 +4138,7 @@ mod tests {
         assert_eq!(desired_name(&schema, "API_KEY"), "SF_API_KEY_prod");
         let both = json!({"key_schema": "SCHEMA_{{secretKey}}", "name_template": "TEMPLATE_{{secretKey}}"});
         assert_eq!(desired_name(&both, "API_KEY"), "TEMPLATE_API_KEY");
-        assert!(validate_sync_config(&json!({"key_schema": "{{secretKey}}_{{secretKey}}"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"key_schema": "{{secretKey}}_{{secretKey}}"})).is_err());
     }
 
     #[test]
@@ -4011,10 +4154,32 @@ mod tests {
         let root = json!({"paths": ["/"], "include_subfolders": true});
         assert!(path_selected(&root, "/anywhere"));
         assert!(!path_selected(&json!({"paths": ["/"]}), "/anywhere"));
-        assert!(validate_sync_config(&json!({"paths": "app"})).is_err());
-        assert!(validate_sync_config(&json!({"paths": [1]})).is_err());
-        assert!(validate_sync_config(&json!({"include_subfolders": "yes"})).is_err());
-        assert!(validate_sync_config(&json!({"disable_secret_deletion": "yes"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"paths": "app"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"paths": [1]})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"include_subfolders": "yes"})).is_err());
+        assert!(validate_sync_config("webhook", &json!({"disable_secret_deletion": "yes"})).is_err());
+    }
+
+    #[test]
+    fn capability_gated_options_are_rejected_for_unsupported_kinds() {
+        assert!(validate_sync_config("aws_secrets_manager", &json!({"tags":{"team":"x"}})).is_ok());
+        assert!(validate_sync_config("azure_key_vault", &json!({"tags":{"team":"x"}})).is_ok());
+        assert!(validate_sync_config("gcp_secret_manager", &json!({"tags":{"team":"x"}})).is_ok());
+        assert!(validate_sync_config("webhook", &json!({"tags":{"team":"x"}})).is_err());
+        assert!(validate_sync_config("azure_key_vault", &json!({"absent":"disable"})).is_ok());
+        assert!(validate_sync_config("aws_secrets_manager", &json!({"absent":"disable"})).is_err());
+        assert!(validate_sync_config("azure_key_vault", &json!({"absent":"delete"})).is_err());
+        assert!(validate_sync_config("azure_key_vault", &json!({"absent":"disable","mode":"mirror"})).is_err());
+    }
+
+    #[test]
+    fn metadata_tags_parse_key_values_and_bare_entries() {
+        assert_eq!(parse_tags("owner=platform, bare ,, key = value "), vec![
+            ("owner".to_string(), "platform".to_string()),
+            ("bare".to_string(), String::new()),
+            ("key".to_string(), "value".to_string()),
+        ]);
+        assert_eq!(merge_tags("owner=metadata", &[("owner".to_string(), "static".to_string())]), vec![("owner".to_string(), "static".to_string())]);
     }
 
     #[tokio::test]
@@ -4026,7 +4191,7 @@ mod tests {
         ]));
         let config = json!({"region":"us-east-1","access_key_id":"BASE","secret_access_key":"base-secret","role_arn":"arn:aws:iam::123456789012:role/openwarp","endpoint":base,"sts_endpoint":base,"mapping":"one_to_one"});
         let secrets = vec![("API_KEY".to_string(), "v1".to_string())];
-        aws_secrets_manager_sync(&config, &secrets, &[]).await.expect("aws sm sync");
+        aws_secrets_manager_sync(&config, &secrets, &std::collections::HashMap::new(), &[]).await.expect("aws sm sync");
         let calls = calls.lock().unwrap();
         let put = calls.iter().find(|(_, _, head, _)| head.contains("secretsmanager.PutSecretValue")).expect("put call");
         assert!(put.2.contains("Credential=ASIAEXAMPLE/"), "{}", put.2);
@@ -4094,7 +4259,7 @@ mod tests {
             ("DELETE /2.0/repositories/ws/repo/pipelines_config/variables/old-id", 204, ""),
         ]));
         let config = json!({"base_url":format!("{}/2.0", base),"workspace":"ws","repo_slug":"repo","token":"tok","mode":"mirror","disable_secret_deletion":true});
-        let secrets = vec![("/".to_string(), "API_KEY".to_string(), "v1".to_string(), "secret".to_string())];
+        let secrets = vec![SyncSecret::new("/", "API_KEY", "v1", "secret", "")];
         let (report, _) = sync_managed("bitbucket", &config, &secrets, &["OLD".to_string()]).await.expect("managed").expect("bitbucket sync");
         assert!(report.contains("deleted=0"), "{}", report);
         assert!(!calls.lock().unwrap().iter().any(|(m, _, _, _)| m == "DELETE"), "disable_secret_deletion must suppress pruning");
@@ -4104,7 +4269,7 @@ mod tests {
     async fn vercel_targets_and_secret_type_are_configurable() {
         let (base, calls) = start_mock_routes(mock_routes(&[("POST /v10/projects/proj/env", 200, "{}")]));
         let config = json!({"base_url": base, "token": "vercel-token", "project_id": "proj", "target": "staging", "type": "sensitive"});
-        sync("vercel", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("vercel sync");
+        sync("vercel", &config, &[SyncSecret::new("/", "API_KEY", "v1", "secret", "")]).await.expect("vercel sync");
         {
             let calls = calls.lock().unwrap();
             let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
@@ -4119,17 +4284,56 @@ mod tests {
     #[tokio::test]
     async fn azure_key_vault_can_write_one_json_blob() {
         let (base, calls) = start_mock_routes(mock_routes(&[("PUT /secrets/app-config", 200, "{}")]));
-        let config = json!({"base_url": base, "token": "azure-token", "mapping": "many_to_one", "secret_name": "app-config"});
-        sync("azure_key_vault", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("azure sync");
+        let config = json!({"base_url": base, "token": "azure-token", "mapping": "many_to_one", "secret_name": "app-config", "tags": {"team": "platform"}});
+        let secrets = vec![SyncSecret::new("/", "API_KEY", "v1", "secret", "owner=metadata")];
+        sync_managed("azure_key_vault", &config, &secrets, &[]).await.expect("managed").expect("azure sync");
         {
             let calls = calls.lock().unwrap();
             let put = calls.iter().find(|(m, _, _, _)| m == "PUT").expect("put");
             let body: Value = serde_json::from_str(&put.3).expect("json");
             let nested: Value = serde_json::from_str(body["value"].as_str().expect("JSON blob")).expect("nested");
             assert_eq!(nested["API_KEY"], "v1");
+            assert_eq!(body["tags"]["team"], "platform");
+            assert!(body["tags"].get("owner").is_none(), "many_to_one uses static tags only: {}", body);
         }
         let missing = json!({"token": "t", "mapping": "many_to_one"});
-        assert!(sync("azure_key_vault", &missing, &[]).await.unwrap_err().contains("secret_name"));
+        assert!(sync_managed("azure_key_vault", &missing, &[], &[]).await.expect("managed").unwrap_err().contains("secret_name"));
+    }
+
+    #[tokio::test]
+    async fn azure_key_vault_disables_absent_names_and_restores_metadata_tags() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("PUT /secrets/app-api-key", 200, "{}"),
+            ("PATCH /secrets/app-api-key", 200, "{}"),
+            ("PATCH /secrets/app-old-key", 200, "{}"),
+        ]));
+        let config = json!({"base_url": base, "token": "azure-token", "absent": "disable", "prefix": "APP_"});
+        let secrets = vec![SyncSecret::new("/", "API_KEY", "v1", "secret", "owner=platform")];
+        let (report, managed) = sync_managed("azure_key_vault", &config, &secrets, &["APP_OLD_KEY".to_string()]).await.expect("managed").expect("azure sync");
+        assert!(report.contains("disabled=1"), "{}", report);
+        assert_eq!(managed, vec!["APP_API_KEY".to_string(), "APP_OLD_KEY".to_string()]);
+        let calls = calls.lock().unwrap();
+        let put = calls.iter().find(|(m, p, _, _)| m == "PUT" && p.contains("/secrets/app-api-key")).expect("put");
+        let body: Value = serde_json::from_str(&put.3).expect("json");
+        assert_eq!(body["tags"]["owner"], "platform");
+        assert!(calls.iter().any(|(m, p, _, body)| m == "PATCH" && p.contains("/secrets/app-api-key") && body.contains("\"enabled\":true")));
+        assert!(calls.iter().any(|(m, p, _, body)| m == "PATCH" && p.contains("/secrets/app-old-key") && body.contains("\"enabled\":false")));
+    }
+
+    #[tokio::test]
+    async fn gcp_secret_manager_syncs_metadata_tags_as_labels() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /v1/projects/proj/secrets", 200, "{}"),
+            ("POST /v1/projects/proj/secrets/api-key:addVersion", 200, "{}"),
+        ]));
+        let config = json!({"base_url": base, "token": "gcp-token", "project": "proj"});
+        let secrets = vec![SyncSecret::new("/", "API_KEY", "v1", "secret", "Owner=Platform,Bare")];
+        sync("gcp_secret_manager", &config, &secrets).await.expect("gcp sync");
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, path, _, _)| m == "POST" && path.contains("/secrets?secretId=api-key")).expect("create");
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["labels"]["owner"], "platform");
+        assert_eq!(body["labels"]["bare"], "");
     }
 
     #[tokio::test]
@@ -4551,7 +4755,7 @@ mod tests {
     async fn sync_applies_naming_to_adapters_without_a_managed_name_list() {
         let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
         let config = json!({"url": format!("{}/hook", base), "prefix": "APP_", "suffix": "_V1"});
-        sync("webhook", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect("webhook sync");
+        sync("webhook", &config, &[SyncSecret::new("/", "API_KEY", "v1", "secret", "")]).await.expect("webhook sync");
         let calls = calls.lock().unwrap();
         let post = calls.iter().find(|(m, _, _, _)| m == "POST").expect("post");
         let body: Value = serde_json::from_str(&post.3).expect("json");
@@ -4562,7 +4766,7 @@ mod tests {
     async fn sync_refuses_a_template_that_collapses_every_key() {
         let (base, calls) = start_mock_routes(mock_routes(&[("POST /hook", 200, "{}")]));
         let config = json!({"url": format!("{}/hook", base), "name_template": "STATIC"});
-        let err = sync("webhook", &config, &[("API_KEY".to_string(), "v1".to_string())]).await.expect_err("template rejected");
+        let err = sync("webhook", &config, &[SyncSecret::new("/", "API_KEY", "v1", "secret", "")]).await.expect_err("template rejected");
         assert!(err.contains("exactly once"), "{}", err);
         assert!(calls.lock().unwrap().is_empty(), "nothing should be posted");
     }
@@ -4758,7 +4962,7 @@ mod tests {
         let env_file = server.dir.join("env"); let db_file = server.dir.join("db");
         let (key, host_key) = (server.key.clone(), server.host_key.clone());
         let config = json!({"host":"127.0.0.1","port":server.port,"user":std::env::var("USER").unwrap(),"private_key":key,"known_hosts":host_key,"mode":"mirror","files":[{"path":env_file,"format":"dotenv","folders":["/app"],"file_mode":"600"},{"path":db_file,"format":"json","folders":["/db"]}]});
-        let secrets = vec![("/app".into(),"API_KEY".into(),"v1".into(),"secret".into()),("/db".into(),"DB_URL".into(),"postgres://db".into(),"secret".into()),("/other".into(),"SKIP".into(),"nope".into(),"secret".into())];
+        let secrets = vec![SyncSecret::new("/app", "API_KEY", "v1", "secret", ""), SyncSecret::new("/db", "DB_URL", "postgres://db", "secret", ""), SyncSecret::new("/other", "SKIP", "nope", "secret", "")];
         let (report, managed) = ssh_file_sync(&config, &secrets, &[]).await.expect("first sync");
         assert!(report.contains(&format!("{}: created=1", env_file.display())), "{}", report);
         assert!(report.contains(&format!("{}: created=1", db_file.display())), "{}", report);
@@ -4770,7 +4974,7 @@ mod tests {
         assert_eq!(managed, vec![format!("{}|API_KEY", env_file.display()), format!("{}|DB_URL", db_file.display())]);
         // A name this integration does not own survives a mirror sync.
         std::fs::write(&env_file, "API_KEY=v1\nFOREIGN=keep\n").unwrap();
-        let (report, _) = ssh_file_sync(&config, &[("/app".into(),"API_KEY".into(),"v2".into(),"secret".into())], &managed).await.expect("second sync");
+        let (report, _) = ssh_file_sync(&config, &[SyncSecret::new("/app", "API_KEY", "v2", "secret", "")], &managed).await.expect("second sync");
         assert!(report.contains("updated=1"), "{}", report);
         let env = std::fs::read_to_string(&env_file).unwrap();
         assert!(env.contains("API_KEY=v2") && env.contains("FOREIGN=keep"), "{}", env);
@@ -4788,7 +4992,7 @@ mod tests {
         let target = server.dir.join("refused");
         let key = server.key.clone();
         let config = json!({"host":"127.0.0.1","port":server.port,"user":std::env::var("USER").unwrap(),"private_key":key,"known_hosts":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIThisIsNotARealKeyItIsATestFixtureOnlyAAAA","path":target});
-        let err = ssh_file_sync(&config, &[("/".into(),"API_KEY".into(),"v".into(),"secret".into())], &[]).await.unwrap_err();
+        let err = ssh_file_sync(&config, &[SyncSecret::new("/", "API_KEY", "v", "secret", "")], &[]).await.unwrap_err();
         assert!(err.to_lowercase().contains("host key") || err.contains("verification"), "{}", err);
         assert!(!target.exists(), "a refused host must not be written");
     }
@@ -4800,14 +5004,14 @@ mod tests {
         let (key, host_key) = (server.key.clone(), server.host_key.clone());
         let base = json!({"host":"127.0.0.1","port":server.port,"user":std::env::var("USER").unwrap(),"private_key":key,"known_hosts":host_key});
         let mut dry = base.clone(); dry["dry_run"] = json!(true); dry["path"] = json!(yaml);
-        let (report, managed) = ssh_file_sync(&dry, &[("/".into(),"API_KEY".into(),"v".into(),"secret".into())], &[]).await.expect("dry run");
+        let (report, managed) = ssh_file_sync(&dry, &[SyncSecret::new("/", "API_KEY", "v", "secret", "")], &[]).await.expect("dry run");
         assert!(report.contains("dry-run") && report.contains("created=1"), "{}", report);
         assert!(managed.is_empty(), "a dry run must not record ownership");
         assert!(!yaml.exists(), "a dry run must not create the file");
         let mut live = base.clone();
         let csv = server.dir.join("app.csv");
         live["files"] = json!([{"path":yaml,"format":"yaml","folders":["/app"]},{"path":exported,"format":"export","folders":["/ops"]},{"path":csv,"format":"csv","folders":["/sheet"]}]);
-        let secrets = vec![("/app".into(),"API_KEY".into(),"a b".into(),"secret".into()),("/ops".into(),"TOKEN".into(),"x".into(),"secret".into()),("/sheet".into(),"ROW".into(),"1".into(),"secret".into())];
+        let secrets = vec![SyncSecret::new("/app", "API_KEY", "a b", "secret", ""), SyncSecret::new("/ops", "TOKEN", "x", "secret", ""), SyncSecret::new("/sheet", "ROW", "1", "secret", "")];
         ssh_file_sync(&live, &secrets, &[]).await.expect("sync");
         let yaml_text = std::fs::read_to_string(&yaml).unwrap();
         assert!(yaml_text.starts_with("# Synced by OpenWarp at "), "yaml records when it was written: {}", yaml_text);
@@ -4821,7 +5025,7 @@ mod tests {
         let parsed = ssh_parse("csv", &quoted).unwrap();
         assert_eq!(parsed.get("NOTE").map(String::as_str), Some("a, \"b\""), "csv quoting round-trips: {}", quoted);
         let mut quiet = base.clone(); quiet["comment"] = json!(false); quiet["path"] = json!(server.dir.join("quiet.env")); quiet["format"] = json!(".env");
-        ssh_file_sync(&quiet, &[("/".into(),"API_KEY".into(),"v".into(),"secret".into())], &[]).await.expect("quiet");
+        ssh_file_sync(&quiet, &[SyncSecret::new("/", "API_KEY", "v", "secret", "")], &[]).await.expect("quiet");
         let quiet_text = std::fs::read_to_string(server.dir.join("quiet.env")).unwrap();
         assert_eq!(quiet_text, "API_KEY=v\n", ".env is dotenv, and comment:false omits the stamp: {}", quiet_text);
         let mut overlap = base.clone();
