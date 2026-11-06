@@ -64,10 +64,16 @@ can create or match an account.
 Set `OPENWARP_KMS_URL` to keep the root key and every managed environment key
 outside the database. The bridge protocol is in the [security model](SECURITY.md).
 A fresh database stores only a KMS-wrapped root; an existing database that
-already has a local master adopts it under the KMS on first boot. After changing
-`OPENWARP_KMS_KEY_ID`, call `POST /api/instance/rewrap` as the instance owner to
-wrap every environment key under the new key ID. Old key IDs must remain
-unwrappable by the KMS adapter until that finishes.
+already has a local master adopts it on first boot, stores the same root as
+`kms_root` and deletes the plaintext `meta.master` row. The KMS then becomes the
+only root, so back up its key. After changing `OPENWARP_KMS_KEY_ID`, call
+`POST /api/instance/rewrap` as the instance owner to wrap every environment key
+under the new key ID. Old key IDs must remain unwrappable by the KMS adapter
+until that finishes.
+
+After upgrading, call `POST /api/instance/encrypt-metadata` once as the
+instance owner. It encrypts existing secret paths and tags and replaces the old
+SHA-256 lookup hashes with HMAC blind indexes. New writes do this automatically.
 
 Without a KMS, `OPENWARP_MASTER_KEY` is still required in production and the
 database is only as private as the host. Use managed (`sse`) environments for

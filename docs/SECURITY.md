@@ -102,14 +102,13 @@ with each wrapped value so a key rotation can still unwrap old data; run
 
 A fresh KMS deployment stores only `meta.kms_root`; the database then has no
 usable root key. An existing deployment that already has `meta.master` adopts
-that key under the KMS on first boot and keeps the legacy row so records
-encrypted outside the environment-key path remain readable. While that row
-exists, it is still a usable root for those records even though environment
-keys are KMS-wrapped. If `OPENWARP_MASTER_KEY` is also set and differs from the
+that key under the KMS on first boot, stores the same root as `kms_root` and
+deletes the plaintext `meta.master` row. TOTP secrets, OIDC client secrets, PKI
+keys, lockbox values and environment keys all use that same root, so no record
+needs re-encryption. If `OPENWARP_MASTER_KEY` is also set and differs from the
 stored master, the server refuses to boot rather than wrapping the wrong root.
-Delete the legacy root only after TOTP secrets, OIDC client secrets, PKI keys
-and lockbox values have been migrated; the current code does not re-encrypt
-them.
+After adoption the KMS is the only root: removing it makes the data unreadable
+unless `OPENWARP_MASTER_KEY` still holds the same key. Back up the KMS key.
 
 ## The honest limit on "we cannot read it"
 
@@ -152,12 +151,14 @@ server cannot obtain a user's key.
 ## Metadata leakage
 
 Secret names, paths, tags and key hashes are metadata. In `sse` mode the value,
-key name and comment are encrypted, but the path, tags and the SHA-256 lookup
-hash are stored in the clear; a database thief can test guesses against the
-hash. Blind indexing with an HMAC under the environment key and encrypting paths
-are planned, not implemented. In `e2e` and `delegated` modes the server still
-stores paths and client-supplied key hashes for lookup; the key names themselves
-are client-encrypted.
+key name, comment, path and tags are all encrypted, and the lookup index is
+HMAC-SHA256 under the environment key rather than a bare SHA-256. A database
+thief without the environment key can neither read the metadata nor test guesses
+against the index. New writes do this automatically; run
+`POST /api/instance/encrypt-metadata` as the instance owner once after upgrading
+to migrate existing rows. In `e2e` and `delegated` modes the server has no key,
+so it stores client-supplied paths and key hashes as opaque metadata; clients
+should treat those fields as public.
 
 ## Runner security
 
@@ -197,10 +198,9 @@ deployment gives those up or moves them into a client.
 - A libsodium or audited WebCrypto client in place of the hand-written
   `e2e.js` X25519.
 - Signed native clients and a reproducible console build.
-- Metadata encryption and blind indexes.
-- Automatic rekey on revoke; it is an explicit CLI action.
+- Automatic rekey on revoke; it is an explicit CLI action because the server
+  never holds the key.
 - KMS key rotation orchestration beyond `POST /api/instance/rewrap`.
-- Re-encrypting non-environment root data after a KMS migration.
 
 Report security issues privately to the maintainers rather than opening a
 public issue with exploit details.

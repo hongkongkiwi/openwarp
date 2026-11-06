@@ -245,6 +245,39 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
 }
 
 #[tokio::test]
+async fn kms_adoption_removes_the_plaintext_master() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "adopt@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let envs = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&t), None).await;
+    let env = envs.body[0]["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(&t), Some(json!({"secrets": [{"key": "A", "value": "before"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    { let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+      let n: i64 = conn.query_row("SELECT COUNT(*) FROM meta WHERE k='master'", [], |r| r.get(0)).unwrap();
+      assert_eq!(n, 1, "a local-first deployment stores a master row"); }
+
+    let kms = start_kms();
+    let dir = s.reuse();
+    let s2 = Server::start_at(dir, &[
+        ("OPENWARP_KMS_URL", kms.url.clone()),
+        ("OPENWARP_KMS_TOKEN", "test-token".into()),
+        ("OPENWARP_KMS_KEY_ID", "adopt-key".into()),
+    ]).await;
+    let r = s2.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.status, 200, "adopted data must stay readable: {}", r.text);
+    assert_eq!(r.body["secrets"][0]["value"], json!("before"));
+    let conn = rusqlite::Connection::open(s2.dir.join("test.db")).unwrap();
+    let master: i64 = conn.query_row("SELECT COUNT(*) FROM meta WHERE k='master'", [], |r| r.get(0)).unwrap();
+    assert_eq!(master, 0, "the plaintext master must be removed after KMS adoption");
+    let kms_root: String = conn.query_row("SELECT v FROM meta WHERE k='kms_root'", [], |r| r.get(0)).unwrap();
+    assert!(kms_root.starts_with("owkms:"), "kms_root is not wrapped: {}", kms_root);
+}
+
+#[tokio::test]
 async fn secret_ciphertext_cannot_be_swapped_between_records() {
     let s = Server::start_env(&[]).await;
     let u = register(&s, "swap@test.invalid").await;
@@ -260,10 +293,11 @@ async fn secret_ciphertext_cannot_be_swapped_between_records() {
     assert_eq!(r.status, 200, "{}", r.text);
 
     let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
-    let a: (String, String) = conn.query_row("SELECT id,value_enc FROM secrets WHERE env_id=? AND key_hash=?", [&env, &oc::hash_token("/:ALPHA")], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    let b: (String, String) = conn.query_row("SELECT id,value_enc FROM secrets WHERE env_id=? AND key_hash=?", [&env, &oc::hash_token("/:BETA")], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![b.1, a.0]).unwrap();
-    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![a.1, b.0]).unwrap();
+    let mut stmt = conn.prepare("SELECT id,value_enc FROM secrets WHERE env_id=? ORDER BY id").unwrap();
+    let rows: Vec<(String, String)> = stmt.query_map([&env], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+    assert_eq!(rows.len(), 2);
+    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![rows[1].1, rows[0].0]).unwrap();
+    conn.execute("UPDATE secrets SET value_enc=? WHERE id=?", rusqlite::params![rows[0].1, rows[1].0]).unwrap();
 
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
     assert_eq!(r.status, 200, "{}", r.text);
@@ -271,6 +305,53 @@ async fn secret_ciphertext_cannot_be_swapped_between_records() {
         assert_eq!(s["decrypt_error"], json!(true), "swapped ciphertext must fail the record binding: {}", r.text);
         assert_eq!(s["value"], json!(""), "swapped ciphertext must not reveal the other value: {}", r.text);
     }
+}
+
+#[tokio::test]
+async fn secret_metadata_is_encrypted_and_blind_indexed() {
+    let s = Server::start_env(&[]).await;
+    let u = register(&s, "metadata@test.invalid").await;
+    let t = u["token"].as_str().unwrap().to_string();
+    let org = u["org_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&t), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let envs = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&t), None).await;
+    let env = envs.body[0]["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(&t), Some(json!({"secrets": [{"key": "ALPHA", "value": "one", "tags": "prod"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let (path, path_enc, tags, tags_enc, khash, kindex): (String, String, String, String, String, String) = conn.query_row(
+        "SELECT path,path_enc,tags,tags_enc,key_hash,key_index FROM secrets WHERE env_id=? AND deleted=0", [&env],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
+    assert!(path.is_empty(), "plaintext path must not be stored: {}", path);
+    assert!(path_enc.starts_with("ow2:"), "path is not encrypted: {}", path_enc);
+    assert!(tags.is_empty(), "plaintext tags must not be stored: {}", tags);
+    assert!(tags_enc.starts_with("ow2:"), "tags are not encrypted: {}", tags_enc);
+    assert_eq!(khash, kindex, "key_hash must carry the blind index");
+    assert_ne!(khash, oc::hash_token("/:ALPHA"), "the old dictionary hash must be gone");
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.body["secrets"][0]["path"], json!("/"), "{}", r.text);
+    assert_eq!(r.body["secrets"][0]["tags"], json!("prod"), "{}", r.text);
+
+    // The same key/path updates the existing row instead of creating another.
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(&t), Some(json!({"secrets": [{"key": "ALPHA", "value": "two", "tags": "prod"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM secrets WHERE env_id=? AND deleted=0", [&env], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "a re-deploy must update the indexed row");
+
+    // Simulate a row written before metadata encryption, then migrate it.
+    conn.execute("UPDATE secrets SET path='/',path_enc='',tags='prod',tags_enc='',key_hash=?,key_index='' WHERE env_id=?",
+        rusqlite::params![oc::hash_token("/:ALPHA"), &env]).unwrap();
+    let r = s.call(Method::POST, "/api/instance/encrypt-metadata", Some(&t), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "metadata migration failed: {} {}", r.status, r.text);
+    let (path_enc, kindex): (String, String) = conn.query_row("SELECT path_enc,key_index FROM secrets WHERE env_id=?", [&env], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(path_enc.starts_with("ow2:"), "migration did not encrypt the path: {}", path_enc);
+    assert!(!kindex.is_empty(), "migration did not set the blind index");
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(&t), None).await;
+    assert_eq!(r.body["secrets"][0]["path"], json!("/"), "{}", r.text);
+    assert_eq!(r.body["secrets"][0]["tags"], json!("prod"), "{}", r.text);
 }
 
 #[tokio::test]

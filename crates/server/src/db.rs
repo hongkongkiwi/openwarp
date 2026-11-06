@@ -113,6 +113,9 @@ impl Db {
             "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
             "ALTER TABLE envs ADD COLUMN runner_id TEXT DEFAULT ''",
             "ALTER TABLE sync_jobs ADD COLUMN claim_id TEXT DEFAULT ''",
+            "ALTER TABLE secrets ADD COLUMN path_enc TEXT DEFAULT ''",
+            "ALTER TABLE secrets ADD COLUMN tags_enc TEXT DEFAULT ''",
+            "ALTER TABLE secrets ADD COLUMN key_index TEXT DEFAULT ''",
         ] { let _ = self.exec(alter, &[]); }
         for idx in INDEXES { let _ = self.exec(idx, &[]); }
         // One-time backfill: environments that already had an allowlist keep it.
@@ -175,7 +178,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS app_members(app_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,PRIMARY KEY(app_id,user_id))",
     "CREATE TABLE IF NOT EXISTS envs(id TEXT PRIMARY KEY,app_id TEXT NOT NULL,name TEXT NOT NULL,env_key_wrapped TEXT NOT NULL,restricted BIGINT DEFAULT 0,require_approval BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS env_members(env_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,deleted_at BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',path_enc TEXT DEFAULT '',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,key_index TEXT DEFAULT '',value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',tags_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,deleted_at BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
     "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
@@ -217,6 +220,7 @@ const SCHEMA: &[&str] = &[
 
 const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_secrets_env ON secrets(env_id)",
+    "CREATE INDEX IF NOT EXISTS idx_secrets_key_index ON secrets(env_id,key_index)",
     "CREATE INDEX IF NOT EXISTS idx_secret_versions_secret ON secret_versions(secret_id)",
     "CREATE INDEX IF NOT EXISTS idx_audit_org ON audit(org_id,created_at)",
     "CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)",

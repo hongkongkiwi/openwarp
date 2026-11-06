@@ -238,15 +238,19 @@ impl AppState {
             }
         }
         let stype = db::s(row, "secret_type");
+        let path = if db::s(row, "path_enc").is_empty() { db::s(row, "path") } else {
+            decrypt_secret_value(key, &env, &sid, "path", version, &db::s(row, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "path")) };
+        let tags = if db::s(row, "tags_enc").is_empty() { db::s(row, "tags") } else {
+            decrypt_secret_value(key, &env, &sid, "tags", version, &db::s(row, "tags_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "tags")) };
         json!({"id": sid, "key": oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "key"), &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
             "value": if stype == "sealed" { Value::Null } else { json!(value) }, "decrypt_error": decrypt_error,
-            "path": db::s(row,"path"), "comment": decrypt_secret_value(key, &env, &sid, "comment", version, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            "tags": db::s(row,"tags"), "type": stype, "version": version, "updated_at": db::n(row,"updated_at")})
+            "path": path, "comment": decrypt_secret_value(key, &env, &sid, "comment", version, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            "tags": tags, "type": stype, "version": version, "updated_at": db::n(row,"updated_at")})
     }
     #[allow(clippy::type_complexity)]
     fn list_secrets_with(&self, env_id: &str, user: Option<&str>) -> Result<Vec<(String, String, Value)>, (StatusCode, Json<Value>)> {
         let key = self.env_key(env_id)?;
-        let rows = self.db.query("SELECT * FROM secrets WHERE env_id=? AND deleted=0 ORDER BY path, key_hash", &[json!(env_id)]).map_err(|e| bad(&e))?;
+        let rows = self.db.query("SELECT * FROM secrets WHERE env_id=? AND deleted=0 ORDER BY key_index, key_hash", &[json!(env_id)]).map_err(|e| bad(&e))?;
         let mut out = Vec::new();
         for r in &rows { let v = self.decrypt_secret(&key, r, user); out.push((v["key"].as_str().unwrap_or("").to_string(), v["value"].as_str().unwrap_or("").to_string(), v)); }
         // resolve ${KEY} and ${/path/KEY} references
@@ -267,6 +271,9 @@ impl AppState {
 // included: restore and point-in-time recovery copy ciphertext into a new
 // version, and binding to the version would make that ciphertext unreadable.
 fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
+// A deterministic index is still needed to look a secret up. HMAC under the
+// environment key removes the offline dictionary attack a bare SHA-256 allows.
+fn key_index(env_key: &[u8;32], path: &str, key: &str) -> String { hmac_hex(env_key, format!("ow-key-index:v1|{}|{}", path, key).as_bytes()) }
 fn secret_aad_v(env: &str, sid: &str, field: &str, version: i64) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}|v{}", env, sid, field, version).into_bytes() }
 fn integration_aad(env: &str, iid: &str, field: &str) -> Vec<u8> { format!("ow-integration:v1|{}|{}|{}", env, iid, field).into_bytes() }
 fn lease_aad(env: &str, lid: &str, field: &str) -> Vec<u8> { format!("ow-lease:v1|{}|{}|{}", env, lid, field).into_bytes() }
@@ -539,8 +546,10 @@ async fn clone_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         let stype = raw["type"].as_str().unwrap_or("secret");
         if stype == "sealed" { skipped += 1; continue; }
         let s = SecretIn{ key: raw["key"].as_str().unwrap_or("").into(), value: raw["value"].as_str().unwrap_or("").into(), path: raw["path"].as_str().unwrap_or("/").into(), comment: raw["comment"].as_str().unwrap_or("").into(), tags: raw["tags"].as_str().unwrap_or("").into(), secret_type: stype.into() };
-        let khash = oc::hash_token(&format!("{}:{}", s.path, s.key.to_uppercase()));
-        if !overwrite && st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(target), json!(&khash)]).map_err(|e| bad(&e))?.is_some() { skipped += 1; continue; }
+        let kname = s.key.to_uppercase();
+        let khash = key_index(&key, &s.path, &kname);
+        let legacy = oc::hash_token(&format!("{}:{}", s.path, kname));
+        if !overwrite && st.db.one("SELECT id FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(target), json!(&khash), json!(&legacy)]).map_err(|e| bad(&e))?.is_some() { skipped += 1; continue; }
         upsert_secret(&st, target, &key, &uid, &s)?; cloned += 1;
     }
     let sync_errors = trigger_sync(&st, target, &uid).await;
@@ -579,20 +588,28 @@ fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> R
     let kname = s.key.trim().to_uppercase();
     if !valid_secret_key(&kname) { return Err(bad("secret key must match [A-Za-z0-9_.-]{1,128}")); }
     if !valid_path(&s.path) { return Err(bad("secret path must be 1-256 printable characters")); }
-    let khash = oc::hash_token(&format!("{}:{}", s.path, kname));
-    let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).map_err(|e| bad(&e))?;
+    let khash = key_index(key, &s.path, &kname);
+    let legacy = oc::hash_token(&format!("{}:{}", s.path, kname));
+    let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(&khash), json!(&legacy)]).map_err(|e| bad(&e))?;
     let mut stype = if s.secret_type.is_empty() { "secret".to_string() } else { s.secret_type.clone() };
     if let Some(row) = &existing { if db::s(row, "secret_type") == "sealed" { if stype != "sealed" { return Err(bad("sealed secrets cannot change type; delete and recreate")); } stype = "sealed".to_string(); } }
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
         let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", ver), s.value.as_bytes());
         let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", ver), s.comment.as_bytes());
-        st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(value_enc), json!(comment_enc), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
+        let path_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "path"), s.path.as_bytes());
+        let tags_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "tags"), s.tags.as_bytes());
+        // path and tags become ciphertext; key_hash carries the blind index.
+        st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,path='',path_enc=?,tags='',tags_enc=?,key_hash=?,key_index=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?",
+            &[json!(value_enc), json!(comment_enc), json!(path_enc), json!(tags_enc), json!(&khash), json!(&khash), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes())), json!(value_enc), json!(comment_enc), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
     } else { let sid = id(); let ver = 1;
         let key_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "key"), kname.as_bytes());
         let value_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "value", ver), s.value.as_bytes());
         let comment_enc = oc::encrypt_symmetric_aad(key, &secret_aad_v(eid, &sid, "comment", ver), s.comment.as_bytes());
-        st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,comment_enc,tags,secret_type,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)", &[json!(sid), json!(eid), json!(s.path), json!(key_enc), json!(khash), json!(value_enc), json!(comment_enc), json!(s.tags), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+        let path_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "path"), s.path.as_bytes());
+        let tags_enc = oc::encrypt_symmetric_aad(key, &secret_aad(eid, &sid, "tags"), s.tags.as_bytes());
+        st.db.exec("INSERT INTO secrets(id,env_id,path,path_enc,key_enc,key_hash,key_index,value_enc,comment_enc,tags,tags_enc,secret_type,version,updated_at,updated_by) VALUES(?,?,'',?,?,?,?,?,?,'',?,?,1,?,?)",
+            &[json!(sid), json!(eid), json!(path_enc), json!(key_enc), json!(&khash), json!(&khash), json!(value_enc), json!(comment_enc), json!(tags_enc), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(comment_enc), json!(stype), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
     } Ok(()) }
 fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pending_comment = String::new();
@@ -881,8 +898,9 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let key_name = body.get("key").and_then(|v|v.as_str()).unwrap_or("");
     let path = body.get("path").and_then(|v|v.as_str()).unwrap_or("/");
     let new_val = body.get("value").and_then(|v|v.as_str()).map(|s|s.to_string()).unwrap_or_else(|| oc::random_token("rot"));
-    let key = st.env_key(&eid)?; let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
-    let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
+    let key = st.env_key(&eid)?; let kname = key_name.to_uppercase();
+    let khash = key_index(&key, path, &kname); let legacy = oc::hash_token(&format!("{}:{}", path, kname));
+    let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(&khash), json!(&legacy)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
     upsert_secret(&st,&eid,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()})?;
     st.audit(&org,&app,&eid,&uid,"secret.rotate",key_name);
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
@@ -965,10 +983,10 @@ async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Jso
         if key_enc.is_empty() || key_hash.is_empty() { continue; }
         if let Some(row) = st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(key_hash)]).map_err(|e| bad(&e))? {
             let ver = db::n(&row,"version")+1; let sid = db::s(&row,"id");
-            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
+            st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(key_enc), json!(value_enc), json!(key_hash), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         } else { let sid = id();
-            st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
+            st.db.exec("INSERT INTO secrets(id,env_id,path,key_enc,key_hash,key_index,value_enc,e2e,version,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,1,1,?,?)", &[json!(sid), json!(eid), json!(path), json!(key_enc), json!(key_hash), json!(key_hash), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
             st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,created_at,created_by) VALUES(?,?,1,?,?,?,?)", &[json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(now()), json!(uid)]).map_err(|e| bad(&e))?;
         } count += 1;
     }
@@ -1050,8 +1068,8 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
             Some(r) => (db::s(&r, "id"), db::n(&r, "version") + 1),
             None => { return Err(bad("rekey payload does not match the stored secrets")); }
         };
-        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
-            vec![json!(key_enc), json!(value_enc), json!(path), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
+        stmts.push(("UPDATE secrets SET key_enc=?,value_enc=?,path=?,key_index=?,version=?,updated_at=?,updated_by=? WHERE id=?".into(),
+            vec![json!(key_enc), json!(value_enc), json!(path), json!(kh), json!(ver), json!(now()), json!(&uid), json!(&sid)]));
         // Old history is encrypted under the old key and cannot be read after
         // the rotation; replace it rather than leave undecryptable rows.
         stmts.push(("DELETE FROM secret_versions WHERE secret_id=?".into(), vec![json!(&sid)]));
@@ -1528,6 +1546,35 @@ async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
     }
     st.audit("", "", "", &uid, "instance.rewrap_keys", &format!("{} environments, key {}", rewrapped, kms.key_id()));
     Ok(j(json!({"rewrapped": rewrapped, "key_id": kms.key_id()}))) }
+async fn encrypt_metadata(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h)?;
+    if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can migrate secret metadata")); }
+    let envs = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>'' AND mode<>'delegated'", &[]).map_err(|e| bad(&e))?;
+    let mut updated = 0;
+    for e in &envs {
+        let eid = db::s(e, "id");
+        let key = match st.env_key(&eid) { Ok(k) => k, Err(_) => continue };
+        let rows = st.db.query("SELECT id,path,tags,path_enc,tags_enc,key_enc FROM secrets WHERE env_id=?", &[json!(&eid)]).map_err(|e| bad(&e))?;
+        for r in &rows {
+            let sid = db::s(r, "id");
+            let path = if db::s(r, "path_enc").is_empty() { db::s(r, "path") }
+                else { oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "path"), &db::s(r, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(r, "path")) };
+            let path = if path.is_empty() { "/".to_string() } else { path };
+            let tags = if db::s(r, "tags_enc").is_empty() { db::s(r, "tags") }
+                else { oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "tags"), &db::s(r, "tags_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(r, "tags")) };
+            let Ok(kname) = oc::decrypt_symmetric_compat(&key, &secret_aad(&eid, &sid, "key"), &db::s(r, "key_enc")) else { continue };
+            let kname = String::from_utf8_lossy(&kname).into_owned();
+            if kname.is_empty() { continue; }
+            let kh = key_index(&key, &path, &kname);
+            let path_enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, "path"), path.as_bytes());
+            let tags_enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, "tags"), tags.as_bytes());
+            st.db.exec("UPDATE secrets SET path='',path_enc=?,tags='',tags_enc=?,key_hash=?,key_index=? WHERE id=?",
+                &[json!(path_enc), json!(tags_enc), json!(&kh), json!(&kh), json!(&sid)]).map_err(|e| bad(&e))?;
+            updated += 1;
+        }
+    }
+    st.audit("", "", "", &uid, "instance.encrypt_metadata", &format!("{} secrets", updated));
+    Ok(j(json!({"updated": updated}))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -2071,8 +2118,10 @@ async fn process_rotations(st: &S) {
         let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).ok().flatten().map(|x| db::s(&x,"mode")).unwrap_or_default();
         if mode == "e2e" || mode == "delegated" { continue; }
         let path = { let p = db::s(r,"path"); if p.is_empty() { "/".to_string() } else { p } };
-        let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
-        let existing = st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(&eid), json!(&khash)]).ok().flatten();
+        let key = match st.env_key(&eid) { Ok(k) => k, Err(_) => continue };
+        let khash = key_index(&key, &path, &key_name.to_uppercase());
+        let legacy = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
+        let existing = st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(&eid), json!(&khash), json!(&legacy)]).ok().flatten();
         let stype = match existing {
             Some(row) if db::s(&row,"secret_type") == "sealed" => {
                 if let Ok((org, app)) = st.env_org_app(&eid) { st.audit(&org,&app,&eid,"rotation-scheduler","rotation.skipped_sealed",&key_name); }
@@ -2084,7 +2133,7 @@ async fn process_rotations(st: &S) {
                 continue;
             }
         };
-        if let Ok(key) = st.env_key(&eid) {
+        {
             let s = SecretIn{ key: key_name.clone(), value: oc::random_token("rot"), path: path.clone(), comment: "scheduled rotation".into(), tags: "".into(), secret_type: stype };
             if upsert_secret(st, &eid, &key, "rotation-scheduler", &s).is_ok() {
                 if let Ok((org, app)) = st.env_org_app(&eid) { st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&key_name); }
@@ -2467,7 +2516,7 @@ async fn main() {
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/rewrap", post(rewrap_env_keys))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
@@ -2535,6 +2584,11 @@ fn load_root(db: &Db) -> Result<([u8;32], Option<kms::Kms>), String> {
             }
             return Err("could not store or read kms_root".into());
         }
+        // The plaintext master row was only needed to adopt the old root. Once
+        // the same root is wrapped by the KMS, remove the copy so the database
+        // has no usable root key. Non-environment records decrypt with the
+        // KMS-unwrapped root and need no re-encryption.
+        let _ = db.exec("DELETE FROM meta WHERE k='master'", &[]);
         return Ok((master, Some(kms)));
     }
     Ok((load_master(db)?, None))
