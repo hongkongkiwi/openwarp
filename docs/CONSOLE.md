@@ -37,6 +37,8 @@ New applications include Development, Staging, and Production environments. Cust
 
 A draft is local UI state until deployed. Do not assume another browser or the CLI can read it. Review pending edits before changing context or leaving the page. Imports, restores, deletes, and other actions may execute immediately rather than joining the same draft batch; read the action's confirmation.
 
+When you stage a `secret` value, the console asks the server whether the same value already exists elsewhere in the workspace. If it does, the warning names the application, environment, key and path, and each entry has a "Go to" action. "Use anyway" stages the value; "Back" returns to the form. The warning is advisory. It does not cover sealed or config values, E2E environments, or environments you cannot open. Workspace admins can turn the check off in Settings; app admins can turn it off under App settings. Both switches default to on.
+
 | Type | Intended behavior |
 | --- | --- |
 | `secret` | A readable value for authorised users |

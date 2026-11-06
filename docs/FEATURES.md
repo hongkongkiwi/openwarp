@@ -10,6 +10,7 @@
 | Versioning, history diff, one-click restore | Free | `GET /api/secrets/:id/history`, `POST .../restore/:ver` |
 | Secret referencing `${KEY}`, `${/path/KEY}` | Free | resolved server-side, 5-deep |
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
+| Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
 | Global search | Free | `GET /api/search?q=` across orgs/apps/envs |
 | Lockbox one-time sharing | Free | `POST /api/lockbox` (key in URL fragment), one view, 24h |
 | `.env` import/export | Free | `POST /api/envs/:id/import`, `GET .../export` |

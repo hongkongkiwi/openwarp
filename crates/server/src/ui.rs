@@ -218,7 +218,7 @@ async function renderApps(){$('topaction').style.display='';$('pagetitle').textC
   let envCounts={};for(let a of APPS){try{let es=await api('GET',`/api/apps/${a.id}/envs`);envCounts[a.id]=es}catch(e){envCounts[a.id]=[]}}
   $('view').innerHTML=`<div class="row" style="margin-bottom:14px"><input id="appfilter" placeholder="Filter apps…" style="min-width:240px" oninput="filterApps(this.value)"><span class="mut small">${APPS.length} app${APPS.length!==1?'s':''}, unlimited environments</span></div>
   <div class="grid" id="appgrid">${APPS.map(a=>appCard(a,envCounts[a.id])).join('')}</div>`}
-function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
+function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}${a.reuse_check===false?' · reuse checks off':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
 function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.style.display=APPS[i].name.toLowerCase().includes(q.toLowerCase())?'':'none'})}
 async function newApp(){modal(`<h3>New app</h3><div class="field"><label for="na-name">App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label for="na-readme">Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
   <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
@@ -236,7 +236,7 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pag
   <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
   <div class="row" style="margin-bottom:12px">
     <input id="sfilter" placeholder="Filter by key or path…" style="min-width:240px" oninput="drawSecrets()">
-    <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button>
+    <button onclick="importModal()">Import .env</button><button onclick="exportEnv()">Export</button><button onclick="appSettings()">App settings</button>
     <span class="grow"></span><button class="primary" onclick="addRow()">+ New secret</button>
   </div>
   <div id="stable"></div>
@@ -258,6 +258,14 @@ async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
 function envMode(e){return e&&e.mode==='e2e'?'e2e':'sse'}
 async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
+function appSettings(){if(!APP){toast('Open an app first',true);return}let on=APP.reuse_check!==false;
+  modal(`<h3>App settings</h3><p class="mut">${esc(APP.name||'')}</p>
+    <label class="row" style="gap:8px;margin:12px 0"><input type="checkbox" id="app-reuse" ${on?'checked':''}> Warn when a secret value is reused elsewhere in this workspace</label>
+    <p class="small mut">The workspace setting must also be on. The warning is advisory; you can still save the value.</p>
+    <div class="row"><button class="primary" onclick="saveAppSettings()">Save</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'App settings')}
+async function saveAppSettings(){try{let on=$('app-reuse').checked;
+  await api('PUT',`/api/apps/${APP.id}/settings`,{reuse_check:on});
+  APP.reuse_check=on;closeModal();toast('App settings saved')}catch(e){toast(e.message,true)}}
 async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createE2eEnv(){try{let d=await api('POST',`/api/apps/${APP.id}/envs/e2e`,{name:$('ne2-name').value});closeModal();toast('E2E environment created: '+d.id);ENVS=await api('GET',`/api/apps/${APP.id}/envs`);renderEnv()}catch(e){toast(e.message,true)}}
 async function delEnv(){if(!confirm(`Delete environment ${ENV.name} and all its secrets?`))return;try{let removed=ENV.id;await api('DELETE',`/api/envs/${removed}`);delete DRAFTS[removed];ENVS=await api('GET',`/api/apps/${APP.id}/envs`);ENV=ENVS[0]||null;toast('Environment deleted');await renderEnv()}catch(e){toast(e.message,true)}}
@@ -287,26 +295,74 @@ function drawSecrets(){
 function findValEl(btn){return btn.closest('tr').querySelector('.val')}
 function revealVal(btn){let el=findValEl(btn);let show=el.dataset.show==='1';el.dataset.show=show?'0':'1';el.textContent=show?'••••••••••':el.dataset.val}
 function copyVal(btn){navigator.clipboard.writeText(findValEl(btn).dataset.val);toast('Value copied')}
-function addRow(){if(!ENV){toast('Open an environment first',true);return}let id='new-'+Date.now();
+let REUSE_PROCEED=null,REUSE_BACK=null;
+async function reusePreflight(items,exclude){if(!ENV)return[];
+  try{let d=await api('POST',`/api/envs/${ENV.id}/secrets/reuse-check`,{secrets:items.map(s=>({key:s.key,value:s.value,path:s.path||'/',type:s.type||'secret'})),exclude:exclude||[]});
+    return d.enabled===false?[]:(d.matches||[])}catch(e){return []}}
+function reuseWarn(matches,proceed,back){
+  REUSE_PROCEED=proceed;REUSE_BACK=back||null;
+  let groups=matches.map(m=>`<div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0">
+    <div class="row" style="justify-content:space-between"><span class="mono">${esc(m.key)}</span><span class="mut small">${esc(m.path||'/')}</span></div>
+    ${m.items.map(it=>`<div class="row" style="justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--line)">
+      <span class="small"><b>${esc(it.app_name||'app')}</b> / ${esc(it.env_name||'env')} <span class="mut">·</span> <span class="mono">${esc(it.key)}</span> <span class="mut">${esc(it.path||'/')}</span></span>
+      <button onclick="reuseGo('${jsq(it.app_id)}','${jsq(it.env_id)}','${jsq(it.key)}')">Go to</button></div>`).join('')}
+  </div>`).join('');
+  modal(`<h3>This value is already in use</h3>
+    <p class="mut">The same value is stored elsewhere in this workspace. Reusing it means one leak exposes every place it is used.</p>
+    ${groups}
+    <div class="row" style="margin-top:14px"><button class="primary" onclick="reuseProceed()">Use anyway</button>${REUSE_BACK?'<button class="ghost" onclick="reuseBack()">Back</button>':''}</div>`,'Reused secret value')}
+function reuseProceed(){let cb=REUSE_PROCEED;REUSE_PROCEED=null;REUSE_BACK=null;closeModal();if(cb)cb()}
+function reuseBack(){let cb=REUSE_BACK;REUSE_PROCEED=null;REUSE_BACK=null;closeModal();if(cb)cb()}
+async function reuseGo(aid,eid,key){
+  if(!aid||!eid){toast('That item is no longer available',true);return}
+  let cur=ENV&&ENV.id;
+  if(cur&&Object.keys(drafts()).length&&!confirm('Discard staged changes?'))return;
+  if(cur)delete DRAFTS[cur];
+  closeModal();REUSE_PROCEED=null;REUSE_BACK=null;
+  try{
+    if(!APPS.some(a=>a.id===aid))APPS=await api('GET',`/api/orgs/${ORG}/apps`);
+    APP=APPS.find(a=>a.id===aid)||{id:aid};
+    ENVS=await api('GET',`/api/apps/${aid}/envs`);
+    ENV=ENVS.find(e=>e.id===eid)||ENVS[0]||null;
+    await renderEnv();
+    let f=$('sfilter');if(f){f.value=key;drawSecrets()}
+    toast('Showing '+key+' in '+(ENV?ENV.name:''));
+  }catch(e){toast(e.message,true)}}
+function addRow(prefill){if(!ENV){toast('Open an environment first',true);return}let id='new-'+Date.now();let v=prefill||{};
+  let types=['secret','sealed','ssh_key','config'];
   modal(`<h3>New secret</h3>
-    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL"></div>
-    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3"></textarea></div>
-    <div class="row"><div class="field" style="flex:1"><label for="ns-path">Path</label><input id="ns-path" value="/"></div>
-    <div class="field"><label for="ns-type">Type</label><select id="ns-type"><option>secret</option><option>sealed</option><option>ssh_key</option><option>config</option></select></div></div>
+    <div class="field"><label for="ns-key">Key</label><input id="ns-key" placeholder="DATABASE_URL" value="${esc(v.key||'')}"></div>
+    <div class="field"><label for="ns-val">Value</label><textarea id="ns-val" rows="3">${esc(v.value||'')}</textarea></div>
+    <div class="row"><div class="field" style="flex:1"><label for="ns-path">Path</label><input id="ns-path" value="${esc(v.path||'/')}"></div>
+    <div class="field"><label for="ns-type">Type</label><select id="ns-type">${types.map(t=>`<option${t===(v.type||'secret')?' selected':''}>${t}</option>`).join('')}</select></div></div>
     <div class="row"><button class="primary" onclick="stageNew('${id}')">Stage secret</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
     <p class="small mut">Staged changes deploy together, like a commit. Sealed values can never be read back.</p>`,'New secret')}
-function stageNew(id){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return}
-  if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};
-  DRAFTS[ENV.id][id]={id,key:k.toUpperCase(),value:$('ns-val').value,path:$('ns-path').value||'/',type:$('ns-type').value,comment:'',isNew:true};
-  closeModal();drawSecrets();updateDeployBar()}
-function editRow(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;let isNew=!!d;
-  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div>
-    <div class="field"><label for="ed-comment">Comment</label><input id="ed-comment" value="${esc(s.comment||'')}"></div>
+function reuseCandidate(){let k=$('ns-key').value.trim();if(!k){toast('Key required',true);return null}
+  return {key:k.toUpperCase(),value:$('ns-val').value,path:$('ns-path').value||'/',type:$('ns-type').value,comment:'',isNew:true}}
+function commitNew(id,s){s.id=id;if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]=s;closeModal();drawSecrets();updateDeployBar()}
+async function stageNew(id){let s=reuseCandidate();if(!s)return;
+  if(s.type==='secret'&&s.value){
+    let matches=await reusePreflight([s],SECRETS.filter(x=>x.type==='secret'&&x.key===s.key&&(x.path||'/')===s.path&&(x.value??'')===s.value).map(x=>x.id));
+    if(matches.length){reuseWarn(matches,()=>commitNew(id,s),()=>addRow(s));return}
+  }
+  commitNew(id,s)}
+function editRow(id,prefill){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;let isNew=!!d;
+  let value=prefill?prefill.value:(s.value??'');let comment=prefill?prefill.comment:(s.comment||'');
+  modal(`<h3>Edit ${esc(s.key)}</h3><div class="field"><label for="ed-val">Value</label><textarea id="ed-val" rows="4">${esc(value)}</textarea></div>
+    <div class="field"><label for="ed-comment">Comment</label><input id="ed-comment" value="${esc(comment)}"></div>
     <div class="row"><button class="primary" onclick="stageEdit('${jsq(id)}')">${isNew?'Stage secret':'Stage change'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Edit secret')}
-function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;
-  if(d){d.value=$('ed-val').value;d.comment=$('ed-comment').value}
-  else{if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]={id,key:s.key,value:$('ed-val').value,path:s.path,type:s.type,comment:$('ed-comment').value}}
+function commitEdit(id,s,value,comment){let d=drafts()[id];
+  if(d){d.value=value;d.comment=comment}
+  else{if(!DRAFTS[ENV.id])DRAFTS[ENV.id]={};DRAFTS[ENV.id][id]={id,key:s.key,value,path:s.path,type:s.type,comment}}
   closeModal();drawSecrets();updateDeployBar();toast('Change staged, deploy when ready')}
+async function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===id);if(!s)return;
+  let value=$('ed-val').value,comment=$('ed-comment').value;
+  let changed=!d||d.value!==value;
+  if(changed&&(s.type||'secret')==='secret'&&value){
+    let matches=await reusePreflight([{key:s.key,value,path:s.path||'/',type:'secret'}],d?[]:[s.id]);
+    if(matches.length){reuseWarn(matches,()=>commitEdit(id,s,value,comment),()=>editRow(id,{value,comment}));return}
+  }
+  commitEdit(id,s,value,comment)}
 async function overrideRow(id,key){modal(`<h3>Personal override: ${esc(key)}</h3><p class="mut">Only you see this value. Teammates keep the shared one.</p><div class="field"><label for="ov-val">Your value</label><textarea id="ov-val" rows="3"></textarea></div><div class="row"><button class="primary" onclick="saveOverride('${jsq(id)}')">Save override</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Personal override')}
 async function saveOverride(id){try{await api('POST',`/api/secrets/${id}/override`,{secrets:[{key:'x',value:$('ov-val').value}]});closeModal();toast('Override saved');renderEnv()}catch(e){toast(e.message,true)}}
 async function delSecret(id,key){let d=drafts()[id];
@@ -326,8 +382,18 @@ async function deployStage(){try{let items=draftList().map(s=>({key:s.key,value:
 async function showHistory(id){try{let h=await api('GET',`/api/secrets/${id}/history`);
   modal(`<h3>History</h3>${h.length?h.map(v=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>v${v.version}</b> <span class="mut small">${new Date(v.created_at*1000).toLocaleString()}</span><br><span class="val">${esc(v.value)}</span></span><button onclick="restoreVer('${jsq(id)}',${v.version})">Restore</button></div>`).join(''):'<p class="mut">No history.</p>'}<div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">Close</button></div>`,'Secret history')}catch(e){toast(e.message,true)}}
 async function restoreVer(id,ver){try{await api('POST',`/api/secrets/${id}/restore/${ver}`,{});closeModal();toast('Restored version '+ver);renderEnv()}catch(e){toast(e.message,true)}}
-function importModal(){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" aria-label=".env contents" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…"></textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
-async function doImport(){try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text:$('imp-text').value});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
+function importModal(text){modal(`<h3>Import secrets into ${esc(ENV.name)}</h3><p class="mut">Paste .env contents. Existing keys are updated and versioned.</p><textarea id="imp-text" aria-label=".env contents" rows="10" placeholder="API_KEY=...&#10;# comment&#10;DATABASE_URL=postgres://…">${esc(text||'')}</textarea><div class="row" style="margin-top:12px"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
+function parseEnvLoose(text){let out=[];for(let line of String(text||'').split('\n')){let l=line.trim();if(!l||l.startsWith('#'))continue;
+  if(l.startsWith('export '))l=l.slice(7).trim();let i=l.indexOf('=');if(i<1)continue;
+  let value=l.slice(i+1).trim();if((value.startsWith('"')&&value.endsWith('"'))||(value.startsWith("'")&&value.endsWith("'")))value=value.slice(1,-1);
+  out.push({key:l.slice(0,i).trim().toUpperCase(),value,path:'/',type:'secret'})}return out}
+async function doImport(force,text){
+  if(text===undefined)text=$('imp-text').value;
+  if(!force){let cands=parseEnvLoose(text);
+    if(cands.length){let exclude=SECRETS.filter(x=>x.type==='secret'&&cands.some(c=>c.key===x.key&&(x.path||'/')===c.path&&(x.value??'')===c.value)).map(x=>x.id);
+      let matches=await reusePreflight(cands,exclude);
+      if(matches.length){reuseWarn(matches,()=>doImport(true,text),()=>importModal(text));return}}}
+  try{let d=await api('POST',`/api/envs/${ENV.id}/import`,{text});closeModal();toast(`Imported ${d.deployed} secrets`);renderEnv()}catch(e){toast(e.message,true)}}
 async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export`);modal(`<h3>Export ${esc(ENV.name)}</h3><textarea id="exp-text" aria-label="Exported secrets" rows="12" readonly>${esc(d.text)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Export copied')">Copy .env</button><button class="ghost" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message,true)}}
 
 // ---------- access, integrations, audit, settings ----------
@@ -426,6 +492,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
+  <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> Warn when a secret value is reused elsewhere in this workspace</label>
+  <p class="small mut" style="margin:0 0 10px">Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.</p>
   <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
   <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" style="min-width:260px"></div>
   <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
@@ -438,7 +506,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
-async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
   if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;

@@ -1355,3 +1355,251 @@ async fn rotation_schedules_store_provider_adapters_without_leaking_config() {
     assert_eq!(relay.status, 200, "{}", relay.text);
     assert_eq!(relay.body["kind"], json!("webhook"));
 }
+
+// ---------- password reuse detection ----------
+
+async fn reuse_check(s: &Server, token: &str, env: &str, secrets: Value, exclude: Value) -> Resp {
+    s.call(
+        Method::POST,
+        &format!("/api/envs/{}/secrets/reuse-check", env),
+        Some(token),
+        Some(json!({"secrets": secrets, "exclude": exclude})),
+    )
+    .await
+}
+
+async fn check_value(s: &Server, token: &str, env: &str, value: &str) -> Resp {
+    reuse_check(s, token, env, json!([{"key": "NEW_PASSWORD", "value": value, "path": "/", "type": "secret"}]), json!([])).await
+}
+
+async fn secret_id(s: &Server, token: &str, env: &str, key: &str) -> String {
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await;
+    assert_eq!(r.status, 200, "list secrets failed: {}", r.text);
+    r.body["secrets"]
+        .as_array()
+        .expect("secrets array")
+        .iter()
+        .find(|row| row["key"] == json!(key))
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("secret {} not found: {}", key, r.text))
+        .to_string()
+}
+
+#[tokio::test]
+async fn reuse_check_finds_a_value_across_app_environments() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-owner@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "hunter2").await;
+    let listing = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(token), None).await;
+    assert_eq!(listing.status, 200, "list envs failed: {}", listing.text);
+    let env_name = listing.body.as_array().expect("env array").iter()
+        .find(|e| e["id"] == json!(&envs[0]))
+        .and_then(|e| e["name"].as_str())
+        .expect("source env name")
+        .to_string();
+
+    let r = reuse_check(
+        &s, token, &envs[1],
+        json!([{"key": "NEW_PASSWORD", "value": "hunter2", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "reuse check failed: {}", r.text);
+    assert_eq!(r.body["enabled"], json!(true), "the check defaults on: {}", r.text);
+    let matches = r.body["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 1, "one candidate must be reported: {}", r.text);
+    assert_eq!(matches[0]["key"], json!("NEW_PASSWORD"), "{}", r.text);
+    assert_eq!(matches[0]["path"], json!("/"), "{}", r.text);
+    let items = matches[0]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "exactly one stored secret holds the value: {}", r.text);
+    assert_eq!(items[0]["key"], json!("SHARED_PASSWORD"), "{}", r.text);
+    assert_eq!(items[0]["path"], json!("/"), "{}", r.text);
+    assert_eq!(items[0]["env_id"], json!(&envs[0]), "{}", r.text);
+    assert_eq!(items[0]["env_name"], json!(env_name), "{}", r.text);
+    assert_eq!(items[0]["app_id"], json!(&app), "{}", r.text);
+    assert_eq!(items[0]["app_name"], json!("app"), "{}", r.text);
+    assert!(items[0]["secret_id"].as_str().map(|v| !v.is_empty()).unwrap_or(false), "{}", r.text);
+    assert!(items[0]["updated_at"].as_i64().unwrap_or(0) > 0, "{}", r.text);
+    assert!(!r.text.contains("hunter2"), "the response must never echo the value: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_stays_inside_the_workspace() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-tenancy@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org_a = u["org_id"].as_str().unwrap();
+    let (_, envs_a) = app_with_envs(&s, token, org_a).await;
+    set_secret(&s, token, &envs_a[0], "SHARED_PASSWORD", "cross-tenant-value").await;
+
+    let r = s.call(Method::POST, "/api/orgs", Some(token), Some(json!({"name": "second"}))).await;
+    assert_eq!(r.status, 200, "create second org failed: {}", r.text);
+    let org_b = r.body["id"].as_str().unwrap();
+    let (_, envs_b) = app_with_envs(&s, token, org_b).await;
+
+    let r = reuse_check(
+        &s, token, &envs_b[0],
+        json!([{"key": "NEW_PASSWORD", "value": "cross-tenant-value", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "another workspace must not match: {}", r.text);
+
+    let r = reuse_check(
+        &s, token, &envs_a[1],
+        json!([{"key": "NEW_PASSWORD", "value": "cross-tenant-value", "path": "/", "type": "secret"}]),
+        json!([]),
+    ).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "the owning workspace must match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_hides_restricted_environments() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-restrict-owner@test.invalid").await;
+    let member = register(&s, "reuse-restrict-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "reuse-restrict-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    set_secret(&s, ot, &envs[0], "RESTRICTED_PASSWORD", "only-admins-see-this").await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"restricted": true}))).await;
+    assert_eq!(r.status, 200, "restrict env failed: {}", r.text);
+
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "only-admins-see-this", "path": "/", "type": "secret"}]);
+    let r = reuse_check(&s, mt, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "a member may check an env they can open: {}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "a restricted env must be omitted: {}", r.text);
+
+    let r = reuse_check(&s, ot, &envs[1], candidates, json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "an admin still sees the match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_respects_workspace_and_project_switches() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-switch-owner@test.invalid").await;
+    let dev = register(&s, "reuse-switch-dev@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let dt = dev["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "reuse-switch-dev@test.invalid", "developer").await;
+    let (app, envs) = app_with_envs(&s, ot, org).await;
+    set_secret(&s, ot, &envs[0], "SHARED_PASSWORD", "switch-value").await;
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "switch-value", "path": "/", "type": "secret"}]);
+    let enabled = |r: &Resp| r.body["enabled"].clone();
+    let match_count = |r: &Resp| r.body["matches"].as_array().map(|m| m.len()).unwrap_or(99);
+
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["reuse_check"], json!(true), "workspace switch defaults on: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/apps/{}/settings", app), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["reuse_check"], json!(true), "project switch defaults on: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let app_row = r.body.as_array().expect("app array").iter().find(|a| a["id"] == json!(&app)).expect("app row");
+    assert_eq!(app_row["reuse_check"], json!(true), "the app list carries the switch: {}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 200, "disable workspace check failed: {}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(enabled(&r), json!(false), "{}", r.text);
+    assert_eq!(match_count(&r), 0, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(ot), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 200, "disable project check failed: {}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(enabled(&r), json!(false), "{}", r.text);
+    assert_eq!(match_count(&r), 0, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(ot), Some(json!({"reuse_check": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = reuse_check(&s, ot, &envs[1], candidates, json!([])).await;
+    assert_eq!(enabled(&r), json!(true), "{}", r.text);
+    assert_eq!(match_count(&r), 1, "{}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(dt), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 403, "only an admin may change the workspace switch: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(dt), Some(json!({"reuse_check": false}))).await;
+    assert_eq!(r.status, 403, "only an admin may change the project switch: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_skips_non_secret_types_and_excluded_ids() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-types@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(token), Some(json!({"secrets": [
+        {"key": "SHARED_PASSWORD", "value": "typed-value", "type": "secret"},
+        {"key": "SHARED_CONFIG", "value": "typed-value", "type": "config"},
+        {"key": "SHARED_SEALED", "value": "typed-value", "type": "sealed"}
+    ]}))).await;
+    assert_eq!(r.status, 200, "seed secrets failed: {}", r.text);
+    let sid = secret_id(&s, token, &envs[0], "SHARED_PASSWORD").await;
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "typed-value", "path": "/", "type": "secret"}]);
+
+    let r = reuse_check(&s, token, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let matches = r.body["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1, "{}", r.text);
+    let items = matches[0]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "config and sealed values must not match: {}", r.text);
+    assert_eq!(items[0]["key"], json!("SHARED_PASSWORD"), "{}", r.text);
+
+    let r = reuse_check(&s, token, &envs[1], candidates.clone(), json!([sid])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "an excluded secret must not match itself: {}", r.text);
+
+    let r = reuse_check(&s, token, &envs[1], json!([
+        {"key": "AS_CONFIG", "value": "typed-value", "path": "/", "type": "config"},
+        {"key": "AS_SEALED", "value": "typed-value", "path": "/", "type": "sealed"}
+    ]), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "only secret candidates are checked: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_matches_exactly_and_ignores_deleted() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-exact@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "Passw0rd!").await;
+    for value in ["passw0rd!", "Passw0rd", ""] {
+        let r = check_value(&s, token, &envs[1], value).await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "value {:?} must not match: {}", value, r.text);
+    }
+    let r = check_value(&s, token, &envs[1], "Passw0rd!").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1), "the exact value must match: {}", r.text);
+
+    let sid = secret_id(&s, token, &envs[0], "SHARED_PASSWORD").await;
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{}", sid), Some(token), None).await;
+    assert_eq!(r.status, 200, "delete failed: {}", r.text);
+    let r = check_value(&s, token, &envs[1], "Passw0rd!").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0), "a deleted secret must not match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_requires_target_environment_access() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-outsider-owner@test.invalid").await;
+    let outsider = register(&s, "reuse-outsider@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let xt = outsider["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = reuse_check(&s, xt, &envs[0], json!([{"key": "NEW_PASSWORD", "value": "x", "type": "secret"}]), json!([])).await;
+    assert_eq!(r.status, 403, "a non-member must not probe another workspace: {}", r.text);
+}

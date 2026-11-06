@@ -173,7 +173,7 @@ function hidden(element) {
 const saved = { id: 'saved-secret', key: 'DATABASE_URL', value: 'fixture-original', path: '/service', type: 'secret', version: 2 };
 const draft = { key: 'NEW_CONFIG', value: 'fixture-draft', path: '/draft', type: 'config', comment: '' };
 
-async function consoleUI(secrets = [saved]) {
+async function consoleUI(secrets = [saved], reuse = []) {
   const document = new Element('document', null);
   document.ownerDocument = document;
   document.getElementById = id => document.querySelector('#' + id);
@@ -215,6 +215,9 @@ async function consoleUI(secrets = [saved]) {
       calls.push(call);
       let body;
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
+      else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) body = { enabled: true, matches: reuse };
+      else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
+      else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
@@ -259,7 +262,7 @@ async function consoleUI(secrets = [saved]) {
       await this.click(this.button(this.el('modal'), /^Stage secret$/));
     },
     async deploy() { await this.click(this.button(this.el('deploybar'), /^Deploy changes$/)); },
-    writes() { return calls.filter(c => c.method !== 'GET'); },
+    writes() { return calls.filter(c => c.method !== 'GET' && !/^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(c.url)); },
     key(key, shiftKey = false) {
       const event = { type: 'keydown', key, shiftKey, metaKey: false, ctrlKey: false };
       document.activeElement.dispatchEvent(event);
@@ -555,4 +558,62 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };
+
+test('a reused value warns before staging, can be saved anyway, and is not a write', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  assert.match(ui.el('modal').textContent, /already in use/i);
+  assert.match(ui.el('modal').textContent, /DATABASE_URL/);
+  assert.match(ui.el('modal').textContent, /Development/);
+  assert.equal(ui.rows().length, 1, 'nothing may be staged until the warning is acknowledged');
+  assert.ok(hidden(ui.el('deploybar')), 'the warning must not enable deployment');
+  assert.deepEqual(ui.writes(), [], 'the preflight is not a write');
+  await ui.click(ui.button(ui.el('modal'), /^Use anyway$/));
+  assert.ok(ui.row('NEW_CONFIG'), 'Use anyway must stage the draft');
+  assert.ok(!hidden(ui.el('deploybar')), 'the acknowledged draft becomes deployable');
+  assert.deepEqual(ui.writes(), [], 'staging stays local');
+});
+
+test('Back from a reuse warning restores the new-secret form', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  await ui.click(ui.button(ui.el('modal'), /^Back$/));
+  assert.equal(ui.el('ns-key').value, draft.key);
+  assert.equal(ui.el('ns-val').value, draft.value);
+  assert.equal(ui.el('ns-path').value, draft.path);
+  assert.equal(ui.el('ns-type').value, 'secret');
+  assert.ok(hidden(ui.el('deploybar')), 'backing out must not stage anything');
+});
+
+test('Go to leaves the warning and filters the matching environment', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.add({ ...draft, type: 'secret' });
+  await ui.click(ui.button(ui.el('modal'), /^Go to$/));
+  assert.ok(!ui.el('modalwrap').classList.contains('show'), 'navigation must close the warning');
+  assert.equal(ui.el('sfilter').value, 'DATABASE_URL');
+  assert.ok(ui.row('DATABASE_URL'), 'the matching row must be visible');
+  assert.ok(hidden(ui.el('deploybar')), 'navigation must not stage the pending secret');
+});
+
+test('workspace and app settings expose the reuse switch', async () => {
+  const ui = await consoleUI();
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('set-reuse').hasAttribute('checked'), 'the workspace switch defaults on');
+  ui.el('set-reuse').checked = false;
+  await ui.invoke('saveSettings()');
+  const orgPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/orgs/org-a/settings');
+  assert.ok(orgPut, 'saving settings must reach the workspace endpoint');
+  assert.equal(orgPut.body.reuse_check, false, 'the workspace switch must be saved');
+  ui.run("APP={id:'app-a',name:'First app'};ENVS=[{id:'env-a',name:'Development'}];ENV=ENVS[0];SECRETS=[];DRAFTS={}");
+  await ui.invoke('appSettings()');
+  assert.ok(ui.el('app-reuse').hasAttribute('checked'), 'the app switch defaults on');
+  ui.el('app-reuse').checked = false;
+  await ui.invoke('saveAppSettings()');
+  const appPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/apps/app-a/settings');
+  assert.ok(appPut, 'saving app settings must reach the app endpoint');
+  assert.equal(appPut.body.reuse_check, false, 'the app switch must be saved');
 });
