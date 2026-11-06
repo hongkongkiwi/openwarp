@@ -42,6 +42,20 @@ docker compose up -d --build
 | `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
 | `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
 | `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
+| `OPENWARP_APPLE_CLIENT_ID` / `OPENWARP_APPLE_CLIENT_SECRET` | Sign in with Apple; the secret is the ES256 client-secret JWT |
+| `OPENWARP_APPLE_PRIVATE_KEY`, `_TEAM_ID`, `_KEY_ID` | Generate Apple's client secret from a `.p8` key instead of storing a JWT |
+| `OPENWARP_OPENAI_CLIENT_ID` / `OPENWARP_OPENAI_CLIENT_SECRET` | Sign in with ChatGPT |
+| `OPENWARP_MICROSOFT_CLIENT_ID` / `OPENWARP_MICROSOFT_CLIENT_SECRET` | Microsoft Entra ID |
+| `OPENWARP_MICROSOFT_TENANT` | Tenant ID, or `common`, `organizations`, `consumers`; defaults to `common` |
+| `OPENWARP_OKTA_ISSUER`, `OPENWARP_OKTA_CLIENT_ID`, `OPENWARP_OKTA_CLIENT_SECRET` | Okta |
+| `OPENWARP_AUTH0_ISSUER`, `OPENWARP_AUTH0_CLIENT_ID`, `OPENWARP_AUTH0_CLIENT_SECRET` | Auth0 |
+| `OPENWARP_GITLAB_CLIENT_ID` / `OPENWARP_GITLAB_CLIENT_SECRET` | GitLab OIDC; `OPENWARP_GITLAB_ISSUER` overrides the default |
+| `OPENWARP_SLACK_CLIENT_ID` / `OPENWARP_SLACK_CLIENT_SECRET` | Slack |
+| `OPENWARP_SALESFORCE_CLIENT_ID` / `OPENWARP_SALESFORCE_CLIENT_SECRET` | Salesforce; `OPENWARP_SALESFORCE_ISSUER` selects sandbox or My Domain |
+| `OPENWARP_ATLASSIAN_CLIENT_ID` / `OPENWARP_ATLASSIAN_CLIENT_SECRET` | Atlassian |
+| `OPENWARP_X_CLIENT_ID`, optional `OPENWARP_X_CLIENT_SECRET` | X OAuth 2.0 with PKCE |
+| `OPENWARP_{PROVIDER}_TOKEN_AUTH_METHOD` | `client_secret_post`, `client_secret_basic`, `private_key_jwt` or `client_secret_jwt` |
+| `OPENWARP_{PROVIDER}_PRIVATE_KEY`, `_KEY_ID`, `_PRIVATE_KEY_ALG` | `private_key_jwt` signing key (RS256 or ES256) |
 | `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
 | `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
 | `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider |
@@ -52,7 +66,49 @@ docker compose up -d --build
 Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
 GitHub callback URL: `{OPENWARP_PUBLIC_URL}/api/auth/social/github/callback`.
 GitHub needs the `read:user` and `user:email` scopes; only a verified address
-can create or match an account.
+can create or match an account. Other callbacks follow
+`{OPENWARP_PUBLIC_URL}/api/auth/social/<provider>/callback`. Apple posts its
+authorization response, so its callback accepts POST as well as GET. An
+`OPENWARP_APPLE_PRIVATE_KEY` avoids the six-month client-secret JWT rotation;
+supply the `.p8` contents plus the team ID and key ID. X needs the `users.read`
+and `users.email` scopes and a confirmed account email.
+
+## Workspace OIDC group mapping
+
+Workspace settings accept `oidc_groups_claim` (default `groups`) and
+`oidc_group_roles`, a JSON object mapping group names to `owner`, `admin` or
+`developer`. On each SSO login a matching group sets the member's role; the
+highest-privileged match wins, no match leaves the current role, and the last
+owner is never demoted. Group claims never create membership: invites or
+auto-provisioning do.
+
+## Identity linking
+
+A signed-in user can attach a provider identity with
+`/api/auth/social/<provider>/start?link=1` or
+`/api/auth/oidc/<org>/start?link=1`. The callback binds the provider subject to
+that account instead of creating or signing in another user. `GET
+/api/me/identities` lists the bindings and `POST /api/me/identities/unlink`
+removes one. An identity belongs to one account; linking never merges accounts
+or changes the account email. The console exposes the same controls under
+Settings.
+
+## Back-channel logout
+
+Register these endpoints with the IdP:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/<provider>/backchannel-logout
+{OPENWARP_PUBLIC_URL}/api/auth/oidc/<org>/backchannel-logout
+```
+
+Each accepts a form-encoded `logout_token`, verifies its signature against the
+provider JWKS, checks `iss`, `aud`, `exp`, the back-channel logout event and a
+single-use `jti`, then revokes every session for the bound subject. Tokens that
+carry only `sid` are rejected because no IdP session ID is stored; `sub` is
+required. Bindings are recorded on each OIDC login, so an account that has not
+signed in since this feature was deployed cannot be resolved until its next
+login.
 
 ## Signups and invitations
 
@@ -77,11 +133,12 @@ end-to-end environments readable. A user who has lost the kit can pass
 end-to-end environments unreadable. Either path revokes every session, OAuth
 token and pending refresh pair for the account.
 
-Email verification is opt-in with `OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`. New
-password registrations then start unverified, receive a 24-hour link, and cannot
-sign in until it is opened. Social and SSO logins arrive with verified
-addresses. The server refuses to start if verification is required but no email
-relay is configured, because nobody could complete it.
+Password signups always require a verified email address. Registration issues no
+session until the 24-hour link is opened, and the first verified account owns the
+instance. A production server refuses new password signups when no email relay is
+configured, while SSO sign-in remains available; outside production the links are
+written to the server log. Social and SSO logins arrive with provider-verified
+addresses.
 
 ## Operational checks
 

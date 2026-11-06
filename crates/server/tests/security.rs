@@ -840,12 +840,16 @@ zx/UpPmCIb8/3cJ8IR+QpA==
 -----END PRIVATE KEY-----"#;
 const OIDC_TEST_N: &str = "uTt-NHHm3ZFrMRYklTgNMQpbuY5FXX5P09Yen7BB6hyQ0S7cUYiXr2jAa-5ipW6eHej0FkOsnRc7IeoG-CKhO_1DjSjYavmSv0qSmmNA4qKxaV-1C36HPUb2W_9M8AbhYuI-JJtgQ2n9PVrxCHf0G4osxPaNBL9WEJMqnJO3c9bediZxOLSNGjs-owL8HHleUH5T7Bpimvj4iZ1xH2Yp-1UU4vyEEV757ULSA5OAjJdqk-Vf3BjSjbaR4vtfc2veqrdISKYbA_z8DGDfQM9QWfP5coE0542SH3KzJ2RG1TUn2U7QGtrc4LngJVMfgiZhBOidTH1VugBhxr-0kel1Yw";
 
-fn start_idp(email: &str) -> String {
+struct MockIdp { issuer: String, nonce: Arc<Mutex<String>> }
+
+fn start_idp(email: &str) -> MockIdp {
     let listener = TcpListener::bind("127.0.0.1:0").expect("idp bind");
     let addr = listener.local_addr().expect("idp addr");
     let issuer = format!("http://{}", addr);
     let thread_issuer = issuer.clone();
     let email = email.to_string();
+    let nonce_slot = Arc::new(Mutex::new(String::new()));
+    let issued_nonce = nonce_slot.clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             use std::io::{Read, Write};
@@ -865,7 +869,9 @@ fn start_idp(email: &str) -> String {
             } else {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let header = jsonwebtoken::Header { alg: jsonwebtoken::Algorithm::RS256, kid: Some("t1".into()), ..Default::default() };
-                let claims = json!({"iss": thread_issuer, "aud": "test-client", "sub": "subject-1", "email": email, "iat": now, "exp": now + 300});
+                let mut claims = json!({"iss": thread_issuer, "aud": "test-client", "sub": "subject-1", "email": email, "iat": now, "exp": now + 300});
+                let nonce = issued_nonce.lock().unwrap().clone();
+                if !nonce.is_empty() { claims["nonce"] = json!(nonce); }
                 let key = jsonwebtoken::EncodingKey::from_rsa_pem(OIDC_TEST_PEM.as_bytes()).expect("rsa pem");
                 let token = jsonwebtoken::encode(&header, &claims, &key).expect("sign id token");
                 json!({"access_token": "x", "id_token": token, "token_type": "Bearer"}).to_string()
@@ -873,17 +879,18 @@ fn start_idp(email: &str) -> String {
             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
         }
     });
-    issuer
+    MockIdp { issuer, nonce: nonce_slot }
 }
 
-async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &str) -> String {
+async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &MockIdp) -> String {
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(session), Some(json!({
-        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_issuer": idp.issuer, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
         "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
         "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid"}))).await;
     assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
     assert_eq!(r.status, 307, "oidc start failed: {}", r.text);
+    *idp.nonce.lock().unwrap() = parse_query(&r.header("location")).get("nonce").cloned().unwrap_or_default();
     parse_query(&r.header("location")).get("state").cloned().expect("state")
 }
 
@@ -1035,12 +1042,13 @@ async fn oidc_new_users_need_org_auto_provisioning() {
     let org = owner["org_id"].as_str().unwrap();
     let idp = start_idp("oidc-nopolicy@test.invalid");
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
-        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
         "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
     assert_eq!(r.status, 307, "{}", r.text);
     let state = parse_query(&r.header("location")).get("state").cloned().expect("state");
+    *idp.nonce.lock().unwrap() = parse_query(&r.header("location")).get("nonce").cloned().unwrap_or_default();
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
     assert_eq!(r.status, 403, "an org without auto-provisioning must not admit a new SSO user, got {} {}", r.status, r.text);
 }

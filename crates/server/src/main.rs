@@ -869,6 +869,8 @@ async fn get_org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<Str
         "oidc_client_secret_set": !secret.is_empty(),
         "oidc_auto_provision": meta_get(&st, &format!("oidc_auto_provision:{}", oid)) == "1",
         "oidc_allowed_domains": meta_get(&st, &format!("oidc_allowed_domains:{}", oid)),
+        "oidc_groups_claim": meta_get(&st, &format!("oidc_groups_claim:{}", oid)),
+        "oidc_group_roles": meta_get(&st, &format!("oidc_group_roles:{}", oid)),
         "audit_webhook": meta_get(&st, &format!("audit_webhook:{}", oid)),
     }))) }
 async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
@@ -890,6 +892,13 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
         if issuer != stored_issuer && supplied_secret.is_empty() { meta_set(&st, &format!("oidc_client_secret:{}", oid), ""); }
     }
     if let Some(v)=body.get("oidc_auto_provision").and_then(|x|x.as_bool()) { meta_set(&st, &format!("oidc_auto_provision:{}",oid), if v {"1"} else {"0"}); }
+    if let Some(v)=body.get("oidc_groups_claim").and_then(|x|x.as_str()) {
+        if v.len() > 200 || v.chars().any(|c| c.is_whitespace() || c.is_control()) { return Err(bad("oidc_groups_claim must be a claim name without whitespace")); }
+        meta_set(&st, &format!("oidc_groups_claim:{}", oid), v); }
+    if let Some(v)=body.get("oidc_group_roles").and_then(|x|x.as_str()) {
+        if v.len() > 8192 { return Err(bad("oidc_group_roles is too large")); }
+        if !v.is_empty() && !valid_group_roles(v) { return Err(bad("oidc_group_roles must map group names to owner, admin or developer")); }
+        meta_set(&st, &format!("oidc_group_roles:{}", oid), v); }
     for (field, enc) in [("oidc_issuer", false), ("oidc_client_id", false), ("oidc_redirect_uri", false), ("oidc_allowed_domains", false), ("oidc_client_secret", true)] {
         if let Some(v)=body.get(field).and_then(|x|x.as_str()) {
             // An omitted secret keeps the stored one; an explicit empty secret
@@ -1110,32 +1119,47 @@ fn db_target_allowed(conn: &str) -> Result<(), String> {
 async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)> {
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
-async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn oidc_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid));
     let client_secret = oc::decrypt_symmetric(&st.master(), &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     if issuer.is_empty() || client_id.is_empty() || redirect_uri.is_empty() { return Err(bad("OIDC not configured for this org (set oidc_issuer, oidc_client_id, oidc_client_secret, oidc_redirect_uri via org settings)")); }
     if client_secret.is_empty() { return Err(bad("OIDC client secret is not configured or was cleared by an issuer change; re-enter the client secret in org settings")); }
     if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("OIDC issuer must be https, or http on a loopback address; private addresses need OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
+    let link_user = if q.get("link").map(|v| v == "1" || v == "true").unwrap_or(false) { st.token_user(&h)? } else { String::new() };
+    if !link_user.is_empty() && st.org_role(&oid, &link_user).is_none() { return Err(err(StatusCode::FORBIDDEN, "join the organisation before linking an SSO identity")); }
     let disc = oidc_discovery(&issuer).await?; let auth_ep = disc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
     if !url_ok(auth_ep) || !egress_allowed(auth_ep) { return Err(bad("OIDC discovery returned no usable authorization_endpoint")); }
     let state = oc::random_token("st"); let nonce = oc::random_token("n");
-    st.db.exec("INSERT INTO oidc_states(state,org_id,created_at,nonce) VALUES(?,?,?,?)", &[json!(state), json!(oid), json!(now()), json!(nonce)]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO oidc_states(state,org_id,created_at,nonce,link_user) VALUES(?,?,?,?,?)", &[json!(state), json!(oid), json!(now()), json!(nonce), json!(&link_user)]).map_err(|e| bad(&e))?;
     let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
     Ok(axum::response::Redirect::temporary(&url)) }
 fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
-async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
-    let srow = st.db.one("SELECT org_id,created_at,nonce FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
-    let oid = db::s(&srow, "org_id"); let expected_nonce = db::s(&srow, "nonce");
+    let srow = st.db.one("SELECT org_id,created_at,nonce,link_user FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
+    let oid = db::s(&srow, "org_id"); let expected_nonce = db::s(&srow, "nonce"); let link_user = db::s(&srow, "link_user");
     let _ = st.db.exec("DELETE FROM oidc_states WHERE state=?", &[json!(state)]);
     if db::n(&srow, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)); let client_secret = oc::decrypt_symmetric(&st.master(), &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("OIDC issuer must be https, or http on a loopback address; private addresses need OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
+    let groups_claim = { let v = meta_get(&st, &format!("oidc_groups_claim:{}", oid)); if v.is_empty() { "groups".to_string() } else { v } };
     let disc = oidc_discovery(&issuer).await?;
-    let (subject, email) = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false, if issuer.contains("login.microsoftonline.com") { "microsoft" } else { "oidc" }).await.map_err(|e| bad(&e))?;
+    let ident = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false, if issuer.contains("login.microsoftonline.com") { "microsoft" } else { "oidc" }, &groups_claim, "").await.map_err(|e| bad(&e))?;
+    let subject = ident.subject.clone(); let email = ident.email.clone();
     let issuer_key = issuer.clone();
+    if !link_user.is_empty() {
+        if !st.principal_active(&link_user) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+        if st.org_role(&oid, &link_user).is_none() { return Err(err(StatusCode::FORBIDDEN, "join the organisation before linking an SSO identity")); }
+        if let Some(bound) = st.db.one("SELECT user_id FROM oidc_subjects WHERE issuer=? AND subject=?", &[json!(&issuer_key), json!(&subject)]).map_err(|e| bad(&e))? {
+            if db::s(&bound, "user_id") != link_user { return Err(err(StatusCode::CONFLICT, "this SSO identity is already linked to another account")); }
+        } else {
+            st.db.exec("INSERT INTO oidc_subjects(issuer,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(&issuer_key), json!(&subject), json!(&link_user), json!(now())]).map_err(|e| bad(&e))?;
+        }
+        record_identity_binding(&st, &ident.issuer, &subject, &link_user, &format!("oidc:{}", issuer_key));
+        st.audit(&oid, "", "", &link_user, "auth.identity_linked", &format!("oidc {}", email));
+        return Ok(axum::response::Redirect::temporary("/#linked=oidc").into_response()); }
     // An SSO login may attach an account to this organisation only through a
     // pending invite, or when the org explicitly enables auto-provisioning for
     // this email domain. Instance-wide signups are not enough.
@@ -1164,9 +1188,24 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
         } else {
             return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
         } }
+    // Group mappings only change the role of an existing member; they never
+    // create membership. The last owner is never demoted by a claim.
+    let mapping: Value = serde_json::from_str(&meta_get(&st, &format!("oidc_group_roles:{}", oid))).unwrap_or_else(|_| json!({}));
+    if let Some(role) = mapped_role(&mapping, &ident.groups) {
+        if let Some(current) = st.org_role(&oid, &uid) {
+            if current != role {
+                let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(&oid)]).map_err(|e| bad(&e))?;
+                if current == "owner" && role != "owner" && owners.len() <= 1 {
+                    st.audit(&oid, "", "", &uid, "auth.oidc_role_sync_skipped", "last owner");
+                } else {
+                    st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&oid), json!(&uid)]).map_err(|e| bad(&e))?;
+                    st.audit(&oid, "", "", &uid, "auth.oidc_role_sync", &format!("{} -> {}", current, role));
+                } } } }
+    record_identity_binding(&st, &ident.issuer, &subject, &uid, &format!("oidc:{}", issuer_key));
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, subject));
     let token = make_session(&st, &uid)?;
-    Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    Ok((hdr, axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))).into_response()) }
 
 // ---------- SAML 2.0 service provider ----------
 struct SamlReplayCache { st: S }
@@ -1474,10 +1513,17 @@ fn social_provider(provider: &str) -> Option<(String, String)> {
         let id = env_nonempty("OPENWARP_X_CLIENT_ID");
         if id.is_empty() { return None; }
         return Some((id, env_nonempty("OPENWARP_X_CLIENT_SECRET"))); }
+    // Apple's client secret is either supplied as a JWT or derived from the
+    // Sign in with Apple private key.
+    if provider == "apple" {
+        let id = env_nonempty("OPENWARP_APPLE_CLIENT_ID");
+        if id.is_empty() { return None; }
+        let mut secret = env_nonempty("OPENWARP_APPLE_CLIENT_SECRET");
+        if secret.is_empty() { secret = apple_client_secret(&id).unwrap_or_default(); }
+        return if secret.is_empty() { None } else { Some((id, secret)) }; }
     let (id_key, secret_key) = match provider {
         "google" => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
         "github" => ("OPENWARP_GITHUB_CLIENT_ID", "OPENWARP_GITHUB_CLIENT_SECRET"),
-        "apple" => ("OPENWARP_APPLE_CLIENT_ID", "OPENWARP_APPLE_CLIENT_SECRET"),
         "openai" => ("OPENWARP_OPENAI_CLIENT_ID", "OPENWARP_OPENAI_CLIENT_SECRET"),
         "microsoft" => ("OPENWARP_MICROSOFT_CLIENT_ID", "OPENWARP_MICROSOFT_CLIENT_SECRET"),
         "okta" => ("OPENWARP_OKTA_CLIENT_ID", "OPENWARP_OKTA_CLIENT_SECRET"),
@@ -1489,6 +1535,8 @@ fn social_provider(provider: &str) -> Option<(String, String)> {
         _ => return None };
     let id = env_nonempty(id_key);
     let secret = env_nonempty(secret_key);
+    // A private_key_jwt client has no secret; the assertion replaces it.
+    if provider != "github" && secret.is_empty() && !provider_private_key(provider).is_empty() { return Some((id, String::new())); }
     if id.is_empty() || secret.is_empty() { None } else { Some((id, secret)) } }
 // OIDC providers also need an issuer; GitHub and X are plain OAuth 2.0.
 fn social_enabled(provider: &str) -> bool {
@@ -1549,6 +1597,65 @@ fn claim_bool(v: &Value) -> Option<bool> {
     match v { Value::Bool(b) => Some(*b), Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
         "true" => Some(true), "false" => Some(false), _ => None }, _ => None } }
 fn email_verified_claim(claims: &Value) -> Option<bool> { claims.get("email_verified").and_then(claim_bool) }
+#[derive(Debug)]
+struct OidcIdentity { subject: String, email: String, issuer: String, groups: Vec<String> }
+fn groups_from_claims(claims: &Value, claim: &str) -> Vec<String> {
+    if claim.is_empty() { return Vec::new(); }
+    match claims.get(claim) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new() } }
+fn role_rank(role: &str) -> u8 { match role { "owner" => 3, "admin" => 2, "developer" => 1, _ => 0 } }
+fn mapped_role(mapping: &Value, groups: &[String]) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for group in groups {
+        if let Some(role) = mapping.get(group).and_then(|v| v.as_str()) {
+            if best.map(|b| role_rank(role) > role_rank(b)).unwrap_or(true) { best = Some(role); } } }
+    best.map(str::to_string) }
+fn valid_group_roles(raw: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else { return false };
+    let Some(obj) = v.as_object() else { return false };
+    obj.len() <= 200 && obj.iter().all(|(k, v)| !k.is_empty() && k.len() <= 200 && matches!(v.as_str(), Some("owner" | "admin" | "developer"))) }
+fn provider_env(provider: &str, suffix: &str) -> String { format!("OPENWARP_{}_{}", provider.to_ascii_uppercase(), suffix) }
+fn provider_token_auth_method(provider: &str) -> String { env_nonempty(&provider_env(provider, "TOKEN_AUTH_METHOD")).to_ascii_lowercase() }
+fn provider_private_key(provider: &str) -> String { env_nonempty(&provider_env(provider, "PRIVATE_KEY")).replace("\\n", "\n") }
+fn client_assertion(provider: &str, client_id: &str, client_secret: &str, token_ep: &str, method: &str) -> Result<String, String> {
+    let now = now();
+    let claims = json!({"iss": client_id, "sub": client_id, "aud": token_ep, "jti": oc::random_token("jwt"), "iat": now, "exp": now + 300});
+    let (alg, key) = if method == "private_key_jwt" {
+        let pem = provider_private_key(provider);
+        if pem.is_empty() { return Err(format!("private_key_jwt needs {}", provider_env(provider, "PRIVATE_KEY"))); }
+        let alg = match env_nonempty(&provider_env(provider, "PRIVATE_KEY_ALG")).to_ascii_uppercase().as_str() {
+            "" | "RS256" => jsonwebtoken::Algorithm::RS256,
+            "ES256" => jsonwebtoken::Algorithm::ES256,
+            other => return Err(format!("unsupported private key algorithm {}", other)) };
+        let key = if matches!(alg, jsonwebtoken::Algorithm::ES256) { jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()) } else { jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()) }.map_err(|e| e.to_string())?;
+        (alg, key)
+    } else if method == "client_secret_jwt" {
+        if client_secret.is_empty() { return Err("client_secret_jwt needs a client secret".into()); }
+        (jsonwebtoken::Algorithm::HS256, jsonwebtoken::EncodingKey::from_secret(client_secret.as_bytes()))
+    } else { return Err(format!("unsupported client assertion method {}", method)) };
+    let mut header = jsonwebtoken::Header::new(alg);
+    let kid = env_nonempty(&provider_env(provider, "KEY_ID"));
+    if !kid.is_empty() { header.kid = Some(kid); }
+    jsonwebtoken::encode(&header, &claims, &key).map_err(|e| e.to_string()) }
+fn apple_client_secret(client_id: &str) -> Option<String> {
+    let pem = env_nonempty("OPENWARP_APPLE_PRIVATE_KEY").replace("\\n", "\n");
+    let team = env_nonempty("OPENWARP_APPLE_TEAM_ID");
+    let kid = env_nonempty("OPENWARP_APPLE_KEY_ID");
+    if pem.is_empty() || team.is_empty() || kid.is_empty() { return None; }
+    let now = now();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(kid);
+    let claims = json!({"iss": team, "iat": now, "exp": now + 30 * 86400, "aud": "https://appleid.apple.com", "sub": client_id});
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).ok()?;
+    jsonwebtoken::encode(&header, &claims, &key).ok() }
+fn record_identity_binding(st: &S, issuer: &str, subject: &str, uid: &str, provider: &str) {
+    if issuer.is_empty() || subject.is_empty() { return; }
+    if let Ok(Some(row)) = st.db.one("SELECT user_id FROM identity_bindings WHERE issuer=? AND subject=?", &[json!(issuer), json!(subject)]) {
+        if db::s(&row, "user_id") != uid { eprintln!("identity binding {} {} is already owned by another account", issuer, subject); }
+        return; }
+    let _ = st.db.exec("INSERT INTO identity_bindings(issuer,subject,user_id,provider,created_at) VALUES(?,?,?,?,?)", &[json!(issuer), json!(subject), json!(uid), json!(provider), json!(now())]); }
 fn github_web() -> String { std::env::var("OPENWARP_GITHUB_WEB").unwrap_or_else(|_| "https://github.com".into()) }
 fn github_api() -> String { std::env::var("OPENWARP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()) }
 fn social_redirect(st: &S, h: &HeaderMap, provider: &str) -> String { format!("{}/api/auth/social/{}/callback", issuer(st, h), provider) }
@@ -1615,7 +1722,7 @@ fn oidc_token_auth_basic(disc: &Value) -> bool {
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
             methods.contains(&"client_secret_basic") && !methods.contains(&"client_secret_post") } } }
 #[allow(clippy::too_many_arguments)] // every argument is a distinct token-exchange value
-async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str, custom: bool, provider: &str) -> Result<(String, String), String> {
+async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str, custom: bool, provider: &str, groups_claim: &str, auth_provider: &str) -> Result<OidcIdentity, String> {
     let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or("");
     let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
     if !issuer_url_ok(token_ep) || !issuer_url_ok(jwks_uri) { return Err("the OIDC token and JWKS endpoints must be https, or http on a loopback address".into()); }
@@ -1627,10 +1734,23 @@ async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, cli
     // would separate token validation from the binding key. Microsoft's
     // multi-tenant documents publish a {tenantid} template, checked per token.
     if !expected_issuer.contains("{tenantid}") && expected_issuer.trim_end_matches('/') != issuer.trim_end_matches('/') { return Err("the OIDC discovery issuer does not match the configured issuer".into()); }
-    let basic = custom && !client_secret.is_empty() && oidc_token_auth_basic(disc);
+    let method = provider_token_auth_method(auth_provider);
+    let basic = match method.as_str() {
+        "client_secret_basic" => { if client_secret.is_empty() { return Err("client_secret_basic needs a client secret".into()); } true },
+        "client_secret_post" | "private_key_jwt" | "client_secret_jwt" => false,
+        "" => custom && !client_secret.is_empty() && oidc_token_auth_basic(disc),
+        other => return Err(format!("unsupported token auth method {}", other)) };
+    let assertion = if matches!(method.as_str(), "private_key_jwt" | "client_secret_jwt") {
+        Some(client_assertion(auth_provider, client_id, client_secret, token_ep, &method)?)
+    } else { None };
     let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)];
-    if !basic { form.push(("client_id", client_id)); }
-    if !client_secret.is_empty() && !basic { form.push(("client_secret", client_secret)); }
+    if let Some(assertion) = &assertion {
+        form.push(("client_id", client_id));
+        form.push(("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"));
+        form.push(("client_assertion", assertion.as_str()));
+    } else {
+        if !basic { form.push(("client_id", client_id)); }
+        if !client_secret.is_empty() && !basic { form.push(("client_secret", client_secret)); } }
     if !verifier.is_empty() { form.push(("code_verifier", verifier)); }
     let mut req = http_client().post(token_ep);
     if basic { req = req.basic_auth(client_id, Some(client_secret)); }
@@ -1649,11 +1769,12 @@ async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, cli
         if !email.contains('@') { email.clear(); } }
     let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if email.is_empty() || subject.is_empty() { return Err("the id_token has no email or subject".into()); }
-    Ok((subject, email)) }
+    let verified_issuer = claims.get("iss").and_then(|v| v.as_str()).unwrap_or(expected_issuer).to_string();
+    Ok(OidcIdentity { subject, email, issuer: verified_issuer, groups: groups_from_claims(&claims, groups_claim) }) }
 #[allow(clippy::too_many_arguments)] // mirrors the token-exchange inputs of oidc_identity_from_doc
-async fn oidc_social_identity(provider: &str, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str) -> Result<(String, String), String> {
+async fn oidc_social_identity(provider: &str, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str) -> Result<OidcIdentity, String> {
     let disc = oidc_discovery(issuer).await.map_err(|(_, j)| j.to_string())?;
-    oidc_identity_from_doc(&disc, issuer, client_id, client_secret, redirect, code, verifier, expected_nonce, false, provider).await }
+    oidc_identity_from_doc(&disc, issuer, client_id, client_secret, redirect, code, verifier, expected_nonce, false, provider, "", provider).await }
 async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
     let tok: Value = http_client().post(format!("{}/login/oauth/access_token", github_web()))
         .header("Accept", "application/json").header("User-Agent", "openwarp")
@@ -1756,17 +1877,20 @@ async fn custom_oidc_metadata() -> Result<Value, (StatusCode, Json<Value>)> {
         if !jwks_uri.is_empty() { obj.insert("jwks_uri".into(), json!(jwks_uri)); }
         obj.entry("issuer").or_insert(json!(&issuer)); }
     Ok(disc) }
-async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
     let state = oc::random_token("sst");
+    // A link flow starts from an authenticated account and binds this provider
+    // identity to it instead of creating or signing in a user.
+    let link_user = if q.get("link").map(|v| v == "1" || v == "true").unwrap_or(false) { st.token_user(&h)? } else { String::new() };
     if provider == "github" {
-        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO social_states(state,provider,created_at,link_user) VALUES(?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&link_user)]).map_err(|e| bad(&e))?;
         let url = format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state);
         return Ok(axum::response::Redirect::temporary(&url)); }
     if provider == "x" {
         let verifier = oc::random_token("pkce");
-        st.db.exec("INSERT INTO social_states(state,provider,created_at,code_verifier) VALUES(?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&verifier)]).map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO social_states(state,provider,created_at,code_verifier,link_user) VALUES(?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&verifier), json!(&link_user)]).map_err(|e| bad(&e))?;
         let url = format!("{}/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
             x_web(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scope("x")), state, pkce_challenge(&verifier));
         return Ok(axum::response::Redirect::temporary(&url)); }
@@ -1780,41 +1904,156 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
     let nonce = oc::random_token("n");
     // PKCE wherever the provider supports it; Apple and Slack do not advertise S256.
     let verifier = if social_pkce(&provider, &disc) { oc::random_token("pkce") } else { String::new() };
-    st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier) VALUES(?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier)]).map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier,link_user) VALUES(?,?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier), json!(&link_user)]).map_err(|e| bad(&e))?;
     let scope = if provider == "oidc" { oidc_custom_scope() } else { social_scope(&provider).to_string() };
     let mut url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect), urlencode(&scope), state, nonce);
     if provider == "apple" { url.push_str("&response_mode=form_post"); }
     if !verifier.is_empty() { url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", pkce_challenge(&verifier))); }
     Ok(axum::response::Redirect::temporary(&url)) }
-async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let (client_id, client_secret) = social_provider(&provider).filter(|_| social_enabled(&provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     // Apple answers with a form POST; every other provider uses the query string.
     let params = if q.contains_key("code") || q.contains_key("state") { q } else { form.ok().map(|axum::extract::Form(f)| f).unwrap_or_default() };
     let code = params.get("code").cloned().unwrap_or_default(); let state = params.get("state").cloned().unwrap_or_default();
-    let row = st.db.one("SELECT provider,created_at,nonce,code_verifier FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
+    let row = st.db.one("SELECT provider,created_at,nonce,code_verifier,link_user FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     let _ = st.db.exec("DELETE FROM social_states WHERE state=?", &[json!(state)]);
     if db::s(&row, "provider") != provider || db::n(&row, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     if code.is_empty() { return Err(bad("missing authorization code")); }
+    let link_user = db::s(&row, "link_user");
     let redirect = social_redirect(&st, &h, &provider);
-    let (subject, email) = if provider == "github" {
-        github_identity(&client_id, &client_secret, &redirect, &code).await.map_err(|e| bad(&e))?
+    let (subject, email, issuer) = if provider == "github" {
+        let (subject, email) = github_identity(&client_id, &client_secret, &redirect, &code).await.map_err(|e| bad(&e))?;
+        (subject, email, String::new())
     } else if provider == "x" {
-        x_identity(&client_id, &client_secret, &redirect, &code, &db::s(&row, "code_verifier")).await.map_err(|e| bad(&e))?
+        let (subject, email) = x_identity(&client_id, &client_secret, &redirect, &code, &db::s(&row, "code_verifier")).await.map_err(|e| bad(&e))?;
+        (subject, email, String::new())
     } else if provider == "oidc" {
         let disc = custom_oidc_metadata().await?;
         let issuer = env_nonempty("OPENWARP_OIDC_ISSUER");
         let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
-        oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce, true, "oidc").await.map_err(|e| bad(&e))?
+        let ident = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce, true, "oidc", "", "oidc").await.map_err(|e| bad(&e))?;
+        (ident.subject, ident.email, ident.issuer)
     } else {
         let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
         let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
-        oidc_social_identity(&provider, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))? };
+        let ident = oidc_social_identity(&provider, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))?;
+        (ident.subject, ident.email, ident.issuer)
+    };
     // Bind a custom-OIDC identity to its issuer so a changed issuer cannot
     // inherit the bindings of the previous one.
     let bound_provider = if provider == "oidc" { format!("oidc:{}", env_nonempty("OPENWARP_OIDC_ISSUER")) } else { provider.clone() };
+    if !link_user.is_empty() {
+        if !st.principal_active(&link_user) { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+        if let Some(bound) = st.db.one("SELECT user_id FROM social_subjects WHERE provider=? AND subject=?", &[json!(&bound_provider), json!(&subject)]).map_err(|e| bad(&e))? {
+            if db::s(&bound, "user_id") != link_user { return Err(err(StatusCode::CONFLICT, "this identity is already linked to another account")); }
+        } else {
+            if let Some(mine) = st.db.one("SELECT subject FROM social_subjects WHERE provider=? AND user_id=?", &[json!(&bound_provider), json!(&link_user)]).map_err(|e| bad(&e))? {
+                if db::s(&mine, "subject") != subject { return Err(err(StatusCode::CONFLICT, "unlink the existing identity for this provider first")); } }
+            st.db.exec("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(&bound_provider), json!(&subject), json!(&link_user), json!(now())]).map_err(|e| bad(&e))?;
+        }
+        if !issuer.is_empty() { record_identity_binding(&st, &issuer, &subject, &link_user, &bound_provider); }
+        st.audit("", "", "", &link_user, "auth.identity_linked", &format!("{} {}", bound_provider, email));
+        return Ok(axum::response::Redirect::temporary(&format!("/#linked={}", provider)).into_response()); }
     let uid = resolve_social(&st, &bound_provider, &subject, &email)?;
+    if !issuer.is_empty() { record_identity_binding(&st, &issuer, &subject, &uid, &bound_provider); }
     let token = make_session(&st, &uid)?;
-    Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    Ok((hdr, axum::response::Redirect::temporary(&format!("/#token={}", token))).into_response()) }
+async fn my_identities(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h)?;
+    let social = st.db.query("SELECT provider,subject,created_at FROM social_subjects WHERE user_id=? ORDER BY created_at", &[json!(&uid)]).map_err(|e| bad(&e))?;
+    let oidc = st.db.query("SELECT issuer,subject,created_at FROM oidc_subjects WHERE user_id=? ORDER BY created_at", &[json!(&uid)]).map_err(|e| bad(&e))?;
+    Ok(j(json!({
+        "social": social.iter().map(db::obj).collect::<Vec<_>>(),
+        "oidc": oidc.iter().map(db::obj).collect::<Vec<_>>(),
+    }))) }
+async fn unlink_identity(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h)?;
+    let issuer = body.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
+    let provider = body.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+    let subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+    if subject.is_empty() { return Err(bad("subject is required")); }
+    let removed = if !issuer.is_empty() {
+        let n = st.db.exec("DELETE FROM oidc_subjects WHERE issuer=? AND subject=? AND user_id=?", &[json!(issuer), json!(subject), json!(&uid)]).map_err(|e| bad(&e))?;
+        if n > 0 { let _ = st.db.exec("DELETE FROM identity_bindings WHERE issuer=? AND subject=? AND user_id=?", &[json!(issuer), json!(subject), json!(&uid)]); }
+        n
+    } else {
+        if provider.is_empty() { return Err(bad("provider or issuer is required")); }
+        let n = st.db.exec("DELETE FROM social_subjects WHERE provider=? AND subject=? AND user_id=?", &[json!(provider), json!(subject), json!(&uid)]).map_err(|e| bad(&e))?;
+        if n > 0 { let _ = st.db.exec("DELETE FROM identity_bindings WHERE subject=? AND user_id=? AND provider=?", &[json!(subject), json!(&uid), json!(provider)]); }
+        n };
+    if removed == 0 { return Err(err(StatusCode::NOT_FOUND, "identity is not linked to this account")); }
+    st.audit("", "", "", &uid, "auth.identity_unlinked", if issuer.is_empty() { provider } else { issuer });
+    Ok(j(json!({"ok": true}))) }
+fn logout_claims(token: &str) -> Result<Value, String> {
+    let payload = token.split('.').nth(1).ok_or("logout_token is not a JWT")?;
+    b64url_json(payload).ok_or_else(|| "logout_token payload is not JSON".into()) }
+fn multi_tenant_issuer(issuer: &str) -> bool {
+    issuer.contains("{tenantid}") || issuer.contains("/common/") || issuer.contains("/organizations/") || issuer.contains("/consumers/") }
+async fn verify_logout_token(configured_issuer: &str, client_id: &str, token: &str, jwks_uri: &str) -> Result<Value, String> {
+    let unverified = logout_claims(token)?;
+    let token_iss = unverified.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+    if token_iss.is_empty() { return Err("logout_token has no iss".into()); }
+    if multi_tenant_issuer(configured_issuer) {
+        let base = configured_issuer.trim_end_matches("/v2.0").rsplit_once('/').map(|(p, _)| p).unwrap_or(configured_issuer);
+        if !token_iss.starts_with(&format!("{}/", base)) || !token_iss.ends_with("/v2.0") { return Err("logout_token issuer is not a tenant of the configured issuer".into()); }
+    } else if token_iss.trim_end_matches('/') != configured_issuer.trim_end_matches('/') { return Err("logout_token issuer does not match this provider".into()); }
+    let claims = verify_id_token(token, token_iss, client_id, jwks_uri).await?;
+    if claims.get("nonce").is_some() { return Err("logout_token must not contain a nonce".into()); }
+    let event = claims.get("events").and_then(|v| v.as_object()).map(|o| o.contains_key("http://schemas.openid.net/event/backchannel-logout")).unwrap_or(false);
+    if !event { return Err("logout_token does not carry the back-channel logout event".into()); }
+    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
+    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    if sub.is_empty() || jti.is_empty() { return Err("logout_token needs sub and jti".into()); }
+    if let Some(iat) = claims.get("iat").and_then(|v| v.as_i64()) {
+        let now = now(); if iat > now + 60 || now - iat > 300 { return Err("logout_token iat is outside the accepted window".into()); } }
+    Ok(claims) }
+fn apply_backchannel_logout(st: &S, issuer: &str, subject: &str, provider: &str) {
+    let Ok(Some(row)) = st.db.one("SELECT user_id FROM identity_bindings WHERE issuer=? AND subject=?", &[json!(issuer), json!(subject)]) else { return };
+    let uid = db::s(&row, "user_id");
+    let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]);
+    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE user_id=?", &[json!(&uid)]);
+    st.audit("", "", "", &uid, "auth.backchannel_logout", provider); }
+async fn social_backchannel_logout(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Path(provider): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Res {
+    let key = format!("bcl:{}", addr.ip());
+    if !st.rate_ok(&key, 60, 300) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many logout requests")); }
+    st.rate_fail(&key, 300);
+    if matches!(provider.as_str(), "github" | "x") { return Err(err(StatusCode::NOT_FOUND, "this provider does not support back-channel logout")); }
+    let (client_id, _) = social_provider(&provider).filter(|_| social_enabled(&provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let configured = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let disc = oidc_discovery(&configured).await?;
+    let jwks = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
+    if !url_ok(jwks) || !egress_allowed(jwks) { return Err(bad("OIDC discovery returned no usable jwks_uri")); }
+    let token = form.get("logout_token").cloned().unwrap_or_default();
+    if token.is_empty() { return Err(bad("logout_token is required")); }
+    let claims = verify_logout_token(&configured, &client_id, &token, jwks).await.map_err(|e| bad(&e))?;
+    let issuer = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    let _ = st.db.exec("DELETE FROM logout_replay WHERE expires_at<?", &[json!(now())]);
+    if st.db.exec("INSERT INTO logout_replay(jti,expires_at) VALUES(?,?)", &[json!(jti), json!(now() + 600)]).is_err() { return Err(bad("logout_token was already used")); }
+    apply_backchannel_logout(&st, &issuer, &subject, &provider);
+    Ok(j(json!({"ok": true}))) }
+async fn org_backchannel_logout(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Res {
+    let key = format!("bcl:{}", addr.ip());
+    if !st.rate_ok(&key, 60, 300) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many logout requests")); }
+    st.rate_fail(&key, 300);
+    let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid));
+    let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid));
+    if issuer.is_empty() || client_id.is_empty() { return Err(err(StatusCode::NOT_FOUND, "OIDC is not configured for this organisation")); }
+    let disc = oidc_discovery(&issuer).await?;
+    let jwks = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
+    if !url_ok(jwks) || !egress_allowed(jwks) { return Err(bad("OIDC discovery returned no usable jwks_uri")); }
+    let token = form.get("logout_token").cloned().unwrap_or_default();
+    if token.is_empty() { return Err(bad("logout_token is required")); }
+    let claims = verify_logout_token(&issuer, &client_id, &token, jwks).await.map_err(|e| bad(&e))?;
+    let token_iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    let _ = st.db.exec("DELETE FROM logout_replay WHERE expires_at<?", &[json!(now())]);
+    if st.db.exec("INSERT INTO logout_replay(jti,expires_at) VALUES(?,?)", &[json!(jti), json!(now() + 600)]).is_err() { return Err(bad("logout_token was already used")); }
+    apply_backchannel_logout(&st, &token_iss, &subject, &format!("oidc:{}", issuer));
+    Ok(j(json!({"ok": true}))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h)?;
     Ok(j(json!({
@@ -2880,7 +3119,8 @@ async fn main() {
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
-        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
+        .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback)).route("/api/auth/social/{provider}/backchannel-logout", post(social_backchannel_logout))
+        .route("/api/me/identities", get(my_identities)).route("/api/me/identities/unlink", post(unlink_identity))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
@@ -2899,7 +3139,7 @@ async fn main() {
         .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
-        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
+        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/{oid}/backchannel-logout", post(org_backchannel_logout)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))

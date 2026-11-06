@@ -125,10 +125,11 @@ document.addEventListener('keydown',e=>{
   }});
 
 // ---------- auth ----------
+const PROVIDERS=[['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X']];
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
   let btns=[];
-  for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X']]){
+  for(const [id,name] of PROVIDERS){
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">Continue with ${name}</button>`)}
   if(p.oidc)btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start'">Continue with ${esc(p.oidc_name||'SSO')}</button>`);
   $('social').innerHTML=btns.join('');
@@ -404,14 +405,19 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" style="min-width:260px"></div>
   <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
+  <div class="field"><label for="set-oidc-groups">Groups claim</label><input id="set-oidc-groups" value="${esc(s?.oidc_groups_claim||'')}" placeholder="groups" style="width:100%"></div>
+  <div class="field"><label for="set-oidc-roles">Group to role mapping (JSON, managed roles only)</label><textarea id="set-oidc-roles" rows="3" placeholder='{"openwarp-admins":"admin","openwarp-eng":"developer"}'>${esc(s?.oidc_group_roles||'')}</textarea></div>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
   ${samlCard}
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
-  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
-async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
+  <div class="card"><h3>Sign-in identities</h3><p>Link a provider to this account. A linked identity signs in to this user instead of creating another account.</p>
+  <div id="ident-list" class="mut small">Loading…</div><div id="ident-links" class="row" style="margin-top:10px;flex-wrap:wrap"></div></div>
+  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`;
+  renderIdentities(s)}
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value,oidc_groups_claim:$('set-oidc-groups').value,oidc_group_roles:$('set-oidc-roles').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
   if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
@@ -419,6 +425,20 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_aut
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
 async function saveSaml(){try{let b={idp_entity_id:$('set-saml-entity').value,metadata_url:$('set-saml-url').value,metadata_xml:$('set-saml-xml').value,allow_unsigned_metadata:$('set-saml-unsigned').checked,auto_provision:$('set-saml-auto').checked,allowed_domains:$('set-saml-domains').value};let d=await api('PUT',`/api/orgs/${ORG}/saml`,b);$('saml-out').textContent='SP metadata: '+d.sp_metadata_url;toast('SAML saved')}catch(e){toast(e.message,true)}}
+function providerName(p){if(p.startsWith('oidc:'))return 'SSO';const m=PROVIDERS.find(x=>x[0]===p);return m?m[1]:p}
+async function renderIdentities(s){try{
+  let [ids,prov]=await Promise.all([api('GET','/api/me/identities'),api('GET','/api/auth/providers')]);
+  let rows=[];
+  for(const x of (ids.social||[]))rows.push(`<div class="row" style="justify-content:space-between"><span class="mono small">${esc(providerName(x.provider))} · ${esc(x.subject)}</span><button class="ghost" onclick="unlinkIdentity('${jsq(x.provider)}','${jsq(x.subject)}','')">Unlink</button></div>`);
+  for(const x of (ids.oidc||[]))rows.push(`<div class="row" style="justify-content:space-between"><span class="mono small">SSO · ${esc(x.issuer)} · ${esc(x.subject)}</span><button class="ghost" onclick="unlinkIdentity('','${jsq(x.subject)}','${jsq(x.issuer)}')">Unlink</button></div>`);
+  let list=$('ident-list');if(list)list.innerHTML=rows.join('')||'No linked provider identities.';
+  let links=[];
+  for(const [id,name] of PROVIDERS){if(prov[id])links.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start?link=1'">Link ${name}</button>`)}
+  if(prov.oidc)links.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start?link=1'">Link ${esc(prov.oidc_name||'SSO')}</button>`);
+  if(s&&s.oidc_issuer&&s.oidc_client_id)links.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/oidc/${encodeURIComponent(ORG)}/start?link=1'">Link workspace SSO</button>`);
+  let box=$('ident-links');if(box)box.innerHTML=links.join('')||'<span class="mut small">No provider is configured on this instance.</span>';
+}catch(e){let list=$('ident-list');if(list)list.textContent='Could not load linked identities: '+(e.message||e)}}
+async function unlinkIdentity(provider,subject,issuer){try{await api('POST','/api/me/identities/unlink',{provider,subject,issuer});toast('Identity unlinked');renderIdentities()}catch(e){toast(e.message,true)}}
 async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
@@ -444,6 +464,7 @@ function boot(){
     history.replaceState(null,'',location.pathname);}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
+  else if(h.startsWith('linked=')){history.replaceState(null,'',location.pathname);toast('Sign-in identity linked');}
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);

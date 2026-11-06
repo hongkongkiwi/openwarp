@@ -184,6 +184,7 @@ async function consoleUI(secrets = [saved]) {
   const calls = [], unexpected = [], confirmations = [], timers = [];
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/me/identities': { social: [], oidc: [] },
     '/api/instance': { instance_owner: false },
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
