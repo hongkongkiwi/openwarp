@@ -312,7 +312,7 @@ async fn org_sso_requires_an_invite_when_signups_are_closed() {
             Method::PUT,
             &format!("/api/orgs/{}/settings", org),
             Some(ot),
-            Some(json!({"oidc_issuer": idp, "oidc_client_id": "test-google", "oidc_client_secret": "secret", "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)})),
+            Some(json!({"oidc_issuer": idp, "oidc_client_id": "test-google", "oidc_client_secret": "secret", "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base), "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid"})),
         )
         .await;
     assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);

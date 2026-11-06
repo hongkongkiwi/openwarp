@@ -967,7 +967,7 @@ async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum
     let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
     Ok(axum::response::Redirect::temporary(&url)) }
 fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
-#[derive(serde::Deserialize)] struct Claims { email: Option<String>, sub: String, #[serde(default)] nonce: Option<String> }
+#[derive(serde::Deserialize)] struct Claims { email: Option<String>, sub: String, #[serde(default)] nonce: Option<String>, #[serde(default)] email_verified: Option<bool> }
 async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let srow = st.db.one("SELECT org_id,created_at,nonce FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
@@ -991,13 +991,20 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     let data = jsonwebtoken::decode::<Claims>(id_token, &dkey, &validation).map_err(|e| bad(&format!("id_token verification failed: {}", e)))?;
     if let Some(returned) = &data.claims.nonce { if !expected_nonce.is_empty() && *returned != expected_nonce { return Err(bad("id_token nonce does not match this login attempt")); } }
     let email = data.claims.email.ok_or_else(|| bad("id_token has no email"))?.to_lowercase();
+    if data.claims.email_verified == Some(false) { return Err(bad("id_token email is not verified")); }
     let subject = data.claims.sub.clone(); let issuer_key = issuer.clone();
-    // An SSO login may attach an account to this organisation only through the
-    // instance signup policy or a pending invite, exactly like social sign-in.
+    // An SSO login may attach an account to this organisation only through a
+    // pending invite, or when the org explicitly enables auto-provisioning for
+    // this email domain. Instance-wide signups are not enough.
     let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&email), json!(&oid), json!(now())]).map_err(|e| bad(&e))?;
+    let auto = meta_get(&st, &format!("oidc_auto_provision:{}", oid)) == "1";
+    let domains = meta_get(&st, &format!("oidc_allowed_domains:{}", oid));
+    let domain = email.split('@').nth(1).unwrap_or("");
+    let domain_ok = domains.is_empty() || domains.split(',').any(|d| d.trim().eq_ignore_ascii_case(domain));
+    let provision_allowed = pending.is_some() || (auto && domain_ok && signups_open(&st));
     let uid = if let Some(bound) = st.db.one("SELECT user_id FROM oidc_subjects WHERE issuer=? AND subject=?", &[json!(issuer_key), json!(subject)]).map_err(|e| bad(&e))? { db::s(&bound, "user_id") } else {
         if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity")); }
-        if pending.is_none() && !signups_open(&st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
+        if !provision_allowed { return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings")); }
         let kp = oc::Keypair::generate(); let pw = oc::random_token("oidc"); let nid = id();
         st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(nid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO oidc_subjects(issuer,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(issuer_key), json!(subject), json!(nid), json!(now())]).map_err(|e| bad(&e))?;
@@ -1008,10 +1015,10 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
         if let Some(inv) = &pending {
             st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&oid), json!(&uid), json!(db::s(inv, "role"))]).map_err(|e| bad(&e))?;
             let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]);
-        } else if signups_open(&st) {
+        } else if auto && domain_ok && signups_open(&st) {
             st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(&oid), json!(&uid)]).map_err(|e| bad(&e))?;
         } else {
-            return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you"));
+            return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
         } }
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
     let token = make_session(&st, &uid)?;

@@ -805,7 +805,8 @@ fn start_idp(email: &str) -> String {
 async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &str) -> String {
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(session), Some(json!({
         "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
-        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)}))).await;
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid"}))).await;
     assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
     assert_eq!(r.status, 307, "oidc start failed: {}", r.text);
@@ -938,4 +939,22 @@ async fn secure_cookie_flag_follows_the_public_url() {
     let r = tls.call(Method::POST, "/api/auth/register", None, Some(json!({"email": "cookie2@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(r.status, 200, "register failed: {}", r.text);
     assert!(r.header("set-cookie").contains("Secure"), "https public URL must set the Secure flag: {}", r.header("set-cookie"));
+}
+
+#[tokio::test]
+async fn oidc_new_users_need_org_auto_provisioning() {
+    let s = Server::start().await;
+    let owner = register(&s, "oidc-policy@test.invalid").await;
+    let token = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let idp = start_idp("oidc-nopolicy@test.invalid");
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
+        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
+    assert_eq!(r.status, 307, "{}", r.text);
+    let state = parse_query(&r.header("location")).get("state").cloned().expect("state");
+    let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
+    assert_eq!(r.status, 403, "an org without auto-provisioning must not admit a new SSO user, got {} {}", r.status, r.text);
 }
