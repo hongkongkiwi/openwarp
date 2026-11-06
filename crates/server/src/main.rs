@@ -46,10 +46,14 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 fn hmac_hex(key: &[u8], data: &[u8]) -> String { hmac_sha256(key, data).iter().map(|b| format!("{:02x}", b)).collect() }
 // Reuse detection stores a keyed digest, never a bare hash: an operator with
 // the database but not the master key cannot test a password list offline.
-fn value_fingerprint(master: &[u8; 32], value: &str) -> String {
+// The workspace id is part of the input so equal values in two workspaces do
+// not produce equal fingerprints.
+fn value_fingerprint(master: &[u8; 32], org: &str, value: &str) -> String {
     let key = hmac_sha256(master, b"openwarp:reuse-fingerprint-key:v1");
-    let mut data = Vec::with_capacity(31 + value.len());
+    let mut data = Vec::with_capacity(32 + org.len() + value.len());
     data.extend_from_slice(b"openwarp:reuse-fingerprint:v1\0");
+    data.extend_from_slice(org.as_bytes());
+    data.push(0);
     data.extend_from_slice(value.as_bytes());
     hmac_hex(&key, &data) }
 fn hex_encode(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).collect() }
@@ -559,7 +563,7 @@ async fn clone_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         let s = SecretIn{ key: raw["key"].as_str().unwrap_or("").into(), value: raw["value"].as_str().unwrap_or("").into(), path: raw["path"].as_str().unwrap_or("/").into(), comment: raw["comment"].as_str().unwrap_or("").into(), tags: raw["tags"].as_str().unwrap_or("").into(), secret_type: stype.into() };
         let khash = oc::hash_token(&format!("{}:{}", s.path, s.key.to_uppercase()));
         if !overwrite && st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(target), json!(&khash)]).await.map_err(|e| bad(&e))?.is_some() { skipped += 1; continue; }
-        upsert_secret(&st, target, &key, &uid, &s).await?; cloned += 1;
+        upsert_secret(&st, target, &org, &key, &uid, &s).await?; cloned += 1;
     }
     let sync_errors = trigger_sync(&st, target, &uid).await;
     st.audit(&org, &app, &eid, &uid, "env.clone", &format!("{}->{} cloned={} skipped={}", eid, target, cloned, skipped)).await;
@@ -598,10 +602,10 @@ async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
         if rules.is_empty() { None } else { Some(json!({"key": s.key, "path": s.path, "rules": rules})) }
     }).collect();
     let key = st.env_key(&eid).await?; let mut count = 0;
-    for s in &inputs { if s.key.trim().is_empty() { continue; } upsert_secret(&st, &eid, &key, &uid, s).await?; count += 1; }
+    for s in &inputs { if s.key.trim().is_empty() { continue; } upsert_secret(&st, &eid, &org, &key, &uid, s).await?; count += 1; }
     st.audit(&org, &app, &eid, &uid, "secret.deploy", &format!("{} secrets", count)).await;
     let sync_errors = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"deployed": count, "sync_errors": sync_errors, "scan_findings": scan_findings}))) }
-async fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> Result<(), (StatusCode, Json<Value>)> {
+async fn upsert_secret(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> Result<(), (StatusCode, Json<Value>)> {
     let kname = s.key.trim().to_uppercase();
     if !valid_secret_key(&kname) { return Err(bad("secret key must match [A-Za-z0-9_.-]{1,128}")); }
     if !valid_path(&s.path) { return Err(bad("secret path must be 1-256 printable characters")); }
@@ -614,7 +618,7 @@ async fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn
     // Only real secret values are indexed. Sealed values are excluded so a
     // match cannot confirm a value the caller is not allowed to read; config
     // and public ssh keys are not credentials.
-    let fp = if stype == "secret" && !s.value.is_empty() { value_fingerprint(&st.master(), &s.value) } else { String::new() };
+    let fp = if stype == "secret" && !s.value.is_empty() { value_fingerprint(&st.master(), org, &s.value) } else { String::new() };
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
         st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(&fp), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(ver), json!(oc::encrypt_symmetric(key, kname.as_bytes())), json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(stype), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
@@ -644,7 +648,7 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?; let new_ver = cur.map(|r| db::n(&r,"version")).unwrap_or(0) + 1;
     let restored_fp = if db::s(&v,"secret_type") == "secret" {
         key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
-            .map(|b| value_fingerprint(&st.master(), &String::from_utf8_lossy(&b))).unwrap_or_default()
+            .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
     } else { String::new() };
     st.db.exec("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?", &[json!(db::s(&v,"value_enc")), json!(&restored_fp), json!(db::s(&v,"comment_enc")), json!(new_ver), json!(now()), json!(uid), json!(sid)]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
@@ -676,45 +680,47 @@ async fn reuse_check(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     if !st.reuse_enabled(&org, &app).await { return Ok(j(json!({"enabled": false, "matches": []}))); }
     let mut candidates: Vec<(usize, String, String, String)> = Vec::new();
-    for (index, s) in r.secrets.iter().take(100).enumerate() {
+    for (index, s) in r.secrets.iter().enumerate() {
         let stype = if s.secret_type.is_empty() { "secret" } else { s.secret_type.as_str() };
         if stype != "secret" || s.value.is_empty() { continue; }
-        candidates.push((index, value_fingerprint(&st.master(), &s.value), s.key.clone(), s.path.clone()));
+        candidates.push((index, value_fingerprint(&st.master(), &org, &s.value), s.key.clone(), s.path.clone()));
     }
     if candidates.is_empty() { return Ok(j(json!({"enabled": true, "matches": []}))); }
-    let mut params: Vec<Value> = vec![json!(&org)];
-    let mut marks: Vec<&str> = Vec::new();
-    for c in &candidates { marks.push("?"); params.push(json!(&c.1)); }
-    let sql = format!("SELECT s.id AS id,s.env_id AS env_id,s.key_enc AS key_enc,s.path AS path,s.value_fp AS value_fp,s.updated_at AS updated_at,s.updated_by AS updated_by,e.name AS env_name,a.id AS app_id,a.name AS app_name \
-        FROM secrets s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id \
-        WHERE a.org_id=? AND s.deleted=0 AND s.e2e=0 AND s.secret_type='secret' AND s.value_fp IN ({})", marks.join(","));
-    let rows = st.db.query(&sql, &params).await.map_err(|e| bad(&e))?;
     let mut visible: HashMap<String, bool> = HashMap::new();
     let mut env_keys: HashMap<String, [u8; 32]> = HashMap::new();
     let mut by_fp: HashMap<String, Vec<Value>> = HashMap::new();
-    for row in &rows {
-        let sid = db::s(row, "id");
-        if r.exclude.iter().any(|x| x == &sid) { continue; }
-        let menv = db::s(row, "env_id");
-        // An environment-scoped token stays confined to its own environment
-        // even when the person behind it could open the others.
-        if st.check_scope(&h, &menv).await.is_err() { continue; }
-        let allowed = match visible.get(&menv) {
-            Some(v) => *v,
-            None => { let v = st.require_env(&menv, &uid).await.is_ok(); visible.insert(menv.clone(), v); v },
-        };
-        if !allowed { continue; }
-        let key = match env_keys.get(&menv) {
-            Some(k) => *k,
-            None => { match st.env_key(&menv).await { Ok(k) => { env_keys.insert(menv.clone(), k); k }, Err(_) => continue } },
-        };
-        let matched_key = oc::decrypt_symmetric(&key, &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-        by_fp.entry(db::s(row, "value_fp")).or_default().push(json!({
-            "secret_id": sid, "key": matched_key, "path": db::s(row, "path"),
-            "app_id": db::s(row, "app_id"), "app_name": db::s(row, "app_name"),
-            "env_id": menv, "env_name": db::s(row, "env_name"),
-            "updated_at": db::n(row, "updated_at"), "updated_by": db::s(row, "updated_by")
-        }));
+    for chunk in candidates.chunks(100) {
+        let mut params: Vec<Value> = vec![json!(&org)];
+        let mut marks: Vec<&str> = Vec::new();
+        for c in chunk { marks.push("?"); params.push(json!(&c.1)); }
+        let sql = format!("SELECT s.id AS id,s.env_id AS env_id,s.key_enc AS key_enc,s.path AS path,s.value_fp AS value_fp,s.updated_at AS updated_at,e.name AS env_name,a.id AS app_id,a.name AS app_name \
+            FROM secrets s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id \
+            WHERE a.org_id=? AND s.deleted=0 AND s.e2e=0 AND s.secret_type='secret' AND s.value_fp IN ({})", marks.join(","));
+        let rows = st.db.query(&sql, &params).await.map_err(|e| bad(&e))?;
+        for row in &rows {
+            let sid = db::s(row, "id");
+            if r.exclude.iter().any(|x| x == &sid) { continue; }
+            let menv = db::s(row, "env_id");
+            // An environment-scoped token stays confined to its own environment
+            // even when the person behind it could open the others.
+            if st.check_scope(&h, &menv).await.is_err() { continue; }
+            let allowed = match visible.get(&menv) {
+                Some(v) => *v,
+                None => { let v = st.require_env(&menv, &uid).await.is_ok(); visible.insert(menv.clone(), v); v },
+            };
+            if !allowed { continue; }
+            let key = match env_keys.get(&menv) {
+                Some(k) => *k,
+                None => { match st.env_key(&menv).await { Ok(k) => { env_keys.insert(menv.clone(), k); k }, Err(_) => continue } },
+            };
+            let matched_key = oc::decrypt_symmetric(&key, &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+            by_fp.entry(db::s(row, "value_fp")).or_default().push(json!({
+                "secret_id": sid, "key": matched_key, "path": db::s(row, "path"),
+                "app_id": db::s(row, "app_id"), "app_name": db::s(row, "app_name"),
+                "env_id": menv, "env_name": db::s(row, "env_name"),
+                "updated_at": db::n(row, "updated_at")
+            }));
+        }
     }
     let mut matches: Vec<Value> = Vec::new();
     for (index, fp, key, path) in &candidates {
@@ -902,7 +908,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
             if initial == "import_local" && existing.contains_key(&kname) { continue; }
             if initial == "import_remote" && existing.get(&kname).map(String::as_str) == Some("sealed") { skipped.push(format!("{} (sealed)", kname)); continue; }
             let s = SecretIn { key: kname, value, path: "/".into(), comment: "imported by integration sync".into(), tags: "import".into(), secret_type: "secret".into() };
-            upsert_secret(st, &eid, &env_key, uid, &s).await?;
+            upsert_secret(st, &eid, &org, &env_key, uid, &s).await?;
             count += 1;
         }
         st.audit(&org, &app, &eid, uid, "integration.import", &format!("{} keys from {}", count, kind)).await;
@@ -962,7 +968,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
                 let tomb_at = if was_deleted { if del_at > 0 { del_at } else { now() } } else { 0 };
                 let fp = if db::s(&v,"secret_type") == "secret" {
                     key.as_ref().and_then(|k| oc::decrypt_symmetric(k, &db::s(&v,"value_enc")).ok())
-                        .map(|b| value_fingerprint(&st.master(), &String::from_utf8_lossy(&b))).unwrap_or_default()
+                        .map(|b| value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&b))).unwrap_or_default()
                 } else { String::new() };
                 st.db.exec("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?",
                     &[json!(db::s(&v,"key_enc")), json!(db::s(&v,"value_enc")), json!(&fp), json!(db::s(&v,"comment_enc")), json!(db::s(&v,"secret_type")), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)]).await.map_err(|e| bad(&e))?;
@@ -1063,7 +1069,7 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let new_val = body.get("value").and_then(|v|v.as_str()).map(|s|s.to_string()).unwrap_or_else(|| oc::random_token("rot"));
     let key = st.env_key(&eid).await?; let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
     let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
-    upsert_secret(&st,&eid,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()}).await?;
+    upsert_secret(&st,&eid,&org,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into()}).await?;
     st.audit(&org,&app,&eid,&uid,"secret.rotate",key_name).await;
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
     let rotation_hook_error = fire_rotation_hook(&st, &org, &eid, key_name, &new_val).await;
@@ -1194,6 +1200,7 @@ async fn backfill_value_fingerprints(st: &S) {
     if st.db.one("SELECT v FROM meta WHERE k='migration:value_fp'", &[]).await.ok().flatten().is_some() { return; }
     let rows = match st.db.query("SELECT id,env_id,value_enc,secret_type,e2e FROM secrets WHERE value_fp='' AND deleted=0", &[]).await { Ok(rows) => rows, Err(_) => return };
     let mut keys: HashMap<String, [u8; 32]> = HashMap::new();
+    let mut orgs: HashMap<String, String> = HashMap::new();
     let mut failed = false;
     for row in &rows {
         if db::n(row, "e2e") == 1 || db::s(row, "secret_type") != "secret" { continue; }
@@ -1202,9 +1209,13 @@ async fn backfill_value_fingerprints(st: &S) {
             Some(k) => *k,
             None => match st.env_key(&eid).await { Ok(k) => { keys.insert(eid.clone(), k); k }, Err(_) => continue },
         };
+        let org = match orgs.get(&eid) {
+            Some(o) => o.clone(),
+            None => match st.env_org_app(&eid).await { Ok((o, _)) => { orgs.insert(eid.clone(), o.clone()); o }, Err(_) => continue },
+        };
         let value = match oc::decrypt_symmetric(&key, &db::s(row, "value_enc")) { Ok(v) => v, Err(_) => continue };
         if value.is_empty() { continue; }
-        let fp = value_fingerprint(&st.master(), &String::from_utf8_lossy(&value));
+        let fp = value_fingerprint(&st.master(), &org, &String::from_utf8_lossy(&value));
         // If a concurrent write replaced the ciphertext, keep the fingerprint
         // that write just computed instead of overwriting it with a stale one.
         if st.db.exec("UPDATE secrets SET value_fp=? WHERE id=? AND value_enc=?", &[json!(fp), json!(db::s(row, "id")), json!(db::s(row, "value_enc"))]).await.is_err() { failed = true; }
@@ -2334,6 +2345,11 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
         result
     }).await.map_err(|e| bad(&e.to_string()))?;
     updates?;
+    // Fingerprints are keyed by the master key and salted by workspace, so the
+    // old ones are invalid. Clear them and rebuild the index off the request.
+    let _ = st.db.exec("UPDATE secrets SET value_fp=''", &[]).await;
+    let _ = st.db.exec("DELETE FROM meta WHERE k='migration:value_fp'", &[]).await;
+    { let st2 = st.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={} saml={} hooks={}", counts.0, counts.1, counts.2, counts.3, counts.4, counts.5)).await;
     Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 
@@ -2466,7 +2482,7 @@ async fn decide_proposal(State(st): State<S>, h: HeaderMap, Path((pid, action)):
         let key = st.env_key(&eid).await?; let plain = oc::decrypt_symmetric(&key, &db::s(&row,"payload_enc")).map_err(|e| bad(&e))?;
         let items: Vec<Value> = serde_json::from_slice(&plain).unwrap_or_default(); let mut count = 0;
         for it in &items { let s = SecretIn{ key: it["key"].as_str().unwrap_or("").into(), value: it["value"].as_str().unwrap_or("").into(), path: it["path"].as_str().unwrap_or("/").into(), comment: it["comment"].as_str().unwrap_or("").into(), tags: it["tags"].as_str().unwrap_or("").into(), secret_type: it["type"].as_str().unwrap_or("secret").into() };
-            if !s.key.is_empty() { upsert_secret(&st, &eid, &key, &uid, &s).await?; count += 1; } }
+            if !s.key.is_empty() { upsert_secret(&st, &eid, &org, &key, &uid, &s).await?; count += 1; } }
         st.db.exec("UPDATE proposals SET status='approved',decided_by=? WHERE id=?", &[json!(uid), json!(pid)]).await.map_err(|e| bad(&e))?;
         st.audit(&org,&app,&eid,&uid,"proposal.approve",&format!("{} applied {} secrets",pid,count)).await; let sync_errors = trigger_sync(&st,&eid,&uid).await;
         Ok(j(json!({"status":"approved","applied":count,"sync_errors":sync_errors})))
@@ -2946,6 +2962,7 @@ async fn process_rotations(st: &S) {
         if claimed == 0 { continue; }
         let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.ok().flatten().map(|x| db::s(&x,"mode")).unwrap_or_default();
         if mode == "e2e" { continue; }
+        let (org, _) = st.env_org_app(&eid).await.unwrap_or_default();
         let path = { let p = db::s(r,"path"); if p.is_empty() { "/".to_string() } else { p } };
         let khash = oc::hash_token(&format!("{}:{}", path, key_name.to_uppercase()));
         let existing = st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(&eid), json!(&khash)]).await.ok().flatten();
@@ -2983,7 +3000,7 @@ async fn process_rotations(st: &S) {
             };
             let new_val = rotated.as_ref().map(|v| v.value.clone()).unwrap_or_else(|| oc::random_token("rot"));
             let s = SecretIn{ key: key_name.clone(), value: new_val.clone(), path: path.clone(), comment: "scheduled rotation".into(), tags: "".into(), secret_type: stype };
-            if upsert_secret(st, &eid, &key, "rotation-scheduler", &s).await.is_ok() {
+            if upsert_secret(st, &eid, &org, &key, "rotation-scheduler", &s).await.is_ok() {
                 if let Ok((org, app)) = st.env_org_app(&eid).await {
                     st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&key_name).await;
                     if let Some(err) = fire_rotation_hook(st, &org, &eid, &key_name, &new_val).await {
@@ -3288,7 +3305,7 @@ async fn mcp_call(st: &S, uid: &str, h: &HeaderMap, params: &Value) -> Result<Va
             Ok(text(json!(hits))) }
         "set_secret" => { let eid = arg("env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, _) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "secrets:write").await.map_err(|_| "forbidden".to_string())?;
             let key = st.env_key(&eid).await.map_err(|_| "env key failed".to_string())?; let s = SecretIn{ key: arg("key"), value: arg("value"), path: { let p = arg("path"); if p.is_empty() { "/".into() } else { p } }, comment: "via MCP".into(), tags: "".into(), secret_type: "secret".into() };
-            upsert_secret(st, &eid, &key, uid, &s).await.map_err(|_| "write failed".to_string())?; mcp_env_audit(st, uid, &eid, "mcp.set_secret", &s.key).await; Ok(text(json!({"ok": true}))) }
+            upsert_secret(st, &eid, &org, &key, uid, &s).await.map_err(|_| "write failed".to_string())?; mcp_env_audit(st, uid, &eid, "mcp.set_secret", &s.key).await; Ok(text(json!({"ok": true}))) }
         "delete_secret" => { let eid = arg("env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, _) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "secrets:delete").await.map_err(|_| "forbidden".to_string())?;
             let items = st.list_secrets_decrypted(&eid, uid).await.map_err(|_| "read failed".to_string())?; let sid = items.iter().find(|(k, _, _)| k == &arg("key").to_uppercase()).map(|(_, _, raw)| raw["id"].as_str().unwrap_or("").to_string()).ok_or("secret not found")?;
             st.db.exec("UPDATE secrets SET deleted=1,updated_at=? WHERE id=?", &[json!(now()), json!(sid)]).await?; mcp_env_audit(st, uid, &eid, "mcp.delete_secret", &arg("key")).await; Ok(text(json!({"ok": true}))) }

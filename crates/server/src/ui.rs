@@ -359,7 +359,7 @@ async function stageEdit(id){let d=drafts()[id];let s=d||SECRETS.find(x=>x.id===
   let value=$('ed-val').value,comment=$('ed-comment').value;
   let changed=!d||d.value!==value;
   if(changed&&(s.type||'secret')==='secret'&&value){
-    let matches=await reusePreflight([{key:s.key,value,path:s.path||'/',type:'secret'}],d?[]:[s.id]);
+    let matches=await reusePreflight([{key:s.key,value,path:s.path||'/',type:'secret'}],[s.id]);
     if(matches.length){reuseWarn(matches,()=>commitEdit(id,s,value,comment),()=>editRow(id,{value,comment}));return}
   }
   commitEdit(id,s,value,comment)}

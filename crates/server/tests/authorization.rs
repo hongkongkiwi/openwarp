@@ -1356,6 +1356,74 @@ async fn rotation_schedules_store_provider_adapters_without_leaking_config() {
     assert_eq!(relay.body["kind"], json!("webhook"));
 }
 
+#[tokio::test]
+async fn reuse_check_confines_environment_scoped_tokens() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-scope@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "scoped-value").await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(token), Some(json!({"name": "scoped", "env_id": envs[1]}))).await;
+    assert_eq!(r.status, 200, "token create failed: {}", r.text);
+    let scoped = r.body["token"].as_str().expect("scoped token").to_string();
+    let candidates = json!([{"key": "NEW_PASSWORD", "value": "scoped-value", "path": "/", "type": "secret"}]);
+
+    let r = reuse_check(&s, &scoped, &envs[1], candidates.clone(), json!([])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0),
+        "an environment-scoped token must not see another environment: {}", r.text);
+
+    let r = reuse_check(&s, &scoped, &envs[0], candidates, json!([])).await;
+    assert_eq!(r.status, 403, "the token is confined to its own environment: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_refreshes_fingerprints_after_restore() {
+    let s = Server::start().await;
+    let u = register(&s, "reuse-restore@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "RESTORED_PASSWORD", "old-value").await;
+    set_secret(&s, token, &envs[0], "RESTORED_PASSWORD", "new-value").await;
+    let sid = secret_id(&s, token, &envs[0], "RESTORED_PASSWORD").await;
+    let r = s.call(Method::POST, &format!("/api/secrets/{}/restore/1", sid), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "restore failed: {}", r.text);
+
+    let r = check_value(&s, token, &envs[1], "old-value").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(1),
+        "the restored value must be indexed again: {}", r.text);
+    let r = check_value(&s, token, &envs[1], "new-value").await;
+    assert_eq!(r.body["matches"].as_array().map(|m| m.len()), Some(0),
+        "the replaced value must not match: {}", r.text);
+}
+
+#[tokio::test]
+async fn reuse_check_survives_master_key_rotation() {
+    let s = Server::start().await;
+    let owner = register(&s, "reuse-rotate@test.invalid").await;
+    let token = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "SHARED_PASSWORD", "rotation-value").await;
+
+    // 32 bytes of 0x01, base64. The value is irrelevant as long as it is not
+    // the generated key already in use.
+    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token),
+        Some(json!({"new_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}))).await;
+    assert_eq!(r.status, 200, "rotation failed: {}", r.text);
+
+    // The re-index runs off the request, so poll for the rebuilt fingerprint.
+    let mut matched = false;
+    for _ in 0..60 {
+        let r = check_value(&s, token, &envs[1], "rotation-value").await;
+        if r.body["matches"].as_array().map(|m| m.len()) == Some(1) { matched = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(matched, "the index must be rebuilt under the new master key");
+}
+
 // ---------- password reuse detection ----------
 
 async fn reuse_check(s: &Server, token: &str, env: &str, secrets: Value, exclude: Value) -> Resp {

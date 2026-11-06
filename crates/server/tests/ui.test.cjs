@@ -173,7 +173,7 @@ function hidden(element) {
 const saved = { id: 'saved-secret', key: 'DATABASE_URL', value: 'fixture-original', path: '/service', type: 'secret', version: 2 };
 const draft = { key: 'NEW_CONFIG', value: 'fixture-draft', path: '/draft', type: 'config', comment: '' };
 
-async function consoleUI(secrets = [saved], reuse = []) {
+async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const document = new Element('document', null);
   document.ownerDocument = document;
   document.getElementById = id => document.querySelector('#' + id);
@@ -215,7 +215,10 @@ async function consoleUI(secrets = [saved], reuse = []) {
       calls.push(call);
       let body;
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
-      else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) body = { enabled: true, matches: reuse };
+      else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
+        if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
+        body = { enabled: true, matches: (call.body.exclude || []).includes('saved-secret') ? [] : reuse };
+      }
       else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
       else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
@@ -616,4 +619,30 @@ test('workspace and app settings expose the reuse switch', async () => {
   const appPut = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/apps/app-a/settings');
   assert.ok(appPut, 'saving app settings must reach the app endpoint');
   assert.equal(appPut.body.reuse_check, false, 'the app switch must be saved');
+});
+
+test('re-editing a draft back to its stored value does not match itself', async () => {
+  const ui = await consoleUI([saved], [reuseMatch]);
+  await ui.click(ui.button(ui.row('DATABASE_URL'), /^Edit$/));
+  ui.el('ed-val').value = 'fixture-changed';
+  await ui.click(ui.button(ui.el('modal'), /^Stage (change|secret)$/));
+  assert.ok(!hidden(ui.el('deploybar')), 'the changed value becomes a draft');
+  await ui.click(ui.button(ui.row('DATABASE_URL'), /^Edit$/));
+  assert.equal(ui.el('ed-val').value, 'fixture-changed', 'the draft value reopens');
+  ui.el('ed-val').value = 'fixture-original';
+  await ui.click(ui.button(ui.el('modal'), /^Stage (change|secret)$/));
+  const preflights = ui.calls.filter(c => /reuse-check$/.test(c.url));
+  assert.ok(preflights.length >= 1, 'the edit must run the preflight');
+  assert.deepEqual(preflights[preflights.length - 1].body.exclude, ['saved-secret'],
+    'editing a stored secret must exclude its own id');
+  assert.ok(!ui.el('modalwrap').classList.contains('show'),
+    'returning to the stored value must not warn about itself');
+});
+
+test('a failed reuse preflight leaves staging available', async () => {
+  const ui = await consoleUI([saved], [], { reuseFail: true });
+  await ui.add({ ...draft, type: 'secret' });
+  assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
+  assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
+  assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
 });
