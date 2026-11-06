@@ -355,7 +355,10 @@ fn parse_tags(tags: &str) -> Vec<(String, String)> {
 fn config_tags(config: &Value) -> Result<Vec<(String, String)>, String> {
     match config.get("tags") {
         None => Ok(Vec::new()),
-        Some(Value::Object(map)) => map.iter().map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())).ok_or_else(|| format!("sync tag {:?} must have a string value", key))).collect(),
+        Some(Value::Object(map)) => map.iter().map(|(key, value)| {
+            if key.trim().is_empty() { return Err("sync tag key must not be empty".into()); }
+            value.as_str().map(|v| (key.clone(), v.to_string())).ok_or_else(|| format!("sync tag {:?} must have a string value", key))
+        }).collect(),
         Some(_) => Err("sync tags must be an object of string values".into()),
     }
 }
@@ -396,10 +399,31 @@ pub fn validate_sync_config(kind: &str, config: &Value) -> Result<(), String> {
     for key in ["include_subfolders", "disable_secret_deletion"] {
         if let Some(value) = config.get(key) { if !value.is_boolean() { return Err(format!("{} must be a boolean", key)); } }
     }
+    if let Some(value) = config.get("initial_sync") {
+        let initial = value.as_str().ok_or("initial_sync must be overwrite, import_local or import_remote")?;
+        if !matches!(initial, "overwrite" | "import_local" | "import_remote") { return Err("initial_sync must be overwrite, import_local or import_remote".into()); }
+        if initial != "overwrite" {
+            if kind == "azure_key_vault" { return Err("initial import is not supported for azure_key_vault".into()); }
+            if !path_selected(config, "/") { return Err("initial import requires the root path to be selected".into()); }
+        }
+    }
+    if kind == "vercel" {
+        if let Some(target) = config.get("target") {
+            let valid = match target {
+                Value::String(value) => matches!(value.as_str(), "" | "all" | "production" | "preview" | "development"),
+                Value::Array(items) => !items.is_empty() && items.iter().all(|item| matches!(item.as_str(), Some("production" | "preview" | "development"))),
+                _ => false,
+            };
+            if !valid { return Err("vercel target must be all, a target name, or a non-empty array of target names".into()); }
+        }
+        if let Some(value) = config.get("type") {
+            if !matches!(value.as_str(), Some("" | "plain" | "encrypted" | "sensitive")) { return Err("vercel type must be plain, encrypted or sensitive".into()); }
+        }
+    }
     let caps = capabilities(kind);
     if config.get("tags").is_some() && !caps.metadata_tags { return Err(format!("{} does not support sync tags", kind)); }
     if caps.metadata_tags { config_tags(config)?; }
-    let absent = cfg(config, "absent");
+    let absent = match config.get("absent") { Some(value) => value.as_str().ok_or("absent must be a string")?, None => "" };
     if !absent.is_empty() {
         if absent != "keep" && absent != "disable" { return Err(format!("absent must be keep or disable (got {:?})", absent)); }
         if absent == "disable" && !caps.disable_absent { return Err(format!("{} does not support absent: disable", kind)); }

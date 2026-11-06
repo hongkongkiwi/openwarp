@@ -105,8 +105,8 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | `hetzner` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. The API cannot replace key material, so a changed key is deleted and created again and its numeric id changes |
 | `linode` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. A changed key is deleted and created again, so its id changes |
 | `digitalocean_ssh` | `token` | Account SSH keys at `/v2/account/keys`, taken only from secrets of type `ssh_key`. Distinct from `digitalocean`, which updates an App Platform spec. A changed key is deleted and created again |
-| `gcp_secret_manager` | `token`, `project`; optional `tags` | Creates/versions secrets; lowercases names and replaces underscores with hyphens; tags become labels |
-| `azure_key_vault` | `token`, `vault` (or `base_url`); optional `mapping`, `secret_name`, `absent`, `tags` | Writes individual secret versions or one JSON blob; lowercases individual names and replaces underscores with hyphens |
+| `gcp_secret_manager` | `project` and either `token` or `service_account_json`; optional `tags` | Creates/versions secrets; lowercases names and replaces underscores with hyphens; tags become labels |
+| `azure_key_vault` | `vault` (or `base_url`) and either `token` or `tenant_id`, `client_id`, `client_secret`; optional `token_endpoint`, `mapping`, `secret_name`, `absent`, `tags` | Writes individual secret versions or one JSON blob; lowercases individual names and replaces underscores with hyphens |
 | `kubernetes` | `token`, `api_server`, `namespace`, `secret_name` | Writes an Opaque Secret; creates it after a not-found response |
 | `hashicorp_vault` | `token`, `addr`, `path` | Sends a `{data: ...}` payload to the configured Vault API path |
 | `webhook` | `url`; optional `token`, `signing_secret` (or `secret`) | POSTs `{secrets: {NAME: value}}`. `token` is sent as a bearer header. A signing secret adds `X-OpenWarp-Timestamp` and `X-OpenWarp-Signature: t=<unix>,v1=<hex>`, the HMAC-SHA256 of `timestamp.body` |
@@ -155,7 +155,7 @@ The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS
 | `exclude_keys` | Array of source keys to omit |
 | `base_url` | Override the adapter's API base for a compatible service |
 | `auto_sync` | Default true. Set false to skip automatic runs on deploy, rotation, proposal, delete, restore and point-in-time restore before sync-option validation; manual Sync still validates and runs |
-| `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync |
+| `initial_sync` | `overwrite` (default), `import_local` (keep local values) or `import_remote` (remote values win). Import runs on the first stateful sync and requires the root path `/` to be selected |
 | `disable_secret_deletion` | Boolean; suppresses pruning and retains ownership of previously managed names |
 
 Filters apply before naming. Mirror uses persisted managed-name state, not blanket deletion of every name on the remote service. Changing targets, prefixes, suffixes, templates or filters affects that state; review a dry run and remote inventory first. The remaining options are not supported by every row in the provider table.
@@ -193,7 +193,7 @@ Two mappings are available:
 
 Both mappings explicitly enable each newly written version in the PUT request. `absent: disable` lists version metadata for previously managed names missing from the source, then disables every returned version with a versioned PATCH, including versions already disabled. It does not read secret values or assume version ordering. Pagination stays on the same vault and secret versions path and fails on cycles or more than 100 pages; version IDs must match the configured vault and secret. The credential needs list-version and update permissions. Discovery or update failures fail the sync rather than silently leaving versions enabled; earlier provider writes may already have succeeded.
 
-Disabled secrets remain in managed state under their logical names, not version IDs; `disabled` counts logical names. Missing secrets or empty version lists are dropped from managed state. Returning names receive a new enabled version, while older disabled versions stay disabled. It cannot be combined with `mode: mirror`; mirror deletes previously managed missing names. `disable_secret_deletion` suppresses both operations and retains ownership. Dry runs do not exchange credentials, discover versions or mutate the vault. Initial import is not implemented for Azure Key Vault.
+Disabled secrets remain in managed state under their logical names, not version IDs; `disabled` counts logical names. Missing secrets or empty version lists are dropped from managed state. Returning names receive a new enabled version, while older disabled versions stay disabled. It cannot be combined with `mode: mirror`; mirror deletes previously managed missing names. `disable_secret_deletion` suppresses both operations and retains ownership. Dry runs do not exchange credentials, discover versions or mutate the vault. Azure Key Vault supports only `initial_sync: overwrite`; initial import is not implemented.
 
 ## AWS Parameter Store
 
