@@ -682,3 +682,250 @@ async fn clients_cannot_request_scopes_they_did_not_register() {
     let r = s.form("/oauth/authorize/decision", &form, Some(token)).await;
     assert_eq!(r.status, 400, "a client must not escalate to an unregistered scope, got {} {}", r.status, r.text);
 }
+
+#[tokio::test]
+async fn settings_round_trip_preserves_the_oidc_secret() {
+    let s = Server::start().await;
+    let u = register(&s, "settings@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
+        "oidc_issuer": "https://idp.example",
+        "oidc_client_id": "client",
+        "oidc_client_secret": "top-secret-value",
+        "oidc_redirect_uri": "https://app.example/cb",
+        "oidc_auto_provision": true,
+        "oidc_allowed_domains": "example.com"
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["oidc_issuer"], "https://idp.example");
+    assert_eq!(r.body["oidc_client_secret_set"], true);
+    assert!(!r.text.contains("top-secret-value"), "the client secret must never be returned: {}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"ip_allowlist": "127.0.0.1/32"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
+    assert_eq!(r.body["oidc_issuer"], "https://idp.example", "a partial update must not clear OIDC: {}", r.text);
+    assert_eq!(r.body["oidc_client_secret_set"], true, "a blank secret must keep the stored one: {}", r.text);
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"ip_allowlist": "not-a-cidr"}))).await;
+    assert_eq!(r.status, 400, "invalid CIDRs must be rejected, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn identities_can_be_rotated_and_deleted() {
+    let s = Server::start().await;
+    let u = register(&s, "identity-life@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(token), Some(json!({"name": "ci", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let iid = r.body["id"].as_str().unwrap().to_string();
+    let cid = r.body["client_id"].as_str().unwrap().to_string();
+    let old_secret = r.body["client_secret"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/identities/{}/rotate", org, iid), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let new_secret = r.body["client_secret"].as_str().unwrap().to_string();
+    assert_ne!(old_secret, new_secret, "rotation must issue a new secret");
+
+    let old_login = s.call(Method::POST, "/api/v1/machine/auth/universal/login", None, Some(json!({"client_id": cid, "client_secret": old_secret}))).await;
+    assert_eq!(old_login.status, 401, "the old secret must stop working, got {} {}", old_login.status, old_login.text);
+    let new_login = s.call(Method::POST, "/api/v1/machine/auth/universal/login", None, Some(json!({"client_id": cid, "client_secret": new_secret}))).await;
+    assert_eq!(new_login.status, 200, "{}", new_login.text);
+
+    let r = s.call(Method::DELETE, &format!("/api/orgs/{}/identities/{}", org, iid), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let after = s.call(Method::POST, "/api/v1/machine/auth/universal/login", None, Some(json!({"client_id": cid, "client_secret": new_secret}))).await;
+    assert_eq!(after.status, 401, "a deleted identity must not authenticate, got {} {}", after.status, after.text);
+}
+
+#[tokio::test]
+async fn integrations_can_be_edited_and_deleted() {
+    let s = Server::start().await;
+    let u = register(&s, "integration-life@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/integrations", envs[0]), Some(token), Some(json!({
+        "kind": "webhook", "name": "first", "config": {"url": "http://127.0.0.1:1/hook"}
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let iid = r.body["id"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::PATCH, &format!("/api/integrations/{}", iid), Some(token), Some(json!({"name": "renamed", "config": {"url": "http://127.0.0.1:2/hook"}}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/integrations", envs[0]), Some(token), None).await;
+    assert!(r.body.as_array().unwrap().iter().any(|i| i["name"] == "renamed"), "{}", r.text);
+
+    let r = s.call(Method::DELETE, &format!("/api/integrations/{}", iid), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/integrations", envs[0]), Some(token), None).await;
+    assert_eq!(r.body.as_array().unwrap().len(), 0, "{}", r.text);
+}
+
+#[tokio::test]
+async fn point_in_time_restore_removes_later_secrets_and_restores_deleted_ones() {
+    let s = Server::start().await;
+    let u = register(&s, "pitr@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "ALPHA", "one").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    set_secret(&s, token, &envs[0], "BETA", "two").await;
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
+    let sid = r.body["secrets"].as_array().unwrap().iter().find(|x| x["key"] == "ALPHA").unwrap()["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{}", sid), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/restore-point", envs[0]), Some(token), Some(json!({"timestamp": ts}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["restored"].as_i64().unwrap_or(0) >= 1, "{}", r.text);
+    assert!(r.body["removed"].as_i64().unwrap_or(0) >= 1, "{}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
+    let keys: Vec<&str> = r.body["secrets"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap_or("")).collect();
+    assert!(keys.contains(&"ALPHA"), "a secret deleted after the timestamp must come back: {}", r.text);
+    assert!(!keys.contains(&"BETA"), "a secret created after the timestamp must be gone: {}", r.text);
+}
+
+#[tokio::test]
+async fn e2e_grants_can_be_listed_and_revoked() {
+    let s = Server::start().await;
+    let owner = register(&s, "e2e-owner@test.invalid").await;
+    let member = register(&s, "e2e-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mid = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, ot, org, "e2e-member@test.invalid", "developer").await;
+    let (app, _) = app_with_envs(&s, ot, org).await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(ot), Some(json!({"name": "vault"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let eid = r.body["id"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), Some(ot), Some(json!({"email": "e2e-member@test.invalid", "wrapped_key": "AAAA"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/e2e/grants", eid), Some(ot), None).await;
+    assert!(r.body.as_array().unwrap().iter().any(|g| g["user_id"] == mid), "{}", r.text);
+
+    let r = s.call(Method::DELETE, &format!("/api/envs/{}/e2e/grants/{}", eid, mid), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/e2e/grants", eid), Some(ot), None).await;
+    assert!(!r.body.as_array().unwrap().iter().any(|g| g["user_id"] == mid), "the revoked member must be gone: {}", r.text);
+}
+
+#[tokio::test]
+async fn a_totp_code_cannot_be_replayed() {
+    let s = Server::start().await;
+    let u = register(&s, "replay@test.invalid").await;
+    let token = u["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/me/totp/setup", Some(&token), Some(json!({}))).await;
+    let secret = r.body["secret"].as_str().unwrap().to_string();
+    let code = totp(&secret);
+    let r = s.call(Method::POST, "/api/me/totp/verify", Some(&token), Some(json!({"code": code}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let r = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "replay@test.invalid", "password": "correct-horse-battery"}))).await;
+    let challenge = r.body["mfa_token"].as_str().expect("mfa challenge").to_string();
+    let r = s.call(Method::POST, "/api/auth/mfa", None, Some(json!({"mfa_token": challenge, "code": code}))).await;
+    assert_eq!(r.status, 200, "the first use of a current code should succeed: {}", r.text);
+
+    let r = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "replay@test.invalid", "password": "correct-horse-battery"}))).await;
+    let challenge = r.body["mfa_token"].as_str().expect("second mfa challenge").to_string();
+    let r = s.call(Method::POST, "/api/auth/mfa", None, Some(json!({"mfa_token": challenge, "code": code}))).await;
+    assert_eq!(r.status, 401, "the same TOTP code must not be accepted twice, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn approval_policy_blocks_direct_developer_deploys() {
+    let s = Server::start().await;
+    let owner = register(&s, "approval-owner@test.invalid").await;
+    let member = register(&s, "approval-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "approval-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"require_approval": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), Some(json!({"secrets": [{"key": "DIRECT", "value": "no"}]}))).await;
+    assert_eq!(r.status, 403, "a developer must not bypass the approval policy, got {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/proposals", envs[0]), Some(mt), Some(json!({"secrets": [{"key": "APPROVED", "value": "yes"}]}))).await;
+    assert_eq!(r.status, 200, "a developer must still be able to propose: {}", r.text);
+    let pid = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/proposals/{}/approve", pid), Some(ot), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(ot), None).await;
+    assert!(r.body["secrets"].as_array().unwrap().iter().any(|x| x["key"] == "APPROVED"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn ownership_can_be_transferred_and_a_member_can_leave() {
+    let s = Server::start().await;
+    let owner = register(&s, "transfer-owner@test.invalid").await;
+    let member = register(&s, "transfer-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mid = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, ot, org, "transfer-member@test.invalid", "developer").await;
+
+    let r = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, mid), Some(ot), Some(json!({"role": "admin"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/transfer", org), Some(ot), Some(json!({"user_id": mid}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(mt), None).await;
+    assert!(r.body.as_array().unwrap().iter().any(|o| o["id"] == org && o["role"] == "owner"), "the grantee must own the org: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/leave", org), Some(ot), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "the former owner must be able to leave: {}", r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(ot), None).await;
+    assert!(!r.body.as_array().unwrap().iter().any(|o| o["id"] == org), "the former owner must no longer see the org: {}", r.text);
+}
+
+#[tokio::test]
+async fn environments_can_be_cloned_and_compared() {
+    let s = Server::start().await;
+    let u = register(&s, "clone@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "ALPHA", "one").await;
+    set_secret(&s, token, &envs[0], "BETA", "two").await;
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/clone", envs[0]), Some(token), Some(json!({"target_env_id": envs[1]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["cloned"].as_i64().unwrap_or(0) >= 2, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[1]), Some(token), None).await;
+    let keys: Vec<&str> = r.body["secrets"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap_or("")).collect();
+    assert!(keys.contains(&"ALPHA") && keys.contains(&"BETA"), "{}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/compare?other={}", envs[0], envs[1]), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["same"].as_i64().unwrap_or(0), 2, "{}", r.text);
+    set_secret(&s, token, &envs[1], "BETA", "changed").await;
+    let r = s.call(Method::GET, &format!("/api/envs/{}/compare?other={}", envs[0], envs[1]), Some(token), None).await;
+    assert!(r.body["changed"].as_array().unwrap().iter().any(|k| k.as_str().unwrap_or("").ends_with("BETA")), "{}", r.text);
+}
+
+#[tokio::test]
+async fn scim_discovery_and_paging_are_available() {
+    let s = Server::start().await;
+    let u = register(&s, "scim-page@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::GET, "/scim/v2/ServiceProviderConfig", None, None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}&startIndex=1&count=1", org), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["itemsPerPage"], 1, "{}", r.text);
+    assert!(r.body["totalResults"].as_i64().unwrap_or(0) >= 1, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}&filter=userName%20eq%20%22scim-page%40test.invalid%22", org), Some(token), None).await;
+    assert_eq!(r.body["totalResults"], 1, "{}", r.text);
+}

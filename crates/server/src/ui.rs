@@ -90,7 +90,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
@@ -144,7 +144,7 @@ function showInvite(token){
   $('authform').dataset.invite=token;}
 async function acceptInvite(){try{
   let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
-  T=d.token;localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);enterApp();
+  T='';history.replaceState(null,'',location.pathname);enterApp();
 }catch(e){toast(e.message,true)}}
 function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
@@ -160,7 +160,7 @@ function showReset(token){
   $('authform').dataset.reset=token}
 async function resetPassword(){try{
   let d=await api('POST','/api/auth/reset',{token:$('authform').dataset.reset,password:$('rp-pw').value,recovery_kit:$('rp-kit').value,discard_e2e_key:!!$('rp-discard').checked});
-  T=d.token;localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);
+  T='';history.replaceState(null,'',location.pathname);
   toast(d.e2e_key_replaced?'Password set; your key was replaced':'Password set');enterApp();
 }catch(e){toast(e.message,true)}}
 let MODE='login';
@@ -170,14 +170,14 @@ async function doAuth(){try{
     if(d.verification_required){
       modal(`<h3>Check your email</h3><p class="mut">We sent a verification link to ${esc($('email').value)}. Save your recovery kit now; it is shown once.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal()">I saved it</button></div>`,'Check your email');
       return}
-    T=d.token;localStorage.setItem('owt',T);
+    T='';
     modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`,'Save your recovery kit');return}
   let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
   if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';$('authbtn').textContent='Verify code';$('authbtn').onclick=doMfa;toast('Enter your authenticator or recovery code');return}
-  T=d.token;localStorage.setItem('owt',T);enterApp();
+  T='';enterApp();
 }catch(e){toast(e.message,true)}}
-async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T=d.token;localStorage.setItem('owt',T);enterApp()}catch(e){toast(e.message,true)}}
-async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';localStorage.removeItem('owt');location.reload()}
+async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
+async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
@@ -212,6 +212,7 @@ async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET
 async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
   if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
   if(!ENV)ENV=ENVS[0];
+  if((ENV.mode||'sse')==='e2e'){await renderE2eEnv();return}
   let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
   $('view').innerHTML=`
   <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><button class="envtab" onclick="newE2eEnv()">+ E2E environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
@@ -223,11 +224,20 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pag
   <div id="stable"></div>
   ${APP?.readme?`<div class="card" style="margin-top:14px"><h3>Readme</h3><pre class="val" style="white-space:pre-wrap">${esc(APP.readme)}</pre></div>`:''}`;
   drawSecrets();updateDeployBar()}
+async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
+  $('view').innerHTML=`
+  <div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}${e.mode==='e2e'?' · E2E':''}</button>`).join('')}<button class="envtab" onclick="newEnv()">+ Environment</button><span class="grow"></span><button class="ghost danger" onclick="delEnv()">Delete env</button></div>
+  <div class="card"><h3>End-to-end encrypted environment</h3>
+    <p class="mut">The server stores only ciphertext for this environment. Paste your recovery kit to decrypt it in this browser. The kit is never sent to the server.</p>
+    <div class="field"><label for="e2e-kit">Recovery kit</label><input id="e2e-kit" type="password" autocomplete="off" placeholder="base64 recovery kit" style="width:100%"></div>
+    <button class="primary" onclick="loadE2E('${ENV.id}')">Decrypt secrets</button>
+    <pre class="val" id="e2e-out" style="margin-top:12px"></pre></div>`;
+  updateDeployBar()}
 async function switchEnv(id){let cur=ENV&&ENV.id;if(cur===id){return}
   if(cur&&Object.keys(drafts()).length&&!confirm('Discard staged changes?'))return;
   if(cur)delete DRAFTS[cur];
   ENV=ENVS.find(e=>e.id===id);await renderEnv()}
-function envMode(e){return 'sse'}
+function envMode(e){return e&&e.mode==='e2e'?'e2e':'sse'}
 async function newEnv(){modal(`<h3>New environment</h3><div class="field"><label for="ne-name">Name (letters, numbers, - or _)</label><input id="ne-name" placeholder="qa-1"></div><div class="row"><button class="primary" onclick="createEnv()">Create</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
 async function createEnv(){try{await api('POST',`/api/apps/${APP.id}/envs`,{name:$('ne-name').value});closeModal();ENVS=await api('GET',`/api/apps/${APP.id}/envs`);toast('Environment created');renderEnv()}catch(e){toast(e.message,true)}}
 async function newE2eEnv(){modal(`<h3>New end-to-end encrypted environment</h3><p class="mut">The server stores only ciphertext and cannot read these secrets. Use the CLI or the E2E panel in Settings with your recovery kit.</p><div class="field"><label for="ne2-name">Name</label><input id="ne2-name" placeholder="vault"></div><div class="row"><button class="primary" onclick="createE2eEnv()">Create E2E env</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`)}
@@ -337,22 +347,23 @@ async function mkToken(){try{let d=await api('POST',`/api/apps/${APP.id}/tokens`
 async function loadTokens(){try{let toks=await api('GET',`/api/apps/${APP.id}/tokens`);$('tok-list').innerHTML=toks.map(t=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0"><span class="mono small">${esc(t.name)} · ${esc(t.kind||'token')} · ${new Date((t.created_at||0)*1000).toLocaleDateString()}</span><button class="danger" onclick="revokeToken('${t.id}')">Revoke</button></div>`).join('')||'<span class="mut">No tokens</span>'}catch(e){toast(e.message,true)}}
 async function revokeToken(id){try{await api('DELETE',`/api/tokens/${id}`);toast('Token revoked');loadTokens()}catch(e){toast(e.message,true)}}
 
-const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','webhook'];
+const KINDS=['trigger','github','gitlab','vercel','netlify','cloudflare','cloudflare_pages','supabase','nomad','coolify','heroku','render','flyio','railway','digitalocean','gcp_secret_manager','azure_key_vault','kubernetes','hashicorp_vault','aws_secrets_manager','aws_parameter_store','webhook','instabox','boat','daytona'];
 async function renderIntegrations(){if(!needAppEnv())return;setTimeout(kindHint,0);$('pagetitle').textContent='Integrations';$('crumb').textContent=ENV?('/ '+ENV.name):'';
   let ints=ENV?await api('GET',`/api/envs/${ENV.id}/integrations`).catch(()=>[]):[];
   $('view').innerHTML=`<div class="card"><h3>Sync secrets to a platform</h3><p>Integrations run automatically on every deploy, or on demand. Config is stored encrypted. Trigger.dev example config: <span class="mono">{"token":"tr_pat_…","project_ref":"proj_…","target_env":"prod"}</span></p>
   <div class="row"><select id="ikind" onchange="kindHint()">${KINDS.map(k=>`<option>${k}</option>`).join('')}</select></div>
   <p class="small" id="ikind-hint"></p><textarea id="icfg" rows="4" placeholder='{"token":"…"}'></textarea>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="mkIntegration()">Add integration</button></div></div>
-  <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
+  <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button> <button class="danger" onclick="delInt('${i.id}')">Delete</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
   <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><pre class="val" id="leases"></pre>
   <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>
   <div class="card"><h3>Lockbox: one-time secret sharing</h3><div class="row"><input id="lb-val" placeholder="value to share once" style="min-width:280px"><button onclick="mkLockbox()">Create link</button></div><pre class="val" id="lb-out"></pre></div>`}
-const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer"}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}'};
+const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer"}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}',instabox:'Instabox: {"api_key":"ibk_…","org":"team","hosts":["api.example.com"],"delivery":"proxy"}',boat:'Boat: {"api_key":"boat_…","environment":"base","upgrade":true}',daytona:'Daytona: {"api_key":"…","organization_id":"…","hosts":["api.example.com"]}'};
 function kindHint(){if(!$('ikind'))return;let k=$('ikind').value;$('ikind-hint').textContent=KIND_HINTS[k]||('Config for '+k+' as JSON. Common keys: token, base_url for self-hosted instances. Stored encrypted at rest.')}
 async function mkIntegration(){try{await api('POST',`/api/envs/${ENV.id}/integrations`,{kind:$('ikind').value,config:JSON.parse($('icfg').value||'{}')});toast('Integration added');renderIntegrations()}catch(e){toast(e.message,true)}}
 async function testInt(id){try{let d=await api('POST',`/api/integrations/${id}/test`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
 async function syncInt(id){try{let d=await api('POST',`/api/integrations/${id}/sync`,{});toast(d.detail)}catch(e){toast(e.message,true)}}
+async function delInt(id){if(!confirm('Delete this integration? Sync state for it is removed too.'))return;try{await api('DELETE',`/api/integrations/${id}`);toast('Integration deleted');renderIntegrations()}catch(e){toast(e.message,true)}}
 async function mkLease(){try{let d=await api('POST',`/api/envs/${ENV.id}/dynamic`,{name:$('lease-name').value||'lease'});$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
 async function loadLeases(){try{let d=await api('GET',`/api/envs/${ENV.id}/dynamic`);$('leases').textContent=JSON.stringify(d,null,2)}catch(e){toast(e.message,true)}}
 async function mkRotation(){try{await api('POST',`/api/envs/${ENV.id}/rotations`,{key:$('rot-key').value,interval_secs:parseInt($('rot-int').value)});toast('Rotation scheduled')}catch(e){toast(e.message,true)}}
@@ -367,26 +378,34 @@ async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-
 
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
   let inst=await api('GET','/api/instance').catch(()=>null);
+  let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
     <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
   $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
-  <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" placeholder="203.0.113.0/24"></div>
-  <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" placeholder="https://accounts.google.com"></div>
-  <div class="row"><input id="set-oidc-cid" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="OIDC client secret"><input id="set-oidc-redir" placeholder="redirect URI" style="min-width:260px"></div>
+  <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
+  <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
+  <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" style="min-width:260px"></div>
+  <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
-async function saveSettings(){try{await api('PUT',`/api/orgs/${ORG}/settings`,{ip_allowlist:$('set-ip').value,oidc_issuer:$('set-oidc-iss').value,oidc_client_id:$('set-oidc-cid').value,oidc_client_secret:$('set-oidc-sec').value,oidc_redirect_uri:$('set-oidc-redir').value});toast('Settings saved')}catch(e){toast(e.message,true)}}
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
+  if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
+  if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
+  if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
+  if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
+  await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
 async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
-async function loadE2E(){try{let d=await api('GET',`/api/envs/${$('e2e-env').value}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
+async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
@@ -406,13 +425,13 @@ function boot(){
     // The OIDC callback appends &org=<id>; the token itself never contains &.
     let parts=h.slice(6).split('&');T=decodeURIComponent(parts[0]);
     for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
-    localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);}
+    history.replaceState(null,'',location.pathname);}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
-if(T){$('auth').style.display='none';enterApp().catch(()=>{T='';localStorage.removeItem('owt');$('auth').style.display='grid';$('shell').style.display='none'})}
+$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
 </script>
 <script src="/e2e.js"></script>
 </body></html>

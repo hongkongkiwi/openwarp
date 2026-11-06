@@ -219,3 +219,54 @@ create the sandbox with `env` and replace it.
 - `OPENWARP_ENV=production` refuses to start without `OPENWARP_MASTER_KEY`.
 - Committed HTTP integration suite in `crates/server/tests/security.rs` and
   CI in `.github/workflows/ci.yml`.
+
+## Second hardening and feature pass (2026-11-06)
+
+- Custom roles are deny-by-default: every route checks `secrets:read`,
+  `secrets:write`, `secrets:delete`, `integrations:write`, `leases:write`,
+  `rotations:write`, `proposals:write`, `tokens:create` or `org:admin`.
+  Managed `developer` keeps the documented breadth; `owner` and `admin` pass all.
+- Organisation settings are admin-only, have a `GET` endpoint, validate IP
+  CIDRs, and never return the OIDC client secret. A partial update cannot wipe
+  OIDC; changing the issuer without a new secret clears the stale secret.
+  `oidc_auto_provision` and `oidc_allowed_domains` gate first-time SSO joins.
+- Rate limits live in the database, so a restart or a second replica keeps the
+  budget. Registration, login, consent, MFA and universal auth all limit.
+  TOTP codes cannot be replayed and MFA challenges are attempt-capped.
+- Deactivated accounts and deleted identities lose sessions, OAuth tokens and
+  PATs immediately. Machine tokens cannot mint long-lived service tokens.
+- Integration sync excludes sealed secrets and personal overrides: only shared
+  base values reach a remote platform. Coolify and Vercel now fail closed.
+- PITR restores the whole environment at a timestamp: later secrets are
+  tombstoned, deleted ones return, and key/value/comment/type are restored.
+- Scheduled rotation claims its slot atomically, honours the stored path, skips
+  sealed secrets with an audit entry, and pushes the new value to integrations.
+  Manual rotation does the same.
+- `DELETE /api/envs/:id` and `DELETE /api/apps/:id` remove every child row,
+  including integration sync state, environment grants and app members.
+- Log streams sign `t=<unix>,v1=<hex HMAC-SHA256(t.payload)>` in
+  `X-OpenWarp-Signature` and send `X-OpenWarp-Timestamp`; delivery is bounded.
+- New settings and lifecycle endpoints: `PATCH /api/orgs/:id`,
+  `POST /api/orgs/:id/leave`, `POST /api/orgs/:id/transfer`,
+  `PATCH /api/orgs/:id/members/:uid`, `GET|PUT /api/orgs/:id/settings`,
+  `POST|DELETE /api/integrations/:id`, `PATCH|DELETE /api/integrations/:id`,
+  `GET|DELETE /api/envs/:id/e2e/grants`,
+  `POST /api/orgs/:id/identities/:iid/rotate`,
+  `DELETE /api/orgs/:id/identities/:iid`,
+  `POST /api/envs/:id/clone`, `GET /api/envs/:id/compare`,
+  `GET /scim/v2/ServiceProviderConfig|ResourceTypes|Schemas`.
+- Service tokens accept `expires_in` seconds. SCIM Users and Groups support
+  `startIndex`, `count` and a simple `userName`/`displayName eq "..."` filter.
+- Per-environment policy: `PUT /api/envs/:id/policy {restricted,require_approval}`.
+  `restricted` narrows membership to explicit env/app grants; `require_approval`
+  blocks direct developer deploys and forces the proposal flow. An approved
+  access request no longer makes an environment exclusive by itself.
+- `/health` checks the database and returns 503 when it cannot query. Request
+  bodies are capped at 8 MiB, handlers time out after five minutes, and the
+  server drains connections on SIGTERM/SIGINT. `/metrics` is token-gated.
+- Lockbox links now resolve to a real one-time viewer page. E2E environments
+  show a dedicated decrypt panel in the console, and grants can be revoked.
+- Console sessions use the HttpOnly cookie rather than localStorage, with a
+  restrictive CSP; secret keys are character-validated and JS-string-escaped.
+- The CLI stores credentials in the OS keyring by default and exports or runs
+  multi-line values without splitting them on newlines.

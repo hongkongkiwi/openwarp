@@ -84,7 +84,8 @@ relay is configured, because nobody could complete it.
 
 ## Operational checks
 
-- `GET /health` is unauthenticated and returns `{"ok":true}`.
+- `GET /health` is unauthenticated and checks the database; it returns 503
+  when the database cannot be queried.
 - `GET /metrics` is disabled unless `OPENWARP_METRICS_TOKEN` is set. Scrape with
   `Authorization: Bearer $OPENWARP_METRICS_TOKEN`.
 - The server drains connections on `SIGTERM` and `SIGINT`.

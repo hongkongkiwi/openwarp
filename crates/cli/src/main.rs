@@ -122,6 +122,13 @@ fn pick(explicit: &str, local: &Value, key: &str, flag: &str) -> String {
     eprintln!("no value for {}: pass the flag or run openwarp init --app <APP_ID> --env <ENV_ID>", flag);
     std::process::exit(2) }
 fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+// A dotenv value with whitespace or quotes must stay on one line; encode the
+// characters that would otherwise break the file.
+fn dotenv_value(v: &str) -> String {
+    if v.is_empty() || v.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\\' || c == '#') {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"))
+    } else { v.to_string() }
+}
 fn token_expired(cfg: &Value) -> bool {
     let has_refresh = cfg["refresh_token"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
     if !has_refresh { return false; }
@@ -225,17 +232,20 @@ fn main() {
             let sid = d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))).and_then(|s| s["id"].as_str().map(|x| x.to_string()));
             match sid { Some(id) => { let r: Value = client.delete(format!("{}/api/secrets/{}", host, id)).bearer_auth(&token).send().expect("req").json().expect("json"); println!("{}", r); } None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
         Cmd::Export { env, format } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/export", host, env));
+            let items = d["secrets"].as_array().cloned().unwrap_or_default();
             match format.as_str() {
                 "json" => println!("{}", serde_json::to_string_pretty(&d["secrets"]).unwrap()),
-                "yaml" => { for s in d["secrets"].as_array().cloned().unwrap_or_default() { println!("{}: {:?}", s["key"].as_str().unwrap_or(""), s["value"].as_str().unwrap_or("")); } }
-                "shell" => { for line in d["text"].as_str().unwrap_or("").lines() { if let Some((k, v)) = line.split_once('=') { println!("export {}='{}'", k, v.replace('\'', "'\\''")); } } }
-                _ => println!("{}", d["text"].as_str().unwrap_or("")), } }
+                "yaml" => { for s in &items { println!("{}: {}", s["key"].as_str().unwrap_or(""), serde_json::to_string(s["value"].as_str().unwrap_or("")).unwrap()); } }
+                "shell" => { for s in &items { let v = s["value"].as_str().unwrap_or(""); println!("export {}='{}'", s["key"].as_str().unwrap_or(""), v.replace('\'', "'\\''")); } }
+                _ => { for s in &items { println!("{}={}", s["key"].as_str().unwrap_or(""), dotenv_value(s["value"].as_str().unwrap_or(""))); } } } }
         Cmd::Import { env, file } => { let env = pick(env, &local, "env_id", "--env"); let text = std::fs::read_to_string(file).expect("read file");
             let d: Value = client.post(format!("{}/api/envs/{}/import", host, env)).bearer_auth(&token).json(&json!({"text": text})).send().expect("request").json().expect("json"); println!("{}", d); }
         Cmd::Run { env, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
             let d = get(&format!("{}/api/envs/{}/export", host, env));
             let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]);
-            for line in d["text"].as_str().unwrap_or("").lines() { if let Some((k, v)) = line.split_once('=') { cmd.env(k, v); } }
+            for s in d["secrets"].as_array().cloned().unwrap_or_default() {
+                if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
+            }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
         Cmd::E2eCreate { app, name } => { let app = pick(app, &local, "app_id", "--app");
             let me = get(&format!("{}/api/me", host));
