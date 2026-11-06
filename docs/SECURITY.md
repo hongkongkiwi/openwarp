@@ -41,6 +41,12 @@ The [`openwarp-crypto` crate](../crates/crypto/src/lib.rs) implements X25519 key
 
 Secret metadata is not uniformly encrypted. Identifiers, membership, paths, tags, timestamps, audit records, and operational state can reveal information. Treat the entire database as sensitive, including when secret values are ciphertext.
 
+## Audit chain and wrapping tokens
+
+Audit rows carry a per-organisation sequence number, the previous row's hash and a SHA-256 hash over the row's fields. `GET /api/orgs/:id/audit/verify` recomputes the chain and reports the first broken link. The chain is tamper-evident, not tamper-proof: an operator with database write access can rewrite rows and recompute an edited prefix, and rows written before migration 17 are unchained. Forward audit events to an independent log stream when the trail must survive the database.
+
+`POST /api/envs/:id/wrap` returns a single-use `owwrap_...` Bearer token that another party can redeem once at `POST /api/unwrap`. The payload is encrypted under the environment key, excludes sealed values, and expires after 60 to 86400 seconds. `GET /api/unwrap` looks the token up without consuming it. The token is not a session or service token and cannot call any other route. Anyone who obtains it can redeem it once, so deliver it over TLS and treat it as the secret it carries. Unwrapping is authorised by the token alone, so an organisation IP allowlist is not consulted on that route.
+
 ## Password reuse detection
 
 When a standard `secret` value is written, the server stores a fingerprint in `secrets.value_fp`, keyed and salted with the workspace id. The fingerprint is HMAC-SHA256 under a key derived from the instance master key, not a plain hash of the value. Equal values in two workspaces do not produce equal fingerprints. A database-only compromise therefore cannot test a candidate password list against the stored fingerprints. The fingerprint is not reversible: the master key lets an attacker test guesses, not recover a value directly.

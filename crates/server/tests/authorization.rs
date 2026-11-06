@@ -994,6 +994,18 @@ async fn approval_policy_blocks_direct_developer_deploys() {
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(ot), None).await;
     assert!(r.body["secrets"].as_array().unwrap().iter().any(|x| x["key"] == "APPROVED"), "{}", r.text);
+
+    // The lifecycle endpoints follow the same gate: a developer barred from
+    // changing a value must not be able to undo or permanently erase it either.
+    let sid = r.body["secrets"].as_array().unwrap().iter().find(|x| x["key"] == "APPROVED").unwrap()["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/secrets/{sid}/destroy"), Some(mt), None).await;
+    assert_eq!(r.status, 403, "a developer must not destroy around the approval policy, got {} {}", r.status, r.text);
+    let r = s.call(Method::DELETE, &format!("/api/secrets/{sid}"), Some(mt), None).await;
+    assert_eq!(r.status, 200, "the existing tombstone path is unchanged: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/secrets/{sid}/undelete"), Some(mt), None).await;
+    assert_eq!(r.status, 403, "a developer must not undelete around the approval policy, got {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/secrets/{sid}/undelete"), Some(ot), None).await;
+    assert_eq!(r.status, 200, "an owner can restore the value: {}", r.text);
 }
 
 #[tokio::test]
