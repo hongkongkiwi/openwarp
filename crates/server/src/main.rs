@@ -1239,7 +1239,11 @@ async fn create_role(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>,
 async fn list_roles(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h)?; st.require_org(&oid,&uid)?;
     let rows = st.db.query("SELECT id,name,permissions FROM roles WHERE org_id=?", &[json!(oid)]).map_err(|e| bad(&e))?;
     let mut out: Vec<Value> = rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "permissions": serde_json::from_str::<Value>(&db::s(r,"permissions")).unwrap_or(json!([]))})).collect();
-    for m in ["owner","admin","developer"] { out.push(json!({"name": m, "permissions": ["*"], "managed": true})); }
+    // Report the managed roles' real breadth so the console does not imply that
+    // a developer can administer the organisation.
+    out.push(json!({"name": "owner", "permissions": ["*"], "managed": true}));
+    out.push(json!({"name": "admin", "permissions": ["*"], "managed": true}));
+    out.push(json!({"name": "developer", "permissions": DEVELOPER_PERMS, "managed": true}));
     Ok(j(json!(out))) }
 
 // ---------- TOTP MFA + recovery codes (T08) ----------
