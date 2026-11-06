@@ -155,9 +155,10 @@ connection test:
 Shared behavioural options:
 
 - Key naming is off by default and applies to every adapter: `prefix` and
-  `suffix` wrap each key and accept `{{environment}}`; `name_template`
-  replaces both and supports `{{secretKey}}` and `{{environment}}`, with
-  exactly one `{{secretKey}}`. Imports strip the same affixes.
+  `suffix` wrap each key and accept `{{environment}}`; `case` rewrites the
+  key to `upper` or `lower` before wrapping; `name_template` replaces both and
+  supports `{{secretKey}}` and `{{environment}}`, with exactly one
+  `{{secretKey}}`. Imports strip the same affixes.
 - `auto_sync: false` skips the integration on deploy, rotation, proposal,
   delete, restore and point-in-time restore; manual Sync still runs it.
 - `initial_sync` accepts `overwrite` (default), `import_local` (keep local
