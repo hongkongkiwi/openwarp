@@ -32,6 +32,9 @@ fn session_cookie(token: &str) -> String {
         || std::env::var("OPENWARP_SECURE_COOKIES").map(|v| v == "1").unwrap_or(false);
     format!("ow_session={}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800{}", token, if secure { "; Secure" } else { "" }) }
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) { (code, Json(json!({"error": msg}))) }
+// A stable code lets clients tell a locked workspace from an ordinary denial
+// without parsing the message.
+fn err_code(code: StatusCode, kind: &str, msg: &str) -> (StatusCode, Json<Value>) { (code, Json(json!({"error": msg, "code": kind}))) }
 fn bad(msg: &str) -> (StatusCode, Json<Value>) { err(StatusCode::BAD_REQUEST, msg) }
 fn now() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 }
 fn id() -> String { oc::random_token("id").replace("id_", "") }
@@ -191,6 +194,10 @@ impl AppState {
     async fn org_role(&self, org: &str, user: &str) -> Option<String> {
         self.db.one("SELECT role FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(user)]).await.ok().flatten().map(|r| db::s(&r, "role"))
     }
+    async fn org_membership(&self, org: &str, user: &str) -> Option<(String, bool)> {
+        self.db.one("SELECT role,locked FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(user)]).await.ok().flatten()
+            .map(|r| (db::s(&r, "role"), db::n(&r, "locked") != 0))
+    }
     async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if let Ok(Some(row)) = self.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(oc::hash_token(token))]).await { let scope = db::s(&row, "env_id"); if !scope.is_empty() && scope != env_id { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
@@ -235,7 +242,12 @@ impl AppState {
             Err(_) => false,
         } }
     async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
-        if let Some(r) = self.org_role(org, user).await { return Ok(r); }
+        if let Some((role, locked)) = self.org_membership(org, user).await {
+            // A lock covers every workspace read and write. The member keeps the
+            // account, other workspaces and the ability to leave this one.
+            if locked { return Err(err_code(StatusCode::FORBIDDEN, "workspace_locked", "Your account is locked in this workspace; contact the workspace owner to restore access.")); }
+            return Ok(role);
+        }
         // machine identities belong to an org directly
         if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { return Ok(db::s(&idn, "role")); }
         Err(err(StatusCode::FORBIDDEN, "not an organisation member")) }
@@ -342,8 +354,8 @@ async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(
     // A caller can always learn the environment its own credential is confined to.
     let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await); Ok(j(out)) }
 async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
-    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role,m.locked AS locked FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(|r| { let mut o = db::obj(r); o["locked"] = json!(db::n(r, "locked") != 0); o }).collect::<Vec<_>>()))) }
 async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; let oid = id();
     st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(r.name), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": oid}))) }
@@ -353,7 +365,12 @@ async fn update_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     st.db.exec("UPDATE orgs SET name=? WHERE id=?", &[json!(r.name.trim()), json!(&oid)]).await.map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "org.rename", r.name.trim()).await; Ok(j(json!({"ok": true}))) }
 async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let role = st.require_org(&oid, &uid).await?;
+    // A locked member must be able to leave rather than stay trapped in a
+    // workspace they cannot read.
+    let role = match st.db.one("SELECT role FROM org_members WHERE org_id=? AND user_id=?", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))? {
+        Some(r) => db::s(&r, "role"),
+        None => st.require_org(&oid, &uid).await?,
+    };
     if role == "owner" {
         let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
         if owners.len() <= 1 { return Err(err(StatusCode::CONFLICT, "transfer ownership before leaving; an organisation needs an owner")); }
@@ -365,16 +382,18 @@ async fn transfer_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     if st.require_org(&oid, &uid).await? != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can transfer ownership")); }
     let target = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     if target.is_empty() || target == uid { return Err(bad("user_id of another member required")); }
-    if st.org_role(&oid, target).await.is_none() { return Err(err(StatusCode::NOT_FOUND, "member not found")); }
+    let target_locked = st.org_membership(&oid, target).await.map(|(_, locked)| locked).ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
+    if target_locked { return Err(err(StatusCode::CONFLICT, "unlock the member before transferring ownership")); }
     st.db.exec("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=?", &[json!(&oid), json!(target)]).await.map_err(|e| bad(&e))?;
     st.db.exec("UPDATE org_members SET role='admin' WHERE org_id=? AND user_id=?", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "org.transfer", target).await; Ok(j(json!({"ok": true}))) }
 async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     let caller_role = st.require_org(&oid, &uid).await?;
-    let target_role = st.org_role(&oid, &target).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
+    let (target_role, target_locked) = st.org_membership(&oid, &target).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
     let new_role = r.role.trim();
     if new_role.is_empty() { return Err(bad("role required")); }
+    if new_role == "owner" && target_locked { return Err(err(StatusCode::CONFLICT, "unlock the member before granting ownership")); }
     if !["owner", "admin", "developer"].contains(&new_role) && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(&oid), json!(new_role)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
     if (new_role == "owner" || new_role == "admin") && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant the owner or admin role")); }
     if target_role == "owner" && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can change another owner")); }
@@ -384,6 +403,20 @@ async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target
     }
     st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(new_role), json!(&oid), json!(target)]).await.map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "member.role", &format!("{}={}", target, new_role)).await; Ok(j(json!({"ok": true}))) }
+async fn set_member_lock(st: &S, h: &HeaderMap, oid: &str, target: &str, locked: bool) -> Res {
+    let uid = st.token_user(h).await?;
+    let caller_role = st.require_org(oid, &uid).await?;
+    if caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can lock or unlock members")); }
+    let target_role = st.org_role(oid, target).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
+    // Owners keep the workspace administrable; transfer or demote first. An
+    // existing locked owner may be unlocked so a workspace is never stranded.
+    if target_role == "owner" && locked { return Err(err(StatusCode::CONFLICT, "workspace owners cannot be locked; change the member's role first")); }
+    st.db.exec("UPDATE org_members SET locked=? WHERE org_id=? AND user_id=?", &[json!(if locked { 1 } else { 0 }), json!(oid), json!(target)]).await.map_err(|e| bad(&e))?;
+    st.audit(oid, "", "", &uid, if locked { "member.lock" } else { "member.unlock" }, target).await;
+    Ok(j(json!({"ok": true, "locked": locked})))
+}
+async fn lock_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>) -> Res { set_member_lock(&st, &h, &oid, &target, true).await }
+async fn unlock_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>) -> Res { set_member_lock(&st, &h, &oid, &target, false).await }
 async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     let caller_role = st.require_org(&oid, &uid).await?; st.check_admin(&oid, &uid).await?;
     let email = r.email.trim().to_lowercase();
@@ -468,8 +501,8 @@ async fn set_env_policy(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     st.audit(&org, &app, &eid, &uid, "env.policy", &changed.join(",")).await;
     Ok(j(json!({"ok": true, "policy": changed}))) }
 async fn list_members(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
-    let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role, m.locked AS locked FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(|r| { let mut m = db::obj(r); m["locked"] = json!(db::n(r, "locked") != 0); m }).collect::<Vec<_>>()))) }
 async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     let role = st.require_org(&oid, &uid).await?; st.check_admin(&oid, &uid).await?;
     if target == uid { return Err(bad("use another admin to remove yourself; leaving your own organisation is not supported")); }
@@ -1078,7 +1111,7 @@ async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<
     let denied = || err(StatusCode::FORBIDDEN, "no user with this email shares an organisation with you");
     let row = st.db.one("SELECT id,email,pubkey FROM users WHERE email=?", &[json!(email.to_lowercase())]).await.map_err(|e| bad(&e))?.ok_or_else(denied)?;
     let tid = db::s(&row, "id");
-    if tid != uid { let shared = st.db.query("SELECT a.org_id FROM org_members a JOIN org_members b ON b.org_id=a.org_id WHERE a.user_id=? AND b.user_id=?", &[json!(uid), json!(&tid)]).await.map_err(|e| bad(&e))?; if shared.is_empty() { return Err(denied()); } }
+    if tid != uid { let shared = st.db.query("SELECT a.org_id FROM org_members a JOIN org_members b ON b.org_id=a.org_id WHERE a.user_id=? AND b.user_id=? AND a.locked=0", &[json!(uid), json!(&tid)]).await.map_err(|e| bad(&e))?; if shared.is_empty() { return Err(denied()); } }
     Ok(j(json!({"id": db::s(&row,"id"), "email": db::s(&row,"email"), "pubkey": db::s(&row,"pubkey")}))) }
 
 
@@ -1599,17 +1632,18 @@ async fn ldap_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum:
         let mapped_role = if mapped.is_some() { role } else { String::new() };
         let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]).await;
     } else {
-        let current = st.org_role(&org, &uid).await.unwrap_or_default();
+        let (current, locked) = st.org_membership(&org, &uid).await.unwrap_or_default();
         if let Some(role) = &mapped {
             // The directory's group mapping stays authoritative, except that it
-            // never demotes an owner: a group change must not lock out the only one.
-            if &current != role && current != "owner" {
+            // never demotes an owner and never changes a locked membership: a
+            // group change must not grant access an owner suspended.
+            if !locked && &current != role && current != "owner" {
                 st.db.exec("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?", &[json!(role), json!(&org), json!(&uid)]).await.map_err(|e| bad(&e))?;
             }
-            if current != "owner" {
-                let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(role), json!(&org), json!(&user.dn)]).await;
+            if !locked && current != "owner" {
+                let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&role), json!(&org), json!(&user.dn)]).await;
             }
-        } else if !stored_role.is_empty() && current == stored_role && current != "owner" {
+        } else if !locked && !stored_role.is_empty() && current == stored_role && current != "owner" {
             // The user left the mapped group: revoke a directory-granted role,
             // unless a human has changed it since.
             let fallback = db::s(&row, "default_role");
@@ -2691,7 +2725,12 @@ async fn list_tokens(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>)
     let rows = st.db.query("SELECT id,app_id,env_id,name,kind,expires_at,scopes,last_used_at,created_at,created_by FROM tokens WHERE app_id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn revoke_token(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT created_by,org_id FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"token not found"))?;
-    if db::s(&row,"created_by") != uid && st.org_role(&db::s(&row,"org_id"),&uid).await.as_deref() != Some("owner") && st.org_role(&db::s(&row,"org_id"),&uid).await.as_deref() != Some("admin") { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+    // Revoking your own token stays available. Managing another member's
+    // credential follows the membership gate, including a workspace lock.
+    if db::s(&row,"created_by") != uid {
+        let role = st.require_org(&db::s(&row,"org_id"), &uid).await?;
+        if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+    }
     st.db.exec("DELETE FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": tid}))) }
 
 
@@ -3042,7 +3081,8 @@ async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(
 // replica shows up here within a second. Frames carry audit fields only.
 async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, ws: WebSocketUpgrade) -> Response {
     let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
-    let mut orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "org_id")).collect::<Vec<_>>();
+    // A locked membership must not keep receiving workspace activity.
+    let mut orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=? AND locked=0", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "org_id")).collect::<Vec<_>>();
     if let Ok(rows) = st.db.query("SELECT org_id FROM identities WHERE id=?", &[json!(&uid)]).await {
         for r in rows { let org = db::s(&r, "org_id"); if !orgs.contains(&org) { orgs.push(org); } } }
     // Reconnect with the last id the client saw. Capped at an hour and 500 rows:
@@ -3094,7 +3134,12 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>
                 let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
                 if !orgs.iter().any(|o| o == org) { continue; }
                 let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
-                if !env.is_empty() && st.require_env(env, &uid).await.is_err() { continue; }
+                // Org-level events have no environment to re-check, so verify
+                // the membership itself. A socket opened before a lock or a
+                // removal must not keep its feed.
+                if env.is_empty() {
+                    if st.require_org(org, &uid).await.is_err() { continue; }
+                } else if st.require_env(env, &uid).await.is_err() { continue; }
                 let mut out = v; out["type"] = json!("event");
                 if socket.send(Message::Text(out.to_string().into())).await.is_err() { return; }
             }
@@ -3293,7 +3338,7 @@ async fn main() {
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
-        .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
+        .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/members/{uid}/lock", post(lock_member)).route("/api/orgs/{oid}/members/{uid}/unlock", post(unlock_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/v1/machine/auth/universal/login", post(universal_login))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))

@@ -92,13 +92,13 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ORGS=[], ME=null;
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
 const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
 async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
-  if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
+  if(!r.ok){let e=new Error(d.error||('HTTP '+r.status));e.code=d.code||'';throw e} return d}
 function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // For values interpolated into an inline handler's JS string literal. HTML
@@ -196,17 +196,21 @@ async function doAuth(){try{
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
-  let me=await api('GET','/api/me');$('whoami').textContent=me.email;
-  let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
-  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
+  let me=await api('GET','/api/me');$('whoami').textContent=me.email;ME=me;
+  let orgs=await api('GET','/api/orgs');ORGS=orgs;ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
+  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}${o.locked?' · locked':''}</option>`).join('');
   $('orgs').value=ORG;
   await nav('apps')}
+function currentOrg(){return ORGS.find(o=>o.id===ORG)||null}
 async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
 
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
+async function renderLocked(){const workspace=esc(currentOrg()?.name||'this workspace');$('topaction').style.display='none';$('pagetitle').textContent='Workspace access locked';$('crumb').textContent='';
+  $('view').innerHTML='<div class="card" role="alert"><h3>Workspace access locked</h3><p>Your account has been locked in <b>'+workspace+'</b>. Contact the workspace owner to restore access.</p><p class="small mut">You can still sign in and use your other workspaces.</p></div>'}
 async function nav(v){VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
   $('topaction').style.display=(v==='apps')?'':'none';
+  if(ORG&&currentOrg()?.locked&&v!=='settings'){await renderLocked();updateDeployBar();return}
   await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
   updateDeployBar()}
 
@@ -334,10 +338,14 @@ async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export
 function needAppEnv(){if(!APP){toast('Open an app first',true);nav('apps');return false} return true}
 async function renderAccess(){if(!ORG)return;$('pagetitle').textContent='Members & access';$('crumb').textContent='';
   let teams=await api('GET',`/api/orgs/${ORG}/teams`).catch(()=>[]);let roles=await api('GET',`/api/orgs/${ORG}/roles`).catch(()=>[]);
+  let members=await api('GET',`/api/orgs/${ORG}/members`).catch(()=>[]);const canLock=currentOrg()?.role==='owner';
   let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
   let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
   $('view').innerHTML=`
   <div class="card"><h3>Invite member</h3><p>Existing accounts are added immediately. New addresses get a single-use link, valid for seven days, to set a password or sign in with a configured provider.</p><div class="row"><label class="small mut" for="inv-email">Email</label><input id="inv-email" type="email" placeholder="teammate@company.com" style="min-width:240px"><label class="small mut" for="inv-role">Role</label><select id="inv-role">${roles.map(r=>`<option value="${esc(r.name)}"${r.name==='developer'?' selected':''}>${esc(r.name)}</option>`).join('')}</select><button class="primary" onclick="invite()">Invite</button></div></div>
+  <div class="card"><h3>Members</h3><p>Locking a member blocks their access to this workspace only. They keep their account, other workspaces and the ability to leave. Only workspace owners can lock or unlock members.</p>
+  ${members.length?`<table><thead><tr><th>Member</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>${members.map(m=>`<tr><td>${esc(m.email)}${ME&&m.id===ME.id?' <span class="mut small">(you)</span>':''}</td><td><span class="chip">${esc(m.role)}</span></td><td>${m.locked?'<span class="chip" style="color:var(--warn)">Locked</span>':'<span class="mut small">Active</span>'}</td><td>${canLock&&m.role!=='owner'&&(!ME||m.id!==ME.id)?`<button class="${m.locked?'':'danger'}" onclick="${m.locked?'unlockMember':'lockMember'}('${jsq(m.id)}')">${m.locked?'Unlock':'Lock'}</button>`:''}</td></tr>`).join('')}</tbody></table>`:'<span class="mut">No members</span>'}
+  </div>
   <div class="card"><h3>Custom roles</h3><p>Comma-separated permissions, for example <span class="mono">secrets:read</span> or <span class="mono">*</span>.</p><div class="row"><input id="role-name" placeholder="deployer"><input id="role-perms" placeholder="secrets:read,secrets:write" style="min-width:260px"><button onclick="mkRole()">Create role</button></div><div>${roles.map(r=>`<span class="chip">${esc(r.name)}: ${esc((r.permissions||[]).join(', '))}${r.managed?' (managed)':''}</span>`).join('')}</div></div>
   <div class="card"><h3>Teams</h3><div class="row"><input id="team-name" placeholder="platform-team"><button onclick="mkTeam()">Create team</button></div><div>${teams.map(t=>`<span class="chip">${esc(t.name)}</span>`).join('')||'<span class="mut">No teams yet</span>'}</div></div>
   <div class="card"><h3>Secret change proposals ${ENV?('· '+esc(ENV.name)):''}</h3><p>Proposals stage secret changes for admin approval instead of deploying directly.</p>
@@ -353,6 +361,9 @@ async function invite(){try{let d=await api('POST',`/api/orgs/${ORG}/members`,{e
     modal(`<h3>Invitation created</h3><p class="mut">Send this single-use link to ${esc($('inv-email').value)}. It expires in 7 days.</p><textarea rows="3" readonly>${esc(link)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Invite link copied')">Copy link</button><button class="primary" onclick="closeModal()">Done</button></div>`);}
   else toast('Member added');
   $('inv-email').value='';renderAccess()}catch(e){toast(e.message,true)}}
+async function lockMember(uid){if(!confirm('Lock this member? They will lose access to this workspace but keep their account and other workspaces.'))return;
+  try{await api('POST',`/api/orgs/${ORG}/members/${uid}/lock`);toast('Member locked');renderAccess()}catch(e){toast(e.message,true)}}
+async function unlockMember(uid){try{await api('POST',`/api/orgs/${ORG}/members/${uid}/unlock`);toast('Member unlocked');renderAccess()}catch(e){toast(e.message,true)}}
 async function mkRole(){try{await api('POST',`/api/orgs/${ORG}/roles`,{name:$('role-name').value,permissions:$('role-perms').value.split(',').map(s=>s.trim()).filter(Boolean)});toast('Role created');renderAccess()}catch(e){toast(e.message,true)}}
 async function mkTeam(){try{await api('POST',`/api/orgs/${ORG}/teams`,{name:$('team-name').value});toast('Team created');renderAccess()}catch(e){toast(e.message,true)}}
 async function decideProp(id,a){try{let d=await api('POST',`/api/proposals/${id}/${a}`,{});toast('Proposal '+d.status);renderAccess()}catch(e){toast(e.message,true)}}
@@ -395,10 +406,11 @@ async function mkStream(){try{await api('POST',`/api/orgs/${ORG}/log-streams`,{n
 async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-streams/deliveries`);$('delivs').textContent=JSON.stringify(d.slice(0,25),null,2)}catch(e){toast(e.message,true)}}
 
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
+  const locked=!!(ORG&&currentOrg()?.locked);
   let inst=await api('GET','/api/instance').catch(()=>null);
-  let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
-  let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
-  let samlCard=`<div class="card"><h3>SAML SSO</h3><p>Service provider metadata: <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
+  let s=locked?null:await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
+  let saml=locked?null:await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
+  let samlCard=locked?'':`<div class="card"><h3>SAML SSO</h3><p>Service provider metadata: <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
     <div class="field"><label for="set-saml-entity">IdP entity ID</label><input id="set-saml-entity" value="${esc(saml?.idp_entity_id||'')}" placeholder="https://idp.example/metadata"></div>
     <div class="field"><label for="set-saml-url">IdP metadata URL</label><input id="set-saml-url" placeholder="https://idp.example/metadata.xml" style="width:100%"></div>
     <div class="field"><label for="set-saml-xml">or paste metadata XML</label><textarea id="set-saml-xml" rows="4">${esc(saml?.metadata_xml||'')}</textarea></div>
@@ -407,8 +419,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
     <div class="field"><label for="set-saml-domains">Allowed email domains</label><input id="set-saml-domains" value="${esc(saml?.allowed_domains||'')}" placeholder="example.com" style="width:100%"></div>
     <div class="row"><button class="primary" onclick="saveSaml()">Save SAML</button></div><pre class="val" id="saml-out"></pre></div>`;
   let prov=await api('GET','/api/auth/providers').catch(()=>null);
-  let ldap=prov?.ldap?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
-  let ldapCard=prov?.ldap?`<div class="card"><h3>LDAP directory</h3><p>Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
+  let ldap=!locked&&prov?.ldap?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
+  let ldapCard=!locked&&prov?.ldap?`<div class="card"><h3>LDAP directory</h3><p>Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
   <div class="field"><label for="ld-url">Directory URL (ldaps:// only)</label><input id="ld-url" value="${esc(ldap?.url||'')}" placeholder="ldaps://dc01.example.com:636" style="width:100%"></div>
   <div class="row"><input id="ld-bind-dn" value="${esc(ldap?.bind_dn||'')}" placeholder="service bind DN" style="min-width:280px"><input id="ld-bind-pw" type="password" placeholder="${ldap?.bind_password_set?'stored; leave blank to keep':'service account password'}"></div>
   <div class="field"><label for="ld-base-dn">Base DN</label><input id="ld-base-dn" value="${esc(ldap?.base_dn||'')}" placeholder="OU=People,DC=example,DC=com" style="width:100%"></div>
@@ -423,8 +435,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
     <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
-  $('view').innerHTML=`${instanceCard}
-  <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
+  $('view').innerHTML=`${locked?'<div class="card" role="status"><h3>Workspace access locked</h3><p>Workspace security, SSO, LDAP, E2E and PKI settings are unavailable while your account is locked here. Account and instance settings remain available.</p></div>':''}${instanceCard}
+  <div class="card" id="org-security-card"${locked?' style="display:none"':''}><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
   <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" style="min-width:260px"></div>
@@ -434,9 +446,9 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   ${samlCard}
   ${ldapCard}
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
-  <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
+  <div class="card" id="e2e-card"${locked?' style="display:none"':''}><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
+  <div class="card" id="pki-card"${locked?' style="display:none"':''}><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;

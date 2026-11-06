@@ -258,6 +258,9 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (11, &[
         "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
     ]),
+    (12, &[
+        "ALTER TABLE org_members ADD COLUMN locked BIGINT DEFAULT 0",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[

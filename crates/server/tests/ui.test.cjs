@@ -173,7 +173,7 @@ function hidden(element) {
 const saved = { id: 'saved-secret', key: 'DATABASE_URL', value: 'fixture-original', path: '/service', type: 'secret', version: 2 };
 const draft = { key: 'NEW_CONFIG', value: 'fixture-draft', path: '/draft', type: 'config', comment: '' };
 
-async function consoleUI(secrets = [saved]) {
+async function consoleUI(secrets = [saved], overrides = {}, failures = {}) {
   const document = new Element('document', null);
   document.ownerDocument = document;
   document.getElementById = id => document.querySelector('#' + id);
@@ -189,6 +189,14 @@ async function consoleUI(secrets = [saved]) {
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
+    '/api/orgs/org-a/members': [
+      { id: 'owner-a', email: 'owner@example.invalid', role: 'owner', locked: false },
+      { id: 'member-a', email: 'member@example.invalid', role: 'developer', locked: false },
+    ],
+    '/api/orgs/org-a/teams': [],
+    '/api/orgs/org-a/roles': [{ name: 'developer', permissions: ['secrets:read'] }],
+    '/api/envs/env-a/proposals': [],
+    '/api/envs/env-a/access-requests': [],
     '/api/orgs/org-a/saml': { configured: false },
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
@@ -200,6 +208,7 @@ async function consoleUI(secrets = [saved]) {
     '/api/envs/env-d/secrets': { secrets: [] },
     '/api/secrets/saved-secret/history': [],
   };
+  Object.assign(responses, overrides);
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
     localStorage: { getItem: () => '', setItem() {}, removeItem() {} },
@@ -213,6 +222,7 @@ async function consoleUI(secrets = [saved]) {
     fetch: async (url, options) => {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
+      if (failures[url]) return { ok: false, status: failures[url].status || 403, text: async () => JSON.stringify(failures[url].body || {}) };
       let body;
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
@@ -220,6 +230,7 @@ async function consoleUI(secrets = [saved]) {
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
       else if (options.method === 'POST' && url === '/api/auth/mfa') body = { token: 'session-token' };
+      else if (options.method === 'POST' && /^\/api\/orgs\/[^/]+\/members\/[^/]+\/(un)?lock$/.test(url)) body = { ok: true, locked: !url.endsWith('/unlock') };
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -270,7 +281,10 @@ async function consoleUI(secrets = [saved]) {
   context.window = context;
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
   await ui.invoke('enterApp()');
-  await ui.invoke("openApp('app-a')");
+  const initialOrgs = responses['/api/orgs'];
+  if (Array.isArray(initialOrgs) && initialOrgs.some(o => o.id === 'org-a' && !o.locked)) {
+    await ui.invoke("openApp('app-a')");
+  }
   calls.length = 0;
   return ui;
 }
@@ -555,4 +569,71 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+test('a locked workspace shows the owner contact message without fetching workspace data', async () => {
+  const ui = await consoleUI([saved], {
+    '/api/orgs': [{ id: 'org-locked', name: 'Locked org', role: 'member', locked: true }],
+  });
+  const view = ui.el('view');
+  assert.match(view.textContent, /locked/i, 'the locked workspace must say it is locked');
+  assert.match(view.textContent, /workspace owner/i, 'the member must be told to contact the workspace owner');
+  assert.equal(ui.el('pagetitle').textContent, 'Workspace access locked');
+  assert.match(ui.el('orgs').textContent, /locked/i, 'the workspace switcher must mark the locked workspace');
+  assert.ok(!ui.calls.some(c => c.url === '/api/orgs/org-locked/apps'),
+    'a locked workspace must not fetch apps');
+});
+
+test('an owner can lock a member from the members list', async () => {
+  const ui = await consoleUI([saved], {
+    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
+    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'owner' }, { id: 'org-b', name: 'Second org', role: 'owner' }],
+  });
+  await ui.invoke("nav('access')");
+  const lock = ui.button(ui.el('view'), /^Lock$/);
+  assert.ok(lock, 'an owner must see a Lock control for a non-owner member');
+  ui.confirm = true;
+  await ui.click(lock);
+  assert.ok(ui.writes().some(c => c.method === 'POST' && c.url === '/api/orgs/org-a/members/member-a/lock'),
+    'locking must POST the member lock route: ' + JSON.stringify(ui.calls));
+});
+
+test('an owner can unlock a member from the members list', async () => {
+  const ui = await consoleUI([saved], {
+    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
+    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'owner' }],
+    '/api/orgs/org-a/members': [{ id: 'member-a', email: 'member@example.invalid', role: 'developer', locked: true }],
+  });
+  await ui.invoke("nav('access')");
+  const unlock = ui.button(ui.el('view'), /^Unlock$/);
+  assert.ok(unlock, 'an owner must see an Unlock control for a locked member');
+  await ui.click(unlock);
+  assert.ok(ui.writes().some(c => c.method === 'POST' && c.url === '/api/orgs/org-a/members/member-a/unlock'),
+    'unlocking must POST the member unlock route: ' + JSON.stringify(ui.calls));
+});
+
+test('the console preserves the workspace_locked error code', async () => {
+  const ui = await consoleUI([saved], {}, {
+    '/api/orgs/org-a/audit': {
+      status: 403,
+      body: { error: 'Your account is locked in this workspace; contact the workspace owner.', code: 'workspace_locked' },
+    },
+  });
+  await assert.rejects(ui.run("api('GET','/api/orgs/org-a/audit')"), error => error.code === 'workspace_locked');
+});
+
+test('a locked workspace keeps account settings available and hides workspace settings', async () => {
+  const ui = await consoleUI([saved], {
+    '/api/orgs': [{ id: 'org-locked', name: 'Locked org', role: 'member', locked: true }],
+  });
+  await ui.invoke("nav('settings')");
+  assert.ok(!ui.calls.some(c => c.url === '/api/orgs/org-locked/settings'),
+    'a locked workspace must not fetch workspace settings');
+  assert.ok(!ui.calls.some(c => c.url.includes('/saml') || c.url.includes('/ldap')),
+    'a locked workspace must not fetch SSO or directory settings');
+  assert.ok(ui.el('totp-out'), 'account TOTP settings must remain available');
+  assert.ok(hidden(ui.el('org-security-card')), 'workspace security settings must be hidden');
+  assert.ok(hidden(ui.el('e2e-card')), 'workspace E2E settings must be hidden');
+  assert.ok(hidden(ui.el('pki-card')), 'workspace PKI settings must be hidden');
+  assert.match(ui.el('view').textContent, /locked/i, 'the settings view must explain why workspace settings are unavailable');
 });

@@ -3,6 +3,7 @@
 | Phase feature | Tier in Phase | OpenWarp |
 |---|---|---|
 | Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Workspace member lock | n/a | owner-only per-membership lock; sign-in and other workspaces continue, workspace data returns 403 `workspace_locked`, audited |
 | Apps + readme | Free | yes |
 | Environments | 3 / 10 / unlimited | **unlimited custom envs**, name `^[a-zA-Z0-9-_]{1,32}$` |
 | Secrets: secret/sealed/config types | Free | yes; sealed never read back |
