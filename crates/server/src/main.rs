@@ -1,5 +1,5 @@
 mod db; mod integrations; mod mailer; mod ui;
-use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
+use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
 use openwarp_crypto as oc;
 use risaml::{
@@ -11,6 +11,7 @@ use risaml::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}, time::{SystemTime, UNIX_EPOCH}};
+use tokio::sync::broadcast;
 
 pub struct AppState {
     db: Db,
@@ -19,6 +20,7 @@ pub struct AppState {
     pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
+    live: broadcast::Sender<Arc<str>>,
 }
 type S = Arc<AppState>;
 type Res = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -129,6 +131,13 @@ impl AppState {
         } }
         if let Ok(Some(wh)) = self.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("audit_webhook:{}", org))]) { let url = db::s(&wh, "v"); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}); std::thread::spawn(move || { if let Ok(c) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5)).build() { let _ = c.post(&url).json(&payload).send(); } }); }
         let _ = self.db.exec("INSERT INTO audit(id,org_id,app_id,env_id,actor,action,detail,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(id()), json!(org), json!(app), json!(env), json!(actor), json!(action), json!(detail), json!(now())]);
+        // Names and actions only. Values stay in the encrypted tables, so a
+        // replica can forward the event without ever seeing plaintext.
+        let mut seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+        for _ in 0..4 {
+            if self.db.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq), json!(org), json!(app), json!(env), json!(action), json!(detail), json!(now())]).is_ok() { break; }
+            seq += 1;
+        }
     }
     fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
@@ -1119,9 +1128,9 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     if db::n(&srow, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid)); let client_secret = oc::decrypt_symmetric(&st.master(), &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-    if !egress_allowed(&issuer) { return Err(bad("OIDC issuer is a private address; set OPENWARP_ALLOW_PRIVATE_EGRESS=1 to allow a self-hosted IdP")); }
+    if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("OIDC issuer must be https, or http on a loopback address; private addresses need OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let disc = oidc_discovery(&issuer).await?;
-    let (subject, email) = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false).await.map_err(|e| bad(&e))?;
+    let (subject, email) = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false, if issuer.contains("login.microsoftonline.com") { "microsoft" } else { "oidc" }).await.map_err(|e| bad(&e))?;
     let issuer_key = issuer.clone();
     // An SSO login may attach an account to this organisation only through a
     // pending invite, or when the org explicitly enables auto-provisioning for
@@ -1456,15 +1465,30 @@ fn social_provider(provider: &str) -> Option<(String, String)> {
         let id = env_nonempty("OPENWARP_OIDC_CLIENT_ID");
         if id.is_empty() || env_nonempty("OPENWARP_OIDC_ISSUER").is_empty() { return None; }
         return Some((id, env_nonempty("OPENWARP_OIDC_CLIENT_SECRET"))); }
+    // X also supports a public client, where PKCE replaces the client secret.
+    if provider == "x" {
+        let id = env_nonempty("OPENWARP_X_CLIENT_ID");
+        if id.is_empty() { return None; }
+        return Some((id, env_nonempty("OPENWARP_X_CLIENT_SECRET"))); }
     let (id_key, secret_key) = match provider {
         "google" => ("OPENWARP_GOOGLE_CLIENT_ID", "OPENWARP_GOOGLE_CLIENT_SECRET"),
         "github" => ("OPENWARP_GITHUB_CLIENT_ID", "OPENWARP_GITHUB_CLIENT_SECRET"),
         "apple" => ("OPENWARP_APPLE_CLIENT_ID", "OPENWARP_APPLE_CLIENT_SECRET"),
         "openai" => ("OPENWARP_OPENAI_CLIENT_ID", "OPENWARP_OPENAI_CLIENT_SECRET"),
+        "microsoft" => ("OPENWARP_MICROSOFT_CLIENT_ID", "OPENWARP_MICROSOFT_CLIENT_SECRET"),
+        "okta" => ("OPENWARP_OKTA_CLIENT_ID", "OPENWARP_OKTA_CLIENT_SECRET"),
+        "auth0" => ("OPENWARP_AUTH0_CLIENT_ID", "OPENWARP_AUTH0_CLIENT_SECRET"),
+        "gitlab" => ("OPENWARP_GITLAB_CLIENT_ID", "OPENWARP_GITLAB_CLIENT_SECRET"),
+        "slack" => ("OPENWARP_SLACK_CLIENT_ID", "OPENWARP_SLACK_CLIENT_SECRET"),
+        "salesforce" => ("OPENWARP_SALESFORCE_CLIENT_ID", "OPENWARP_SALESFORCE_CLIENT_SECRET"),
+        "atlassian" => ("OPENWARP_ATLASSIAN_CLIENT_ID", "OPENWARP_ATLASSIAN_CLIENT_SECRET"),
         _ => return None };
     let id = env_nonempty(id_key);
     let secret = env_nonempty(secret_key);
     if id.is_empty() || secret.is_empty() { None } else { Some((id, secret)) } }
+// OIDC providers also need an issuer; GitHub and X are plain OAuth 2.0.
+fn social_enabled(provider: &str) -> bool {
+    social_provider(provider).is_some() && (matches!(provider, "github" | "x") || social_issuer(provider).is_some()) }
 fn google_issuer() -> String { std::env::var("OPENWARP_GOOGLE_ISSUER").unwrap_or_else(|_| "https://accounts.google.com".into()) }
 // Apple's client secret is a short-lived JWT the operator generates with their
 // Sign in with Apple key; OpenAI issues a regular OAuth client secret.
@@ -1473,11 +1497,38 @@ fn social_issuer(provider: &str) -> Option<String> {
         "google" => Some(google_issuer()),
         "apple" => Some(std::env::var("OPENWARP_APPLE_ISSUER").unwrap_or_else(|_| "https://appleid.apple.com".into())),
         "openai" => Some(std::env::var("OPENWARP_OPENAI_ISSUER").unwrap_or_else(|_| "https://auth.openai.com".into())),
+        "microsoft" => Some(microsoft_issuer()),
+        "okta" => issuer_or("OPENWARP_OKTA_ISSUER", ""),
+        "auth0" => issuer_or("OPENWARP_AUTH0_ISSUER", ""),
+        "gitlab" => issuer_or("OPENWARP_GITLAB_ISSUER", "https://gitlab.com"),
+        "slack" => issuer_or("OPENWARP_SLACK_ISSUER", "https://slack.com"),
+        "salesforce" => issuer_or("OPENWARP_SALESFORCE_ISSUER", "https://login.salesforce.com"),
+        "atlassian" => issuer_or("OPENWARP_ATLASSIAN_ISSUER", "https://auth.atlassian.com"),
         "oidc" => { let issuer = env_nonempty("OPENWARP_OIDC_ISSUER"); if issuer.is_empty() { None } else { Some(issuer) } },
         _ => None } }
+fn issuer_or(key: &str, default: &str) -> Option<String> {
+    let value = env_nonempty(key);
+    if !value.is_empty() { Some(value) } else if !default.is_empty() { Some(default.to_string()) } else { None } }
+fn microsoft_issuer() -> String {
+    let explicit = env_nonempty("OPENWARP_MICROSOFT_ISSUER");
+    if !explicit.is_empty() { return explicit; }
+    let tenant = env_nonempty("OPENWARP_MICROSOFT_TENANT");
+    let tenant = if tenant.is_empty() { "common".to_string() } else { tenant };
+    format!("https://login.microsoftonline.com/{}/v2.0", tenant.trim_matches('/')) }
+fn x_web() -> String { issuer_or("OPENWARP_X_WEB", "https://x.com").unwrap_or_else(|| "https://x.com".into()) }
+fn x_api() -> String { issuer_or("OPENWARP_X_API", "https://api.x.com").unwrap_or_else(|| "https://api.x.com".into()) }
 // Apple rejects scopes outside its advertised set (openid, email, name).
 fn social_scope(provider: &str) -> &'static str {
-    if provider == "apple" { "openid email" } else { "openid email profile" } }
+    match provider {
+        "apple" => "openid email",
+        "x" => "users.read users.email",
+        _ => "openid email profile" } }
+// PKCE is safe wherever the provider supports S256. Some IdPs implement it but
+// omit it from discovery, so the known ones are explicit here.
+fn social_pkce(provider: &str, disc: &Value) -> bool {
+    if matches!(provider, "oidc" | "openai" | "microsoft" | "okta" | "auth0" | "gitlab" | "salesforce" | "atlassian") { return true; }
+    disc.get("code_challenge_methods_supported").and_then(|v| v.as_array())
+        .map(|a| a.iter().any(|v| v.as_str() == Some("S256"))).unwrap_or(false) }
 fn oidc_custom_name() -> String { let name = env_nonempty("OPENWARP_OIDC_NAME"); if name.is_empty() { "SSO".into() } else { name } }
 fn oidc_custom_scope() -> String {
     let raw = env_nonempty("OPENWARP_OIDC_SCOPES");
@@ -1520,6 +1571,17 @@ fn jwk_decoding_key(jwk: &Value, alg: jsonwebtoken::Algorithm) -> Result<jsonweb
             jwk.get("x").and_then(|v| v.as_str()).ok_or("the JWK has no EC x coordinate")?,
             jwk.get("y").and_then(|v| v.as_str()).ok_or("the JWK has no EC y coordinate")?).map_err(|e| e.to_string()),
         _ => Err(format!("unsupported id_token signature algorithm: {:?}", alg)) } }
+fn b64url_json(segment: &str) -> Option<Value> {
+    let mut s = segment.replace('-', "+").replace('_', "/");
+    while s.len() % 4 != 0 { s.push('='); }
+    serde_json::from_slice(&oc::unb64(&s).ok()?).ok() }
+// Microsoft publishes a templated issuer for multi-tenant apps. The tid claim
+// selects the concrete tenant; the signature and audience are still checked.
+fn concrete_issuer(issuer: &str, id_token: &str) -> String {
+    if !issuer.contains("{tenantid}") { return issuer.to_string(); }
+    let tid = id_token.split('.').nth(1).and_then(b64url_json)
+        .and_then(|c| c.get("tid").and_then(|v| v.as_str()).map(str::to_string));
+    match tid { Some(t) if !t.is_empty() => issuer.replace("{tenantid}", &t), _ => issuer.to_string() } }
 async fn verify_id_token(id_token: &str, issuer: &str, audience: &str, jwks_uri: &str) -> Result<Value, String> {
     let header = jsonwebtoken::decode_header(id_token).map_err(|e| e.to_string())?;
     let kid = header.kid.clone().unwrap_or_default();
@@ -1531,10 +1593,16 @@ async fn verify_id_token(id_token: &str, issuer: &str, audience: &str, jwks_uri:
     } else { keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid)).ok_or("kid not found in the JWKS")? };
     let alg = jwk_signing_algorithm(jwk, header.alg)?;
     let dkey = jwk_decoding_key(jwk, alg)?;
+    let expected_issuer = concrete_issuer(issuer, id_token);
     let mut validation = jsonwebtoken::Validation::new(alg);
-    validation.set_audience(&[audience]); validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]); validation.set_issuer(&[&expected_issuer]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let data = jsonwebtoken::decode::<Value>(id_token, &dkey, &validation).map_err(|e| e.to_string())?;
-    Ok(data.claims) }
+    let claims = data.claims;
+    // OIDC Core 3.1.3.7: multiple audiences require a matching authorised party.
+    if claims.get("aud").and_then(|v| v.as_array()).map(|a| a.len() > 1).unwrap_or(false)
+        && claims.get("azp").and_then(|v| v.as_str()) != Some(audience) { return Err("the id_token has multiple audiences but no matching azp".into()); }
+    Ok(claims) }
 fn oidc_token_auth_basic(disc: &Value) -> bool {
     match env_nonempty("OPENWARP_OIDC_TOKEN_AUTH_METHOD").as_str() {
         "client_secret_basic" => true,
@@ -1543,7 +1611,7 @@ fn oidc_token_auth_basic(disc: &Value) -> bool {
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
             methods.contains(&"client_secret_basic") && !methods.contains(&"client_secret_post") } } }
 #[allow(clippy::too_many_arguments)] // every argument is a distinct token-exchange value
-async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str, custom: bool) -> Result<(String, String), String> {
+async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str, custom: bool, provider: &str) -> Result<(String, String), String> {
     let token_ep = disc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or("");
     let jwks_uri = disc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or("");
     if !issuer_url_ok(token_ep) || !issuer_url_ok(jwks_uri) { return Err("the OIDC token and JWKS endpoints must be https, or http on a loopback address".into()); }
@@ -1551,6 +1619,10 @@ async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, cli
     // Validate iss against the issuer the discovery document identifies, not the
     // configured URL: providers commonly differ by a trailing slash.
     let expected_issuer = disc.get("issuer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(issuer);
+    // The metadata must identify the issuer we configured; a differing value
+    // would separate token validation from the binding key. Microsoft's
+    // multi-tenant documents publish a {tenantid} template, checked per token.
+    if !expected_issuer.contains("{tenantid}") && expected_issuer.trim_end_matches('/') != issuer.trim_end_matches('/') { return Err("the OIDC discovery issuer does not match the configured issuer".into()); }
     let basic = custom && !client_secret.is_empty() && oidc_token_auth_basic(disc);
     let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)];
     if !basic { form.push(("client_id", client_id)); }
@@ -1563,15 +1635,21 @@ async fn oidc_identity_from_doc(disc: &Value, issuer: &str, client_id: &str, cli
     if let Some(err) = tok.get("error").and_then(|v| v.as_str()) { return Err(format!("the token endpoint rejected the code: {}", err)); }
     let id_token = tok.get("id_token").and_then(|v| v.as_str()).ok_or("the token response has no id_token")?;
     let claims = verify_id_token(id_token, expected_issuer, client_id, jwks_uri).await?;
-    if let Some(returned) = claims.get("nonce").and_then(|v| v.as_str()) { if !expected_nonce.is_empty() && returned != expected_nonce { return Err("id_token nonce does not match this sign-in attempt".into()); } }
+    if !expected_nonce.is_empty() && claims.get("nonce").and_then(|v| v.as_str()) != Some(expected_nonce) { return Err("id_token nonce does not match this sign-in attempt".into()); }
     if email_verified_claim(&claims) == Some(false) { return Err("the provider reports this email address as unverified".into()); }
-    let email = claims.get("email").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+    let mut email = claims.get("email").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+    // Entra work accounts often omit email and identify the user by UPN.
+    if email.is_empty() && provider == "microsoft" {
+        email = ["preferred_username", "upn"].iter()
+            .find_map(|k| claims.get(*k).and_then(|v| v.as_str())).unwrap_or("").trim().to_lowercase();
+        if !email.contains('@') { email.clear(); } }
     let subject = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if email.is_empty() || subject.is_empty() { return Err("the id_token has no email or subject".into()); }
     Ok((subject, email)) }
-async fn oidc_social_identity(issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str) -> Result<(String, String), String> {
+#[allow(clippy::too_many_arguments)] // mirrors the token-exchange inputs of oidc_identity_from_doc
+async fn oidc_social_identity(provider: &str, issuer: &str, client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str, expected_nonce: &str) -> Result<(String, String), String> {
     let disc = oidc_discovery(issuer).await.map_err(|(_, j)| j.to_string())?;
-    oidc_identity_from_doc(&disc, issuer, client_id, client_secret, redirect, code, verifier, expected_nonce, false).await }
+    oidc_identity_from_doc(&disc, issuer, client_id, client_secret, redirect, code, verifier, expected_nonce, false, provider).await }
 async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str) -> Result<(String, String), String> {
     let tok: Value = http_client().post(format!("{}/login/oauth/access_token", github_web()))
         .header("Accept", "application/json").header("User-Agent", "openwarp")
@@ -1592,6 +1670,24 @@ async fn github_identity(client_id: &str, client_secret: &str, redirect: &str, c
             .or_else(|| arr.iter().find(|e| e.get("verified").and_then(|v| v.as_bool()) == Some(true))) });
     let email = verified.and_then(|e| e.get("email").and_then(|v| v.as_str())).unwrap_or("").to_lowercase();
     if email.is_empty() { return Err("GitHub account has no verified email".into()); }
+    Ok((subject, email)) }
+async fn x_identity(client_id: &str, client_secret: &str, redirect: &str, code: &str, verifier: &str) -> Result<(String, String), String> {
+    let token_ep = format!("{}/2/oauth2/token", x_api());
+    let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect)];
+    if !verifier.is_empty() { form.push(("code_verifier", verifier)); }
+    let mut req = http_client().post(&token_ep);
+    if client_secret.is_empty() { form.push(("client_id", client_id)); } else { req = req.basic_auth(client_id, Some(client_secret)); }
+    let tok: Value = req.form(&form).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    if let Some(err) = tok.get("error").and_then(|v| v.as_str()) { return Err(format!("the X token endpoint rejected the code: {}", err)); }
+    let at = tok.get("access_token").and_then(|v| v.as_str()).ok_or("the X token response has no access_token")?;
+    let me: Value = http_client().get(format!("{}/2/users/me?user.fields=confirmed_email", x_api()))
+        .bearer_auth(at).header("User-Agent", "openwarp")
+        .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let data = me.get("data").ok_or("the X user response has no data")?;
+    let subject = data.get("id").and_then(|v| v.as_str()).ok_or("the X user has no id")?.to_string();
+    // confirmed_email is present only when the app holds the users.email scope.
+    let email = data.get("confirmed_email").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+    if email.is_empty() { return Err("X did not return a confirmed email; enable the users.email scope and confirm an email on the account".into()); }
     Ok((subject, email)) }
 fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
     if let Some(bound) = st.db.one("SELECT user_id FROM social_subjects WHERE provider=? AND subject=?", &[json!(provider), json!(subject)]).map_err(|e| bad(&e))? {
@@ -1621,13 +1717,21 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email));
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
-    let oidc = social_provider("oidc").is_some();
+    let oidc = social_enabled("oidc");
     Ok(j(json!({
         "password": true,
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-        "apple": social_provider("apple").is_some(),
-        "openai": social_provider("openai").is_some(),
+        "google": social_enabled("google"),
+        "github": social_enabled("github"),
+        "apple": social_enabled("apple"),
+        "openai": social_enabled("openai"),
+        "microsoft": social_enabled("microsoft"),
+        "okta": social_enabled("okta"),
+        "auth0": social_enabled("auth0"),
+        "gitlab": social_enabled("gitlab"),
+        "slack": social_enabled("slack"),
+        "salesforce": social_enabled("salesforce"),
+        "atlassian": social_enabled("atlassian"),
+        "x": social_enabled("x"),
         "oidc": oidc,
         "oidc_name": if oidc { oidc_custom_name() } else { String::new() },
         "signups": if signups_open(&st) { "open" } else { "invite" },
@@ -1656,6 +1760,12 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
         st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
         let url = format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state);
         return Ok(axum::response::Redirect::temporary(&url)); }
+    if provider == "x" {
+        let verifier = oc::random_token("pkce");
+        st.db.exec("INSERT INTO social_states(state,provider,created_at,code_verifier) VALUES(?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&verifier)]).map_err(|e| bad(&e))?;
+        let url = format!("{}/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+            x_web(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scope("x")), state, pkce_challenge(&verifier));
+        return Ok(axum::response::Redirect::temporary(&url)); }
     let disc = if provider == "oidc" { custom_oidc_metadata().await? } else {
         let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
         if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("the provider issuer must be https, or http on a loopback address")); }
@@ -1664,9 +1774,8 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
     if !url_ok(auth_ep) || !egress_allowed(auth_ep) { return Err(bad("OIDC discovery returned no usable authorization_endpoint")); }
     if provider == "oidc" && !issuer_url_ok(auth_ep) { return Err(bad("OPENWARP_OIDC_AUTHORIZATION_ENDPOINT must be https, or http on a loopback address")); }
     let nonce = oc::random_token("n");
-    // OpenAI documents PKCE for confidential clients too; the custom provider
-    // always uses it so a public client (no secret) also works. Apple does not.
-    let verifier = if provider == "openai" || provider == "oidc" { oc::random_token("pkce") } else { String::new() };
+    // PKCE wherever the provider supports it; Apple and Slack do not advertise S256.
+    let verifier = if social_pkce(&provider, &disc) { oc::random_token("pkce") } else { String::new() };
     st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier) VALUES(?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier)]).map_err(|e| bad(&e))?;
     let scope = if provider == "oidc" { oidc_custom_scope() } else { social_scope(&provider).to_string() };
     let mut url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect), urlencode(&scope), state, nonce);
@@ -1674,7 +1783,7 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
     if !verifier.is_empty() { url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", pkce_challenge(&verifier))); }
     Ok(axum::response::Redirect::temporary(&url)) }
 async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
-    let (client_id, client_secret) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let (client_id, client_secret) = social_provider(&provider).filter(|_| social_enabled(&provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     // Apple answers with a form POST; every other provider uses the query string.
     let params = if q.contains_key("code") || q.contains_key("state") { q } else { form.ok().map(|axum::extract::Form(f)| f).unwrap_or_default() };
     let code = params.get("code").cloned().unwrap_or_default(); let state = params.get("state").cloned().unwrap_or_default();
@@ -1685,15 +1794,17 @@ async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path
     let redirect = social_redirect(&st, &h, &provider);
     let (subject, email) = if provider == "github" {
         github_identity(&client_id, &client_secret, &redirect, &code).await.map_err(|e| bad(&e))?
+    } else if provider == "x" {
+        x_identity(&client_id, &client_secret, &redirect, &code, &db::s(&row, "code_verifier")).await.map_err(|e| bad(&e))?
     } else if provider == "oidc" {
         let disc = custom_oidc_metadata().await?;
         let issuer = env_nonempty("OPENWARP_OIDC_ISSUER");
         let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
-        oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce, true).await.map_err(|e| bad(&e))?
+        oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce, true, "oidc").await.map_err(|e| bad(&e))?
     } else {
         let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
         let nonce = db::s(&row, "nonce"); let verifier = db::s(&row, "code_verifier");
-        oidc_social_identity(&issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))? };
+        oidc_social_identity(&provider, &issuer, &client_id, &client_secret, &redirect, &code, &verifier, &nonce).await.map_err(|e| bad(&e))? };
     // Bind a custom-OIDC identity to its issuer so a changed issuer cannot
     // inherit the bindings of the previous one.
     let bound_provider = if provider == "oidc" { format!("oidc:{}", env_nonempty("OPENWARP_OIDC_ISSUER")) } else { provider.clone() };
@@ -1706,11 +1817,19 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
         "signups_open": signups_open(&st),
         "signups_env_locked": std::env::var("OPENWARP_SIGNUPS").is_ok(),
         "instance_owner": instance_owner(&st).as_deref() == Some(uid.as_str()),
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-        "apple": social_provider("apple").is_some(),
-        "openai": social_provider("openai").is_some(),
-        "oidc": social_provider("oidc").is_some(),
+        "google": social_enabled("google"),
+        "github": social_enabled("github"),
+        "apple": social_enabled("apple"),
+        "openai": social_enabled("openai"),
+        "microsoft": social_enabled("microsoft"),
+        "okta": social_enabled("okta"),
+        "auth0": social_enabled("auth0"),
+        "gitlab": social_enabled("gitlab"),
+        "slack": social_enabled("slack"),
+        "salesforce": social_enabled("salesforce"),
+        "atlassian": social_enabled("atlassian"),
+        "x": social_enabled("x"),
+        "oidc": social_enabled("oidc"),
     }))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
@@ -1963,23 +2082,26 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, creds.to_string().as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
-    if matches!(typ, "openrouter" | "resend" | "openai") {
+    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface") {
         let config = body.get("config").cloned().unwrap_or(json!({}));
         let issued = match typ {
             "openrouter" => integrations::openrouter_create_key(&config, &name, ttl).await,
             "resend" => integrations::resend_create_key(&config, &name).await,
+            "huggingface" => integrations::huggingface_create_token(&config, &name).await,
             _ => integrations::openai_create_key(&config, &name, ttl).await,
         }.map_err(|e| bad(&e))?;
         let (secret, remote_id, base_url) = match typ {
             "openrouter" => (issued["key"].as_str().unwrap_or("").to_string(), issued["hash"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://openrouter.ai/api/v1")),
             "resend" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.resend.com")),
+            "huggingface" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://huggingface.co")),
             _ => (issued["value"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.openai.com/v1")),
         };
         // The parent credential is encrypted for the revoke call only. The response carries the child secret.
         let mut stored = json!({"type": typ, "base_url": base_url, "remote_id": remote_id});
-        let parent = match typ { "openrouter" => config.get("management_key"), "resend" => config.get("api_key"), _ => config.get("admin_key") }.and_then(|v| v.as_str()).unwrap_or("");
+        let parent = match typ { "openrouter" => config.get("management_key"), "huggingface" => config.get("token"), "resend" => config.get("api_key"), _ => config.get("admin_key") }.and_then(|v| v.as_str()).unwrap_or("");
         stored["parent"] = json!(parent);
         if typ == "openai" { stored["project_id"] = json!(config.get("project_id").and_then(|v| v.as_str()).unwrap_or("")); }
+        if typ == "huggingface" { stored["org"] = json!(config.get("org").and_then(|v| v.as_str()).unwrap_or("")); stored["service_account_id"] = json!(config.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("")); }
         let config_enc = oc::encrypt_symmetric(&key, stored.to_string().as_bytes());
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, secret.as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "value": secret, "remote_id": remote_id, "expires_at": now()+ttl, "type": typ})));
@@ -1994,16 +2116,19 @@ async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>
         match cfg.get("type").and_then(|v| v.as_str()) {
             Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 let _ = std::thread::spawn(move || { if let Ok(mut cl) = postgres::Client::connect(&conn, postgres::NoTls) { let _ = cl.execute(&format!("DROP ROLE IF EXISTS \"{}\"", username), &[]); } }).join(); }
-            Some(kind @ ("openrouter" | "resend" | "openai")) => {
+            Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let project = cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let hf_org = cfg.get("org").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let service_account = cfg.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let kind = kind.to_string();
                 // A failed remote delete must not mark the local lease revoked.
                 let remote_result = match kind.as_str() {
                     "openrouter" => integrations::openrouter_revoke_key(&base, &parent, &remote).await,
                     "resend" => integrations::resend_revoke_key(&base, &parent, &remote).await,
+                    "huggingface" => integrations::huggingface_revoke_token(&base, &parent, &hf_org, &service_account, &remote).await,
                     _ => integrations::openai_revoke_key(&base, &parent, &project, &remote).await,
                 };
                 remote_result.map_err(|e| bad(&e))?;
@@ -2321,6 +2446,7 @@ async fn process_rotations(st: &S) {
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]);
     let _ = st.db.exec("DELETE FROM saml_replay WHERE expires_at<?", &[json!(now() - 3600)]);
     let _ = st.db.exec("DELETE FROM rate_limits WHERE window_start<?", &[json!(now() - 86400)]);
+    let _ = st.db.exec("DELETE FROM live_events WHERE created_at<?", &[json!(now() - 3600)]);
     let due = st.db.query("SELECT * FROM rotation_schedules WHERE enabled=1 AND next_run<=?", &[json!(now())]).unwrap_or_default();
     for r in &due {
         let id = db::s(r,"id"); let eid = db::s(r,"env_id"); let key_name = db::s(r,"key_name");
@@ -2514,6 +2640,42 @@ async fn mcp_post(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) ->
     };
     match result { Ok(r) => Json(rpc_result(&id, r)).into_response(), Err(e) => Json(rpc_error(&id, -32000, &e)).into_response() } }
 async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(json!({"error":"stateless MCP server: POST JSON-RPC to /mcp"}))) }
+// The socket stays on the replica that accepted it. That replica's single poll
+// reads the shared table and fans matching events out, so a write on any
+// replica shows up here within a second. Frames carry audit fields only.
+async fn live_ws(State(st): State<S>, h: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let uid = match st.token_user(&h) { Ok(u) => u, Err(e) => return e.into_response() };
+    let mut orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(&uid)]).unwrap_or_default().iter().map(|r| db::s(r, "org_id")).collect::<Vec<_>>();
+    if let Ok(rows) = st.db.query("SELECT org_id FROM identities WHERE id=?", &[json!(&uid)]) {
+        for r in rows { let org = db::s(&r, "org_id"); if !orgs.contains(&org) { orgs.push(org); } } }
+    // Subscribing before the upgrade means the poll is already running when the
+    // first frame could be missed, and a slow client is dropped rather than blocking.
+    let rx = st.live.subscribe();
+    ws.on_upgrade(move |socket| live_socket(st, uid, orgs, rx, socket)) }
+async fn live_socket(st: S, uid: String, orgs: Vec<String>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
+    if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(p))) => { if socket.send(Message::Pong(p)).await.is_err() { break; } }
+                    _ => {}
+                }
+            }
+            ev = rx.recv() => {
+                let raw = match ev { Ok(v) => v, Err(_) => break };
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
+                let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
+                if !orgs.iter().any(|o| o == org) { continue; }
+                let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
+                if !env.is_empty() { if st.require_env(env, &uid).is_err() { continue; } }
+                let mut out = v; out["type"] = json!("event");
+                if socket.send(Message::Text(out.to_string().into())).await.is_err() { return; }
+            }
+        }
+    }
+}
 fn origin_matches(st: &S, h: &HeaderMap, origin: &str) -> bool {
     let origin = origin.trim_end_matches('/');
     let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -2661,8 +2823,26 @@ async fn main() {
     #[cfg(feature = "redis-cache")]
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
-    let state = Arc::new(AppState { db, db_url: db_url.clone(), instance_id: oc::random_token("inst"), pub_url, master: std::sync::RwLock::new(master), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
+    let (live, _) = broadcast::channel(256);
+    let state = Arc::new(AppState { db, db_url: db_url.clone(), instance_id: oc::random_token("inst"), pub_url, master: std::sync::RwLock::new(master), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn), live });
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", &st2.instance_id, 60) { process_rotations(&st2).await; } } }); }
+    // One poll for the whole process. With no sockets subscribed it only reads
+    // the current high-water mark, so the next connection starts from now.
+    { let st2 = state.clone(); tokio::spawn(async move {
+        let mut cursor = st2.db.one("SELECT MAX(id) AS id FROM live_events", &[]).ok().flatten().map(|r| db::n(&r, "id")).unwrap_or(0);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if st2.live.receiver_count() == 0 {
+                if let Some(r) = st2.db.one("SELECT MAX(id) AS id FROM live_events", &[]).ok().flatten() { cursor = db::n(&r, "id"); }
+                continue; }
+            let rows = st2.db.query("SELECT id,org_id,app_id,env_id,action,detail,created_at FROM live_events WHERE id>? ORDER BY id LIMIT 200", &[json!(cursor)]).unwrap_or_default();
+            for r in &rows {
+                cursor = cursor.max(db::n(r, "id"));
+                let ev = json!({"id":db::n(r,"id"),"org":db::s(r,"org_id"),"app":db::s(r,"app_id"),"env":db::s(r,"env_id"),"action":db::s(r,"action"),"detail":db::s(r,"detail"),"ts":db::n(r,"created_at")}).to_string();
+                let _ = st2.live.send(Arc::from(ev));
+            }
+        }
+    }); }
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
@@ -2670,6 +2850,7 @@ async fn main() {
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/live", get(live_ws))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))

@@ -1,0 +1,24 @@
+# One address in front of every replica. `dynamic a` re-resolves the server
+# name's A records, which is what Docker Compose publishes for a scaled service,
+# so a container that starts is joined and one that stops is dropped.
+# WebSocket upgrades pass through; the replica that accepts the socket owns it.
+{
+	admin off
+	auto_https off
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:8080 {
+	reverse_proxy {
+		dynamic a {$OPENWARP_UPSTREAMS:server} 8080
+		lb_policy least_conn
+		health_uri /health
+		health_interval 5s
+		health_timeout 2s
+		fail_duration 10s
+		lb_try_duration 2s
+		flush_interval -1
+	}
+}

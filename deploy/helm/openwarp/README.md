@@ -66,9 +66,16 @@ Enable `ingress.enabled`, set `ingress.className`, and configure `ingress.hosts`
 Kubernetes TLS entries with `secretName` and `hosts`. Supply TLS Secrets and an
 ingress controller separately. The Service defaults to ClusterIP port 8080.
 
-Both probes call `/health` on container port 8080. Secret updates require a rollout
-restart because environment variables are read at startup. No Secret contents or
-checksums are embedded in the chart.
+Both probes call `/health` on container port 8080. The Service has no session
+affinity: any ready pod can take a request, and a pod that fails readiness stops
+receiving new ones. `preStop` waits five seconds so the endpoints controller
+drops the pod before the process drains, and `terminationGracePeriodSeconds` is
+30. A WebSocket on `/api/live` is tied to the pod that accepted it and ends when
+that pod stops; the client reconnects to whichever pod is ready. The default
+ingress annotations raise the nginx read and send timeouts to an hour so that
+socket is not cut off. Secret updates require a rollout restart because
+environment variables are read at startup. No Secret contents or checksums are
+embedded in the chart.
 
 ```sh
 helm lint deploy/helm/openwarp

@@ -203,6 +203,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS saml_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS saml_subjects(org_id TEXT NOT NULL,idp_entity_id TEXT NOT NULL,name_id TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(org_id,idp_entity_id,name_id))",
     "CREATE TABLE IF NOT EXISTS rotation_hooks(org_id TEXT PRIMARY KEY,url TEXT NOT NULL,secret_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
 ];
 
 // Additive migrations applied after the baseline schema. A statement may fail
@@ -232,6 +233,9 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE social_states ADD COLUMN nonce TEXT DEFAULT ''",
         "ALTER TABLE social_states ADD COLUMN code_verifier TEXT DEFAULT ''",
     ]),
+    (8, &[
+        "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -249,6 +253,7 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_rotations_due ON rotation_schedules(enabled,next_run)",
     "CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)",
     "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_live_events_id ON live_events(id)",
 ];
 
 #[cfg(test)]

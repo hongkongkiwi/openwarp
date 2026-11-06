@@ -22,7 +22,11 @@ service:
 ingress:
   enabled: false
   className: ""
-  annotations: {}
+  # Long-lived sockets on /api/live. nginx-ingress honours these; other
+  # controllers need the equivalent read and send timeout.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   hosts:
     - host: openwarp.example.com
       paths:
@@ -67,3 +71,23 @@ tolerations: []
 affinity: {}
 # Kubernetes EnvVar entries, including valueFrom.secretKeyRef when needed.
 extraEnv: []
+# External Secrets Operator bridge. Serves one OpenWarp environment as the JSON
+# map an ESO webhook SecretStore expects. The bridge holds no credentials: each
+# request carries an OpenWarp service token. Read docs/KUBERNETES.md first.
+eso:
+  enabled: false
+  image:
+    # Empty reuses image.repository and the resulting tag above.
+    repository: ""
+    tag: ""
+  replicas: 1
+  port: 8090
+  # Empty targets this release's own Service.
+  openwarpUrl: ""
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+

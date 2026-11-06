@@ -6,7 +6,7 @@ version.workspace = true
 
 [dependencies]
 openwarp-crypto = { path = "../crypto" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

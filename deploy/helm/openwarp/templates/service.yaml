@@ -10,5 +10,9 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
+  # A starting pod joins and a stopping pod leaves. The socket that accepted
+  # /api/live stays on that pod, so new connections must not land on a pod
+  # that is already terminating.
+  sessionAffinity: None
   selector:
     {{- include "openwarp.selectorLabels" . | nindent 4 }}
