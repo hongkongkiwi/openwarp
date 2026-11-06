@@ -91,6 +91,16 @@ CN and SANs are taken from the device record, never from the CSR, so one enrolle
 
 The CRL and OCSP endpoints are public. A CRL is a signed public artifact and brokers fetch it without credentials; it reveals the serial numbers and revocation state of that CA's certificates. CA identifiers are random and not enumerable. Revocation times come from the stored `revoked_at` value, and the CRL's `nextUpdate` is seven days, so short-lived certificates are the more reliable revocation mechanism for a fleet.
 
+A workspace can run a root CA and intermediates signed by it. The root is the broker's trust anchor; an intermediate has a path length of zero and can sign leaves only. Revoking an intermediate marks it revoked, revokes every certificate it issued and lists its serial in the root's CRL, so one environment or factory can be distrusted without replacing the root. The intermediate private key is encrypted with the master key exactly like a root key.
+
+The pre-issuance hook is a policy gate, not an advisory call. The configured URL is part of the trust boundary: the server sends the device identity, CA and CSR hash, signs the body with the configured HMAC secret when one is set, and requires `{"allow":true}`. A deny, an error, a non-2xx response, a timeout or an egress rejection blocks enrollment, and the code remains usable. The endpoint inherits the egress guards; `OPENWARP_ALLOW_PRIVATE_EGRESS` is needed to call a private-network hook. Redirects are not followed, and in production the host is resolved, a private answer is refused, and the checked address is pinned for the request.
+
+Hardware attestation trusts one operator-configured issuer and public key per CA. The server verifies the JWT signature, issuer, audience, expiry, device subject, the enrollment nonce and the SHA-256 of the submitted CSR, and requires `hardware_backed: true`. It does not inspect the device itself: a compromised attestation service can assert hardware backing, so the issuer and key are the trust anchor. The nonce is single-enrollment, the assertion is checked before the code is consumed, and an accepted assertion is recorded on the device.
+
+Device revocation, deletion, group revocation and CA revocation run as a single database transaction. The delete and revoke paths still carry the epoch and tombstone checks, so a concurrent enrollment cannot attach a certificate while the transaction is in flight; a failed transaction leaves the prior state rather than a half-revoked device.
+
+Renewal (`POST /api/pki/devices/:id/renew`) sets `revoke_previous` on the new code. The previous active certificate is revoked only after the replacement attaches, so a failed enrollment leaves the old certificate valid.
+
 ## Network and operational controls
 
 Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They are not a replacement for a firewall: authentication/bootstrap routes have different handling. Keep the server and database on trusted networks and expose only the intended HTTPS entry point.

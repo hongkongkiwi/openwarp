@@ -68,7 +68,7 @@ static DELIVERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_DELIVERY_THREADS: usize = 16;
 // Managed roles keep their historic breadth; custom roles are exactly their
 // stored permission list, deny by default.
-const DEVELOPER_PERMS: &[&str] = &["secrets:read","secrets:write","secrets:delete","integrations:write","leases:write","rotations:write","proposals:write","tokens:create","access:request"];
+const DEVELOPER_PERMS: &[&str] = &["secrets:read","secrets:write","secrets:delete","integrations:write","leases:write","rotations:write","proposals:write","tokens:create","access:request","pki:read"];
 fn valid_secret_key(k: &str) -> bool { !k.is_empty() && k.len() <= 128 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-') }
 fn valid_path(p: &str) -> bool { !p.is_empty() && p.len() <= 256 && !p.chars().any(|c| c.is_control()) }
 fn scan_rules(value: &str) -> Vec<&'static str> {
@@ -1226,18 +1226,18 @@ async fn backfill_value_fingerprints(st: &S) {
 fn url_ok(u: &str) -> bool { let u = u.trim().to_ascii_lowercase(); (u.starts_with("https://") || u.starts_with("http://")) && !u.contains(' ') && !u.contains('\n') }
 // Admin-configured URLs are trusted, but production should not be usable as a
 // probe into loopback or private networks. Self-hosted services can opt out.
+fn private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => { if let Some(v4) = v6.to_ipv4_mapped() { return private_ip(std::net::IpAddr::V4(v4)); } v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local() },
+    } }
 fn egress_allowed(u: &str) -> bool {
     if std::env::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false) { return true; }
     if !std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) { return true; }
     let Ok(url) = reqwest::Url::parse(u) else { return false };
     let Some(host) = url.host_str() else { return false };
     if host.eq_ignore_ascii_case("localhost") { return false; }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
-            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local()),
-        };
-    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() { return !private_ip(ip); }
     true }
 // Outbound OIDC/SAML metadata may only use TLS, except for a loopback IdP used in
 // development or tests. Link-local metadata addresses are always refused.
@@ -2672,7 +2672,13 @@ fn device_params(name: &str, sans: &str, days: i64) -> Result<rcgen::Certificate
 fn device_json(r: &Row) -> Value {
     let active = if db::s(r, "cert_id").is_empty() { Value::Null } else {
         json!({"id": db::s(r,"cert_id"), "serial": db::s(r,"cert_serial"), "expires_at": db::n(r,"cert_expires_at"), "revoked": db::n(r,"cert_revoked") == 1, "revoked_at": db::n(r,"cert_revoked_at")}) };
-    json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "ca_id": db::s(r,"ca_id"), "app_id": db::s(r,"app_id"), "env_id": db::s(r,"env_id"), "name": db::s(r,"name"), "model": db::s(r,"model"), "hardware_serial": db::s(r,"hardware_serial"), "tags": db::s(r,"tags"), "sans": db::s(r,"sans").split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(), "cert_days": db::n(r,"cert_days"), "active_cert_id": db::s(r,"active_cert_id"), "created_at": db::n(r,"created_at"), "updated_at": db::n(r,"updated_at"), "active_cert": active}) }
+    json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "ca_id": db::s(r,"ca_id"), "app_id": db::s(r,"app_id"), "env_id": db::s(r,"env_id"), "group_id": db::s(r,"group_id"), "name": db::s(r,"name"), "model": db::s(r,"model"), "hardware_serial": db::s(r,"hardware_serial"), "tags": db::s(r,"tags"), "sans": db::s(r,"sans").split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(), "cert_days": db::n(r,"cert_days"), "attested": db::n(r,"attested") == 1, "active_cert_id": db::s(r,"active_cert_id"), "created_at": db::n(r,"created_at"), "updated_at": db::n(r,"updated_at"), "active_cert": active}) }
+fn group_json(r: &Row) -> Value {
+    json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "ca_id": db::s(r,"ca_id"), "name": db::s(r,"name"), "env_id": db::s(r,"env_id"), "sans": db::s(r,"sans").split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(), "cert_days": db::n(r,"cert_days"), "tags": db::s(r,"tags"), "device_count": db::n(r,"device_count"), "created_at": db::n(r,"created_at"), "updated_at": db::n(r,"updated_at")}) }
+fn csv_field(v: &str) -> String {
+    let formula = v.chars().next().map(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r')).unwrap_or(false);
+    let safe = if formula { format!("'{}", v) } else { v.to_string() };
+    if safe.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r')) { format!("\"{}\"", safe.replace('"', "\"\"")) } else { safe } }
 async fn load_device(st: &S, did: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     st.db.one(&format!("{} WHERE d.id=?", DEVICE_SELECT), &[json!(did)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "device not found")) }
 async fn resolve_device_scope(st: &S, org: &str, app_id: String, env_id: String) -> Result<(String, String), (StatusCode, Json<Value>)> {
@@ -2687,15 +2693,83 @@ async fn resolve_device_scope(st: &S, org: &str, app_id: String, env_id: String)
         Ok((app_id, env_id))
     } else { Ok((app_id, env_id)) } }
 fn body_str(body: &Value, key: &str) -> Option<String> { body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()) }
-async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
+fn device_conflict(e: String) -> (StatusCode, Json<Value>) { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a device with this name already exists for the CA") } else { bad(&e) } }
+fn group_conflict(e: String) -> (StatusCode, Json<Value>) { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a group with this name already exists for the CA") } else { bad(&e) } }
+async fn insert_device(st: &S, org: &str, caid: &str, body: &Value, scoped: &str) -> Result<Row, (StatusCode, Json<Value>)> {
+    let name = body_str(body, "name").unwrap_or_default();
+    if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
+    let group_id = body_str(body, "group_id").unwrap_or_default();
+    let group = if group_id.is_empty() { None } else {
+        Some(st.db.one("SELECT * FROM pki_groups WHERE id=? AND ca_id=? AND org_id=?", &[json!(&group_id), json!(caid), json!(org)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "group not found"))?) };
+    let g = |key: &str| group.as_ref().map(|r| db::s(r, key)).unwrap_or_default();
+    let mut env_id = body_str(body, "env_id").unwrap_or_else(|| g("env_id"));
+    if !scoped.is_empty() {
+        if env_id.is_empty() { env_id = scoped.to_string(); }
+        else if env_id != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
+    if !g("env_id").is_empty() && env_id != g("env_id") { return Err(bad("device environment must match the group environment")); }
+    let sans = if body.get("sans").is_some() { device_sans(body)?.join(",") } else { g("sans") };
+    let group_days = group.as_ref().map(|r| db::n(r, "cert_days")).unwrap_or(0);
+    let cert_days = body.get("cert_days").and_then(|v| v.as_i64()).unwrap_or(if group_days > 0 { group_days } else { 90 }).clamp(1, 365);
+    let tags = body_str(body, "tags").unwrap_or_else(|| g("tags"));
+    let (app_id, env_id) = resolve_device_scope(st, org, body_str(body, "app_id").unwrap_or_default(), env_id).await?;
+    let did = id(); let t = now();
+    let insert_sql = "INSERT INTO pki_devices(id,org_id,ca_id,app_id,env_id,name,model,hardware_serial,tags,sans,cert_days,active_cert_id,enroll_epoch,deleting,created_at,updated_at,group_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,'',0,0,?,?,?)";
+    let params = vec![json!(&did), json!(org), json!(caid), json!(&app_id), json!(&env_id), json!(&name), json!(body_str(body,"model").unwrap_or_default()), json!(body_str(body,"hardware_serial").unwrap_or_default()), json!(&tags), json!(&sans), json!(cert_days), json!(t), json!(t), json!(&group_id)];
+    if group_id.is_empty() {
+        st.db.exec(insert_sql, &params).await.map_err(device_conflict)?;
+    } else {
+        st.db.tx_locked("SELECT env_id FROM pki_groups WHERE id=?", &[json!(&group_id)], |r| db::s(r,"env_id").is_empty() || db::s(r,"env_id") == env_id, &[(insert_sql, params)], &[(0, 1)]).await
+            .map_err(|e| if e == "lock condition failed" { err(StatusCode::CONFLICT, "group changed or was removed; retry") } else { device_conflict(e) })?; }
+    st.db.one(&format!("{} WHERE d.id=?", DEVICE_SELECT), &[json!(&did)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("device not found")) }
+async fn insert_enrollment(st: &S, did: &str, row: &Row, ttl: i64, revoke_previous: bool, uid: &str) -> Result<(String, i64, String), (StatusCode, Json<Value>)> {
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(db::s(row,"ca_id"))]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "CA not found"))?;
+    if ca_revoked(st,&ca).await { return Err(bad("CA is revoked")); }
+    let t = now(); let expires = t + ttl.clamp(300, 604800);
+    let code = oc::random_token("owdev"); let eid = id(); let nonce = hex_encode(&oc::random_key()[..16]);
+    let _ = st.db.exec("DELETE FROM pki_enrollments WHERE device_id=? AND (used_at>0 OR expires_at<?)", &[json!(did), json!(t)]).await;
+    st.db.exec("INSERT INTO pki_enrollments(id,device_id,token_hash,expires_at,used_at,created_by,created_at,enroll_epoch,revoke_previous,nonce) VALUES(?,?,?,?,0,?,?,?,?,?)",
+        &[json!(&eid), json!(did), json!(oc::hash_token(&code)), json!(expires), json!(uid), json!(t), json!(db::n(row,"enroll_epoch")), json!(if revoke_previous {1} else {0}), json!(&nonce)]).await.map_err(|e| bad(&e))?;
+    Ok((code, expires, nonce)) }
+async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid,&uid).await?;
+    let name = body_str(&body,"name").unwrap_or_else(|| "OpenWarp CA".to_string());
+    let parent_id = body_str(&body,"parent_id").unwrap_or_default();
+    let parent = if parent_id.is_empty() { None } else {
+        let p = st.db.one("SELECT * FROM pki_cas WHERE id=? AND org_id=?", &[json!(&parent_id), json!(&oid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "parent CA not found"))?;
+        if db::s(&p,"kind") != "root" { return Err(bad("only a root CA can sign an intermediate")); }
+        if db::n(&p,"revoked") == 1 { return Err(bad("parent CA is revoked")); }
+        Some(p) };
     let kp = rcgen::KeyPair::generate().map_err(|e| bad(&e.to_string()))?;
-    let mut params = ca_params(if r.name.is_empty(){"OpenWarp CA"}else{&r.name}, true);
+    let mut params = ca_params(&name, true);
+    if parent.is_some() { params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0)); }
     let serial_bytes = oc::random_key()[..16].to_vec();
     params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial_bytes));
-    let cert = params.self_signed(&kp).map_err(|e| bad(&e.to_string()))?;
-    let cid = id(); st.db.exec("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,serial,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(cid), json!(oid), json!(r.name), json!(cert.pem()), json!(oc::encrypt_symmetric(&st.master(), kp.serialize_pem().as_bytes())), json!(hex_encode(&serial_bytes)), json!(now())]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!({"id": cid, "certificate": cert.pem()}))) }
+    let cert = if let Some(p) = &parent { let (parent_cert, parent_kp) = load_issuer(&st,p)?; params.signed_by(&kp,&parent_cert,&parent_kp).map_err(|e| bad(&e.to_string()))? }
+        else { params.self_signed(&kp).map_err(|e| bad(&e.to_string()))? };
+    let kind = if parent.is_some() { "intermediate" } else { "root" };
+    let cid = id(); let insert_sql = "INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,serial,created_at,parent_id,kind) VALUES(?,?,?,?,?,?,?,?,?)";
+    let params = vec![json!(&cid), json!(&oid), json!(&name), json!(cert.pem()), json!(oc::encrypt_symmetric(&st.master(), kp.serialize_pem().as_bytes())), json!(hex_encode(&serial_bytes)), json!(now()), json!(&parent_id), json!(kind)];
+    if parent_id.is_empty() {
+        st.db.exec(insert_sql, &params).await.map_err(|e| bad(&e))?;
+    } else {
+        st.db.tx_locked("SELECT revoked FROM pki_cas WHERE id=?", &[json!(&parent_id)], |r| db::n(r,"revoked") == 0, &[(insert_sql, params)], &[(0, 1)]).await
+            .map_err(|e| if e == "lock condition failed" { bad("parent CA is revoked or missing") } else { bad(&e) })?; }
+    Ok(j(json!({"id": cid, "certificate": cert.pem(), "kind": kind, "parent_id": parent_id}))) }
+async fn ca_chain(st: &S, ca: &Row) -> Vec<String> {
+    let mut out = vec![db::s(ca,"cert_pem")]; let mut parent_id = db::s(ca,"parent_id");
+    for _ in 0..3 {
+        if parent_id.is_empty() { break; }
+        let Some(p) = st.db.one("SELECT cert_pem,parent_id FROM pki_cas WHERE id=?", &[json!(&parent_id)]).await.ok().flatten() else { break; };
+        out.push(db::s(&p,"cert_pem")); parent_id = db::s(&p,"parent_id"); }
+    out }
+async fn ca_revoked(st: &S, ca: &Row) -> bool {
+    let mut revoked = db::n(ca,"revoked") == 1; let mut parent_id = db::s(ca,"parent_id");
+    for _ in 0..3 {
+        if revoked || parent_id.is_empty() { break; }
+        match st.db.one("SELECT revoked,parent_id FROM pki_cas WHERE id=?", &[json!(&parent_id)]).await {
+            Ok(Some(p)) => { revoked = db::n(&p,"revoked") == 1; parent_id = db::s(&p,"parent_id"); }
+            _ => break } }
+    revoked }
 fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair), (StatusCode, Json<Value>)> {
     let pem = oc::decrypt_symmetric(&st.master(), &db::s(ca,"key_enc")).map_err(|e| bad(&e))?;
     let kp = rcgen::KeyPair::from_pem(&String::from_utf8_lossy(&pem)).map_err(|e| bad(&e.to_string()))?;
@@ -2706,6 +2780,7 @@ fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair),
 async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     st.check_admin(&db::s(&ca,"org_id"), &uid).await?;
+    if ca_revoked(&st,&ca).await { return Err(bad("CA is revoked")); }
     let device_id = body_str(&body, "device_id").unwrap_or_default();
     let (cn, sans, days, epoch) = if device_id.is_empty() {
         let cn = body_str(&body, "cn").unwrap_or_else(|| "service".to_string());
@@ -2723,13 +2798,23 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     leaf_params.serial_number = Some(rcgen::SerialNumber::from_slice(&leaf_serial));
     if !sans.is_empty() && device_id.is_empty() { apply_device_sans(&mut leaf_params, &sans)?; }
     let leaf = leaf_params.signed_by(&leaf_kp, &issuer_cert, &issuer_kp).map_err(|e| bad(&e.to_string()))?;
-    let cert_id = id(); let serial = hex_encode(&leaf_serial); let expires = now()+days*86400;
-    st.db.exec("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'server')", &[json!(cert_id), json!(caid), json!(cn), json!(leaf.pem()), json!(serial), json!(expires), json!(now()), json!(&device_id)]).await.map_err(|e| bad(&e))?;
+    let cert_id = id(); let serial = hex_encode(&leaf_serial); let t = now(); let expires = t+days*86400;
+    let mut stmts: Vec<(&str, Vec<Value>)> = vec![
+        ("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'server')", vec![json!(&cert_id), json!(&caid), json!(&cn), json!(leaf.pem()), json!(&serial), json!(expires), json!(t), json!(&device_id)]),
+    ];
+    let mut expect = vec![(0usize, 1u64)];
     if !device_id.is_empty() {
-        let attached = st.db.exec("UPDATE pki_devices SET active_cert_id=?,updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=? AND enroll_epoch=?", &[json!(&cert_id), json!(now()), json!(&device_id), json!(epoch)]).await.map_err(|e| bad(&e))?;
-        if attached != 1 { let _ = st.db.exec("DELETE FROM pki_certs WHERE id=?", &[json!(&cert_id)]).await; return Err(err(StatusCode::CONFLICT, "device changed while issuing; retry")); }
-        st.audit(&db::s(&ca,"org_id"), "", "", &uid, "pki.issue.device", &format!("{} {}", device_id, serial)).await; }
-    Ok(j(json!({"id": cert_id, "certificate": leaf.pem(), "private_key": leaf_kp.serialize_pem(), "ca_certificate": db::s(&ca,"cert_pem"), "device_id": device_id, "expires_at": expires}))) }
+        stmts.push(("UPDATE pki_devices SET active_cert_id=?,updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=? AND enroll_epoch=?", vec![json!(&cert_id), json!(t), json!(&device_id), json!(epoch)]));
+        expect.push((1, 1)); }
+    // Lock the issuing CA row: a concurrent revoke either commits first (the
+    // lock check fails) or waits and sweeps this certificate afterwards.
+    match st.db.tx_locked("SELECT revoked FROM pki_cas WHERE id=?", &[json!(&caid)], |r| db::n(r,"revoked") == 0, &stmts, &expect).await {
+        Ok(_) => {}
+        Err(e) if e == "lock condition failed" => return Err(err(StatusCode::CONFLICT, "CA was revoked; retry")),
+        Err(e) if e.contains("affected 0 rows") => return Err(err(StatusCode::CONFLICT, "device changed while issuing; retry")),
+        Err(e) => return Err(bad(&e)) }
+    if !device_id.is_empty() { st.audit(&db::s(&ca,"org_id"), "", "", &uid, "pki.issue.device", &format!("{} {}", device_id, serial)).await; }
+    Ok(j(json!({"id": cert_id, "certificate": leaf.pem(), "private_key": leaf_kp.serialize_pem(), "ca_certificate": db::s(&ca,"cert_pem"), "ca_chain": ca_chain(&st,&ca).await, "device_id": device_id, "expires_at": expires}))) }
 async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     let cert_der = match keystore_ocsp::pem::decode("CERTIFICATE", &db::s(&ca,"cert_pem")) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
@@ -2756,7 +2841,8 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/ocsp-response"));
     resp }
 async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.require_org(&db::s(&ca,"org_id"),&uid).await?;
+    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
     let rows = st.db.query("SELECT id,ca_id,cn,serial,revoked,revoked_at,expires_at,created_at,device_id,issued_via FROM pki_certs WHERE ca_id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT ca_id,device_id FROM pki_certs WHERE id=?", &[json!(cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"cert not found"))?;
@@ -2775,6 +2861,13 @@ async fn ca_crl(State(st): State<S>, Path(caid): Path<String>) -> Response {
         let at = db::n(r,"revoked_at");
         let revocation_time = if at > 0 { time::OffsetDateTime::from_unix_timestamp(at).unwrap_or_else(|_| time::OffsetDateTime::now_utc()) } else { time::OffsetDateTime::now_utc() };
         revoked.push(rcgen::RevokedCertParams { serial_number: rcgen::SerialNumber::from_slice(&serial), revocation_time, reason_code: None, invalidity_date: None }); } } }
+    // Revoked immediate children are listed in the root's CRL so a broker can
+    // distrust one environment or factory without replacing the root.
+    if let Ok(children) = st.db.query("SELECT serial,revoked_at FROM pki_cas WHERE parent_id=? AND revoked=1", &[json!(&caid)]).await {
+        for r in &children { if let Some(serial) = hex_decode(&db::s(r,"serial")) {
+            let at = db::n(r,"revoked_at");
+            let revocation_time = if at > 0 { time::OffsetDateTime::from_unix_timestamp(at).unwrap_or_else(|_| time::OffsetDateTime::now_utc()) } else { time::OffsetDateTime::now_utc() };
+            revoked.push(rcgen::RevokedCertParams { serial_number: rcgen::SerialNumber::from_slice(&serial), revocation_time, reason_code: None, invalidity_date: None }); } } }
     let params = rcgen::CertificateRevocationListParams {
         this_update: time::OffsetDateTime::now_utc(),
         next_update: time::OffsetDateTime::now_utc() + time::Duration::days(7),
@@ -2791,31 +2884,19 @@ async fn ca_crl(State(st): State<S>, Path(caid): Path<String>) -> Response {
         Err(e) => bad(&e.to_string()).into_response(),
     } }
 async fn list_cas(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    st.require_org(&oid,&uid).await?;
-    let rows = st.db.query("SELECT id,name,cert_pem,serial,created_at FROM pki_cas WHERE org_id=? ORDER BY created_at", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "certificate": db::s(r,"cert_pem"), "serial": db::s(r,"serial"), "created_at": db::n(r,"created_at")})).collect::<Vec<_>>()))) }
+    st.require_org(&oid,&uid).await?; st.check_perm(&oid,&uid,"pki:read").await?;
+    let rows = st.db.query("SELECT id,name,cert_pem,serial,created_at,parent_id,kind,revoked,revoked_at,hook_url,attest_issuer,attest_required FROM pki_cas WHERE org_id=? ORDER BY created_at", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "certificate": db::s(r,"cert_pem"), "serial": db::s(r,"serial"), "created_at": db::n(r,"created_at"), "parent_id": db::s(r,"parent_id"), "kind": db::s(r,"kind"), "revoked": db::n(r,"revoked") == 1, "revoked_at": db::n(r,"revoked_at"), "hook_set": !db::s(r,"hook_url").is_empty(), "attest_issuer": db::s(r,"attest_issuer"), "attest_required": db::n(r,"attest_required") == 1})).collect::<Vec<_>>()))) }
 async fn create_device(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
-    let name = body_str(&body,"name").unwrap_or_default();
-    if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
-    let scoped = env_scope_of(&st, &h).await; let mut env_id = body_str(&body,"env_id").unwrap_or_default();
-    if !scoped.is_empty() {
-        if env_id.is_empty() { env_id = scoped; }
-        else if env_id != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
-    let (app_id, env_id) = resolve_device_scope(&st,&org,body_str(&body,"app_id").unwrap_or_default(),env_id).await?;
-    let sans = device_sans(&body)?.join(",");
-    let cert_days = body.get("cert_days").and_then(|v| v.as_i64()).unwrap_or(90).clamp(1,365);
-    let did = id(); let t = now();
-    st.db.exec("INSERT INTO pki_devices(id,org_id,ca_id,app_id,env_id,name,model,hardware_serial,tags,sans,cert_days,active_cert_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?)",
-        &[json!(&did), json!(&org), json!(&caid), json!(&app_id), json!(&env_id), json!(&name), json!(body_str(&body,"model").unwrap_or_default()), json!(body_str(&body,"hardware_serial").unwrap_or_default()), json!(body_str(&body,"tags").unwrap_or_default()), json!(&sans), json!(cert_days), json!(t), json!(t)]).await
-        .map_err(|e| { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a device with this name already exists for the CA") } else { bad(&e) } })?;
-    st.audit(&org,&app_id,&env_id,&uid,"pki.device.create",&format!("{} ({})", name, did)).await;
-    let row = st.db.one(&format!("{} WHERE d.id=?", DEVICE_SELECT), &[json!(&did)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("device not found"))?;
+    let scoped = env_scope_of(&st, &h).await;
+    let row = insert_device(&st, &org, &caid, &body, &scoped).await?;
+    st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.create",&format!("{} ({})", db::s(&row,"name"), db::s(&row,"id"))).await;
     Ok(j(device_json(&row))) }
 async fn list_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
-    st.require_org(&db::s(&ca,"org_id"),&uid).await?;
+    let org = db::s(&ca,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
     let scoped = env_scope_of(&st, &h).await;
     let rows = if scoped.is_empty() {
         st.db.query(&format!("{} WHERE d.ca_id=? ORDER BY d.name", DEVICE_SELECT), &[json!(&caid)]).await
@@ -2824,7 +2905,7 @@ async fn list_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String
     }.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(device_json).collect::<Vec<_>>()))) }
 async fn get_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let row = load_device(&st,&did).await?; st.require_org(&db::s(&row,"org_id"),&uid).await?;
+    let row = load_device(&st,&did).await?; let org = db::s(&row,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
     let certs = st.db.query("SELECT id,cn,serial,revoked,revoked_at,expires_at,created_at,issued_via FROM pki_certs WHERE device_id=? ORDER BY created_at DESC", &[json!(&did)]).await.map_err(|e| bad(&e))?;
     let mut out = device_json(&row); out["certs"] = json!(certs.iter().map(db::obj).collect::<Vec<_>>()); Ok(j(out)) }
 async fn update_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
@@ -2837,55 +2918,82 @@ async fn update_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
     if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
     let app_in = if scoped.is_empty() { body_str(&body,"app_id").unwrap_or_else(|| db::s(&row,"app_id")) } else { String::new() };
     let env_in = if scoped.is_empty() { body_str(&body,"env_id").unwrap_or_else(|| db::s(&row,"env_id")) } else { scoped };
+    if !db::s(&row,"group_id").is_empty() {
+        if let Ok(Some(grp)) = st.db.one("SELECT env_id FROM pki_groups WHERE id=?", &[json!(db::s(&row,"group_id"))]).await {
+            let genv = db::s(&grp,"env_id"); if !genv.is_empty() && env_in != genv { return Err(bad("device environment must match the group environment")); } } }
     let (app_id, env_id) = resolve_device_scope(&st,&org,app_in,env_in).await?;
     let sans = if body.get("sans").is_some() { device_sans(&body)?.join(",") } else { db::s(&row,"sans") };
     let cert_days = body.get("cert_days").and_then(|v| v.as_i64()).unwrap_or(db::n(&row,"cert_days")).clamp(1,365);
-    st.db.exec("UPDATE pki_devices SET name=?,app_id=?,env_id=?,model=?,hardware_serial=?,tags=?,sans=?,cert_days=?,updated_at=? WHERE id=?",
-        &[json!(&name), json!(&app_id), json!(&env_id), json!(body_str(&body,"model").unwrap_or_else(|| db::s(&row,"model"))), json!(body_str(&body,"hardware_serial").unwrap_or_else(|| db::s(&row,"hardware_serial"))), json!(body_str(&body,"tags").unwrap_or_else(|| db::s(&row,"tags"))), json!(&sans), json!(cert_days), json!(now()), json!(&did)]).await
-        .map_err(|e| { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a device with this name already exists for the CA") } else { bad(&e) } })?;
+    let update_sql = "UPDATE pki_devices SET name=?,app_id=?,env_id=?,model=?,hardware_serial=?,tags=?,sans=?,cert_days=?,updated_at=? WHERE id=? AND deleting=0";
+    let params = vec![json!(&name), json!(&app_id), json!(&env_id), json!(body_str(&body,"model").unwrap_or_else(|| db::s(&row,"model"))), json!(body_str(&body,"hardware_serial").unwrap_or_else(|| db::s(&row,"hardware_serial"))), json!(body_str(&body,"tags").unwrap_or_else(|| db::s(&row,"tags"))), json!(&sans), json!(cert_days), json!(now()), json!(&did)];
+    if db::s(&row,"group_id").is_empty() {
+        let n = st.db.exec(update_sql, &params).await.map_err(device_conflict)?;
+        if n != 1 { return Err(err(StatusCode::NOT_FOUND, "device not found")); }
+    } else {
+        st.db.tx_locked("SELECT env_id FROM pki_groups WHERE id=?", &[json!(db::s(&row,"group_id"))], |r| db::s(r,"env_id").is_empty() || db::s(r,"env_id") == env_id, &[(update_sql, params)], &[(0, 1)]).await
+            .map_err(|e| if e == "lock condition failed" { err(StatusCode::CONFLICT, "group changed or was removed; retry") } else { device_conflict(e) })?; }
     st.audit(&org,&app_id,&env_id,&uid,"pki.device.update",&format!("{} ({})", name, did)).await;
     let fresh = load_device(&st,&did).await?; Ok(j(device_json(&fresh))) }
 async fn revoke_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     let t = now();
-    // Invalidate outstanding codes and any in-flight enrollment before the
-    // certificate sweep, so a second code cannot undo this revocation.
-    st.db.exec("DELETE FROM pki_enrollments WHERE device_id=?", &[json!(&did)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("UPDATE pki_devices SET active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=?", &[json!(t), json!(&did)]).await.map_err(|e| bad(&e))?;
-    let n = st.db.exec("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id=? AND revoked=0", &[json!(t), json!(&did)]).await.map_err(|e| bad(&e))?;
+    // Invalidate codes and the epoch, then sweep the certificates, atomically.
+    let counts = st.db.tx(&[
+        ("DELETE FROM pki_enrollments WHERE device_id=?", vec![json!(&did)]),
+        ("UPDATE pki_devices SET active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=?", vec![json!(t), json!(&did)]),
+        ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id=? AND revoked=0", vec![json!(t), json!(&did)]),
+    ]).await.map_err(|e| bad(&e))?;
+    let n = counts.get(2).copied().unwrap_or(0);
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.revoke",&format!("{} ({})", db::s(&row,"name"), did)).await;
     Ok(j(json!({"revoked": n}))) }
 async fn delete_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     let t = now();
-    // Tombstone first: a mint or issuance that starts after this point cannot
-    // attach, and a crash leaves a retryable device record, not a live one.
-    st.db.exec("UPDATE pki_devices SET deleting=1,active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=?", &[json!(t), json!(&did)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("DELETE FROM pki_enrollments WHERE device_id=?", &[json!(&did)]).await.map_err(|e| bad(&e))?;
-    let revoked = st.db.exec("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id=? AND revoked=0", &[json!(t), json!(&did)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("DELETE FROM pki_devices WHERE id=?", &[json!(&did)]).await.map_err(|e| bad(&e))?;
+    // Tombstone, sweep and removal in one transaction: no interleaving can
+    // attach a certificate, and a failure leaves the device intact.
+    let counts = st.db.tx(&[
+        ("UPDATE pki_devices SET deleting=1,active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=?", vec![json!(t), json!(&did)]),
+        ("DELETE FROM pki_enrollments WHERE device_id=?", vec![json!(&did)]),
+        ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id=? AND revoked=0", vec![json!(t), json!(&did)]),
+        ("DELETE FROM pki_devices WHERE id=?", vec![json!(&did)]),
+    ]).await.map_err(|e| bad(&e))?;
+    let revoked = counts.get(2).copied().unwrap_or(0);
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.delete",&format!("{} ({})", db::s(&row,"name"), did)).await;
     Ok(j(json!({"deleted": true, "revoked": revoked}))) }
 async fn create_enrollment(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     if db::n(&row,"deleting") == 1 { return Err(err(StatusCode::NOT_FOUND, "device not found")); }
-    let ttl = body.get("ttl_seconds").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(300, 604800);
-    let t = now(); let expires = t + ttl; let code = oc::random_token("owdev"); let eid = id();
-    let _ = st.db.exec("DELETE FROM pki_enrollments WHERE device_id=? AND (used_at>0 OR expires_at<?)", &[json!(&did), json!(t)]).await;
-    st.db.exec("INSERT INTO pki_enrollments(id,device_id,token_hash,expires_at,used_at,created_by,created_at,enroll_epoch) VALUES(?,?,?,?,0,?,?,?)", &[json!(&eid), json!(&did), json!(oc::hash_token(&code)), json!(expires), json!(&uid), json!(t), json!(db::n(&row,"enroll_epoch"))]).await.map_err(|e| bad(&e))?;
+    let ttl = body.get("ttl_seconds").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let revoke_previous = body.get("revoke_previous").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (code, expires, nonce) = insert_enrollment(&st,&did,&row,ttl,revoke_previous,&uid).await?;
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.enrollment",&format!("{} ({}) expires {}", db::s(&row,"name"), did, expires)).await;
-    Ok(j(json!({"code": code, "expires_at": expires}))) }
+    Ok(j(json!({"code": code, "expires_at": expires, "nonce": nonce, "revoke_previous": revoke_previous}))) }
+async fn renew_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let row = load_device(&st,&did).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    if db::n(&row,"deleting") == 1 { return Err(err(StatusCode::NOT_FOUND, "device not found")); }
+    let ttl = body.get("ttl_seconds").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let (code, expires, nonce) = insert_enrollment(&st,&did,&row,ttl,true,&uid).await?;
+    st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.renew",&format!("{} ({}) expires {}", db::s(&row,"name"), did, expires)).await;
+    Ok(j(json!({"code": code, "expires_at": expires, "nonce": nonce, "revoke_previous": true}))) }
 async fn enroll_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let code = body_str(&body,"code").unwrap_or_default(); let csr_pem = body.get("csr").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if code.is_empty() || code.len() > 256 { return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code")); }
     if csr_pem.is_empty() || csr_pem.len() > 16384 { return Err(bad("csr is required (PEM, max 16 KiB)")); }
     let csr = rcgen::CertificateSigningRequestParams::from_pem(&csr_pem).map_err(|e| bad(&format!("invalid CSR: {}", e)))?;
     let hash = oc::hash_token(&code);
-    let row = st.db.one("SELECT e.id AS enrollment_id,e.used_at,e.expires_at AS enrollment_expires_at,e.enroll_epoch AS code_epoch,d.* FROM pki_enrollments e JOIN pki_devices d ON d.id=e.device_id WHERE e.token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?
+    let row = st.db.one("SELECT e.id AS enrollment_id,e.used_at,e.expires_at AS enrollment_expires_at,e.enroll_epoch AS code_epoch,e.revoke_previous AS code_revoke_previous,e.nonce AS code_nonce,d.* FROM pki_enrollments e JOIN pki_devices d ON d.id=e.device_id WHERE e.token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?
         .filter(|r| db::n(r,"used_at") == 0 && db::n(r,"enrollment_expires_at") > now() && db::n(r,"code_epoch") == db::n(r,"enroll_epoch") && db::n(r,"deleting") == 0)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code"))?;
-    let did = db::s(&row,"id"); let ca_id = db::s(&row,"ca_id");
+    let did = db::s(&row,"id"); let ca_id = db::s(&row,"ca_id"); let old_cert = db::s(&row,"active_cert_id");
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&ca_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    if ca_revoked(&st,&ca).await { return Err(bad("CA is revoked")); }
+    let attestation = body.get("attestation").and_then(|v| v.as_str()).unwrap_or("");
+    let attestation_summary = if attestation.is_empty() {
+        if db::n(&ca,"attest_required") == 1 { return Err(err(StatusCode::FORBIDDEN, "attestation is required for this CA")); }
+        String::new()
+    } else if db::s(&ca,"attest_key_pem").is_empty() { return Err(bad("attestation is not configured for this CA")); }
+    else { verify_attestation(&ca,&did,&db::s(&row,"code_nonce"),&csr_pem,attestation)?.to_string() };
+    enrollment_hook_ok(&st,&ca,&row,&db::s(&row,"enrollment_id"),&csr_pem).await?;
     let days = db::n(&row,"cert_days").clamp(1,365);
     let mut params = device_params(&db::s(&row,"name"), &db::s(&row,"sans"), days)?;
     let serial_bytes = oc::random_key()[..16].to_vec(); params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial_bytes));
@@ -2893,16 +3001,299 @@ async fn enroll_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     // Sign before consuming the code so a CSR the CA cannot sign does not burn it.
     let leaf = rcgen::CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&issuer_cert, &issuer_kp).map_err(|e| bad(&e.to_string()))?;
     let t = now();
-    let consumed = st.db.exec("UPDATE pki_enrollments SET used_at=? WHERE id=? AND used_at=0 AND expires_at>?", &[json!(t), json!(db::s(&row,"enrollment_id")), json!(t)]).await.map_err(|e| bad(&e))?;
-    if consumed != 1 { return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code")); }
     let cert_id = id(); let serial = hex_encode(&serial_bytes); let expires = t+days*86400;
-    st.db.exec("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'csr')", &[json!(&cert_id), json!(&ca_id), json!(db::s(&row,"name")), json!(leaf.pem()), json!(&serial), json!(expires), json!(t), json!(&did)]).await.map_err(|e| bad(&e))?;
-    // Attaching the certificate is the commit point: a device revoked or deleted
-    // after the row was read bumps enroll_epoch, so this update matches nothing.
-    let attached = st.db.exec("UPDATE pki_devices SET active_cert_id=?,updated_at=?,enroll_epoch=enroll_epoch+1 WHERE id=? AND enroll_epoch=?", &[json!(&cert_id), json!(t), json!(&did), json!(db::n(&row,"enroll_epoch"))]).await.map_err(|e| bad(&e))?;
-    if attached != 1 { let _ = st.db.exec("DELETE FROM pki_certs WHERE id=?", &[json!(&cert_id)]).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code")); }
-    st.audit(&db::s(&row,"org_id"),&db::s(&row,"app_id"),&db::s(&row,"env_id"),&format!("device:{}", did),"pki.enroll",&format!("cert {} serial {}", cert_id, serial)).await;
-    Ok(j(json!({"device_id": did, "name": db::s(&row,"name"), "serial": serial, "certificate": leaf.pem(), "ca_certificate": db::s(&ca,"cert_pem"), "expires_at": expires}))) }
+    let mut stmts: Vec<(&str, Vec<Value>)> = vec![
+        ("UPDATE pki_enrollments SET used_at=? WHERE id=? AND used_at=0 AND expires_at>?", vec![json!(t), json!(db::s(&row,"enrollment_id")), json!(t)]),
+        ("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'csr')", vec![json!(&cert_id), json!(&ca_id), json!(db::s(&row,"name")), json!(leaf.pem()), json!(&serial), json!(expires), json!(t), json!(&did)]),
+        // Attaching the certificate is the commit point: a device revoked or
+        // deleted after the row was read bumps enroll_epoch, so this matches nothing.
+        ("UPDATE pki_devices SET active_cert_id=?,updated_at=?,enroll_epoch=enroll_epoch+1,attested=?,attestation=? WHERE id=? AND enroll_epoch=?", vec![json!(&cert_id), json!(t), json!(if attestation_summary.is_empty() {0} else {1}), json!(&attestation_summary), json!(&did), json!(db::n(&row,"enroll_epoch"))]),
+    ];
+    if db::n(&row,"code_revoke_previous") == 1 && !old_cert.is_empty() {
+        stmts.push(("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE id=? AND revoked=0", vec![json!(t), json!(&old_cert)])); }
+    match st.db.tx_checked(&stmts, &[(0, 1), (2, 1)]).await {
+        Ok(_) => {}
+        Err(e) if e.contains("affected 0 rows") => return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code")),
+        Err(e) => return Err(bad(&e)),
+    }
+    st.audit(&db::s(&row,"org_id"),&db::s(&row,"app_id"),&db::s(&row,"env_id"),&format!("device:{}", did),"pki.enroll",&format!("cert {} serial {} attested {}", cert_id, serial, !attestation_summary.is_empty())).await;
+    let chain = ca_chain(&st,&ca).await;
+    Ok(j(json!({"device_id": did, "name": db::s(&row,"name"), "serial": serial, "certificate": leaf.pem(), "ca_certificate": db::s(&ca,"cert_pem"), "ca_chain": chain, "attested": !attestation_summary.is_empty(), "expires_at": expires}))) }
+
+
+async fn expiring_certs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?;
+    st.require_org(&oid,&uid).await?; st.check_perm(&oid,&uid,"pki:read").await?;
+    let days = q.get("days").and_then(|s| s.parse::<i64>().ok()).unwrap_or(30).clamp(1, 365);
+    let scoped = env_scope_of(&st,&h).await; let window = days.max(30); let cutoff = now() + window*86400;
+    let rows = if scoped.is_empty() {
+        st.db.query("SELECT c.id AS cert_id,c.serial,c.expires_at,c.device_id,d.name,d.env_id,d.group_id,d.attested FROM pki_certs c JOIN pki_devices d ON d.id=c.device_id WHERE d.org_id=? AND c.revoked=0 AND c.expires_at<=? ORDER BY c.expires_at", &[json!(&oid), json!(cutoff)]).await
+    } else {
+        st.db.query("SELECT c.id AS cert_id,c.serial,c.expires_at,c.device_id,d.name,d.env_id,d.group_id,d.attested FROM pki_certs c JOIN pki_devices d ON d.id=c.device_id WHERE d.org_id=? AND d.env_id=? AND c.revoked=0 AND c.expires_at<=? ORDER BY c.expires_at", &[json!(&oid), json!(&scoped), json!(cutoff)]).await
+    }.map_err(|e| bad(&e))?;
+    let t = now(); let mut items = Vec::new(); let (mut c7, mut c14, mut c30) = (0, 0, 0);
+    for r in &rows { let expires = db::n(r,"expires_at"); let left = ((expires - t).max(0) + 86399) / 86400;
+        if expires <= t + 7*86400 { c7 += 1; }
+        if expires <= t + 14*86400 { c14 += 1; }
+        if expires <= t + 30*86400 { c30 += 1; }
+        if expires <= t + days*86400 { items.push(json!({"certificate_id": db::s(r,"cert_id"), "serial": db::s(r,"serial"), "expires_at": expires, "days_left": left, "device_id": db::s(r,"device_id"), "name": db::s(r,"name"), "env_id": db::s(r,"env_id"), "group_id": db::s(r,"group_id"), "attested": db::n(r,"attested") == 1})); } }
+    Ok(j(json!({"days": days, "counts": {"7": c7, "14": c14, "30": c30}, "certificates": items}))) }
+async fn import_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let list = body.get("devices").and_then(|v| v.as_array()).ok_or_else(|| bad("devices must be an array"))?;
+    if list.len() > 1000 { return Err(bad("at most 1000 devices per import")); }
+    let mint = body.get("mint_codes").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ttl = body.get("ttl_seconds").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let scoped = env_scope_of(&st,&h).await; let mut results = Vec::new(); let (mut created, mut failed) = (0, 0);
+    for item in list {
+        match insert_device(&st,&org,&caid,item,&scoped).await {
+            Ok(row) => { created += 1; let did = db::s(&row,"id");
+                let mut out = json!({"name": db::s(&row,"name"), "id": did});
+                if mint { match insert_enrollment(&st,&db::s(&row,"id"),&row,ttl,false,&uid).await {
+                    Ok((code, expires, nonce)) => { out["code"] = json!(code); out["expires_at"] = json!(expires); out["nonce"] = json!(nonce); }
+                    Err(e) => { out["error"] = e.1.0.get("error").cloned().unwrap_or(json!("enrollment failed")); } } }
+                results.push(out); }
+            Err(e) => { failed += 1; results.push(json!({"name": item.get("name").cloned().unwrap_or(Value::Null), "error": e.1.0.get("error").cloned().unwrap_or(json!("failed"))})); } } }
+    st.audit(&org,"","",&uid,"pki.device.import",&format!("created={} failed={}", created, failed)).await;
+    Ok(j(json!({"created": created, "failed": failed, "results": results}))) }
+async fn bulk_codes(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let ids = body.get("device_ids").and_then(|v| v.as_array()).ok_or_else(|| bad("device_ids must be an array"))?;
+    if ids.len() > 500 { return Err(bad("at most 500 devices per request")); }
+    let ttl = body.get("ttl_seconds").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let scoped = env_scope_of(&st,&h).await; let mut results = Vec::new();
+    for id in ids.iter().filter_map(|v| v.as_str()) {
+        match st.db.one("SELECT * FROM pki_devices WHERE id=? AND ca_id=?", &[json!(id), json!(&caid)]).await.map_err(|e| bad(&e))? {
+            Some(row) if db::n(&row,"deleting") == 0 && (scoped.is_empty() || db::s(&row,"env_id") == scoped) => {
+                match insert_enrollment(&st,id,&row,ttl,false,&uid).await {
+                    Ok((code, expires, nonce)) => results.push(json!({"id": id, "name": db::s(&row,"name"), "code": code, "expires_at": expires, "nonce": nonce})),
+                    Err(e) => results.push(json!({"id": id, "error": e.1.0.get("error").cloned().unwrap_or(json!("enrollment failed"))})) } }
+            _ => results.push(json!({"id": id, "error": "device not found"})) } }
+    st.audit(&org,"","",&uid,"pki.device.codes",&format!("requested={} issued={}", ids.len(), results.iter().filter(|r| r.get("code").is_some()).count())).await;
+    Ok(j(json!({"codes": results}))) }
+async fn export_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response { let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
+    let ca = match st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
+    let org = db::s(&ca,"org_id");
+    if let Err(e) = st.require_org(&org,&uid).await { return e.into_response(); }
+    if let Err(e) = st.check_perm(&org,&uid,"pki:read").await { return e.into_response(); }
+    let scoped = env_scope_of(&st,&h).await;
+    let rows = if scoped.is_empty() {
+        st.db.query("SELECT d.name,d.model,d.hardware_serial,d.tags,d.env_id,d.group_id,d.sans,d.cert_days,c.serial AS cert_serial,c.expires_at,c.revoked,d.attested FROM pki_devices d LEFT JOIN pki_certs c ON c.id=d.active_cert_id WHERE d.ca_id=? ORDER BY d.name", &[json!(&caid)]).await
+    } else {
+        st.db.query("SELECT d.name,d.model,d.hardware_serial,d.tags,d.env_id,d.group_id,d.sans,d.cert_days,c.serial AS cert_serial,c.expires_at,c.revoked,d.attested FROM pki_devices d LEFT JOIN pki_certs c ON c.id=d.active_cert_id WHERE d.ca_id=? AND d.env_id=? ORDER BY d.name", &[json!(&caid), json!(&scoped)]).await
+    };
+    let rows = match rows { Ok(r) => r, Err(e) => return bad(&e).into_response() };
+    let mut csv = String::from("name,model,hardware_serial,tags,env_id,group_id,sans,cert_days,serial,expires_at,revoked,attested\n");
+    for r in &rows { let fields = [db::s(r,"name"), db::s(r,"model"), db::s(r,"hardware_serial"), db::s(r,"tags"), db::s(r,"env_id"), db::s(r,"group_id"), db::s(r,"sans"), db::n(r,"cert_days").to_string(), db::s(r,"cert_serial"), db::n(r,"expires_at").to_string(), (db::n(r,"revoked") == 1).to_string(), (db::n(r,"attested") == 1).to_string()];
+        csv.push_str(&fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(",")); csv.push('\n'); }
+    let mut resp = csv.into_response(); resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/csv; charset=utf-8"));
+    resp.headers_mut().insert(axum::http::header::CONTENT_DISPOSITION, axum::http::HeaderValue::from_static("attachment; filename=\"openwarp-devices.csv\""));
+    resp }
+async fn create_group(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let name = body_str(&body,"name").unwrap_or_default();
+    if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
+    let mut env_id = body_str(&body,"env_id").unwrap_or_default();
+    let scoped = env_scope_of(&st,&h).await;
+    if !scoped.is_empty() { if env_id.is_empty() { env_id = scoped; } else if env_id != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
+    if !env_id.is_empty() { let (eorg, _) = st.env_org_app(&env_id).await.map_err(|_| err(StatusCode::NOT_FOUND, "environment not found"))?; if eorg != org { return Err(err(StatusCode::NOT_FOUND, "environment not found")); } }
+    let sans = device_sans(&body)?.join(",");
+    let cert_days = body.get("cert_days").and_then(|v| v.as_i64()).unwrap_or(90).clamp(1,365);
+    let gid = id(); let t = now();
+    st.db.exec("INSERT INTO pki_groups(id,org_id,ca_id,name,env_id,sans,cert_days,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        &[json!(&gid), json!(&org), json!(&caid), json!(&name), json!(&env_id), json!(&sans), json!(cert_days), json!(body_str(&body,"tags").unwrap_or_default()), json!(t), json!(t)]).await
+        .map_err(group_conflict)?;
+    st.audit(&org,"",&env_id,&uid,"pki.group.create",&format!("{} ({})", name, gid)).await;
+    let row = st.db.one("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("group not found"))?;
+    Ok(j(group_json(&row))) }
+async fn list_groups(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
+    let scoped = env_scope_of(&st,&h).await;
+    let rows = if scoped.is_empty() {
+        st.db.query("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.ca_id=? ORDER BY g.name", &[json!(&caid)]).await
+    } else {
+        st.db.query("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.ca_id=? AND g.env_id=? ORDER BY g.name", &[json!(&caid), json!(&scoped)]).await
+    }.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(group_json).collect::<Vec<_>>()))) }
+async fn update_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
+    let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let scoped = env_scope_of(&st,&h).await;
+    if !scoped.is_empty() && db::s(&row,"env_id") != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); }
+    let name = body_str(&body,"name").unwrap_or_else(|| db::s(&row,"name"));
+    if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
+    let env_id = if scoped.is_empty() { body_str(&body,"env_id").unwrap_or_else(|| db::s(&row,"env_id")) } else { scoped.clone() };
+    if !env_id.is_empty() { let (eorg, _) = st.env_org_app(&env_id).await.map_err(|_| err(StatusCode::NOT_FOUND, "environment not found"))?; if eorg != org { return Err(err(StatusCode::NOT_FOUND, "environment not found")); } }
+    let sans = if body.get("sans").is_some() { device_sans(&body)?.join(",") } else { db::s(&row,"sans") };
+    let cert_days = body.get("cert_days").and_then(|v| v.as_i64()).unwrap_or(db::n(&row,"cert_days")).clamp(1,365);
+    let update_sql = "UPDATE pki_groups SET name=?,env_id=?,sans=?,cert_days=?,tags=?,updated_at=? WHERE id=? AND NOT EXISTS (SELECT 1 FROM pki_devices WHERE group_id=? AND env_id<>?)";
+    let params = vec![json!(&name), json!(&env_id), json!(&sans), json!(cert_days), json!(body_str(&body,"tags").unwrap_or_else(|| db::s(&row,"tags"))), json!(now()), json!(&gid), json!(&gid), json!(&env_id)];
+    let scope_check = scoped.clone();
+    st.db.tx_locked("SELECT env_id FROM pki_groups WHERE id=?", &[json!(&gid)], |r| scope_check.is_empty() || db::s(r,"env_id") == scope_check, &[(update_sql, params)], &[(0, 1)]).await
+        .map_err(|e| if e.contains("affected 0 rows") { bad("move or detach the group's devices before changing its environment") } else if e == "lock condition failed" { err(StatusCode::CONFLICT, "group changed or was removed; retry") } else { group_conflict(e) })?;
+    st.audit(&org,"",&env_id,&uid,"pki.group.update",&format!("{} ({})", name, gid)).await;
+    let fresh = st.db.one("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("group not found"))?;
+    Ok(j(group_json(&fresh))) }
+async fn delete_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
+    let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let scoped = env_scope_of(&st,&h).await;
+    if !scoped.is_empty() && db::s(&row,"env_id") != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); }
+    let (sql1, p1) = if scoped.is_empty() {
+        ("UPDATE pki_devices SET group_id='' WHERE group_id=?", vec![json!(&gid)])
+    } else {
+        ("UPDATE pki_devices SET group_id='' WHERE group_id=? AND env_id=?", vec![json!(&gid), json!(&scoped)]) };
+    let (sql2, p2) = if scoped.is_empty() {
+        ("DELETE FROM pki_groups WHERE id=?", vec![json!(&gid)])
+    } else {
+        ("DELETE FROM pki_groups WHERE id=? AND NOT EXISTS (SELECT 1 FROM pki_devices WHERE group_id=? AND env_id<>?)", vec![json!(&gid), json!(&gid), json!(&scoped)]) };
+    let counts = st.db.tx_locked("SELECT env_id FROM pki_groups WHERE id=?", &[json!(&gid)], |r| scoped.is_empty() || db::s(r,"env_id") == scoped, &[(sql1, p1), (sql2, p2)], &[(1, 1)]).await
+        .map_err(|e| if e == "lock condition failed" { err(StatusCode::FORBIDDEN, "this token is scoped to a different environment") } else if e.contains("affected 0 rows") { err(StatusCode::CONFLICT, "group contains devices outside this token's environment") } else { bad(&e) })?;
+    st.audit(&org,"",&db::s(&row,"env_id"),&uid,"pki.group.delete",&format!("{} ({})", db::s(&row,"name"), gid)).await;
+    Ok(j(json!({"deleted": true, "detached": counts.first().copied().unwrap_or(0)}))) }
+async fn revoke_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
+    let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    let scoped = env_scope_of(&st,&h).await;
+    if !scoped.is_empty() && db::s(&row,"env_id") != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); }
+    let t = now();
+    let (sql1, p1) = if scoped.is_empty() {
+        ("UPDATE pki_devices SET active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE group_id=?", vec![json!(t), json!(&gid)])
+    } else {
+        ("UPDATE pki_devices SET active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE group_id=? AND env_id=?", vec![json!(t), json!(&gid), json!(&scoped)]) };
+    let (sql2, p2) = if scoped.is_empty() {
+        ("DELETE FROM pki_enrollments WHERE device_id IN (SELECT id FROM pki_devices WHERE group_id=?)", vec![json!(&gid)])
+    } else {
+        ("DELETE FROM pki_enrollments WHERE device_id IN (SELECT id FROM pki_devices WHERE group_id=? AND env_id=?)", vec![json!(&gid), json!(&scoped)]) };
+    let (sql3, p3) = if scoped.is_empty() {
+        ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id IN (SELECT id FROM pki_devices WHERE group_id=?) AND revoked=0", vec![json!(t), json!(&gid)])
+    } else {
+        ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE device_id IN (SELECT id FROM pki_devices WHERE group_id=? AND env_id=?) AND revoked=0", vec![json!(t), json!(&gid), json!(&scoped)]) };
+    let counts = st.db.tx(&[(sql1, p1), (sql2, p2), (sql3, p3)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org,"",&db::s(&row,"env_id"),&uid,"pki.group.revoke",&format!("{} ({})", db::s(&row,"name"), gid)).await;
+    Ok(j(json!({"devices": counts.first().copied().unwrap_or(0), "revoked": counts.get(2).copied().unwrap_or(0)}))) }
+
+
+async fn revoke_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
+    let t = now();
+    // Lock the CA row first, then take the fresh statement snapshot that sees
+    // any intermediate created between the caller's read and this transaction.
+    let counts = st.db.tx_locked("SELECT revoked FROM pki_cas WHERE id=?", &[json!(&caid)], |_| true, &[
+        ("UPDATE pki_cas SET revoked=1,revoked_at=? WHERE (id=? OR parent_id=?) AND revoked=0", vec![json!(t), json!(&caid), json!(&caid)]),
+        ("UPDATE pki_devices SET active_cert_id='',updated_at=?,enroll_epoch=enroll_epoch+1 WHERE ca_id=? OR ca_id IN (SELECT id FROM pki_cas WHERE parent_id=?)", vec![json!(t), json!(&caid), json!(&caid)]),
+        ("DELETE FROM pki_enrollments WHERE device_id IN (SELECT id FROM pki_devices WHERE ca_id=? OR ca_id IN (SELECT id FROM pki_cas WHERE parent_id=?))", vec![json!(&caid), json!(&caid)]),
+        ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE (ca_id=? OR ca_id IN (SELECT id FROM pki_cas WHERE parent_id=?)) AND revoked=0", vec![json!(t), json!(&caid), json!(&caid)]),
+    ], &[]).await.map_err(|e| if e == "lock condition failed" { err(StatusCode::NOT_FOUND, "CA not found") } else { bad(&e) })?;
+    st.audit(&org,"","",&uid,"pki.ca.revoke",&format!("{} ({}) cas={} certs={}", db::s(&ca,"name"), caid, counts.first().copied().unwrap_or(0), counts.get(3).copied().unwrap_or(0))).await;
+    Ok(j(json!({"revoked": true, "cas": counts.first().copied().unwrap_or(0), "certificates": counts.get(3).copied().unwrap_or(0)}))) }
+async fn get_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    st.check_admin(&db::s(&ca,"org_id"),&uid).await?;
+    Ok(j(json!({"url": db::s(&ca,"hook_url"), "secret_set": !db::s(&ca,"hook_secret_enc").is_empty()}))) }
+async fn put_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
+    let url = body_str(&body,"url").unwrap_or_default();
+    if !url.is_empty() && (!url_ok(&url) || !egress_allowed(&url)) { return Err(bad("hook url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
+    let secret_enc = if let Some(s) = body.get("secret").and_then(|v| v.as_str()) { if s.is_empty() { String::new() } else { oc::encrypt_symmetric(&st.master(), s.as_bytes()) } } else { db::s(&ca,"hook_secret_enc") };
+    st.db.exec("UPDATE pki_cas SET hook_url=?,hook_secret_enc=? WHERE id=?", &[json!(&url), json!(&secret_enc), json!(&caid)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org,"","",&uid,"pki.ca.hook",&format!("{} ({})", db::s(&ca,"name"), caid)).await;
+    Ok(j(json!({"url": url, "secret_set": !secret_enc.is_empty()}))) }
+async fn enrollment_hook_ok(st: &S, ca: &Row, dev: &Row, enrollment_id: &str, csr_pem: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let url = db::s(ca,"hook_url"); if url.is_empty() { return Ok(()); }
+    if !url_ok(&url) || !egress_allowed(&url) { return Err(err(StatusCode::BAD_GATEWAY, "enrollment policy hook is blocked by the egress policy")); }
+    // A DNS name can resolve into a private network even though the URL has no
+    // IP literal. Resolve in production, refuse private answers, and pin the
+    // checked address for the request so a rebinding answer cannot swap it.
+    let mut pinned: Option<(String, std::net::SocketAddr)> = None;
+    if !std::env::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false) && std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) {
+        if let Ok(parsed) = reqwest::Url::parse(&url) { if let Some(host) = parsed.host_str() {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                let addrs = match tokio::net::lookup_host((host, port)).await {
+                    Ok(addrs) => addrs.collect::<Vec<_>>(),
+                    Err(_) => return Err(err(StatusCode::BAD_GATEWAY, "enrollment hook host did not resolve")) };
+                if addrs.iter().any(|a| private_ip(a.ip())) { return Err(err(StatusCode::BAD_GATEWAY, "enrollment hook resolves to a private address")); }
+                if let Some(addr) = addrs.first() { pinned = Some((host.to_string(), *addr)); } } } } }
+    let secret = { let enc = db::s(ca,"hook_secret_enc"); if enc.is_empty() { String::new() } else { oc::decrypt_symmetric(&st.master(), &enc).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| bad(&e))? } };
+    use sha2::Digest; let csr_sha256 = format!("{:x}", sha2::Sha256::digest(csr_pem.as_bytes()));
+    let sans_raw = db::s(dev,"sans"); let sans: Vec<&str> = sans_raw.split(',').filter(|s| !s.is_empty()).collect();
+    let ts = now().to_string();
+    let payload = json!({"event": "pki.enroll", "enrollment_id": enrollment_id, "device": {"id": db::s(dev,"id"), "name": db::s(dev,"name"), "env_id": db::s(dev,"env_id"), "model": db::s(dev,"model"), "tags": db::s(dev,"tags"), "sans": sans}, "ca": {"id": db::s(ca,"id"), "name": db::s(ca,"name")}, "csr_sha256": csr_sha256}).to_string();
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addr)) = pinned { builder = builder.resolve(&host, addr); }
+    let client = builder.build().map_err(|e| bad(&e.to_string()))?;
+    let mut req = client.post(&url).header("content-type", "application/json").body(payload.clone());
+    if !secret.is_empty() { let sig = hmac_hex(secret.as_bytes(), format!("{}.{}", ts, payload).as_bytes()); req = req.header("X-OpenWarp-Timestamp", ts.clone()).header("X-OpenWarp-Signature", format!("t={},v1={}", ts, sig)); }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => { let v: Value = r.json().await.unwrap_or_else(|_| json!({}));
+            if v.get("allow").and_then(|x| x.as_bool()) == Some(true) { Ok(()) }
+            else { Err(err(StatusCode::FORBIDDEN, &format!("enrollment denied by policy: {}", v.get("reason").and_then(|x| x.as_str()).unwrap_or("no reason")))) } }
+        Ok(r) => Err(err(StatusCode::BAD_GATEWAY, &format!("enrollment policy hook returned {}", r.status()))),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, &format!("enrollment policy hook failed: {}", e))) }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AttestClaims { iss: String, aud: String, sub: String, exp: i64, #[serde(default)] iat: i64, nonce: String, csr_sha256: String, #[serde(default)] hardware_backed: bool, #[serde(default)] key_id: String }
+fn attest_key(ca: &Row) -> Result<jsonwebtoken::DecodingKey, (StatusCode, Json<Value>)> {
+    let pem = db::s(ca,"attest_key_pem"); let alg = db::s(ca,"attest_alg");
+    let key = if alg == "RS256" { jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()) } else { jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()) };
+    key.map_err(|e| bad(&format!("attestation public key is invalid: {}", e))) }
+fn verify_attestation(ca: &Row, dev_id: &str, nonce: &str, csr_pem: &str, token: &str) -> Result<Value, (StatusCode, Json<Value>)> {
+    let alg = if db::s(ca,"attest_alg") == "RS256" { jsonwebtoken::Algorithm::RS256 } else { jsonwebtoken::Algorithm::ES256 };
+    let key = attest_key(ca)?;
+    let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.set_audience(&["openwarp-pki"]);
+    let issuer = db::s(ca,"attest_issuer"); validation.set_issuer(&[issuer.as_str()]);
+    validation.required_spec_claims = ["exp","iss","aud","sub"].iter().map(|s| s.to_string()).collect();
+    let data = jsonwebtoken::decode::<AttestClaims>(token, &key, &validation).map_err(|e| err(StatusCode::FORBIDDEN, &format!("attestation rejected: {}", e)))?;
+    let claims = data.claims;
+    if claims.sub != dev_id { return Err(err(StatusCode::FORBIDDEN, "attestation subject does not match the device")); }
+    if claims.nonce != nonce { return Err(err(StatusCode::FORBIDDEN, "attestation nonce does not match the enrollment challenge")); }
+    use sha2::Digest; let digest = format!("{:x}", sha2::Sha256::digest(csr_pem.as_bytes()));
+    if claims.csr_sha256.to_lowercase() != digest { return Err(err(StatusCode::FORBIDDEN, "attestation does not bind the submitted CSR")); }
+    if !claims.hardware_backed { return Err(err(StatusCode::FORBIDDEN, "attestation does not assert a hardware-backed key")); }
+    Ok(json!({"issuer": claims.iss, "subject": claims.sub, "key_id": claims.key_id, "iat": claims.iat, "hardware_backed": true})) }
+async fn get_ca_attestation(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    st.check_admin(&db::s(&ca,"org_id"),&uid).await?;
+    Ok(j(json!({"issuer": db::s(&ca,"attest_issuer"), "algorithm": db::s(&ca,"attest_alg"), "required": db::n(&ca,"attest_required") == 1, "key_set": !db::s(&ca,"attest_key_pem").is_empty()}))) }
+async fn put_ca_attestation(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
+    let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
+    let issuer = body_str(&body,"issuer").unwrap_or_default();
+    let alg = body_str(&body,"algorithm").unwrap_or_else(|| "ES256".to_string());
+    if !matches!(alg.as_str(), "ES256" | "RS256") { return Err(bad("algorithm must be ES256 or RS256")); }
+    let key = match body.get("public_key_pem").and_then(|v| v.as_str()) { Some(k) => k.to_string(), None => db::s(&ca,"attest_key_pem") };
+    if !key.is_empty() {
+        let parsed = if alg == "RS256" { jsonwebtoken::DecodingKey::from_rsa_pem(key.as_bytes()) } else { jsonwebtoken::DecodingKey::from_ec_pem(key.as_bytes()) };
+        parsed.map_err(|e| bad(&format!("public key is invalid: {}", e)))?; }
+    let required = body.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+    if required && (issuer.is_empty() || key.is_empty()) { return Err(bad("required attestation needs an issuer and a public key")); }
+    st.db.exec("UPDATE pki_cas SET attest_issuer=?,attest_key_pem=?,attest_alg=?,attest_required=? WHERE id=?", &[json!(&issuer), json!(&key), json!(&alg), json!(if required {1} else {0}), json!(&caid)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org,"","",&uid,"pki.ca.attestation",&format!("{} ({}) required={}", db::s(&ca,"name"), caid, required)).await;
+    Ok(j(json!({"issuer": issuer, "algorithm": alg, "required": required, "key_set": !key.is_empty()}))) }
+
+
+async fn pki_expiry_alerts(st: &S) {
+    let day = now() / 86400;
+    let orgs = st.db.query("SELECT id FROM orgs", &[]).await.unwrap_or_default();
+    for o in &orgs { let org = db::s(o,"id");
+        let key = format!("pki_expiry_alert:{}", org);
+        if meta_get(st, &key).await.parse::<i64>().unwrap_or(0) >= day { continue; }
+        let rows = st.db.query("SELECT c.expires_at FROM pki_certs c JOIN pki_devices d ON d.id=c.device_id WHERE d.org_id=? AND c.revoked=0 AND c.expires_at<=?", &[json!(&org), json!(now()+30*86400)]).await.unwrap_or_default();
+        if rows.is_empty() { meta_set(st, &key, &day.to_string()).await; continue; }
+        let t = now(); let (mut c7, mut c14, mut c30) = (0, 0, 0);
+        for r in &rows { let e = db::n(r,"expires_at");
+            if e <= t+7*86400 { c7 += 1; }
+            if e <= t+14*86400 { c14 += 1; }
+            c30 += 1; }
+        st.audit(&org, "", "", "system", "pki.expiry", &format!("7d={} 14d={} 30d={}", c7, c14, c30)).await;
+        meta_set(st, &key, &day.to_string()).await; } }
 
 
 // ---------- IP allowlist enforcement (T01) ----------
@@ -2925,6 +3316,7 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
     }
     if let Some(caid) = seg("/api/pki/cas/") { return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
     if let Some(did) = seg("/api/pki/devices/") { return st.db.one("SELECT org_id FROM pki_devices WHERE id=?", &[json!(did)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
+    if let Some(gid) = seg("/api/pki/groups/") { return st.db.one("SELECT org_id FROM pki_groups WHERE id=?", &[json!(gid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
     if let Some(cid) = seg("/api/pki/certs/") {
         if let Ok(Some(r)) = st.db.one("SELECT ca_id FROM pki_certs WHERE id=?", &[json!(cid)]).await {
             return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(db::s(&r, "ca_id"))]).await.ok().flatten().map(|r| db::s(&r, "org_id"));
@@ -2982,7 +3374,7 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     next.run(req).await }
 fn scope_requirement(path: &str, method: &axum::http::Method) -> &'static str {
     let read = matches!(method, &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
-    let pki = path.starts_with("/api/pki/") || (path.starts_with("/api/orgs/") && path.ends_with("/pki/cas"));
+    let pki = path.starts_with("/api/pki/") || (path.starts_with("/api/orgs/") && (path.ends_with("/pki/cas") || path.ends_with("/pki/expiring")));
     if pki { if read { "pki:read" } else { "pki:write" } }
     else if read { "secrets:read" } else { "secrets:write" } }
 async fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
@@ -2997,8 +3389,13 @@ async fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/api/pki/cas/") {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        return tail == "devices";
+        return tail == "devices" || tail.starts_with("devices/") || tail == "groups" || tail.starts_with("groups/");
     }
+    if let Some(rest) = path.strip_prefix("/api/pki/groups/") {
+        let gid = rest.split('/').next().unwrap_or("");
+        return st.db.one("SELECT env_id FROM pki_groups WHERE id=?", &[json!(gid)]).await.ok().flatten().map(|r| db::s(&r, "env_id") == scope).unwrap_or(false);
+    }
+    if path.starts_with("/api/orgs/") && path.ends_with("/pki/expiring") { return true; }
     if let Some(rest) = path.strip_prefix("/api/pki/certs/") {
         let cid = rest.split('/').next().unwrap_or("");
         if let Ok(Some(r)) = st.db.one("SELECT device_id FROM pki_certs WHERE id=?", &[json!(cid)]).await {
@@ -3627,7 +4024,7 @@ async fn main() {
     let (live, _) = broadcast::channel(256);
     let state = Arc::new(AppState { db, db_url: db_url.clone(), instance_id: oc::random_token("inst"), pub_url, master: std::sync::RwLock::new(master), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn), live });
     { let st2 = state.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
-    { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", &st2.instance_id, 60).await { process_rotations(&st2).await; } } }); }
+    { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", &st2.instance_id, 60).await { process_rotations(&st2).await; if try_leader(&st2, "pki-expiry", &st2.instance_id, 3600).await { pki_expiry_alerts(&st2).await; } } } }); }
     // One poll for the whole process. With no sockets subscribed it only reads
     // the current high-water mark, so the next connection starts from now.
     { let st2 = state.clone(); tokio::spawn(async move {
@@ -3666,7 +4063,7 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", get(list_cas).post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/devices", get(list_devices).post(create_device)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/devices/{did}", get(get_device).patch(update_device).delete(delete_device)).route("/api/pki/devices/{did}/revoke", post(revoke_device)).route("/api/pki/devices/{did}/enrollment", post(create_enrollment)).route("/api/pki/enroll", post(enroll_device)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", get(list_cas).post(create_ca)).route("/api/orgs/{oid}/pki/expiring", get(expiring_certs)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/devices", get(list_devices).post(create_device)).route("/api/pki/cas/{caid}/devices/import", post(import_devices)).route("/api/pki/cas/{caid}/devices/codes", post(bulk_codes)).route("/api/pki/cas/{caid}/devices/export", get(export_devices)).route("/api/pki/cas/{caid}/groups", get(list_groups).post(create_group)).route("/api/pki/cas/{caid}/hook", get(get_ca_hook).put(put_ca_hook)).route("/api/pki/cas/{caid}/attestation", get(get_ca_attestation).put(put_ca_attestation)).route("/api/pki/cas/{caid}/revoke", post(revoke_ca)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/devices/{did}", get(get_device).patch(update_device).delete(delete_device)).route("/api/pki/devices/{did}/revoke", post(revoke_device)).route("/api/pki/devices/{did}/renew", post(renew_device)).route("/api/pki/devices/{did}/enrollment", post(create_enrollment)).route("/api/pki/groups/{gid}", axum::routing::patch(update_group).delete(delete_group)).route("/api/pki/groups/{gid}/revoke", post(revoke_group)).route("/api/pki/enroll", post(enroll_device)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));

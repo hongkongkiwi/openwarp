@@ -472,11 +472,52 @@ from five minutes to seven days, and consumed atomically on the first successful
 request. Revoking or deleting a device invalidates its outstanding codes, and an
 enrollment that races a revocation fails rather than attaching a certificate.
 `pki:write` grants device administration without full admin; owner and admin hold
-it through `*` and the managed developer role does not. OAuth access tokens and
-service tokens can request the `pki:read` and `pki:write` scopes. An
+it through `*`, the managed developer role has `pki:read` but not `pki:write`,
+and custom roles can be granted either. Read endpoints require `pki:read`.
+OAuth access tokens and service tokens can request the `pki:read` and `pki:write`
+scopes. An
 environment-scoped token can create, list, enroll and revoke only devices whose
 `env_id` matches its own environment; the CA-wide issuance and certificate-list
 endpoints stay closed to it.
+
+`GET /api/orgs/:id/pki/expiring?days=30` lists unrevoked device certificates in
+the window with 7/14/30 day counts. A daily background job records a `pki.expiry`
+audit event for each workspace with certificates in that window, so existing log
+streams and audit webhooks receive the alert. `POST
+/api/pki/devices/:id/renew` mints a code that revokes the previous certificate
+after the replacement attaches.
+
+Bulk operations: `POST /api/pki/cas/:id/devices/import` accepts up to 1000
+device objects and can mint one code per device, `POST
+/api/pki/cas/:id/devices/codes` mints codes for up to 500 existing devices, and
+`GET /api/pki/cas/:id/devices/export` returns CSV.
+
+Groups hold defaults for a set of devices: `POST/GET
+/api/pki/cas/:id/groups`, `PATCH/DELETE /api/pki/groups/:id` and `POST
+/api/pki/groups/:id/revoke`. A device created with `group_id` inherits the
+group's environment, SANs, `cert_days` and tags unless the request overrides
+them; a device cannot join a group in another environment. Group revoke clears
+the active pointer, invalidates codes and revokes every unrevoked certificate for
+the group.
+
+The optional pre-issuance hook (`PUT /api/pki/cas/:id/hook`) posts a signed JSON
+event to an operator URL before a code is consumed. A response of
+`{"allow":true}` proceeds; a deny, a non-2xx response, a timeout or an egress
+policy rejection blocks enrollment and leaves the code usable.
+
+A CA can be a root or an intermediate: `POST /api/orgs/:id/pki/cas` accepts
+`parent_id` for a root in the same workspace, and the leaf responses carry
+`ca_chain` from the issuing CA to the root. `POST /api/pki/cas/:id/revoke` marks
+the CA, its immediate children, their devices and their certificates revoked, and
+the parent's CRL lists a revoked child's serial.
+
+Hardware attestation is an optional per-CA JWT requirement (`PUT
+/api/pki/cas/:id/attestation`). The enrollment response includes a nonce; the
+device returns a compact JWS from the configured issuer with `aud: openwarp-pki`,
+`sub` equal to the device id, the nonce, `csr_sha256` over the submitted CSR and
+`hardware_backed: true`. ES256 and RS256 are supported. A required but missing or
+invalid assertion blocks enrollment without consuming the code, and an accepted
+assertion marks the device as hardware attested.
 
 A broker that trusts the CA validates the certificate directly. Register the CA
 certificate returned by `GET /api/orgs/:id/pki/cas` as its trust anchor (EMQX,

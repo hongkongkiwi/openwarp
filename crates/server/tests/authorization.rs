@@ -75,13 +75,23 @@ impl Server {
     }
 
     async fn start_at(dir: PathBuf) -> Server {
+        Server::start_with_env(dir, &[]).await
+    }
+
+    async fn start_allowing_private_egress() -> Server {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("openwarp-authz-{}-{}", std::process::id(), seq));
+        Server::start_with_env(dir, &[("OPENWARP_ALLOW_PRIVATE_EGRESS", "1")]).await
+    }
+
+    async fn start_with_env(dir: PathBuf, extra: &[(&str, &str)]) -> Server {
         let _start = START_LOCK.lock().await;
         std::fs::create_dir_all(&dir).expect("temp dir");
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
         let (inbox_url, inbox) = start_inbox();
-        let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
-            .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
+        cmd.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &base)
             .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
@@ -90,7 +100,9 @@ impl Server {
             .env_remove("REDIS_URL")
             .env_remove("OPENWARP_TRUST_PROXY")
             .env_remove("OPENWARP_ALLOWED_DB_HOSTS")
-            .env_remove("OPENWARP_ENV")
+            .env_remove("OPENWARP_ENV");
+        for (key, value) in extra { cmd.env(key, value); }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -181,6 +193,40 @@ fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
         }
     });
     (format!("http://{}/mail", addr), inbox)
+}
+
+/// Enrollment policy hook: /deny refuses, /fail returns 500, anything else allows.
+fn start_hook() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("hook bind");
+    let addr = listener.local_addr().expect("hook addr");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
+            let mut buf = Vec::new(); let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) { Ok(0) => break, Ok(n) => n, Err(_) => break };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let len = head.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
+                    if buf.len() >= end + 4 + len { break; }
+                }
+            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let head = String::from_utf8_lossy(&buf[..end.min(buf.len())]).to_string();
+            let body = String::from_utf8_lossy(&buf[end.min(buf.len())..]).to_string();
+            if let Ok(v) = serde_json::from_str::<Value>(&body) { sink.lock().unwrap().push(v); }
+            let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+            let (status, payload) = if path.contains("deny") { ("200 OK", "{\"allow\":false,\"reason\":\"inventory says no\"}") }
+                else if path.contains("fail") { ("500 Internal Server Error", "{}") }
+                else { ("200 OK", "{\"allow\":true}") };
+            let response = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, payload.len(), payload);
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{}/hook", addr), seen)
 }
 
 async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
@@ -1806,11 +1852,11 @@ async fn device_management_requires_pki_write() {
     let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&viewer), Some(json!({"name": "sensor-1"}))).await;
     assert_eq!(r.status, 403, "a viewer must not create devices: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(&viewer), None).await;
-    assert_eq!(r.status, 200, "a workspace member may read the inventory: {}", r.text);
+    assert_eq!(r.status, 403, "a role without pki:read must not read the inventory: {}", r.text);
 
     let operator = register(&s, "pki-operator@test.invalid").await;
     let op_token = operator["token"].as_str().unwrap().to_string();
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&owner), Some(json!({"name": "pki-ops", "permissions": ["pki:write"]}))).await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&owner), Some(json!({"name": "pki-ops", "permissions": ["pki:read", "pki:write"]}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     invite(&s, &owner, &org, "pki-operator@test.invalid", "pki-ops").await;
     let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&op_token), Some(json!({"name": "sensor-2"}))).await;
@@ -1818,6 +1864,8 @@ async fn device_management_requires_pki_write() {
     let device = r.body["id"].as_str().unwrap().to_string();
     let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(&op_token), Some(json!({}))).await;
     assert_eq!(r.status, 200, "pki:write may mint enrollment codes: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(&op_token), None).await;
+    assert_eq!(r.status, 200, "pki:read may read the inventory: {}", r.text);
 }
 
 #[tokio::test]
@@ -1974,4 +2022,244 @@ async fn server_issued_device_cert_is_bound_to_device() {
     let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
     assert!(r.body["active_cert"].is_null(), "revoking the cert must clear the active pointer: {}", r.text);
     assert_eq!(r.body["active_cert_id"], json!(""));
+}
+
+fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
+fn sha256_hex(data: &str) -> String { use sha2::Digest; format!("{:x}", sha2::Sha256::digest(data.as_bytes())) }
+
+#[tokio::test]
+async fn device_renewal_revokes_the_previous_certificate() {
+    let s = Server::start().await;
+    let u = register(&s, "device-renewal@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "renewal-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let first_key = rcgen::KeyPair::generate().expect("device key");
+    let first_csr = device_csr(&first_key, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": first_csr}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let first_serial = r.body["serial"].as_str().unwrap().to_string();
+
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/renew", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["revoke_previous"], json!(true));
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let second_key = rcgen::KeyPair::generate().expect("device key");
+    let second_csr = device_csr(&second_key, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": second_csr}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let second_serial = r.body["serial"].as_str().unwrap().to_string();
+    assert_ne!(second_serial, first_serial);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["active_cert"]["serial"], json!(second_serial));
+    let certs = r.body["certs"].as_array().expect("cert history");
+    assert!(certs.iter().any(|c| c["serial"] == json!(first_serial) && c["revoked"] == json!(1)), "the previous cert must be revoked: {}", r.text);
+}
+
+#[tokio::test]
+async fn device_expiry_report_lists_buckets() {
+    let s = Server::start().await;
+    let u = register(&s, "device-expiry@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "expiry-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"device_id": device, "days": 6}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let device2 = pki_device(&s, token, &ca, "sensor-2").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"device_id": device2, "days": 20}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/pki/expiring?days=7", org), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["counts"]["7"], json!(1), "{}", r.text);
+    assert_eq!(r.body["counts"]["14"], json!(1), "{}", r.text);
+    assert_eq!(r.body["counts"]["30"], json!(2), "the 30-day bucket must cover the full window: {}", r.text);
+    let certificates = r.body["certificates"].as_array().expect("certs");
+    assert_eq!(certificates.len(), 1, "a 7-day request returns only the 7-day window: {}", r.text);
+    assert_eq!(certificates[0]["name"], json!("sensor-1"));
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/pki/expiring?days=30", org), Some(token), None).await;
+    assert_eq!(r.body["counts"]["30"], json!(2), "{}", r.text);
+    assert_eq!(r.body["certificates"].as_array().expect("certs").len(), 2, "{}", r.text);
+}
+
+#[tokio::test]
+async fn device_bulk_import_codes_and_export() {
+    let s = Server::start().await;
+    let u = register(&s, "device-bulk@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "bulk-ca").await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices/import", ca), Some(token), Some(json!({"devices": [{"name": "bulk-1", "tags": "site=a"}, {"name": "bulk-2"}, {"name": "bulk-1"}], "mint_codes": true, "ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["created"], json!(2), "{}", r.text);
+    assert_eq!(r.body["failed"], json!(1), "{}", r.text);
+    let results = r.body["results"].as_array().expect("results");
+    assert_eq!(results.iter().filter(|x| x["code"].is_string()).count(), 2, "{}", r.text);
+    let ids: Vec<String> = results.iter().filter_map(|x| x["id"].as_str().map(|s| s.to_string())).collect();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices/codes", ca), Some(token), Some(json!({"device_ids": ids, "ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["codes"].as_array().expect("codes").iter().filter(|x| x["code"].is_string()).count(), 2, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices/export", ca), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.header("content-type").contains("text/csv"), "{}", r.header("content-type"));
+    assert!(r.text.contains("name,model") && r.text.contains("bulk-1"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn device_groups_inherit_defaults_and_revoke() {
+    let s = Server::start().await;
+    let u = register(&s, "device-groups@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "group-ca").await;
+    let (_app, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/groups", ca), Some(token), Some(json!({"name": "factory-a", "env_id": envs[0], "sans": ["gw.local"], "cert_days": 45, "tags": "site=a"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let group = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(token), Some(json!({"name": "grouped-other-env", "group_id": group, "env_id": envs[1]}))).await;
+    assert_eq!(r.status, 400, "a device may not join a group in another environment: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(token), Some(json!({"name": "grouped", "group_id": group}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["env_id"], json!(envs[0]));
+    assert_eq!(r.body["cert_days"], json!(45));
+    assert_eq!(r.body["tags"], json!("site=a"));
+    assert_eq!(r.body["sans"], json!(["gw.local"]));
+    let device = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"device_id": device, "days": 10}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/groups/{}/revoke", group), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["revoked"], json!(1), "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert!(r.body["active_cert"].is_null(), "group revoke must clear the active cert: {}", r.text);
+    let r = s.call(Method::PATCH, &format!("/api/pki/groups/{}", group), Some(token), Some(json!({"name": "factory-b"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PATCH, &format!("/api/pki/groups/{}", group), Some(token), Some(json!({"env_id": envs[1]}))).await;
+    assert_eq!(r.status, 400, "a group with members in its environment may not move: {}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/pki/groups/{}", group), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert_eq!(r.body["group_id"], json!(""));
+}
+
+#[tokio::test]
+async fn device_enrollment_hook_fails_closed() {
+    let (hook_url, seen) = start_hook();
+    let s = Server::start_allowing_private_egress().await;
+    let u = register(&s, "device-hook@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "hook-ca").await;
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::PUT, &format!("/api/pki/cas/{}/hook", ca), Some(token), Some(json!({"url": format!("{}/deny", hook_url), "secret": "s3cret"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "sensor-1");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 403, "a denied hook must block enrollment: {}", r.text);
+    assert!(r.text.contains("denied by policy"), "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/pki/cas/{}/hook", ca), Some(token), Some(json!({"url": format!("{}/allow", hook_url)}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 200, "a denied attempt must not consume the code: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/pki/cas/{}/hook", ca), Some(token), Some(json!({"url": format!("{}/fail", hook_url)}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 502, "a failing hook must deny enrollment: {}", r.text);
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 3, "the hook must be called for each attempt");
+    assert_eq!(seen[0]["event"], json!("pki.enroll"));
+    assert_eq!(seen[0]["csr_sha256"].as_str().unwrap_or("").len(), 64);
+}
+
+#[tokio::test]
+async fn intermediate_ca_chain_and_revocation() {
+    let s = Server::start().await;
+    let u = register(&s, "device-intermediate@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (root, _) = pki_ca(&s, token, org, "root-ca").await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "factory", "parent_id": root}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["kind"], json!("intermediate"));
+    let intermediate = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", intermediate), Some(token), Some(json!({"name": "sensor-int"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let device = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "sensor-int");
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", intermediate), Some(token), Some(json!({"device_id": device, "days": 10}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["ca_chain"].as_array().expect("chain").len(), 2, "{}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/revoke", intermediate), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["certificates"].as_i64().unwrap_or(0) >= 1, "{}", r.text);
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert!(matches!(r.status, 400 | 401), "a revoked CA must not issue: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 400, "minting under a revoked CA must fail: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/crl", root), None, None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.text.contains("BEGIN X509 CRL"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn device_attestation_is_required_and_bound_to_the_csr() {
+    let s = Server::start().await;
+    let u = register(&s, "device-attest@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (ca, _) = pki_ca(&s, token, org, "attest-ca").await;
+    let attest_key = rcgen::KeyPair::generate().expect("attest key");
+    let r = s.call(Method::PUT, &format!("/api/pki/cas/{}/attestation", ca), Some(token), Some(json!({"issuer": "attest.test", "public_key_pem": attest_key.public_key_pem(), "algorithm": "ES256", "required": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // Saving again without the key must keep the configured key.
+    let r = s.call(Method::PUT, &format!("/api/pki/cas/{}/attestation", ca), Some(token), Some(json!({"issuer": "attest.test", "algorithm": "ES256", "required": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["key_set"], json!(true), "the configured key must be preserved: {}", r.text);
+    let device = pki_device(&s, token, &ca, "sensor-1").await;
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let nonce = r.body["nonce"].as_str().unwrap().to_string();
+    let key = rcgen::KeyPair::generate().expect("device key");
+    let csr = device_csr(&key, "sensor-1");
+    let enc = jsonwebtoken::EncodingKey::from_ec_pem(attest_key.serialize_pem().as_bytes()).expect("attest encoding key");
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    let sign = |claim_nonce: &str| {
+        let claims = json!({"iss": "attest.test", "aud": "openwarp-pki", "sub": device, "exp": now_secs() + 300, "iat": now_secs(), "nonce": claim_nonce, "csr_sha256": sha256_hex(&csr), "hardware_backed": true});
+        jsonwebtoken::encode(&header, &claims, &enc).expect("attestation jwt") };
+    let jwt = sign(&nonce);
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr, "attestation": jwt}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["attested"], json!(true), "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
+    assert_eq!(r.body["attested"], json!(true), "{}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr}))).await;
+    assert_eq!(r.status, 403, "required attestation must block an unattested enrollment: {}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(token), Some(json!({"ttl_seconds": 300}))).await;
+    let code = r.body["code"].as_str().unwrap().to_string();
+    let correct_nonce = r.body["nonce"].as_str().unwrap().to_string();
+    let bad = sign("wrong-nonce");
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr, "attestation": bad}))).await;
+    assert_eq!(r.status, 403, "a stale nonce must be rejected: {}", r.text);
+    let good = sign(&correct_nonce);
+    let r = s.call(Method::POST, "/api/pki/enroll", None, Some(json!({"code": code, "csr": csr, "attestation": good}))).await;
+    assert_eq!(r.status, 200, "a rejected assertion must not consume the code: {}", r.text);
 }

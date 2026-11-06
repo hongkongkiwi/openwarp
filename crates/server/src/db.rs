@@ -18,6 +18,18 @@ fn pg_err(error: tokio_postgres::Error) -> String {
         None => error.to_string(),
     }
 }
+fn pg_row(r: &tokio_postgres::Row) -> Row {
+    let mut m = Row::new();
+    for (i, col) in r.columns().iter().enumerate() {
+        let v: Value = if let Ok(v) = r.try_get::<_, Option<String>>(i) { v.map(Value::String).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<i64>>(i) { v.map(|n| Value::Number(n.into())).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<bool>>(i) { v.map(Value::Bool).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<Value>>(i) { v.unwrap_or(Value::Null) }
+            else { Value::Null };
+        m.insert(col.name().to_string(), v);
+    }
+    m
+}
 impl Db {
     pub async fn open(url: &str) -> Result<Self, String> {
         if url.starts_with("postgres") {
@@ -48,6 +60,86 @@ impl Db {
                 let client = pool.get().await.map_err(|e| e.to_string())?;
                 let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
                 client.execute(sql2.as_str(), &refs[..]).await.map_err(pg_err)
+            }
+        }
+    }
+    // Multi-statement atomicity for the flows where a partial apply would leave
+    // a delivered certificate live or a device half-deleted.
+    pub async fn tx(&self, statements: &[(&str, Vec<Value>)]) -> Result<Vec<u64>, String> {
+        self.tx_checked(statements, &[]).await
+    }
+    // tx_checked rolls back when a named statement affects a different number of
+    // rows than expected, so a lost race cannot commit a partial certificate.
+    pub async fn tx_checked(&self, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String> {
+        fn verify(index: usize, n: u64, expect: &[(usize, u64)]) -> Result<(), String> {
+            match expect.iter().find(|(i, _)| *i == index) { Some((_, want)) if n != *want => Err(format!("statement {} affected {} rows, expected {}", index, n, want)), _ => Ok(()) } }
+        match self {
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                let mut counts = Vec::with_capacity(statements.len());
+                for (sql, params) in statements {
+                    let index = counts.len();
+                    match exec_sqlite(&conn, sql, params) {
+                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); } }
+                        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); } } }
+                if let Err(e) = conn.execute_batch("COMMIT") { let _ = conn.execute_batch("ROLLBACK"); return Err(e.to_string()); }
+                Ok(counts)
+            }
+            Db::Postgres(pool) => {
+                let client = pool.get().await.map_err(|e| e.to_string())?;
+                client.batch_execute("BEGIN").await.map_err(pg_err)?;
+                let mut counts = Vec::with_capacity(statements.len());
+                for (sql, params) in statements {
+                    let index = counts.len();
+                    let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                    match client.execute(sql2.as_str(), &refs[..]).await {
+                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = client.batch_execute("ROLLBACK").await; return Err(e); } }
+                        Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } } }
+                if let Err(e) = client.batch_execute("COMMIT").await { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); }
+                Ok(counts)
+            }
+        }
+    }
+    // Lock one row, verify it with `ok`, then run statements in the same
+    // transaction. PostgreSQL uses FOR UPDATE; SQLite serializes writers with
+    // BEGIN IMMEDIATE, so the row read and the writes cannot interleave.
+    pub async fn tx_locked<F>(&self, lock_sql: &str, lock_params: &[Value], ok: F, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String>
+    where F: Fn(&Row) -> bool {
+        fn verify(index: usize, n: u64, expect: &[(usize, u64)]) -> Result<(), String> {
+            match expect.iter().find(|(i, _)| *i == index) { Some((_, want)) if n != *want => Err(format!("statement {} affected {} rows, expected {}", index, n, want)), _ => Ok(()) } }
+        match self {
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                let rows = match query_sqlite(&conn, lock_sql, lock_params) { Ok(r) => r, Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); } };
+                if !rows.first().map(ok).unwrap_or(false) { let _ = conn.execute_batch("ROLLBACK"); return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (sql, params) in statements {
+                    let index = counts.len();
+                    match exec_sqlite(&conn, sql, params) {
+                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = conn.execute_batch("ROLLBACK"); return Err(e); } }
+                        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); } } }
+                if let Err(e) = conn.execute_batch("COMMIT") { let _ = conn.execute_batch("ROLLBACK"); return Err(e.to_string()); }
+                Ok(counts)
+            }
+            Db::Postgres(pool) => {
+                let client = pool.get().await.map_err(|e| e.to_string())?;
+                client.batch_execute("BEGIN").await.map_err(pg_err)?;
+                let locked_sql = format!("{} FOR UPDATE", lock_sql); let sql2 = pg_sql(&locked_sql);
+                let pg = PgParams::new(lock_params); let refs = pg.refs();
+                let rows = match client.query(sql2.as_str(), &refs[..]).await { Ok(r) => r, Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } };
+                let first = rows.first().map(pg_row);
+                if !first.as_ref().map(ok).unwrap_or(false) { let _ = client.batch_execute("ROLLBACK").await; return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (sql, params) in statements {
+                    let index = counts.len();
+                    let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                    match client.execute(sql2.as_str(), &refs[..]).await {
+                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = client.batch_execute("ROLLBACK").await; return Err(e); } }
+                        Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } } }
+                if let Err(e) = client.batch_execute("COMMIT").await { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); }
+                Ok(counts)
             }
         }
     }
@@ -282,6 +374,26 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
         "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
     ]),
+    (15, &[
+        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN kind TEXT DEFAULT 'root'",
+        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
+        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
+        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
+        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
+        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
+        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -315,9 +427,27 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 14, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 15, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 14, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 15, "each migration must be recorded exactly once");
+    }
+    #[tokio::test]
+    async fn checked_transaction_rolls_back_on_a_lost_race() {
+        let db = Db::open_memory().await.unwrap();
+        let result = db.tx_checked(&[("UPDATE orgs SET name='x' WHERE id=?", vec![json!("missing")])], &[(0, 1)]).await;
+        assert!(result.is_err(), "a statement with the wrong affected-row count must abort");
+    }
+    #[tokio::test]
+    async fn transaction_rolls_back_on_error() {
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!("o1"), json!("Acme"), json!(1)]).await.unwrap();
+        let result = db.tx(&[
+            ("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", vec![json!("o2"), json!("Two"), json!(2)]),
+            ("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", vec![json!("o1"), json!("Duplicate"), json!(3)]),
+        ]).await;
+        assert!(result.is_err(), "a failing statement must abort the transaction");
+        let rows = db.query("SELECT id FROM orgs", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1, "the first insert must be rolled back");
     }
 }
