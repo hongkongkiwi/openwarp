@@ -1,6 +1,7 @@
 // Account lifecycle: signup policy, invites, and Google/GitHub sign-in against
 // local mock providers. Each test owns a private database and port.
 
+use hmac::Mac;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
@@ -113,6 +114,23 @@ fn query_param(location: &str, key: &str) -> String {
     location.split_once('?').map(|(_, q)| q).unwrap_or("")
         .split('&').filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == key).map(|(_, v)| v.to_string()).unwrap_or_default()
+}
+fn totp(secret_b32: &str) -> String {
+    let mut out = Vec::new();
+    let (mut val, mut bits) = (0u32, 0u32);
+    for c in secret_b32.chars() {
+        let d = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".find(c).expect("base32") as u32;
+        val = (val << 5) | d;
+        bits += 5;
+        if bits >= 8 { out.push(((val >> (bits - 8)) & 0xff) as u8); bits -= 8; }
+    }
+    let counter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 30;
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&out).expect("hmac");
+    mac.update(&counter.to_be_bytes());
+    let hash = mac.finalize().into_bytes();
+    let off = (hash[19] & 0x0f) as usize;
+    let code = (((hash[off] as u32 & 0x7f) << 24) | ((hash[off + 1] as u32) << 16) | ((hash[off + 2] as u32) << 8) | hash[off + 3] as u32) % 1_000_000;
+    format!("{:06}", code)
 }
 
 const TEST_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -275,6 +293,42 @@ async fn google_login_provisions_a_user() {
     assert_eq!(orgs.status, 200, "{}", orgs.text);
     assert_eq!(orgs.body.as_array().map(|a| a.len()).unwrap_or(0), 1, "a self-signed-up social user gets a personal org: {}", orgs.text);
     assert_eq!(orgs.body[0]["role"], json!("owner"), "{}", orgs.text);
+}
+
+#[tokio::test]
+async fn social_sign_in_still_requires_the_second_factor() {
+    let idp = start_mock("social-mfa@test.invalid");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.clone()),
+    ]).await;
+
+    // First sign-in provisions the account, then it enrols TOTP.
+    let r = s.get("/api/auth/social/google/start").await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    assert!(!token.is_empty(), "first social sign-in failed: {}", r.header("location"));
+    let r = s.call(Method::POST, "/api/me/totp/setup", Some(&token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "totp setup failed: {}", r.text);
+    let secret = r.body["secret"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, "/api/me/totp/verify", Some(&token), Some(json!({"code": totp(&secret)}))).await;
+    assert_eq!(r.status, 200, "totp verify failed: {}", r.text);
+
+    // The provider authenticates the address, not the second factor.
+    let r = s.get("/api/auth/social/google/start").await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    let location = r.header("location");
+    assert!(location.contains("#mfa="), "social sign-in must not mint a session before MFA: {}", location);
+    assert!(!location.contains("#token="), "social sign-in leaked a session token: {}", location);
+    let challenge = location.split("#mfa=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let r = s.call(Method::POST, "/api/auth/mfa", None, Some(json!({"mfa_token": challenge, "code": totp(&secret)}))).await;
+    assert_eq!(r.status, 200, "MFA after social sign-in failed: {} {}", r.status, r.text);
+    let session = r.body["token"].as_str().unwrap();
+    let me = s.call(Method::GET, "/api/me", Some(session), None).await;
+    assert_eq!(me.body["email"], json!("social-mfa@test.invalid"), "{}", me.text);
 }
 
 #[tokio::test]

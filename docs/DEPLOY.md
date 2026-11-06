@@ -37,15 +37,18 @@ docker compose up -d --build
 | `OPENWARP_TRUST_PROXY` | `1` enables `X-Forwarded-For` from trusted proxies |
 | `OPENWARP_TRUSTED_PROXIES` | Peer addresses allowed to send `X-Forwarded-For` |
 | `OPENWARP_SIGNUPS` | `open` or `closed`; when set it overrides the console toggle |
+| `OPENWARP_AUTH_PROVIDERS` | Comma list of `password`, `google`, `github`, `oidc`; pins sign-in methods and overrides the console |
 | `OPENWARP_GOOGLE_CLIENT_ID` / `OPENWARP_GOOGLE_CLIENT_SECRET` | Google sign-in |
 | `OPENWARP_GOOGLE_ISSUER` | Override for a Google-compatible IdP |
 | `OPENWARP_GITHUB_CLIENT_ID` / `OPENWARP_GITHUB_CLIENT_SECRET` | GitHub sign-in |
 | `OPENWARP_GITHUB_WEB` / `OPENWARP_GITHUB_API` | GitHub Enterprise endpoints |
 | `OPENWARP_ALLOWED_DB_HOSTS` | `host[:port],...` allowed for dynamic Postgres leases; empty disables the feature |
 | `OPENWARP_METRICS_TOKEN` | Enables `GET /metrics`; the token is required as a bearer |
-| `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider |
+| `OPENWARP_EMAIL_WEBHOOK` | HTTP relay that receives `{to,subject,text}` and forwards it to your mail provider; also enables emailed second factors |
 | `OPENWARP_EMAIL_TOKEN` | Optional bearer sent to the email relay |
 | `OPENWARP_REQUIRE_EMAIL_VERIFICATION` | `1` blocks password sign-in until the emailed link is opened; requires the webhook |
+| `OPENWARP_RP_ID` | WebAuthn relying-party ID; defaults to the host in `OPENWARP_PUBLIC_URL` |
+| `OPENWARP_RP_ORIGIN` | WebAuthn origin; defaults to `OPENWARP_PUBLIC_URL` |
 | `REDIS_URL` | Optional session cache |
 
 Google redirect URI: `{OPENWARP_PUBLIC_URL}/api/auth/social/google/callback`.
@@ -62,6 +65,23 @@ directly, new addresses get a single-use link valid for seven days. The invitee
 sets a password from that link, or signs in with a configured social provider,
 which redeems the invite and applies its role.
 
+## Sign-in methods and two-factor authentication
+
+The instance owner can turn password, Google, GitHub or OIDC sign-in off under
+Settings, but at least one method must stay on. `OPENWARP_AUTH_PROVIDERS` pins
+the list for an operator, for example `github` or `password,google`. A listed
+method whose credentials are missing stops the server at startup. Disabling
+password also blocks password registration, reset and the OAuth consent
+password form, so confirm another method works before turning it off.
+
+Users add TOTP, passkeys and emailed codes from Settings. Email codes and email
+verification share `OPENWARP_EMAIL_WEBHOOK`; without it the email-code option
+is reported unavailable. Passkeys require a secure browser context (HTTPS or
+localhost). `OPENWARP_RP_ID` and `OPENWARP_RP_ORIGIN` override the relying-party
+values derived from `OPENWARP_PUBLIC_URL` when a proxy or split origin needs
+it. Registration and authentication challenges are kept server-side and expire
+after five minutes.
+
 ## Password reset and email verification
 
 Password reset needs an email relay: `OPENWARP_EMAIL_WEBHOOK` receives a JSON
@@ -74,7 +94,9 @@ recovery kit and a new password, which re-wraps the same private key and keeps
 end-to-end environments readable. A user who has lost the kit can pass
 `discard_e2e_key: true`, which generates a new key pair and makes existing
 end-to-end environments unreadable. Either path revokes every session, OAuth
-token and pending refresh pair for the account.
+token and pending refresh pair for the account. If the account has a second
+factor, the reset response is an MFA challenge; no session is issued until it
+is completed.
 
 Email verification is opt-in with `OPENWARP_REQUIRE_EMAIL_VERIFICATION=1`. New
 password registrations then start unverified, receive a 24-hour link, and cannot

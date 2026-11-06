@@ -186,6 +186,7 @@ async function consoleUI(secrets = [saved]) {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
     '/api/instance': { instance_owner: false },
     '/api/me': { email: 'fixture@example.invalid' },
+    '/api/me/mfa': { methods: [], required: false, totp: false, email: false, email_available: false, recovery_codes: 0, passkeys: [] },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },

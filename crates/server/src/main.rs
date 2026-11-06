@@ -1,4 +1,4 @@
-mod db; mod integrations; mod ui;
+mod db; mod integrations; mod mfa; mod ui;
 use axum::{extract::{ConnectInfo, Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
 use openwarp_crypto as oc;
@@ -38,8 +38,14 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) { return None; }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect() }
 const OAUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
-fn html_csp(body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP)); r }
-fn hidden_fields(form: &HashMap<String, String>) -> String { form.iter().filter(|(k, _)| k.as_str() != "otp").map(|(k, v)| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v))).collect() }
+const OAUTH_MFA_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+fn html_csp(body: String) -> Response { html_csp_with(OAUTH_CSP, body) }
+fn html_csp_with(csp: &'static str, body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(csp)); r }
+// Only authorization parameters may survive a failed attempt. Passwords and
+// one-time codes must never be echoed back into the page.
+fn hidden_fields(form: &HashMap<String, String>) -> String {
+    ["client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method", "resource"]
+        .iter().filter_map(|k| form.get(*k).map(|v| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v)))).collect() }
 fn bearer_token(h: &HeaderMap) -> String { h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").strip_prefix("Bearer ").unwrap_or("").to_string() }
 static DELIVERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_DELIVERY_THREADS: usize = 16;
@@ -54,24 +60,6 @@ fn valid_cidr_list(list: &str) -> bool {
 fn valid_domain_list(list: &str) -> bool {
     list.split(',').map(str::trim).filter(|s| !s.is_empty())
         .all(|d| !d.is_empty() && d.len() <= 253 && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')) }
-fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
-    if meta_get(st, &format!("totp_enabled:{}", uid)) != "1" { return true; }
-    if code.is_empty() { return false; }
-    if let Ok(secret) = oc::decrypt_symmetric(&st.master, &meta_get(st, &format!("totp_secret:{}", uid))) {
-        let counter = (now() / 30) as u64;
-        for c in [counter.wrapping_sub(1), counter, counter + 1] {
-            if totp_code(&secret, c) == code {
-                let last = meta_get(st, &format!("totp_last:{}", uid)).parse::<u64>().unwrap_or(0);
-                if c <= last { return false; }
-                meta_set(st, &format!("totp_last:{}", uid), &c.to_string());
-                return true;
-            }
-        }
-    }
-    let stored = meta_get(st, &format!("totp_recovery:{}", uid)); let hash = oc::hash_token(code);
-    let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")); return true; }
-    false }
 
 #[derive(Deserialize, Default)] struct AuthReq { email: String, password: String }
 #[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64 }
@@ -268,6 +256,7 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let rl = format!("register:{}", addr.ip());
     if !st.rate_ok(&rl, 5, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
     st.rate_fail(&rl, 3600);
+    if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password registration is disabled on this instance; sign in with a configured provider")); }
     if r.email.is_empty() || r.password.len() < 8 { return Err(bad("email and password (>=8 chars) required")); }
     if !signups_open(&st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     let kp = oc::Keypair::generate();
@@ -278,6 +267,7 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
     let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).map_err(|e| bad(&e))?;
     claim_instance_owner(&st, &uid);
+    mfa::note_password_login(&st, &uid);
     if verification_required() {
         let link_token = issue_auth_token(&st, &uid, "verify", 86400);
         let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
@@ -290,6 +280,7 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
 }
 fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; use a configured provider")); }
     let key = format!("login:{}:{}", addr.ip(), r.email.trim().to_lowercase());
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
     let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
@@ -298,7 +289,11 @@ async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extr
     if verification_required() && db::n(&row, "email_verified") == 0 { return Err(err(StatusCode::FORBIDDEN, "verify your email address before signing in; POST /api/auth/resend-verification for a new link")); }
     st.rate_clear(&key);
     let uid = db::s(&row, "id");
-    if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
+    mfa::note_password_login(&st, &uid);
+    if mfa::required(&st, &uid) {
+        let challenge = mfa::new_challenge(&st, &uid)?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid), "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid)})))); }
     let token = make_session(&st, &uid)?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
     Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": db::s(&row, "pubkey")}))))
@@ -370,6 +365,7 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     Ok(j(json!({"ok": true, "invite_token": token, "expires_at": expires, "note": "single use, valid 7 days; the invitee redeems it at POST /api/auth/accept-invite or by signing in with a configured social provider"}))) }
 #[derive(Deserialize)] struct InviteReq { token: String, password: String }
 async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
     if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
@@ -380,6 +376,7 @@ async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).map_err(|e| bad(&e))?;
     st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).map_err(|e| bad(&e))?;
     claim_instance_owner(&st, &uid);
+    mfa::note_password_login(&st, &uid);
     st.audit(&org, "", "", &uid, "member.accept_invite", &email);
     let token = make_session(&st, &uid)?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
@@ -954,6 +951,7 @@ async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
 async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "oidc") { return Err(err(StatusCode::FORBIDDEN, "single sign-on is disabled on this instance")); }
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)); let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)); let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid));
     let secret_enc = meta_get(&st, &format!("oidc_client_secret:{}", oid));
     let client_secret = oc::decrypt_symmetric(&st.master, &secret_enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
@@ -969,6 +967,7 @@ async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum
 fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
 #[derive(serde::Deserialize)] struct Claims { email: Option<String>, sub: String, #[serde(default)] nonce: Option<String>, #[serde(default)] email_verified: Option<bool> }
 async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "oidc") { return Err(err(StatusCode::FORBIDDEN, "single sign-on is disabled on this instance")); }
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let srow = st.db.one("SELECT org_id,created_at,nonce FROM oidc_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     let oid = db::s(&srow, "org_id"); let expected_nonce = db::s(&srow, "nonce");
@@ -1021,6 +1020,9 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
             return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
         } }
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
+    if mfa::required(&st, &uid) {
+        let challenge = mfa::new_challenge(&st, &uid)?;
+        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}&org={}", challenge, oid))); }
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
 
@@ -1029,13 +1031,19 @@ fn verification_required() -> bool {
     matches!(std::env::var("OPENWARP_REQUIRE_EMAIL_VERIFICATION").unwrap_or_default().to_ascii_lowercase().as_str(), "1" | "true" | "yes") }
 // The operator supplies a small HTTP relay that forwards {to,subject,text} to
 // their mail provider. Without one, mail is suppressed and logged, never queued.
-async fn send_email(to: &str, subject: &str, text: &str) {
+// Security codes need the delivery outcome, so they use the fallible variant.
+async fn send_email_result(to: &str, subject: &str, text: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let url = std::env::var("OPENWARP_EMAIL_WEBHOOK").unwrap_or_default();
-    if url.trim().is_empty() { eprintln!("email suppressed (OPENWARP_EMAIL_WEBHOOK unset): {}", subject); return; }
+    if url.trim().is_empty() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "email delivery is not configured on this instance")); }
     let token = std::env::var("OPENWARP_EMAIL_TOKEN").unwrap_or_default();
     let mut req = http_client().post(&url).json(&json!({"to": to, "subject": subject, "text": text}));
     if !token.is_empty() { req = req.bearer_auth(token); }
-    if let Err(e) = req.send().await { eprintln!("email delivery failed: {}", e); } }
+    let response = req.send().await.map_err(|_| err(StatusCode::BAD_GATEWAY, "the email relay could not be reached"))?;
+    if !response.status().is_success() { return Err(err(StatusCode::BAD_GATEWAY, "the email relay rejected the message")); }
+    Ok(()) }
+async fn send_email(to: &str, subject: &str, text: &str) {
+    if let Err((_, Json(v))) = send_email_result(to, subject, text).await {
+        eprintln!("email delivery failed: {}", v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error")); } }
 fn issue_auth_token(st: &S, uid: &str, kind: &str, ttl: i64) -> String {
     let token = oc::random_token(kind);
     let _ = st.db.exec("INSERT INTO auth_tokens(token_hash,user_id,kind,created_at,expires_at) VALUES(?,?,?,?,?)", &[json!(oc::hash_token(&token)), json!(uid), json!(kind), json!(now()), json!(now() + ttl)]);
@@ -1057,6 +1065,7 @@ async fn verify_email(State(st): State<S>, Query(q): Query<HashMap<String,String
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP));
     r }
 async fn forgot_password(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, h: HeaderMap, Json(r): Json<EmailReq>) -> Res {
+    if !auth_enabled(&st, "password") { return Ok(j(json!({"ok": true, "note": "if that address has an account, a reset link is on its way"}))); }
     let key = format!("forgot:{}", addr.ip());
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many reset requests; try again later")); }
     st.rate_fail(&key, 900);
@@ -1081,6 +1090,7 @@ async fn resend_verification(State(st): State<S>, axum::extract::ConnectInfo(add
     }
     Ok(j(json!({"ok": true}))) }
 async fn reset_password(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<ResetReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    if !auth_enabled(&st, "password") { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance")); }
     let key = format!("reset:{}", addr.ip());
     if !st.rate_ok(&key, 10, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later")); }
     if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
@@ -1103,7 +1113,15 @@ async fn reset_password(State(st): State<S>, axum::extract::ConnectInfo(addr): a
     let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]);
     let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]);
     let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]);
+    mfa::note_password_login(&st, &uid);
     st.audit("", "", "", &uid, "auth.password_reset", if replaced { "key replaced" } else { "kit supplied" });
+    // A reset link proves the mailbox, not the second factor. Changing the
+    // password must not be a way around an enrolled factor.
+    if mfa::required(&st, &uid) {
+        let challenge = mfa::new_challenge(&st, &uid)?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid), "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid),
+            "e2e_key_replaced": replaced})))); }
     let session = make_session(&st, &uid)?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap());
     Ok((hdr, j(json!({"token": session, "user_id": uid, "e2e_key_replaced": replaced})))) }
@@ -1131,6 +1149,48 @@ fn social_provider(provider: &str) -> Option<(String, String)> {
     let id = std::env::var(id_key).ok().unwrap_or_default();
     let secret = std::env::var(secret_key).ok().unwrap_or_default();
     if id.trim().is_empty() || secret.trim().is_empty() { None } else { Some((id, secret)) } }
+const AUTH_METHODS: &[&str] = &["password", "google", "github", "oidc"];
+fn auth_method_configured(st: &S, method: &str) -> bool {
+    match method {
+        "password" => true,
+        // Per-organisation SSO counts only once an org has an issuer. Otherwise
+        // it could keep the "last method" check green while logging nobody in.
+        "oidc" => st.db.one("SELECT COUNT(*) AS n FROM meta WHERE k LIKE 'oidc_issuer:%' AND v<>''", &[]).ok().flatten().map(|r| db::n(&r, "n") > 0).unwrap_or(false),
+        "google" => social_provider("google").is_some(),
+        "github" => social_provider("github").is_some(),
+        _ => false } }
+fn auth_env_lock() -> Option<Vec<String>> {
+    std::env::var("OPENWARP_AUTH_PROVIDERS").ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()) }
+// Operators can pin the method list with OPENWARP_AUTH_PROVIDERS. Otherwise the
+// instance owner's stored choice wins, defaulting to every configured method.
+fn auth_enabled(st: &S, method: &str) -> bool {
+    if !auth_method_configured(st, method) { return false; }
+    if let Some(lock) = auth_env_lock() { return lock.iter().any(|m| m == method); }
+    let stored = meta_get(st, "auth_providers");
+    if stored.is_empty() { return true; }
+    serde_json::from_str::<Value>(&stored).ok()
+        .and_then(|v| v.get(method).and_then(|b| b.as_bool())).unwrap_or(true) }
+fn auth_settings(st: &S) -> Value {
+    let enabled: Vec<&str> = AUTH_METHODS.iter().copied().filter(|m| auth_enabled(st, m)).collect();
+    let configured: Vec<&str> = AUTH_METHODS.iter().copied().filter(|m| auth_method_configured(st, m)).collect();
+    json!({
+        "password": auth_enabled(st, "password"),
+        "google": auth_enabled(st, "google"),
+        "github": auth_enabled(st, "github"),
+        "oidc": auth_enabled(st, "oidc"),
+        "methods": enabled,
+        "configured": configured,
+        "env_locked": auth_env_lock().is_some(),
+    }) }
+fn validate_auth_env(st: &S) -> Result<(), String> {
+    let Some(lock) = auth_env_lock() else { return Ok(()) };
+    if lock.is_empty() { return Err("OPENWARP_AUTH_PROVIDERS is set but names no sign-in method".into()); }
+    for m in &lock {
+        if !AUTH_METHODS.contains(&m.as_str()) { return Err(format!("OPENWARP_AUTH_PROVIDERS contains unknown method {:?}; use {:?}", m, AUTH_METHODS)); }
+        if !auth_method_configured(st, m) { return Err(format!("OPENWARP_AUTH_PROVIDERS enables {:?} but its credentials are not configured", m)); }
+    }
+    Ok(()) }
 fn google_issuer() -> String { std::env::var("OPENWARP_GOOGLE_ISSUER").unwrap_or_else(|_| "https://accounts.google.com".into()) }
 fn github_web() -> String { std::env::var("OPENWARP_GITHUB_WEB").unwrap_or_else(|_| "https://github.com".into()) }
 fn github_api() -> String { std::env::var("OPENWARP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()) }
@@ -1208,14 +1268,11 @@ fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> Result<
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email));
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
-    Ok(j(json!({
-        "password": true,
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-        "signups": if signups_open(&st) { "open" } else { "invite" },
-    }))) }
+    let mut out = auth_settings(&st);
+    out["signups"] = json!(if signups_open(&st) { "open" } else { "invite" });
+    Ok(j(out)) }
 async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
-    let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let (client_id, _) = social_provider(&provider).filter(|_| auth_enabled(&st, &provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
     let state = oc::random_token("sst");
     st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).map_err(|e| bad(&e))?;
@@ -1228,7 +1285,7 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
         format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state) };
     Ok(axum::response::Redirect::temporary(&url)) }
 async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
-    let (client_id, client_secret) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
+    let (client_id, client_secret) = social_provider(&provider).filter(|_| auth_enabled(&st, &provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let row = st.db.one("SELECT provider,created_at FROM social_states WHERE state=?", &[json!(state)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     let _ = st.db.exec("DELETE FROM social_states WHERE state=?", &[json!(state)]);
@@ -1238,17 +1295,40 @@ async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path
     let (subject, email) = if provider == "google" { google_identity(&client_id, &client_secret, &redirect, &code).await }
         else { github_identity(&client_id, &client_secret, &redirect, &code).await }.map_err(|e| bad(&e))?;
     let uid = resolve_social(&st, &provider, &subject, &email)?;
+    // The provider proved the address, not possession of the account's second
+    // factor, so MFA still applies to social sign-in.
+    if mfa::required(&st, &uid) {
+        let challenge = mfa::new_challenge(&st, &uid)?;
+        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}", challenge))); }
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h)?;
-    Ok(j(json!({
-        "signups_open": signups_open(&st),
-        "signups_env_locked": std::env::var("OPENWARP_SIGNUPS").is_ok(),
-        "instance_owner": instance_owner(&st).as_deref() == Some(uid.as_str()),
-        "google": social_provider("google").is_some(),
-        "github": social_provider("github").is_some(),
-    }))) }
+    let mut auth = auth_settings(&st);
+    auth["signups_open"] = json!(signups_open(&st));
+    auth["signups_env_locked"] = json!(std::env::var("OPENWARP_SIGNUPS").is_ok());
+    auth["instance_owner"] = json!(instance_owner(&st).as_deref() == Some(uid.as_str()));
+    auth["mfa_email"] = json!(mfa::email_available());
+    Ok(j(auth)) }
+async fn set_auth_providers(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h)?;
+    if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change sign-in methods")); }
+    if auth_env_lock().is_some() { return Err(err(StatusCode::CONFLICT, "OPENWARP_AUTH_PROVIDERS controls sign-in methods on this instance")); }
+    let mut chosen: Vec<&str> = Vec::new();
+    for method in AUTH_METHODS {
+        let value = body.get(*method).and_then(|v| v.as_bool()).unwrap_or_else(|| auth_enabled(&st, method));
+        if value {
+            if !auth_method_configured(&st, method) { return Err(bad(&format!("{} sign-in is not configured; set its client credentials first", method))); }
+            chosen.push(method);
+        }
+    }
+    if chosen.is_empty() { return Err(bad("at least one sign-in method must stay enabled, or nobody could sign in")); }
+    let cfg = json!({
+        "password": chosen.contains(&"password"), "google": chosen.contains(&"google"),
+        "github": chosen.contains(&"github"), "oidc": chosen.contains(&"oidc") });
+    meta_set(&st, "auth_providers", &cfg.to_string());
+    st.audit("", "", "", &uid, "instance.auth_providers", &chosen.join(","));
+    Ok(j(auth_settings(&st))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h)?;
     if instance_owner(&st).as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -1613,39 +1693,34 @@ fn totp_code(secret: &[u8], counter: u64) -> String { use sha1::Sha1; use hmac::
     let off = (hash[19] & 0x0f) as usize; let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off+1] as u32) << 16) | ((hash[off+2] as u32) << 8) | hash[off+3] as u32; format!("{:06}", code % 1_000_000) }
 fn meta_set(st: &S, k: &str, v: &str) { if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k), json!(v)]).is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(k)]); } }
 async fn totp_setup(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
-    // Re-enrolling is equivalent to removing the second factor, so it needs the
-    // password once MFA is already active.
-    if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" {
-        let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-        let row = st.db.one("SELECT pass_hash FROM users WHERE id=?", &[json!(&uid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
-        if password.is_empty() || !oc::verify_password(password, &db::s(&row, "pass_hash")) { return Err(err(StatusCode::UNAUTHORIZED, "current password required to change two-factor settings")); } }
+    // Re-enrolling is equivalent to adding a factor to an account that already
+    // has one, so it needs the password the user knows.
+    mfa::reauth_add(&st, &uid, &body)?;
     let provided = body.get("secret").and_then(|v| v.as_str()).unwrap_or("");
     let secret_bytes: Vec<u8> = if provided.is_empty() { oc::random_key()[..20].to_vec() } else { let d = b32decode(provided); if d.len() < 10 { return Err(bad("provided TOTP secret must be base32, at least 10 bytes")); } d };
     let secret_b32 = b32encode(&secret_bytes);
-    meta_set(&st, &format!("totp_secret:{}", uid), &oc::encrypt_symmetric(&st.master, &secret_bytes));
-    meta_set(&st, &format!("totp_enabled:{}", uid), "0");
-    let codes: Vec<String> = (0..8).map(|_| oc::random_token("rc")).collect();
-    let hashed: Vec<String> = codes.iter().map(|c| oc::hash_token(c)).collect();
-    meta_set(&st, &format!("totp_recovery:{}", uid), &hashed.join(","));
-    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default(); let _ = &secret_bytes;
+    // Keep the new secret pending until a code proves it. A re-enrolment must
+    // not disable the factor that is already protecting the account.
+    meta_set(&st, &format!("totp_pending:{}", uid), &oc::encrypt_symmetric(&st.master, &secret_bytes));
+    let codes = if mfa::recovery_count(&st, &uid) == 0 { mfa::issue_recovery_codes(&st, &uid) } else { Vec::new() };
+    let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).map(|r| r.map(|x| db::s(&x,"email")).unwrap_or_default()).unwrap_or_default();
     Ok(j(json!({"secret": secret_b32, "otpauth_url": format!("otpauth://totp/OpenWarp:{}?secret={}&issuer=OpenWarp", email, secret_b32), "recovery_codes": codes, "note": "call POST /api/me/totp/verify {code} with a current TOTP code to enable"}))) }
 async fn totp_verify(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h)?;
-    let enc = meta_get(&st, &format!("totp_secret:{}", uid)); let secret = oc::decrypt_symmetric(&st.master, &enc).map_err(|_| bad("TOTP not set up"))?;
-    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or(""); let counter = (now() / 30) as u64;
-    if ![counter.wrapping_sub(1), counter, counter + 1].iter().any(|c| totp_code(&secret, *c) == code) { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
-    meta_set(&st, &format!("totp_enabled:{}", uid), "1"); Ok(j(json!({"enabled": true}))) }
+    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    if !mfa::confirm_totp(&st, &uid, code) { return Err(err(StatusCode::UNAUTHORIZED, "invalid TOTP code")); }
+    st.audit("", "", "", &uid, "auth.totp_enabled", "");
+    Ok(j(json!({"enabled": true}))) }
 async fn mfa_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let token = body.get("mfa_token").and_then(|v| v.as_str()).unwrap_or(""); let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let row = st.db.one("SELECT user_id,created_at FROM mfa_challenges WHERE token=?", &[json!(token)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid MFA challenge"))?;
-    if db::n(&row,"created_at") + 300 < now() { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired")); }
-    let uid = db::s(&row,"user_id");
+    let uid = mfa::challenge_user(&st, token).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or expired MFA challenge"))?;
     // The password was already accepted upstream, so this step guards the second
     // factor itself: cap guesses per address and account.
     let key = format!("mfa:{}:{}", addr.ip(), uid);
     if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
-    if !otp_ok(&st, &uid, code) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
+    if !mfa::second_factor_ok(&st, &uid, code) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
     st.rate_clear(&key);
-    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(token)]);
+    mfa::consume_challenge(&st, token);
+    st.audit("", "", "", &uid, "auth.mfa_login", "");
     let session = make_session(&st, &uid)?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
 
@@ -1762,40 +1837,106 @@ fn authorize_params_ok(st: &S, q: &HashMap<String, String>) -> Result<(String, S
     }
     if scope.split_whitespace().next().is_none() { return Err("at least one scope is required".into()); }
     Ok((client_id, redirect, scope)) }
+const OAUTH_PASSKEY_JS: &str = r#"<script>
+function b64uToBuf(s){var b=atob(s.replace(/-/g,'+').replace(/_/g,'/'));var u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u.buffer}
+function bufToB64u(x){var u=new Uint8Array(x),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+async function passkeySignIn(){var f=document.getElementById('mfaform');var t=f.querySelector('input[name=mfa_token]').value;try{
+var r=await fetch('/api/auth/mfa/passkey/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mfa_token:t})});
+var d=await r.json();if(!r.ok)throw new Error(d.error||'passkey sign-in could not start');
+var o=d.options.publicKey;o.challenge=b64uToBuf(o.challenge);if(o.allowCredentials)o.allowCredentials=o.allowCredentials.map(function(c){c.id=b64uToBuf(c.id);return c});
+var a=await navigator.credentials.get({publicKey:o});
+var body={mfa_token:t,credential:{id:a.id,rawId:bufToB64u(a.rawId),type:a.type,response:{clientDataJSON:bufToB64u(a.response.clientDataJSON),authenticatorData:bufToB64u(a.response.authenticatorData),signature:bufToB64u(a.response.signature),userHandle:a.response.userHandle?bufToB64u(a.response.userHandle):null}}};
+var r2=await fetch('/api/auth/mfa/passkey/finish',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+var d2=await r2.json();if(!r2.ok)throw new Error(d2.error||'passkey sign-in failed');
+f.querySelector('input[name=mfa_token]').remove();var b=document.createElement('input');b.type='hidden';b.name='approve';b.value='1';f.appendChild(b);f.submit();
+}catch(e){document.getElementById('mfaerr').textContent=e.message||String(e)}}
+</script>"#;
+fn consent_mfa_page(st: &S, uid: &str, form: &HashMap<String, String>, token: &str, message: &str) -> Response {
+    let methods = mfa::methods(st, uid);
+    // The token is only ever minted by this page after a password step, never
+    // inherited from the authorize query string.
+    let mut hidden = hidden_fields(form);
+    hidden.push_str(&format!("<input type=hidden name=mfa_token value=\"{}\">", esc(token)));
+    let mut buttons = String::new();
+    if methods.contains(&"email") && mfa::email_available() {
+        buttons.push_str("<button name=action value=send_email style=\"padding:10px 20px;margin-right:8px\">Email me a code</button>"); }
+    if methods.contains(&"passkey") {
+        buttons.push_str("<button type=button onclick=\"passkeySignIn()\" style=\"padding:10px 20px;margin-right:8px\">Use a passkey</button>"); }
+    let note = if methods.contains(&"totp") { "Enter a code from your authenticator app, or a recovery code." }
+        else if methods.contains(&"email") && mfa::email_available() { "Enter the code sent to your email, or a recovery code." }
+        else if methods.contains(&"passkey") { "Use your passkey, or a recovery code." }
+        else { "Enter a recovery code." };
+    // The passkey script is only needed when a passkey exists; keep the page
+    // otherwise under the stricter CSP.
+    let page = format!("<!doctype html><html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>{}</p><p style=\"color:#fb7185\" id=mfaerr>{}</p><form id=mfaform method=post action=\"/oauth/authorize/decision\">{}{}<input name=otp placeholder=\"code or recovery code\" autocomplete=one-time-code style=\"padding:8px\"><br><div style=\"margin-top:10px\">{}<button name=approve value=1 style=\"padding:10px 20px\">Continue</button></div></form>{}</body></html>",
+        esc(note), esc(message), &hidden, &buttons, "", if methods.contains(&"passkey") { OAUTH_PASSKEY_JS } else { "" });
+    let mut r = if methods.contains(&"passkey") { html_csp_with(OAUTH_MFA_CSP, page) } else { html_csp(page) };
+    *r.status_mut() = StatusCode::UNAUTHORIZED; r }
+fn oauth_error_page(status: StatusCode, msg: &str) -> Response {
+    let mut r = html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>OAuth error</h1><p>{}</p></body></html>", esc(msg)));
+    *r.status_mut() = status; r }
 async fn oauth_authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Response {
-    if let Err(e) = authorize_params_ok(&st, &q) { return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>OAuth error</h1><p>{}</p></body></html>", esc(&e))); }
+    if let Err(e) = authorize_params_ok(&st, &q) { return oauth_error_page(StatusCode::BAD_REQUEST, &e); }
     let hidden = hidden_fields(&q);
     let client = esc(q.get("client_id").map(|s| s.as_str()).unwrap_or(""));
     let scope = esc(q.get("scope").map(|s| s.as_str()).unwrap_or(""));
-    if let Some(uid) = oauth_user(&st, &h) {
-        let otp = if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { "<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code><br>".to_string() } else { String::new() };
-        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden, otp));
+    if oauth_user(&st, &h).is_some() {
+        return html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Authorize application</h1><p>Client: {}<br>Scopes: {}</p><form method=post action=\"/oauth/authorize/decision\">{}{}<button name=approve value=1 style=\"padding:10px 20px\">Approve</button> <button name=approve value=0 style=\"padding:10px 20px\">Deny</button></form></body></html>", client, scope, hidden, ""));
     }
-    html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><input name=otp placeholder=\"authenticator code (if enabled)\" autocomplete=one-time-code style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>", hidden))
+    if !auth_enabled(&st, "password") {
+        return oauth_error_page(StatusCode::FORBIDDEN, "Password sign-in is disabled on this instance. Sign in to the console with a configured provider, then open this link again."); }
+    html_csp(format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Sign in to OpenWarp</h1><form method=post action=\"/oauth/authorize/decision\">{}<input name=email type=email placeholder=email required style=\"padding:8px\"><br><input name=password type=password placeholder=password required style=\"padding:8px\"><br><input name=otp placeholder=\"code if two-factor is enabled\" autocomplete=one-time-code style=\"padding:8px\"><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Sign in and approve</button></form></body></html>", hidden))
 }
 async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
-    let (client_id, redirect, scope) = match authorize_params_ok(&st, &form) { Ok(x) => x, Err(e) => return (StatusCode::BAD_REQUEST, e).into_response() };
-    let uid = if let Some(u) = oauth_user(&st, &h) { u } else {
+    let (client_id, redirect, scope) = match authorize_params_ok(&st, &form) { Ok(x) => x, Err(e) => return oauth_error_page(StatusCode::BAD_REQUEST, &e) };
+    let form_token = form.get("mfa_token").cloned().unwrap_or_default();
+    let uid = if let Some(u) = oauth_user(&st, &h) { u }
+    else if !form_token.is_empty() {
+        let uid = match mfa::challenge_user(&st, &form_token) { Some(u) => u, None => return oauth_error_page(StatusCode::UNAUTHORIZED, "This two-factor challenge expired. Sign in again.") };
+        if form.get("action").map(|s| s.as_str()) == Some("send_email") {
+            let key = format!("email-mfa:{}:{}", addr.ip(), uid);
+            if !st.rate_ok(&key, 3, 600) { return oauth_error_page(StatusCode::TOO_MANY_REQUESTS, "Too many codes requested. Try again later."); }
+            st.rate_fail(&key, 600);
+            if let Err((_, Json(v))) = mfa::send_login_code(&st, &uid).await {
+                return consent_mfa_page(&st, &uid, &form, &form_token, v.get("error").and_then(|e| e.as_str()).unwrap_or("The code could not be sent.")); }
+            return consent_mfa_page(&st, &uid, &form, &form_token, "A code is on its way to the account email."); }
+        let key = format!("otp:{}:{}", addr.ip(), uid);
+        if !st.rate_ok(&key, 5, 900) { return oauth_error_page(StatusCode::TOO_MANY_REQUESTS, "Too many failed two-factor attempts. Try again later."); }
+        if !mfa::second_factor_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")) {
+            if !form.get("otp").map(|s| s.is_empty()).unwrap_or(true) { st.rate_fail(&key, 900); }
+            return consent_mfa_page(&st, &uid, &form, &form_token, "That code was not accepted."); }
+        st.rate_clear(&key);
+        mfa::consume_challenge(&st, &form_token);
+        uid }
+    else {
+        if !auth_enabled(&st, "password") { return oauth_error_page(StatusCode::FORBIDDEN, "Password sign-in is disabled on this instance."); }
         let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr.ip(), email.to_lowercase());
-        if !st.rate_ok(&key, 5, 900) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
-        let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
-        if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
-        if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
-        db::s(&row, "id") };
-    if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
-    let otp_key = format!("otp:{}:{}", addr.ip(), uid);
-    if !st.rate_ok(&otp_key, 5, 900) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
-    if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")) {
-        st.rate_fail(&otp_key, 900);
-        let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
-        return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
-    }
-    st.rate_clear(&otp_key);
+        if !st.rate_ok(&key, 5, 900) { return oauth_error_page(StatusCode::TOO_MANY_REQUESTS, "Too many failed sign-in attempts. Try again later."); }
+        let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); } };
+        if db::n(&row, "active") == 0 { return oauth_error_page(StatusCode::UNAUTHORIZED, "Account deactivated."); }
+        if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return oauth_error_page(StatusCode::UNAUTHORIZED, "Invalid credentials."); }
+        st.rate_clear(&key);
+        let uid = db::s(&row, "id");
+        mfa::note_password_login(&st, &uid);
+        if mfa::required(&st, &uid) {
+            let token = match mfa::new_challenge(&st, &uid) { Ok(t) => t, Err(_) => return oauth_error_page(StatusCode::INTERNAL_SERVER_ERROR, "Could not start two-factor verification.") };
+            let otp = form.get("otp").map(|s| s.as_str()).unwrap_or("");
+            if otp.is_empty() { return consent_mfa_page(&st, &uid, &form, &token, ""); }
+            let key = format!("otp:{}:{}", addr.ip(), uid);
+            if !st.rate_ok(&key, 5, 900) { return oauth_error_page(StatusCode::TOO_MANY_REQUESTS, "Too many failed two-factor attempts. Try again later."); }
+            if !mfa::second_factor_ok(&st, &uid, otp) {
+                st.rate_fail(&key, 900);
+                return consent_mfa_page(&st, &uid, &form, &token, "That code was not accepted."); }
+            st.rate_clear(&key);
+            mfa::consume_challenge(&st, &token);
+        }
+        uid };
+    if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return oauth_error_page(StatusCode::UNAUTHORIZED, "Account deactivated."); }
     let state = form.get("state").cloned().unwrap_or_default();
     if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::to(&format!("{}?error=access_denied&state={}", redirect, urlencode(&state))).into_response(); }
     let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));
-    if st.db.exec("INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,code_challenge,scope,resource,expires_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(oc::hash_token(&code)), json!(client_id), json!(uid), json!(redirect), json!(form.get("code_challenge").cloned().unwrap_or_default()), json!(scope), json!(resource), json!(now()+300)]).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, "could not create code").into_response(); }
+    if st.db.exec("INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,code_challenge,scope,resource,expires_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(oc::hash_token(&code)), json!(client_id), json!(uid), json!(redirect), json!(form.get("code_challenge").cloned().unwrap_or_default()), json!(scope), json!(resource), json!(now()+300)]).is_err() { return oauth_error_page(StatusCode::INTERNAL_SERVER_ERROR, "Could not create an authorization code."); }
     axum::response::Redirect::to(&format!("{}?code={}&state={}", redirect, code, urlencode(&state))).into_response() }
 fn issue_oauth_tokens(st: &S, client_id: &str, uid: &str, scope: &str, resource: &str, pair: &str) -> Value {
     let access = oc::random_token("oat"); let refresh = oc::random_token("ort"); let pair = if pair.is_empty() { id() } else { pair.to_string() };
@@ -2018,6 +2159,7 @@ async fn main() {
     let redis_conn = std::env::var("REDIS_URL").ok().and_then(|u| redis::Client::open(u).ok()).and_then(|c| c.get_connection().ok());
     let pub_url = std::env::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
     let state = Arc::new(AppState { db, db_url: db_url.clone(), pub_url, master, #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis_conn) });
+    if let Err(e) = validate_auth_env(&state) { eprintln!("{}", e); std::process::exit(1); }
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; process_rotations(&st2).await; } }); }
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
@@ -2025,7 +2167,7 @@ async fn main() {
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
@@ -2040,7 +2182,13 @@ async fn main() {
         .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", post(set_override))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/auth/mfa", post(mfa_login)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable))
+        .route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate))
+        .route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable))
+        .route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete))
+        .route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send))
+        .route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish))
+        .route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", post(create_ca)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
         .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
         .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
         .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox))

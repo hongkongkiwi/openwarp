@@ -23,6 +23,12 @@ jsonwebtoken = "9"
 rcgen = "0.13"
 sha1 = "0.10"
 ipnet = "2"
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
+
+[dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"
+base64ct = "1"
 
 [features]
 default = ["redis-cache"]

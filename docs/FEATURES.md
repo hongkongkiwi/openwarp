@@ -95,6 +95,44 @@ secret-change proposals, and Postgres dynamic roles are not Phase features.
 Deferred by design: CLI parity (separate effort), Kubernetes operator,
 SDKs, AWS-IAM dynamic secrets, Phase billing/licence code (never copied).
 
+## Sign-in methods and second factors
+
+The instance owner chooses which methods the server offers under Settings:
+email and password, Google, GitHub and organisation OIDC can each be turned
+off, as long as one method stays on. `OPENWARP_AUTH_PROVIDERS` pins the list and
+wins over the console. Google and GitHub need client credentials before they
+can be enabled; OIDC counts once an organisation has an issuer. Turning
+password off also blocks password registration, password reset and the OAuth
+consent password form.
+
+Each account can add any combination of second factors:
+
+- TOTP authenticator app with recovery codes (`/api/me/totp/setup`, verify,
+  `DELETE /api/me/totp`).
+- WebAuthn passkeys (`/api/me/passkeys/start|finish`, list in `/api/me/mfa`,
+  `DELETE /api/me/passkeys/:id`). Registration and assertions are verified by
+  `webauthn-rs` with user verification required. Challenges live server-side
+  for five minutes, credential IDs are unique across the instance, and a
+  stalled signature counter rejects the credential.
+- Emailed six-digit codes (`/api/me/mfa/email/...`), valid for ten minutes,
+  single use, five attempts. Enrolment and delivery fail closed when
+  `OPENWARP_EMAIL_WEBHOOK` is unset.
+
+Once a factor is enabled, every sign-in path asks for it: password, Google,
+GitHub, OIDC and the OAuth consent form. `POST /api/auth/mfa` accepts a TOTP,
+recovery or emailed code; `POST /api/auth/mfa/passkey/start|finish` completes a
+passkey assertion. Adding a factor to an account that already has one, and
+removing any factor, requires the current password when the user knows one.
+Recovery codes are shown once when the first factor is enrolled and can be
+replaced with `POST /api/me/mfa/recovery-codes`. A completed password reset
+asks for a configured factor too; it does not issue a session on its own.
+Re-enrolling TOTP keeps the previous secret active until the new one is
+verified, so an abandoned setup never leaves the account without a factor.
+
+Passkeys need a secure browser context: HTTPS, or localhost in development.
+`OPENWARP_PUBLIC_URL` supplies the relying-party origin; `OPENWARP_RP_ID` and
+`OPENWARP_RP_ORIGIN` override it when a proxy or split origin requires that.
+
 ## Trigger.dev sync
 
 Kind `trigger`, modelled directly on Trigger's env var REST API. Config:

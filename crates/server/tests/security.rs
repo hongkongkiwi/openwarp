@@ -432,7 +432,7 @@ async fn authorize_page_escapes_untrusted_parameters() {
     let challenge = { use sha2::{Digest, Sha256}; base64url(&Sha256::digest(verifier.as_bytes())) };
     let payload = "%22%3E%3Cscript%3Ealert(1)%3C/script%3E%3Cinput%20name%3D%22";
     let path = format!(
-        "/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8917%2Fcallback&response_type=code&scope=secrets%3Aread&code_challenge={}&code_challenge_method=S256&{}=1",
+        "/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8917%2Fcallback&response_type=code&scope=secrets%3Aread&code_challenge={}&code_challenge_method=S256&state={}",
         client_id, challenge, payload
     );
     let r = s.call(Method::GET, &path, None, None).await;
@@ -440,6 +440,10 @@ async fn authorize_page_escapes_untrusted_parameters() {
     assert!(!r.text.contains("<script>alert(1)</script>"), "authorize page rendered an injected script tag");
     assert!(r.text.contains("&lt;script&gt;"), "expected escaped script text in the authorize page");
     assert!(!r.header("content-security-policy").is_empty(), "authorize pages need a Content-Security-Policy");
+    // Parameters outside the authorization set (including a replayed password)
+    // are dropped rather than echoed into the next page.
+    let r = s.call(Method::GET, &format!("{}&password=hunter2", path), None, None).await;
+    assert!(!r.text.contains("hunter2"), "unknown authorize parameters must not be echoed: {}", r.text);
 }
 
 #[tokio::test]

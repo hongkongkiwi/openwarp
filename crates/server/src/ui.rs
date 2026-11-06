@@ -54,11 +54,12 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
     <h1 id="authtitle">Welcome back</h1><p class="sub">Secrets management with no tiers and no licence gates.</p>
     <div class="seg"><button id="seglogin" class="on" onclick="authMode('login')">Sign in</button><button id="segreg" onclick="authMode('register')">Create account</button></div>
     <div id="authform">
-      <div class="field"><label for="email">Email</label><input id="email" type="email" autocomplete="email" placeholder="you@company.com"></div>
-      <div class="field"><label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••••" onkeydown="if(event.key==='Enter')doAuth()"></div>
-      <div class="field" id="mfafield" style="display:none"><label for="mfacode">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
-      <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
-      <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()">Forgot password?</button>
+      <div id="loginfields">
+        <div class="field"><label for="email">Email</label><input id="email" type="email" autocomplete="email" placeholder="you@company.com"></div>
+        <div class="field"><label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••••" onkeydown="if(event.key==='Enter')doAuth()"></div>
+        <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()">Sign in</button>
+        <button class="ghost" style="width:100%;margin-top:6px" id="forgotbtn" onclick="forgotPrompt()">Forgot password?</button>
+      </div>
       <div id="social" class="row" style="margin-top:12px"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
     </div>
@@ -91,7 +92,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, MFAMETHODS=[], MFA_INFO=null, LASTFOCUS=null, PENDING_ORG=null;
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
@@ -104,6 +105,16 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 // escaping alone is not enough: the parser turns &#39; back into a quote before
 // the JS is parsed, which would let a secret key break out of the string.
 function jsq(s){return String(s??'').replace(/&/g,'&amp;').replace(/\\/g,'\\\\').replace(/'/g,"\\u0027").replace(/"/g,'\\u0022').replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
+function b64uToBuf(s){let b=atob(String(s).replace(/-/g,'+').replace(/_/g,'/'));let u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u.buffer}
+function bufToB64u(x){let u=new Uint8Array(x),s='';for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+function creationOptions(o){o.challenge=b64uToBuf(o.challenge);o.user.id=b64uToBuf(o.user.id);
+  if(o.excludeCredentials)o.excludeCredentials=o.excludeCredentials.map(c=>{c.id=b64uToBuf(c.id);return c});return o}
+function requestOptions(o){o.challenge=b64uToBuf(o.challenge);
+  if(o.allowCredentials)o.allowCredentials=o.allowCredentials.map(c=>{c.id=b64uToBuf(c.id);return c});return o}
+function attestationJson(c){return {id:c.id,rawId:bufToB64u(c.rawId),type:c.type,clientExtensionResults:c.getClientExtensionResults?c.getClientExtensionResults():{},
+  response:{clientDataJSON:bufToB64u(c.response.clientDataJSON),attestationObject:bufToB64u(c.response.attestationObject),transports:c.response.getTransports?c.response.getTransports():[]}}}
+function assertionJson(a){return {id:a.id,rawId:bufToB64u(a.rawId),type:a.type,clientExtensionResults:a.getClientExtensionResults?a.getClientExtensionResults():{},
+  response:{clientDataJSON:bufToB64u(a.response.clientDataJSON),authenticatorData:bufToB64u(a.response.authenticatorData),signature:bufToB64u(a.response.signature),userHandle:a.response.userHandle?bufToB64u(a.response.userHandle):null}}}
 function modal(html,label){let m=$('modal');m.innerHTML=html;m.setAttribute('role','dialog');m.setAttribute('aria-modal','true');
   if(label)m.setAttribute('aria-label',label);else m.removeAttribute('aria-label');
   $('modalwrap').classList.add('show');LASTFOCUS=document.activeElement;
@@ -130,12 +141,28 @@ async function loadProviders(){try{
   if(p.google)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/google/start'">Continue with Google</button>`);
   if(p.github)btns.push(`<button style="flex:1" onclick="location.href='/api/auth/social/github/start'">Continue with GitHub</button>`);
   $('social').innerHTML=btns.join('');
-  if(p.signups!=='open'){
+  if(p.password===false){
+    $('loginfields').style.display='none';$('segreg').style.display='none';$('seglogin').style.display='none';
+    $('signupnote').textContent=btns.length?'Password sign-in is disabled on this instance. Use one of the providers above.':'Password sign-in is disabled and no provider is enabled. Contact the administrator.';
+  }else if(p.signups!=='open'){
     $('segreg').style.display='none';
     if(MODE==='register')authMode('login');
     $('signupnote').textContent='Signups are closed. Ask an administrator for an invitation.';
   }
 }catch(e){}}
+function showMfa(token,methods,emailAvailable){
+  MFA=token;MFAMETHODS=Array.isArray(methods)?methods:['totp'];
+  $('auth').style.display='grid';$('shell').style.display='none';
+  $('authtitle').textContent='Two-step verification';
+  let html=`<p class="mut">Enter a code for this account.</p>
+    <div class="field"><label for="mfacode">Code or recovery code</label><input id="mfacode" autocomplete="one-time-code" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
+    <button class="primary" style="width:100%;padding:11px" onclick="doMfa()">Verify</button>`;
+  if(MFAMETHODS.includes('email')&&emailAvailable)html+=`<button class="ghost" style="width:100%;margin-top:6px" onclick="sendEmailCode()">Email me a code</button>`;
+  if(MFAMETHODS.includes('passkey'))html+=`<button style="width:100%;margin-top:6px" onclick="usePasskey()">Use a passkey</button>`;
+  $('authform').innerHTML=html}
+async function showAuthMfa(){$('auth').style.display='grid';$('shell').style.display='none';
+  try{let d=await api('POST','/api/auth/mfa/options',{mfa_token:MFA});showMfa(MFA,d.methods,d.email_available)}
+  catch(e){$('authtitle').textContent='Sign in';$('authform').innerHTML='<p class="mut">This verification link expired.</p><button class="primary" style="width:100%" onclick="location.reload()">Sign in again</button>'}}
 function showInvite(token){
   $('auth').style.display='grid';$('shell').style.display='none';
   $('authtitle').textContent='Accept invitation';
@@ -162,6 +189,7 @@ function showReset(token){
 async function resetPassword(){try{
   let d=await api('POST','/api/auth/reset',{token:$('authform').dataset.reset,password:$('rp-pw').value,recovery_kit:$('rp-kit').value,discard_e2e_key:!!$('rp-discard').checked});
   T='';history.replaceState(null,'',location.pathname);
+  if(d.mfa_required){toast(d.e2e_key_replaced?'Password set and key replaced; verify your second factor':'Password set; verify your second factor');showMfa(d.mfa_token,d.methods,d.email_available);return}
   toast(d.e2e_key_replaced?'Password set; your key was replaced':'Password set');enterApp();
 }catch(e){toast(e.message,true)}}
 let MODE='login';
@@ -174,10 +202,17 @@ async function doAuth(){try{
     T='';
     modal(`<h3>Save your recovery kit</h3><p class="mut">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toast('Recovery kit copied')">Copy kit</button><button class="primary" onclick="closeModal();enterApp()">I saved it, continue</button></div>`,'Save your recovery kit');return}
   let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
-  if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';$('authbtn').textContent='Verify code';$('authbtn').onclick=doMfa;toast('Enter your authenticator or recovery code');return}
+  if(d.mfa_required){showMfa(d.mfa_token,d.methods,d.email_available);return}
   T='';enterApp();
 }catch(e){toast(e.message,true)}}
-async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
+async function doMfa(){try{await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
+async function sendEmailCode(){try{await api('POST','/api/auth/mfa/email/send',{mfa_token:MFA});toast('A code is on its way to your email')}catch(e){toast(e.message,true)}}
+async function usePasskey(){try{
+  let s=await api('POST','/api/auth/mfa/passkey/start',{mfa_token:MFA});
+  let cred=await navigator.credentials.get({publicKey:requestOptions(s.options.publicKey)});
+  await api('POST','/api/auth/mfa/passkey/finish',{mfa_token:MFA,credential:assertionJson(cred)});
+  T='';enterApp();
+}catch(e){toast(e.message||String(e),true)}}
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;
@@ -381,11 +416,35 @@ async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
-  let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
-    <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
-    <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
-    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
-  $('view').innerHTML=`${instanceCard}
+  let m=await api('GET','/api/me/mfa').catch(()=>null);MFA_INFO=m;
+  let instanceCard='';
+  if(inst&&inst.instance_owner){let configured=inst.configured||[];
+    instanceCard=`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
+      <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
+      <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
+      <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>
+    <div class="card"><h3>Sign-in methods</h3><p>Choose how accounts sign in on this server. At least one method must stay on. Turning off email and password also disables password reset, so those users need a linked provider.</p>
+      <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-password" ${inst.password?'checked':''}> Email and password</label>
+      <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-google" ${inst.google?'checked':''} ${configured.includes('google')?'':'disabled'}> Google${configured.includes('google')?'':' (client credentials not configured)'}</label>
+      <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-github" ${inst.github?'checked':''} ${configured.includes('github')?'':'disabled'}> GitHub${configured.includes('github')?'':' (client credentials not configured)'}</label>
+      <label class="row" style="gap:8px;margin-bottom:6px"><input type="checkbox" id="ap-oidc" ${inst.oidc?'checked':''} ${configured.includes('oidc')?'':'disabled'}> Organisation SSO (OIDC)${configured.includes('oidc')?'':' (configure an issuer under Organisation security first)'}</label>
+      <div class="row" style="margin-top:8px"><button class="primary" onclick="saveAuthMethods()" ${inst.env_locked?'disabled':''}>Save sign-in methods</button></div>
+      <p class="small mut">${inst.env_locked?'Locked by OPENWARP_AUTH_PROVIDERS.':'Every configured method is enabled until you change it here.'}</p></div>`;}
+  let pk=(m?.passkeys||[]);
+  let mfaCard=`<div class="card"><h3>Two-factor authentication</h3>
+    <p>${m&&m.required?'A second factor is required when you sign in.':'No second factor yet. Add one to protect this account.'}</p>
+    <div class="row" style="margin-bottom:8px"><span class="chip">Authenticator: ${m?.totp?'on':'off'}</span><span class="chip">Passkeys: ${pk.length}</span><span class="chip">Email codes: ${m?.email?'on':'off'}</span><span class="chip">Recovery codes: ${m?.recovery_codes||0}</span></div>
+    <div class="row"><button onclick="totpSetup()">Set up authenticator</button><button onclick="regenRecovery()">New recovery codes</button></div>
+    <pre class="val" id="totp-out"></pre>
+    <div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button><button class="danger" onclick="disableTotp()">Disable authenticator</button></div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+    <h3>Passkeys</h3><p>Sign in with Touch ID, Windows Hello, a security key, or a synced passkey.</p>
+    ${pk.length?pk.map(p=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0"><span class="small">${esc(p.name)} <span class="mut">· added ${new Date((p.created_at||0)*1000).toLocaleDateString()}</span></span><button class="danger" onclick="delPasskey('${jsq(p.id)}')">Remove</button></div>`).join(''):'<p class="mut small">No passkeys yet.</p>'}
+    <div class="row" style="margin-top:8px"><input id="pk-name" placeholder="e.g. MacBook Touch ID"><button onclick="addPasskey()">Add passkey</button></div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+    <h3>Email codes</h3><p>${m?.email_available?'Send a one-time code to your account email when you sign in.':'Set OPENWARP_EMAIL_WEBHOOK to enable emailed codes.'}</p>
+    <div class="row"><button onclick="startEmailMfa()" ${m?.email_available?'':'disabled'}>Send code</button><input id="email-mfa-code" placeholder="code from email"><button onclick="verifyEmailMfa()">Enable</button><button class="danger" onclick="disableEmailMfa()">Disable</button></div></div>`;
+  $('view').innerHTML=`${instanceCard}${mfaCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <div class="field"><label for="set-oidc-iss">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
@@ -393,7 +452,6 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="field"><label for="set-oidc-domains">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
-  <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
   <div class="card"><h3>End-to-end environments</h3><p>Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Issue internal certificates from your own CA.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre></div>
@@ -405,8 +463,40 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_aut
   if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
-async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$('totp-out').textContent='Secret: '+d.secret+'\n'+d.otpauth_url+'\nRecovery codes (save once):\n'+d.recovery_codes.join('\n')}catch(e){toast(e.message,true)}}
-async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('TOTP enabled')}catch(e){toast(e.message,true)}}
+async function saveAuthMethods(){try{
+  let body={password:$('ap-password').checked};
+  for(let k of ['google','github','oidc']){let el=$('ap-'+k);if(el)body[k]=el.checked;}
+  await api('PUT','/api/instance/auth',body);toast('Sign-in methods saved');renderSettings();
+}catch(e){toast(e.message,true)}}
+function reauthPrompt(msg){let p=prompt(msg||'Current password (leave blank if you sign in with a provider)');return p===null?null:(p||'')}
+async function regenRecovery(){let pw=reauthPrompt('Current password to replace recovery codes');if(pw===null)return;
+  try{let d=await api('POST','/api/me/mfa/recovery-codes',{password:pw});$('totp-out').textContent='New recovery codes (save now):\n'+d.recovery_codes.join('\n');toast('Recovery codes replaced')}catch(e){toast(e.message,true)}}
+async function totpSetup(){let body={};
+  if(MFA_INFO&&MFA_INFO.required){let pw=reauthPrompt('Current password to change the authenticator');if(pw===null)return;body.password=pw}
+  try{let d=await api('POST','/api/me/totp/setup',body);let txt='Secret: '+d.secret+'\n'+d.otpauth_url;
+    if(d.recovery_codes&&d.recovery_codes.length)txt+='\nRecovery codes (save once):\n'+d.recovery_codes.join('\n');
+    else txt+='\nExisting recovery codes remain valid.';
+    $('totp-out').textContent=txt}catch(e){toast(e.message,true)}}
+async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toast('Authenticator enabled');renderSettings()}catch(e){toast(e.message,true)}}
+async function disableTotp(){let pw=reauthPrompt('Current password to disable the authenticator');if(pw===null)return;
+  if(!confirm('Disable the authenticator app?'))return;
+  try{await api('DELETE','/api/me/totp',{password:pw});toast('Authenticator disabled');renderSettings()}catch(e){toast(e.message,true)}}
+async function addPasskey(){let pw=reauthPrompt('Current password to add a passkey');if(pw===null)return;
+  try{let s=await api('POST','/api/me/passkeys/start',{password:pw});
+    let cred=await navigator.credentials.create({publicKey:creationOptions(s.options.publicKey)});
+    let d=await api('POST','/api/me/passkeys/finish',{state_id:s.state_id,name:$('pk-name').value,credential:attestationJson(cred)});
+    if(d.recovery_codes)$('totp-out').textContent='Recovery codes (save now):\n'+d.recovery_codes.join('\n');
+    toast('Passkey added');renderSettings();
+  }catch(e){toast(e.message||String(e),true)}}
+async function delPasskey(id){let pw=reauthPrompt('Current password to remove this passkey');if(pw===null)return;
+  try{await api('DELETE',`/api/me/passkeys/${id}`,{password:pw});toast('Passkey removed');renderSettings()}catch(e){toast(e.message,true)}}
+async function startEmailMfa(){let pw=reauthPrompt('Current password to enable email codes');if(pw===null)return;
+  try{await api('POST','/api/me/mfa/email/start',{password:pw});toast('Code sent to your email')}catch(e){toast(e.message,true)}}
+async function verifyEmailMfa(){try{let d=await api('POST','/api/me/mfa/email/verify',{code:$('email-mfa-code').value});
+  if(d.recovery_codes)$('totp-out').textContent='Recovery codes (save now):\n'+d.recovery_codes.join('\n');
+  toast('Email codes enabled');renderSettings()}catch(e){toast(e.message,true)}}
+async function disableEmailMfa(){let pw=reauthPrompt('Current password to disable email codes');if(pw===null)return;
+  try{await api('DELETE','/api/me/mfa/email',{password:pw});toast('Email codes disabled');renderSettings()}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
 async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
@@ -428,6 +518,12 @@ function boot(){
     let parts=h.slice(6).split('&');T=decodeURIComponent(parts[0]);
     for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
     history.replaceState(null,'',location.pathname);}
+  else if(h.startsWith('mfa=')){
+    // Social and OIDC sign-in hand the browser an MFA challenge instead of a
+    // session when the account has a second factor.
+    let parts=h.slice(4).split('&');MFA=decodeURIComponent(parts[0]);
+    for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
+    history.replaceState(null,'',location.pathname);showAuthMfa();}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
 }
