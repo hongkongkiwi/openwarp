@@ -1667,6 +1667,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let mut config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
     if !manual && config.get("auto_sync").and_then(Value::as_bool) == Some(false) { return Ok(format!("{}: skipped (auto_sync is disabled)", kind)); }
+    integrations::validate_sync_config(&kind, &config).map_err(|e| bad(&e))?;
     let env_name = st.db.one("SELECT name FROM envs WHERE id=?", &[json!(&eid)]).await.map(|r| r.map(|x| db::s(&x, "name")).unwrap_or_default()).unwrap_or_default();
     config["_environment"] = json!(env_name);
     let prev_rows = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?;
@@ -1697,11 +1698,15 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid).await?;
-    let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
+    let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
     let pairs = integrations::secret_keys(&located);
+    let mut tags_by_name: HashMap<String, String> = HashMap::new();
+    for (k, _, raw) in items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))) {
+        tags_by_name.entry(integrations::desired_name(&config, k)).or_insert_with(|| raw["tags"].as_str().unwrap_or("").to_string());
+    }
     if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-        let result = integrations::sync_managed(&kind, &config, &located, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
+        let result = integrations::sync_managed_with_tags(&kind, &config, &located, &tags_by_name, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
         let (msg, managed) = match result {
             Ok(x) => x,
             Err(e) => {
@@ -1724,7 +1729,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
                 st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await.map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?; }
         }
         st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; return Ok(msg); }
-    let msg = integrations::sync(&kind, &config, &pairs).await.map_err(|e| bad(&e))?;
+    let msg = integrations::sync_with_tags(&kind, &config, &pairs, &tags_by_name).await.map_err(|e| bad(&e))?;
     st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; Ok(msg)
 }
 

@@ -175,8 +175,12 @@ Shared behavioural options:
   1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
   Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps and
   OpenWarp. Adapters that never return values reject import explicitly.
-- AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
-  assumes the role and signs with the temporary credentials.
+- AWS integrations accept `role_arn` plus optional `external_id` and
+  `sts_endpoint`; the adapter assumes the role and signs with temporary credentials.
+- Server-managed sync supports path selection and deletion suppression. AWS Secrets
+  Manager, Azure Key Vault and GCP Secret Manager support metadata tags. Azure
+  can write one JSON blob or disable absent managed names. Delegated runner sync
+  does not yet support those path, metadata or managed Azure options.
 
 Kamal has no server API or central secret store, so there is no `kamal` adapter.
 Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
