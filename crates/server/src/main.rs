@@ -2270,7 +2270,15 @@ async fn reset_password(State(st): State<S>, axum::extract::ConnectInfo(addr): a
     let _ = st.db.exec("UPDATE auth_tokens SET used=1 WHERE token_hash=?", &[json!(&hash)]).await;
     let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await;
     let _ = st.db.exec("DELETE FROM oauth_tokens WHERE user_id=?", &[json!(&uid)]).await;
+    mfa::note_password_login(&st, &uid).await;
     st.audit("", "", "", &uid, "auth.password_reset", if replaced { "key replaced" } else { "kit supplied" }).await;
+    // A reset link proves the mailbox, not the second factor. Changing the
+    // password must not be a way around an enrolled factor.
+    if mfa::required(&st, &uid).await {
+        let challenge = mfa::new_challenge(&st, &uid).await?;
+        return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge,
+            "methods": mfa::methods(&st, &uid).await, "email_available": mfa::email_available() && mfa::email_enabled(&st, &uid).await,
+            "e2e_key_replaced": replaced})))); }
     let session = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap());
     Ok((hdr, j(json!({"token": session, "user_id": uid, "e2e_key_replaced": replaced})))) }
@@ -4091,6 +4099,9 @@ async fn main() {
     }); }
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
+        .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
+        .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
+        .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
         .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
