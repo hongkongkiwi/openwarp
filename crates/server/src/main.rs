@@ -1432,11 +1432,15 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let default_role = if default_role.is_empty() { "developer".to_string() } else { default_role };
     if !role_known(&st, &oid, &default_role) { return Err(bad("default_role must be owner, admin, developer or a custom role in this organisation")); }
     // The membership API lets only an owner grant owner or admin; a directory
-    // mapping must not become the side door around that rule.
-    let privileged = matches!(default_role.as_str(), "owner" | "admin")
-        || group_roles.split(';').filter_map(|p| p.rsplit_once('=')).any(|(_, r)| matches!(r.trim(), "owner" | "admin"));
+    // mapping must not become the side door around that rule. Custom roles are
+    // checked by effective permissions, because one carrying "*" or
+    // "org:admin" is admin by another name.
+    let requested = std::iter::once(default_role.clone()).chain(
+        group_roles.split(';').filter_map(|p| p.rsplit_once('=')).map(|(_, r)| r.trim().to_string()));
+    let privileged = requested.into_iter().any(|role| {
+        st.role_perms(&oid, &role).iter().any(|p| p == "*" || p == "org:admin") });
     if privileged && st.require_org(&oid, &uid)? != "owner" {
-        return Err(err(StatusCode::FORBIDDEN, "only an owner can map the owner or admin role through LDAP")); }
+        return Err(err(StatusCode::FORBIDDEN, "only an owner can map a role with admin rights through LDAP")); }
     let allowed_domains = ldap_field(&body, existing.as_ref(), "allowed_domains");
     if !valid_domain_list(&allowed_domains) { return Err(bad("allowed_domains must be comma-separated DNS domains")); }
     let ca_cert_pem = ldap_field(&body, existing.as_ref(), "ca_cert_pem");

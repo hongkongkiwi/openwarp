@@ -700,6 +700,20 @@ async fn only_an_owner_can_map_the_owner_or_admin_role() {
     let owner_default = s.put_ldap(&admin_token, &org, &dir, json!({"default_role": "admin"})).await;
     assert_eq!(owner_default.status, 403, "an admin set default_role admin through LDAP: {}", owner_default.text);
 
+    // A custom role with admin permissions is the same escalation by another
+    // name, so it is checked by effective permissions rather than the name.
+    let wide = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/roles", org), Some(&admin_token),
+        Some(json!({"name": "ops", "permissions": ["*"]}))).await;
+    assert_eq!(wide.status, 200, "custom role creation failed: {}", wide.text);
+    let wide_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=ops"})).await;
+    assert_eq!(wide_mapping.status, 403, "an admin mapped an all-powerful custom role: {}", wide_mapping.text);
+
+    let narrow = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/roles", org), Some(&admin_token),
+        Some(json!({"name": "reader", "permissions": ["secrets:read"]}))).await;
+    assert_eq!(narrow.status, 200, "narrow role creation failed: {}", narrow.text);
+    let narrow_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=reader"})).await;
+    assert_eq!(narrow_mapping.status, 200, "a read-only custom role was refused: {}", narrow_mapping.text);
+
     let by_owner = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin"})).await;
     assert_eq!(by_owner.status, 200, "the owner was refused: {}", by_owner.text);
 }
