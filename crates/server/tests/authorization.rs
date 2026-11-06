@@ -358,6 +358,54 @@ async fn oauth_access_token(s: &Server, session: &str, scope: &str) -> String {
 }
 
 #[tokio::test]
+async fn custom_roles_with_admin_rights_need_an_owner_to_grant() {
+    let s = Server::start().await;
+    let owner = register(&s, "owner-roles@test.invalid").await;
+    let admin = register(&s, "admin-roles@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let at = admin["token"].as_str().unwrap().to_string();
+    let au = admin["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "admin-roles@test.invalid", "admin").await;
+
+    let wide = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&at),
+        Some(json!({"name": "ops", "permissions": ["*"]}))).await;
+    assert_eq!(wide.status, 200, "admin could not create a role: {}", wide.text);
+    let narrow = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&at),
+        Some(json!({"name": "reader", "permissions": ["secrets:read"]}))).await;
+    assert_eq!(narrow.status, 200, "admin could not create a read-only role: {}", narrow.text);
+
+    // An all-powerful custom role is admin by another name: a non-owner admin
+    // must not be able to grant it, to themselves or to anyone else.
+    let self_promote = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&at),
+        Some(json!({"role": "ops"}))).await;
+    assert_eq!(self_promote.status, 403, "admin granted itself an all-powerful custom role: {}", self_promote.text);
+    let invite_wide = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&at),
+        Some(json!({"email": "newcomer@test.invalid", "role": "ops"}))).await;
+    assert_eq!(invite_wide.status, 403, "admin invited a member into an all-powerful custom role: {}", invite_wide.text);
+
+    // A machine identity is a durable principal, so it follows the same rule.
+    let machine = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&at),
+        Some(json!({"name": "ci", "role": "ops"}))).await;
+    assert_eq!(machine.status, 403, "admin minted an admin-equivalent machine identity: {}", machine.text);
+
+    // Read-only custom roles remain delegable.
+    let delegate = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&at),
+        Some(json!({"role": "reader"}))).await;
+    assert_eq!(delegate.status, 200, "admin could not grant a read-only custom role: {}", delegate.text);
+
+    // The owner can grant it, and it behaves as admin afterwards.
+    let by_owner = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, au), Some(&ot),
+        Some(json!({"role": "ops"}))).await;
+    assert_eq!(by_owner.status, 200, "owner could not grant the custom role: {}", by_owner.text);
+    let machine_owner = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&ot),
+        Some(json!({"name": "ci-owner", "role": "ops"}))).await;
+    assert_eq!(machine_owner.status, 200, "owner could not mint an identity with the custom role: {}", machine_owner.text);
+    let settings = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(&at), None).await;
+    assert_eq!(settings.status, 200, "the granted role does not carry admin access: {}", settings.text);
+}
+
+#[tokio::test]
 async fn custom_roles_are_enforced_on_reads() {
     let s = Server::start().await;
     let (ot, org, mt, _, _, envs) = org_with_viewer(&s, "reads").await;

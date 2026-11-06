@@ -297,10 +297,12 @@ create the sandbox with `env` and replace it.
   changed the role in the meantime. Login attempts are counted before the
   directory is contacted, so concurrent guesses cannot outrun the rate limit.
   The `ldap` cargo feature is on by default for native builds and absent from a
-  Workers/WASM port, where the routes and the console entry do not exist.
-  A configured directory is trusted with process availability: malformed BER
-  from it can crash the parser in the LDAP client library, so restrict who can
-  edit the workspace directory settings.
+  Workers/WASM port, where the routes and the console entry do not exist. The
+  BER parser is a vendored copy of `lber` capped at 64 nested elements, so a
+  hostile directory cannot exhaust the stack with a deeply nested response.
+- A custom role carrying `*` or `org:admin` counts as admin for every
+  owner-only grant: assigning it through a member update or an invitation needs
+  an owner, and the LDAP group map follows the same rule.
 - OAuth consent enforces TOTP when the account has it enabled, rejects
   deactivated accounts, rate-limits password attempts, escapes every
   parameter and serves a restrictive Content-Security-Policy.

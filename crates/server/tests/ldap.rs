@@ -819,6 +819,31 @@ async fn ldap_providers_are_advertised_to_the_console() {
     assert_eq!(r.body["ldap"], json!(true), "native build should advertise LDAP");
 }
 
+// The LDAP client parses responses with lber, which is recursive. A hostile
+// directory must not be able to exhaust the process stack with deep nesting.
+#[test]
+fn deeply_nested_ber_is_rejected_before_it_reaches_the_stack() {
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 128 {
+            out.push(len as u8);
+        } else {
+            let bytes = len.to_be_bytes();
+            let start = bytes.iter().position(|b| *b != 0).unwrap();
+            out.push(0x80 | (bytes.len() - start) as u8);
+            out.extend_from_slice(&bytes[start..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+    let mut wire = vec![0x0a, 0x01, 0x00];
+    for _ in 0..100 {
+        wire = tlv(0x30, &wire);
+    }
+    assert!(lber::parse::parse_tag(&wire).is_err(), "deep nesting must be refused, not parsed");
+}
+
 #[tokio::test]
 async fn only_an_owner_can_map_the_owner_or_admin_role() {
     let s = Server::start().await;

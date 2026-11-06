@@ -202,6 +202,10 @@ impl AppState {
             _ => self.db.one("SELECT permissions FROM roles WHERE org_id=? AND name=?", &[json!(org), json!(role)]).await.ok().flatten()
                 .and_then(|row| serde_json::from_str::<Vec<String>>(&db::s(&row, "permissions")).ok()).unwrap_or_default(),
         } }
+    // A custom role carrying "*" or "org:admin" is admin by another name, so
+    // every owner-only grant has to test permissions, not the label.
+    async fn role_privileged(&self, org: &str, role: &str) -> bool {
+        self.role_perms(org, role).await.iter().any(|p| p == "*" || p == "org:admin") }
     async fn check_perm(&self, org: &str, user: &str, action: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let role = self.require_org(org, user).await?;
         let perms = self.role_perms(org, &role).await;
@@ -376,7 +380,7 @@ async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target
     let new_role = r.role.trim();
     if new_role.is_empty() { return Err(bad("role required")); }
     if !["owner", "admin", "developer"].contains(&new_role) && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(&oid), json!(new_role)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
-    if (new_role == "owner" || new_role == "admin") && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant the owner or admin role")); }
+    if st.role_privileged(&oid, new_role).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant a role with admin rights")); }
     if target_role == "owner" && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can change another owner")); }
     if target_role == "owner" && new_role != "owner" {
         let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
@@ -389,8 +393,10 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     let email = r.email.trim().to_lowercase();
     if email.is_empty() { return Err(bad("email required")); }
     let new_role = if r.role.trim().is_empty() { "developer".to_string() } else { r.role.trim().to_string() };
-    if (new_role == "owner" || new_role == "admin") && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant the owner or admin role")); }
     if new_role != "owner" && new_role != "admin" && new_role != "developer" && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(&oid), json!(&new_role)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
+    // Existence first: role permissions cannot change after creation, so the
+    // privilege read cannot race a role being created between the two checks.
+    if st.role_privileged(&oid, &new_role).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant a role with admin rights")); }
     if let Some(target) = st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))? {
         let tid = db::s(&target, "id");
         if st.org_role(&oid, &tid).await.is_some() { return Err(err(StatusCode::CONFLICT, "user is already a member")); }
@@ -2288,8 +2294,11 @@ async fn create_identity(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let caller_role = st.require_org(&oid, &uid).await?; st.check_admin(&oid, &uid).await?;
     let want = if r.role.trim().is_empty() { "developer".to_string() } else { r.role.trim().to_string() };
     if want == "owner" { return Err(bad("machine identities cannot hold the owner role")); }
-    if want == "admin" && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can create an admin identity")); }
-    if want != "developer" && want != "admin" && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(oid), json!(want)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
+    if want != "developer" && want != "admin" && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(oid), json!(&want)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
+    // A machine identity is a durable principal, so an admin must not mint one
+    // with a role that is admin-equivalent under another name. The role must
+    // exist first: permissions are immutable, so this read cannot go stale.
+    if st.role_privileged(&oid, &want).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can create an identity with admin rights")); }
     let iid = id(); let client_id = oc::random_token("cid"); let client_secret = oc::random_token("csec");
     st.db.exec("INSERT INTO identities(id,org_id,name,role,created_at) VALUES(?,?,?,?,?)", &[json!(iid), json!(oid), json!(r.name), json!(want), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO identity_credentials(id,identity_id,client_id,secret_hash,created_at) VALUES(?,?,?,?,?)", &[json!(id()), json!(iid), json!(client_id), json!(oc::hash_token(&client_secret)), json!(now())]).await.map_err(|e| bad(&e))?;
