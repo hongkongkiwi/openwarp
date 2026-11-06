@@ -300,6 +300,44 @@ async fn github_login_provisions_a_user() {
 }
 
 #[tokio::test]
+async fn org_sso_requires_an_invite_when_signups_are_closed() {
+    let idp = start_mock("sso-invite@test.invalid");
+    let s = Server::start().await;
+    let owner = register(&s, "sso-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let r = s
+        .call(
+            Method::PUT,
+            &format!("/api/orgs/{}/settings", org),
+            Some(ot),
+            Some(json!({"oidc_issuer": idp, "oidc_client_id": "test-google", "oidc_client_secret": "secret", "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);
+    let r = s.call(Method::PUT, "/api/instance/signups", Some(ot), Some(json!({"open": false}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let r = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 403, "org SSO must not join an uninvited account while signups are closed, got {} {}", r.status, r.text);
+
+    let r = s
+        .call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "sso-invite@test.invalid", "role": "developer"})))
+        .await;
+    assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let r = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    let state = query_param(&r.header("location"), "state");
+    let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "an invited SSO user must be admitted, got {} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
+    assert!(orgs.text.contains(org), "the invited SSO user must join the org: {}", orgs.text);
+    assert!(orgs.text.contains("developer"), "the invite role must apply: {}", orgs.text);
+}
+
+#[tokio::test]
 async fn social_login_requires_an_invite_when_signups_are_closed() {
     let idp = start_mock("closed-google@test.invalid");
     let s = Server::start_env(&[

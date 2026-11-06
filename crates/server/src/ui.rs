@@ -89,7 +89,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null;
+let T=localStorage.getItem('owt')||'', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null;
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 const $=id=>document.getElementById(id);
@@ -158,7 +158,9 @@ async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';localStorage.removeItem('owt');location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');$('whoami').textContent=me.email;
-  let orgs=await api('GET','/api/orgs');ORG=orgs[0]?.id||'';$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
+  let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
+  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
+  $('orgs').value=ORG;
   await nav('apps')}
 async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
 
@@ -378,8 +380,12 @@ loadProviders();
 (function boot(){
   if(typeof location==='undefined')return;
   let h=(location.hash||'').slice(1);
-  if(h.startsWith('token=')){T=decodeURIComponent(h.slice(6));localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);}
-  else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7)));return;}
+  if(h.startsWith('token=')){
+    // The OIDC callback appends &org=<id>; the token itself never contains &.
+    let parts=h.slice(6).split('&');T=decodeURIComponent(parts[0]);
+    for(let p of parts.slice(1)){if(p.startsWith('org='))PENDING_ORG=decodeURIComponent(p.slice(4));}
+    localStorage.setItem('owt',T);history.replaceState(null,'',location.pathname);}
+  else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));return;}
 })();
 if(T){$('auth').style.display='none';enterApp().catch(()=>{T='';localStorage.removeItem('owt');$('auth').style.display='grid';$('shell').style.display='none'})}
 </script>

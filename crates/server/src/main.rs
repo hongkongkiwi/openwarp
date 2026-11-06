@@ -31,17 +31,8 @@ const OAUTH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-act
 fn html_csp(body: String) -> Response { let mut r = Html(body).into_response(); r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(OAUTH_CSP)); r }
 fn hidden_fields(form: &HashMap<String, String>) -> String { form.iter().filter(|(k, _)| k.as_str() != "otp").map(|(k, v)| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v))).collect() }
 fn bearer_token(h: &HeaderMap) -> String { h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").strip_prefix("Bearer ").unwrap_or("").to_string() }
-static LOGIN_FAILS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<i64>>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-fn rate_allowed_for(key: &str, max: usize, window: i64) -> bool {
-    let now = now(); let mut m = LOGIN_FAILS.lock().unwrap();
-    if m.len() > 50_000 { m.clear(); }
-    let len = { let e = m.entry(key.to_string()).or_default(); e.retain(|t| now - *t < window); e.len() };
-    m.retain(|_, v| { v.retain(|t| now - *t < 3600); !v.is_empty() }); len < max }
-fn rate_allowed(key: &str) -> bool { rate_allowed_for(key, 5, 900) }
 static DELIVERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_DELIVERY_THREADS: usize = 16;
-fn rate_fail(key: &str) { LOGIN_FAILS.lock().unwrap().entry(key.to_string()).or_default().push(now()); }
-fn rate_clear(key: &str) { LOGIN_FAILS.lock().unwrap().remove(key); }
 // Managed roles keep their historic breadth; custom roles are exactly their
 // stored permission list, deny by default.
 const DEVELOPER_PERMS: &[&str] = &["secrets:read","secrets:write","secrets:delete","integrations:write","leases:write","rotations:write","proposals:write","tokens:create","access:request"];
@@ -151,6 +142,23 @@ impl AppState {
         let perms = self.role_perms(org, &role);
         if perms.iter().any(|p| p == "*" || p == action) { Ok(()) } else { Err(err(StatusCode::FORBIDDEN, &format!("role {} lacks permission {}", role, action))) } }
     fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin") }
+    // Counters live in the database so a restart, or a second replica behind a
+    // load balancer, does not reset an attacker's budget.
+    fn rate_ok(&self, key: &str, max: usize, window: i64) -> bool {
+        let cutoff = now() - window;
+        let count = self.db.one("SELECT count FROM rate_limits WHERE key=? AND window_start>?", &[json!(key), json!(cutoff)])
+            .ok().flatten().map(|r| db::n(&r, "count")).unwrap_or(0);
+        (count as usize) < max }
+    fn rate_fail(&self, key: &str, window: i64) {
+        let current = now(); let cutoff = current - window;
+        let _ = self.db.query(
+            "INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) \
+             ON CONFLICT(key) DO UPDATE SET \
+               count = CASE WHEN rate_limits.window_start <= ? THEN 1 ELSE rate_limits.count + 1 END, \
+               window_start = CASE WHEN rate_limits.window_start <= ? THEN ? ELSE rate_limits.window_start END \
+             RETURNING count",
+            &[json!(key), json!(current), json!(cutoff), json!(cutoff), json!(current)]); }
+    fn rate_clear(&self, key: &str) { let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(key)]); }
     // Deactivated users and deleted identities must lose every credential at once.
     fn principal_active(&self, uid: &str) -> bool {
         match self.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]) {
@@ -225,8 +233,8 @@ fn resolve_refs(v: &str, by_path: &HashMap<String, String>, by_key: &HashMap<Str
 // ---------- auth ----------
 async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let rl = format!("register:{}", addr.ip());
-    if !rate_allowed_for(&rl, 5, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
-    rate_fail(&rl);
+    if !st.rate_ok(&rl, 5, 3600) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many registrations from this address; try again later")); }
+    st.rate_fail(&rl, 3600);
     if r.email.is_empty() || r.password.len() < 8 { return Err(bad("email and password (>=8 chars) required")); }
     if !signups_open(&st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     let kp = oc::Keypair::generate();
@@ -243,11 +251,11 @@ async fn register(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::e
 fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let key = format!("login:{}:{}", addr.ip(), r.email.trim().to_lowercase());
-    if !rate_allowed(&key) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
-    let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))? { Some(x) => x, None => { rate_fail(&key); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
+    if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later")); }
+    let row = match st.db.one("SELECT * FROM users WHERE email=?", &[json!(r.email.trim().to_lowercase())]).map_err(|e| bad(&e))? { Some(x) => x, None => { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); } };
     if db::n(&row, "active") == 0 && row.contains_key("active") { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
-    if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { rate_fail(&key); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
-    rate_clear(&key);
+    if !oc::verify_password(&r.password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials")); }
+    st.rate_clear(&key);
     let uid = db::s(&row, "id");
     if meta_get(&st, &format!("totp_enabled:{}", uid)) == "1" { let challenge = oc::random_token("mfa"); st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)", &[json!(challenge), json!(uid), json!(now())]).map_err(|e| bad(&e))?; return Ok((HeaderMap::new(), j(json!({"mfa_required": true, "mfa_token": challenge})))); }
     let token = make_session(&st, &uid)?;
@@ -750,14 +758,27 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     if let Some(returned) = &data.claims.nonce { if !expected_nonce.is_empty() && *returned != expected_nonce { return Err(bad("id_token nonce does not match this login attempt")); } }
     let email = data.claims.email.ok_or_else(|| bad("id_token has no email"))?.to_lowercase();
     let subject = data.claims.sub.clone(); let issuer_key = issuer.clone();
+    // An SSO login may attach an account to this organisation only through the
+    // instance signup policy or a pending invite, exactly like social sign-in.
+    let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&email), json!(&oid), json!(now())]).map_err(|e| bad(&e))?;
     let uid = if let Some(bound) = st.db.one("SELECT user_id FROM oidc_subjects WHERE issuer=? AND subject=?", &[json!(issuer_key), json!(subject)]).map_err(|e| bad(&e))? { db::s(&bound, "user_id") } else {
         if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity")); }
+        if pending.is_none() && !signups_open(&st) { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
         let kp = oc::Keypair::generate(); let pw = oc::random_token("oidc"); let nid = id();
         st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)", &[json!(nid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).map_err(|e| bad(&e))?;
         st.db.exec("INSERT INTO oidc_subjects(issuer,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(issuer_key), json!(subject), json!(nid), json!(now())]).map_err(|e| bad(&e))?;
+        claim_instance_owner(&st, &nid);
         nid };
     if let Some(u) = st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).map_err(|e| bad(&e))? { if db::n(&u, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); } }
-    if st.org_role(&oid, &uid).is_none() { let _ = st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(oid), json!(uid)]); }
+    if st.org_role(&oid, &uid).is_none() {
+        if let Some(inv) = &pending {
+            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&oid), json!(&uid), json!(db::s(inv, "role"))]).map_err(|e| bad(&e))?;
+            let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]);
+        } else if signups_open(&st) {
+            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(&oid), json!(&uid)]).map_err(|e| bad(&e))?;
+        } else {
+            return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you"));
+        } }
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, data.claims.sub));
     let token = make_session(&st, &uid)?;
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
@@ -1259,9 +1280,9 @@ async fn mfa_login(State(st): State<S>, axum::extract::ConnectInfo(addr): axum::
     // The password was already accepted upstream, so this step guards the second
     // factor itself: cap guesses per address and account.
     let key = format!("mfa:{}:{}", addr.ip(), uid);
-    if !rate_allowed(&key) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
-    if !otp_ok(&st, &uid, code) { rate_fail(&key); return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
-    rate_clear(&key);
+    if !st.rate_ok(&key, 5, 900) { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
+    if !otp_ok(&st, &uid, code) { st.rate_fail(&key, 900); return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
+    st.rate_clear(&key);
     let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(token)]);
     let session = make_session(&st, &uid)?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
@@ -1302,6 +1323,7 @@ async fn delete_rotation(State(st): State<S>, h: HeaderMap, Path(rid): Path<Stri
     let (org, _) = st.require_env(&db::s(&row,"env_id"),&uid)?; st.check_perm(&org, &uid, "rotations:write")?;
     st.db.exec("DELETE FROM rotation_schedules WHERE id=?", &[json!(rid)]).map_err(|e| bad(&e))?; Ok(j(json!({"deleted": rid}))) }
 fn process_rotations(st: &S) {
+    let _ = st.db.exec("DELETE FROM rate_limits WHERE window_start<?", &[json!(now() - 86400)]);
     let due = st.db.query("SELECT * FROM rotation_schedules WHERE enabled=1 AND next_run<=?", &[json!(now())]).unwrap_or_default();
     for r in &due { let eid = db::s(r,"env_id"); let key_name = db::s(r,"key_name");
         let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).ok().flatten().map(|x| db::s(&x,"mode")).unwrap_or_default();
@@ -1371,20 +1393,20 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
     let uid = if let Some(u) = oauth_user(&st, &h) { u } else {
         let email = form.get("email").cloned().unwrap_or_default(); let password = form.get("password").cloned().unwrap_or_default();
         let key = format!("oauth:{}:{}", addr.ip(), email.to_lowercase());
-        if !rate_allowed(&key) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
-        let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { rate_fail(&key); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
+        if !st.rate_ok(&key, 5, 900) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-in attempts; try again later").into_response(); }
+        let row = match st.db.one("SELECT id,pass_hash,active FROM users WHERE email=?", &[json!(email.to_lowercase())]) { Ok(Some(r)) => r, _ => { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); } };
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
-        if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { rate_fail(&key); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
+        if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { st.rate_fail(&key, 900); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
         db::s(&row, "id") };
     if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
     let otp_key = format!("otp:{}:{}", addr.ip(), uid);
-    if !rate_allowed(&otp_key) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
+    if !st.rate_ok(&otp_key, 5, 900) { return (StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later").into_response(); }
     if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")) {
-        rate_fail(&otp_key);
+        st.rate_fail(&otp_key, 900);
         let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
         return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
     }
-    rate_clear(&otp_key);
+    st.rate_clear(&otp_key);
     let state = form.get("state").cloned().unwrap_or_default();
     if form.get("approve").map(|s| s.as_str()) != Some("1") { return axum::response::Redirect::to(&format!("{}?error=access_denied&state={}", redirect, urlencode(&state))).into_response(); }
     let code = oc::random_token("code"); let resource = form.get("resource").cloned().unwrap_or_else(|| format!("{}/mcp", issuer(&st, &h)));

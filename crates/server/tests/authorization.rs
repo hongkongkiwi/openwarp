@@ -36,13 +36,14 @@ struct Server {
     base: String,
     dir: PathBuf,
     client: Client,
+    keep: bool,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep { let _ = std::fs::remove_dir_all(&self.dir); }
     }
 }
 
@@ -56,9 +57,13 @@ fn free_port() -> u16 {
 
 impl Server {
     async fn start() -> Server {
-        let _start = START_LOCK.lock().await;
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-authz-{}-{}", std::process::id(), seq));
+        Server::start_at(dir).await
+    }
+
+    async fn start_at(dir: PathBuf) -> Server {
+        let _start = START_LOCK.lock().await;
         std::fs::create_dir_all(&dir).expect("temp dir");
         let port = free_port();
         let base = format!("http://127.0.0.1:{}", port);
@@ -82,7 +87,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("http client");
-        let server = Server { child, base, dir, client };
+        let server = Server { child, base, dir, client, keep: false };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -582,6 +587,35 @@ async fn pkce_rejects_an_empty_verifier() {
     ];
     let r = s.form("/oauth/token", &exchange, None).await;
     assert_eq!(r.status, 400, "an empty PKCE verifier must be rejected, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn rate_limits_survive_a_restart() {
+    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("openwarp-authz-persist-{}-{}", std::process::id(), seq));
+    let first = Server::start_at(dir.clone()).await;
+    register(&first, "persist@test.invalid").await;
+    let mut last = 0;
+    for _ in 0..6 {
+        let r = first
+            .call(Method::POST, "/api/auth/login", None, Some(json!({"email": "persist@test.invalid", "password": "wrong-password"})))
+            .await;
+        last = r.status;
+    }
+    assert_eq!(last, 429, "the first process must exhaust the budget");
+    let mut first = first;
+    first.keep = true;
+    drop(first);
+
+    let second = Server::start_at(dir.clone()).await;
+    let r = second
+        .call(Method::POST, "/api/auth/login", None, Some(json!({"email": "persist@test.invalid", "password": "wrong-password"})))
+        .await;
+    assert_eq!(r.status, 429, "a restart must not clear the failure budget, got {} {}", r.status, r.text);
+    let mut second = second;
+    second.keep = true;
+    drop(second);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
