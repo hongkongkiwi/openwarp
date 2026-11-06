@@ -172,7 +172,7 @@ fn get_json(client: &reqwest::blocking::Client, host: &str, token: &str, path: &
     client.get(format!("{}{}", host, path)).bearer_auth(token).send().expect("request")
         .error_for_status().expect("GET failed (are you logged in?)").json().expect("json")
 }
-fn rekey_env(client: &reqwest::blocking::Client, host: &str, token: &str, env: &str, privkey: &str) -> Value {
+fn rekey_env(client: &reqwest::blocking::Client, host: &str, token: &str, env: &str, privkey: &str, remove_user: Option<&str>) -> Value {
     let kp = openwarp_crypto::Keypair::from_secret_b64(privkey).expect("bad privkey (recovery kit)");
     let d = get_json(client, host, token, &format!("/api/envs/{}/e2e/secrets", env));
     let old: [u8;32] = kp.decrypt(d["wrapped_key"].as_str().expect("wrapped key")).expect("decrypt env key").try_into().expect("env key length");
@@ -191,6 +191,7 @@ fn rekey_env(client: &reqwest::blocking::Client, host: &str, token: &str, env: &
     let mut grants = Vec::new();
     for g in existing.as_array().cloned().unwrap_or_default() {
         let uid = g["user_id"].as_str().unwrap_or(""); let email = g["email"].as_str().unwrap_or("");
+        if remove_user == Some(uid) { continue; }
         let pubkey = g["pubkey"].as_str().map(str::to_string).filter(|p| !p.is_empty()).unwrap_or_else(|| {
             let u = get_json(client, host, token, &format!("/api/users/lookup?email={}", urlq(email)));
             u["pubkey"].as_str().unwrap_or("").to_string()
@@ -203,6 +204,7 @@ fn rekey_env(client: &reqwest::blocking::Client, host: &str, token: &str, env: &
     if let Some(pk) = meta["runner"]["public_key"].as_str() {
         body["runner_wrapped_key"] = json!(openwarp_crypto::encrypt_to(pk, &new_key).expect("wrap runner key"));
     }
+    if let Some(target) = remove_user { body["remove_user"] = json!(target); }
     client.post(format!("{}/api/envs/{}/e2e/rekey", host, env)).bearer_auth(token).json(&body).send().expect("req").json().expect("json")
 }
 fn main() {
@@ -320,12 +322,10 @@ fn main() {
             let d: Value = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
         Cmd::E2eRevoke { env, email, privkey } => { let env = pick(env, &local, "env_id", "--env");
             let u = get(&format!("{}/api/users/lookup?email={}", host, urlq(email)));
-            let uid = u["id"].as_str().expect("grantee id");
-            let r = client.delete(format!("{}/api/envs/{}/e2e/grants/{}", host, env, uid)).bearer_auth(&token).send().expect("req");
-            if !r.status().is_success() { eprintln!("revoke failed: HTTP {}", r.status()); std::process::exit(1); }
-            println!("{}", rekey_env(&client, &host, &token, &env, privkey)); }
+            let uid = u["id"].as_str().expect("grantee id").to_string();
+            println!("{}", rekey_env(&client, &host, &token, &env, privkey, Some(&uid))); }
         Cmd::E2eRekey { env, privkey } => { let env = pick(env, &local, "env_id", "--env");
-            println!("{}", rekey_env(&client, &host, &token, &env, privkey)); }
+            println!("{}", rekey_env(&client, &host, &token, &env, privkey, None)); }
         Cmd::RunnerCreate { org, name } => { let kp = openwarp_crypto::Keypair::generate();
             let d: Value = client.post(format!("{}/api/orgs/{}/runners", host, org)).bearer_auth(&token).json(&json!({"name": name, "public_key": kp.public})).send().expect("req").json().expect("json");
             println!("runner_id: {}\nrunner_token: {}\nrunner_key: {}", d["id"].as_str().unwrap_or(""), d["token"].as_str().unwrap_or(""), kp.secret_b64()); }

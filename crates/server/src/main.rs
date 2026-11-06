@@ -1051,6 +1051,12 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         ids.insert(gid.to_string());
     }
     if !ids.contains(&uid) { return Err(bad("the new grants must include the caller, or the environment would become unreadable to them")); }
+    let remove_user = body.get("remove_user").and_then(|v| v.as_str()).unwrap_or("");
+    if !remove_user.is_empty() {
+        if remove_user == uid { return Err(bad("the caller cannot remove their own grant in a rekey")); }
+        if !current_grants.contains(remove_user) { return Err(bad("remove_user has no grant in this environment")); }
+        if ids.contains(remove_user) { return Err(bad("remove_user cannot also appear in the new grants")); }
+    }
     let runner_wrapped = body.get("runner_wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
     if mode == "delegated" {
         if runner_wrapped.is_empty() { return Err(bad("runner_wrapped_key required for a delegated environment")); }
@@ -1095,7 +1101,8 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     // re-encrypted under a key nobody can unwrap.
     st.db.batch(&stmts).map_err(|e| bad(&format!("rekey did not complete: {}", e)))?;
     meta_set(&st, &format!("rekey_required:{}", eid), "0");
-    st.audit(&org, &app, &eid, &uid, "e2e.rekey", &format!("{} secrets, {} grants", rekeyed, grants.len()));
+    let detail = if remove_user.is_empty() { format!("{} secrets, {} grants", rekeyed, grants.len()) } else { format!("{} secrets, {} grants, removed {}", rekeyed, grants.len(), remove_user) };
+    st.audit(&org, &app, &eid, &uid, "e2e.rekey", &detail);
     Ok(j(json!({"rekeyed": rekeyed, "grants": grants.len()}))) }
 async fn e2e_revoke(State(st): State<S>, h: HeaderMap, Path((eid, target)): Path<(String, String)>) -> Res { let uid = st.token_user(&h)?;
     let (org, app) = st.require_env(&eid, &uid)?; st.check_perm(&org, &uid, "secrets:write")?;

@@ -339,6 +339,54 @@ async fn e2e_paths_can_be_stored_as_client_ciphertext() {
 }
 
 #[tokio::test]
+async fn rekey_can_remove_a_grantee_atomically() {
+    let s = Server::start_env(&[]).await;
+    let owner = register(&s, "owner-remove@test.invalid").await;
+    let member = register(&s, "member-remove@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let owner_id = owner["user_id"].as_str().unwrap().to_string();
+    let owner_pub = owner["public_key"].as_str().unwrap().to_string();
+    let mt = member["token"].as_str().unwrap().to_string();
+    let member_id = member["user_id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&ot), Some(json!({"email": "member-remove@test.invalid", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "add member failed: {} {}", r.status, r.text);
+    let member_pub = s.call(Method::GET, "/api/users/lookup?email=member-remove@test.invalid", Some(&ot), None).await.body["pubkey"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&ot), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+    let env_key = oc::random_key();
+    let wrapped = oc::encrypt_to(&owner_pub, &env_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&ot), Some(json!({"name": "vault", "wrapped_key": wrapped}))).await;
+    let env = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", env), Some(&ot), Some(json!({"email": "member-remove@test.invalid", "wrapped_key": oc::encrypt_to(&member_pub, &env_key).unwrap()}))).await;
+    assert_eq!(r.status, 200, "grant failed: {} {}", r.status, r.text);
+    let key_hash = oc::hash_token("/:API_KEY");
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&ot), Some(json!({"secrets": [{
+        "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&env_key, b"old"),
+        "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")
+    }]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let before = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&mt), None).await;
+    assert_eq!(before.status, 200, "the member should have a grant before removal: {} {}", before.status, before.text);
+
+    let new_key = oc::random_key();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&ot), Some(json!({
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new"), "key_hash": key_hash, "path": "", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
+        "grants": [{"user_id": owner_id, "wrapped_key": oc::encrypt_to(&owner_pub, &new_key).unwrap()}],
+        "remove_user": member_id
+    }))).await;
+    assert_eq!(r.status, 200, "atomic revoke+rekey failed: {} {}", r.status, r.text);
+    let grants = s.call(Method::GET, &format!("/api/envs/{}/e2e/grants", env), Some(&ot), None).await;
+    assert_eq!(grants.body.as_array().map(|a| a.len()), Some(1), "the removed grant must be gone: {}", grants.text);
+    let after = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&mt), None).await;
+    assert_eq!(after.status, 403, "the removed member must lose access: {} {}", after.status, after.text);
+    let d = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&ot), None).await;
+    let raw = oc::Keypair::from_secret_b64(owner["recovery_kit"].as_str().unwrap()).unwrap().decrypt(d.body["wrapped_key"].as_str().unwrap()).unwrap();
+    let rotated: [u8;32] = raw.try_into().unwrap();
+    assert_eq!(oc::decrypt_symmetric(&rotated, d.body["secrets"][0]["value_enc"].as_str().unwrap()).unwrap(), b"new");
+}
+
+#[tokio::test]
 async fn secret_metadata_is_encrypted_and_blind_indexed() {
     let s = Server::start_env(&[]).await;
     let u = register(&s, "metadata@test.invalid").await;

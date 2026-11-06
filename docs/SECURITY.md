@@ -139,10 +139,12 @@ server cannot obtain a user's key.
   organisation that needs escrow should hold a recovery key split between
   administrators, not store it in OpenWarp.
 - Removing a member deletes their wrapped key and sets `rekey_required`. Run
-  `openwarp e2e revoke --env <ENV_ID> --email <ADDRESS>` to revoke and rotate in
-  one step, or `openwarp e2e rekey --env <ENV_ID>` if the grant was already
-  removed. Rotation generates a new environment key, re-encrypts every secret,
-  and rewraps the new key to every remaining grantee and the runner. Old history rows are replaced because they
+  `openwarp e2e revoke --env <ENV_ID> --email <ADDRESS>` to remove the grant and
+  rotate in one atomic request (`remove_user` on the rekey endpoint), so there is
+  no window where the grant is gone but the ciphertext is not rotated. Rotation
+  generates a new environment key, re-encrypts every secret, and rewraps the new
+  key to every remaining grantee and the runner. `openwarp e2e rekey` remains for
+  a grant that was already removed. Old history rows are replaced because they
   are encrypted under the old key. The rewrite runs in one database transaction;
   a failed grant write rolls the whole rotation back. A rekey may remove
   grantees but cannot add one: grant access first, then rotate.

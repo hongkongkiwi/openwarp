@@ -118,8 +118,9 @@ runner crashes.
 Removing a member from an `e2e` or delegated environment sets a rekey flag. Run
 `openwarp e2e revoke --env ENV_ID --email ADDRESS` to remove the grant and
 rotate in one command, or `openwarp e2e rekey --env ENV_ID` if the grant was
-already removed. Rotation rewraps the new key to the remaining grantees and the
-runner.
+already removed. The revoke command sends the removal and the new grants in one
+rekey request, so the grant is never absent while the old ciphertext is still
+readable. Rotation rewraps the new key to the remaining grantees and the runner.
 
 ## Signups and invitations
 
