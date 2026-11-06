@@ -6,10 +6,13 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","azure_app_configuration","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","scaleway_secret_manager","vultr","hetzner","linode","digitalocean_ssh","ssh","keeper","oci_vault","huggingface"];
 
-fn http_client() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
+#[cfg(not(target_arch = "wasm32"))]
+fn http_client() -> crate::http::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
+#[cfg(target_arch = "wasm32")]
+fn http_client() -> crate::http::Client { crate::http::Client::new() }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
-async fn req(r: reqwest::RequestBuilder) -> Result<String, String> {
+async fn req(r: crate::http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }
@@ -364,7 +367,7 @@ fn instabox_config(config: &Value) -> Result<(String, String, reqwest::Url), Str
     Ok((key.to_string(), org.to_string(), url))
 }
 
-async fn instabox_list(client: &reqwest::Client, root: &reqwest::Url, key: &str) -> Result<Vec<String>, String> {
+async fn instabox_list(client: &crate::http::Client, root: &reqwest::Url, key: &str) -> Result<Vec<String>, String> {
     let text = req(client.get(root.clone()).header("X-API-Key", key)).await.map_err(|e| format!("Instabox list failed: {}", e))?;
     let response: Value = serde_json::from_str(&text).map_err(|e| format!("Instabox invalid list response: {}", e))?;
     let items = response.get("items").and_then(Value::as_array).ok_or("Instabox invalid list response: missing items array")?;
@@ -456,7 +459,7 @@ fn dotenv_map(text: &str) -> std::collections::HashMap<String, String> {
 fn env_names_ok(names: &[&str]) -> Option<String> {
     let bad: Vec<&str> = names.iter().copied().filter(|n| { let b = n.as_bytes(); b.is_empty() || (!b[0].is_ascii_alphabetic() && b[0] != b'_') || b.iter().any(|c| !c.is_ascii_alphanumeric() && *c != b'_') }).collect();
     if bad.is_empty() { None } else { Some(bad.join(", ")) } }
-async fn boat_find_env(client: &reqwest::Client, api: &str, key: &str, want: &str, org: &str) -> Result<(String, String, Value), String> {
+async fn boat_find_env(client: &crate::http::Client, api: &str, key: &str, want: &str, org: &str) -> Result<(String, String, Value), String> {
     let url = if org.is_empty() { format!("{}/environments", api) } else { format!("{}/environments?org={}", api, enc(org)) };
     let text = req(client.get(&url).bearer_auth(key)).await.map_err(|e| format!("Boat list environments failed: {}", e))?;
     let list: Value = serde_json::from_str(&text).map_err(|e| format!("Boat invalid environment list: {}", e))?;
@@ -504,10 +507,10 @@ pub async fn boat_test(config: &Value) -> Result<String, String> {
     Ok(format!("Boat connection OK: environment {} currently has {} variables", ename, vars)) }
 
 // ---------- Daytona vault secrets ----------
-async fn daytona_send(key: &str, org: &str, r: reqwest::RequestBuilder) -> Result<String, String> {
+async fn daytona_send(key: &str, org: &str, r: crate::http::RequestBuilder) -> Result<String, String> {
     let r = if org.is_empty() { r.bearer_auth(key) } else { r.bearer_auth(key).header("X-Daytona-Organization-ID", org) };
     req(r).await }
-async fn daytona_secret_list(client: &reqwest::Client, key: &str, org: &str, api: &str) -> Result<Vec<Value>, String> {
+async fn daytona_secret_list(client: &crate::http::Client, key: &str, org: &str, api: &str) -> Result<Vec<Value>, String> {
     let text = match daytona_send(key, org, client.get(format!("{}/secret/paginated?limit=200", api))).await {
         Ok(t) => t,
         Err(_) => daytona_send(key, org, client.get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?,
@@ -561,7 +564,7 @@ pub async fn daytona_test(config: &Value) -> Result<String, String> {
     let list = daytona_secret_list(&http_client(), key, org, &api).await?;
     Ok(format!("Daytona connection OK: organisation currently has {} vault secrets", list.len())) }
 
-async fn github_sync(client: &reqwest::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
+async fn github_sync(client: &crate::http::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
     // Use GitHub public-key endpoint; sealed-box encryption is performed with crypto_box SalsaBox via helper binary if present.
     // Fallback: if config contains pre-encrypted payloads, push them; otherwise report precise blocker per secret.
     let owner = cfg(config, "owner"); let repo = cfg(config, "repo");
@@ -642,7 +645,7 @@ fn config_i64(config: &Value, key: &str) -> Option<i64> {
 
 // ---------- AWS SigV4 ----------
 struct AwsReq<'a> { service: &'a str, region: &'a str, ak: &'a str, sk: &'a str, session_token: &'a str, target: &'a str, payload: &'a str, endpoint: &'a str }
-async fn aws_signed(client: &reqwest::Client, r: AwsReq<'_>) -> Result<String, String> {
+async fn aws_signed(client: &crate::http::Client, r: AwsReq<'_>) -> Result<String, String> {
     let host_default = format!("{}.{}.amazonaws.com", r.service, r.region); let url_default = format!("https://{}", host_default);
     let (host, url, uri) = if r.endpoint.is_empty() { (host_default, url_default, "/".to_string()) } else {
         let parsed = reqwest::Url::parse(r.endpoint).map_err(|e| format!("invalid AWS endpoint: {}", e))?;
@@ -669,7 +672,7 @@ async fn aws_signed(client: &reqwest::Client, r: AwsReq<'_>) -> Result<String, S
     req(request.body(r.payload.to_string())).await
 }
 #[allow(clippy::too_many_arguments)]
-async fn aws_call(client: &reqwest::Client, config: &Value, service: &str, region: &str, ak: &str, sk: &str, target: &str, payload: &Value) -> Result<Value, String> {
+async fn aws_call(client: &crate::http::Client, config: &Value, service: &str, region: &str, ak: &str, sk: &str, target: &str, payload: &Value) -> Result<Value, String> {
     let body = payload.to_string();
     let text = aws_signed(client, AwsReq { service, region, ak, sk, session_token: cfg(config, "session_token"), target, payload: &body, endpoint: cfg(config, "endpoint") }).await?;
     if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("AWS {} returned invalid JSON: {}", target, e)) }
@@ -698,7 +701,7 @@ fn ssm_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 1011 && !name.contains(' ') && !name.contains("//") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
 }
 
-async fn aws_sm_list(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+async fn aws_sm_list(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new(); let mut token = String::new();
     loop {
         let mut payload = json!({"MaxResults": 100});
@@ -787,7 +790,7 @@ fn ssm_path(config: &Value) -> String {
     let path = cfg(config, "path_prefix").trim_end_matches('/');
     if path.is_empty() { String::new() } else if path.starts_with('/') { path.to_string() } else { format!("/{}", path) }
 }
-async fn ssm_list(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+async fn ssm_list(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
     let path = ssm_path(config);
     let mut out = Vec::new(); let mut token = String::new();
     loop {
@@ -866,7 +869,7 @@ fn onepassword_config(config: &Value) -> Result<(String, String, String, String,
     let category = { let v = cfg(config, "category"); if v.is_empty() { "API_CREDENTIAL" } else { v } };
     Ok((base, token.to_string(), vault.to_string(), label.to_string(), category.to_string()))
 }
-async fn onepassword_items(client: &reqwest::Client, base: &str, token: &str, vault: &str) -> Result<Vec<Value>, String> {
+async fn onepassword_items(client: &crate::http::Client, base: &str, token: &str, vault: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/v1/vaults/{}/items", base, vault)).bearer_auth(token)).await.map_err(|e| format!("1Password list items failed: {}", e))?;
     if let Ok(items) = serde_json::from_str::<Vec<Value>>(&text) { return Ok(items); }
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("1Password invalid item list: {}", e))?;
@@ -961,7 +964,7 @@ pub async fn dokploy_sync(config: &Value, secrets: &[(String, String)], previous
     let dry = is_dry(config);
     let client = http_client();
     let read_url = if is_app { format!("{}/api/application.one?applicationId={}", base, form_encode(&id)) } else { format!("{}/api/compose.one?composeId={}", base, form_encode(&id)) };
-    let text = req(client.get(read_url).header("x-api-key", &key)).await.map_err(|e| format!("Dokploy read failed: {}", e))?;
+    let text = req(client.get(&read_url).header("x-api-key", &key)).await.map_err(|e| format!("Dokploy read failed: {}", e))?;
     let current: Value = serde_json::from_str(&text).map_err(|e| format!("Dokploy invalid read response: {}", e))?;
     let current_map = dotenv_map(current.get("env").and_then(Value::as_str).unwrap_or(""));
     let desired = trigger_desired(config, secrets);
@@ -991,7 +994,7 @@ pub async fn dokploy_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- CapRover ----------
-async fn caprover_auth(client: &reqwest::Client, config: &Value) -> Result<(String, String), String> {
+async fn caprover_auth(client: &crate::http::Client, config: &Value) -> Result<(String, String), String> {
     let base = cfg(config, "base_url").trim_end_matches('/').to_string();
     if base.is_empty() { return Err("CapRover requires base_url".into()); }
     let api = format!("{}/api/v2", base);
@@ -1003,7 +1006,7 @@ async fn caprover_auth(client: &reqwest::Client, config: &Value) -> Result<(Stri
     } };
     Ok((api, token))
 }
-async fn caprover_apps(client: &reqwest::Client, api: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn caprover_apps(client: &crate::http::Client, api: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/user/apps/appDefinitions", api)).header("x-captain-auth", token)).await.map_err(|e| format!("CapRover list apps failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("CapRover invalid app list: {}", e))?;
     value.get("data").and_then(|d| d.get("appDefinitions")).and_then(Value::as_array).cloned().ok_or("CapRover invalid app list: missing data.appDefinitions".into())
@@ -1043,7 +1046,7 @@ fn portainer_auth(config: &Value) -> Result<(String, String), String> {
     if base.is_empty() || key.is_empty() { return Err("Portainer requires base_url and api_key".into()); }
     Ok((base, key.to_string()))
 }
-async fn portainer_stacks(client: &reqwest::Client, base: &str, key: &str) -> Result<Vec<Value>, String> {
+async fn portainer_stacks(client: &crate::http::Client, base: &str, key: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/api/stacks", base)).header("X-API-Key", key)).await.map_err(|e| format!("Portainer list stacks failed: {}", e))?;
     serde_json::from_str(&text).map_err(|e| format!("Portainer invalid stack list: {}", e))
 }
@@ -1083,17 +1086,26 @@ pub async fn portainer_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Docker Swarm ----------
-fn docker_client(config: &Value) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+fn docker_client(config: &Value) -> Result<crate::http::Client, String> {
     let cert = cfg(config, "client_cert"); let key = cfg(config, "client_key"); let ca = cfg(config, "ca_cert");
-    if !cert.is_empty() || !key.is_empty() {
-        if cert.is_empty() || key.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
-        let identity = reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("Docker client certificate is invalid: {}", e))?;
-        builder = builder.identity(identity);
+    if !cert.is_empty() || !key.is_empty() || !ca.is_empty() {
+        #[cfg(target_arch = "wasm32")]
+        { let _ = (cert, key, ca); return Err("Docker client certificates are unavailable on Workers".into()); }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+            if !cert.is_empty() || !key.is_empty() {
+                if cert.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
+                if key.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
+                let identity = reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("Docker client certificate is invalid: {}", e))?;
+                builder = builder.identity(identity);
+            }
+            if !ca.is_empty() { builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).map_err(|e| format!("Docker CA certificate is invalid: {}", e))?); }
+            if config.get("insecure").and_then(Value::as_bool).unwrap_or(false) { builder = builder.danger_accept_invalid_certs(true); }
+            return builder.build().map_err(|e| e.to_string());
+        }
     }
-    if !ca.is_empty() { builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).map_err(|e| format!("Docker CA certificate is invalid: {}", e))?); }
-    if config.get("insecure").and_then(Value::as_bool).unwrap_or(false) { builder = builder.danger_accept_invalid_certs(true); }
-    builder.build().map_err(|e| e.to_string())
+    Ok(http_client())
 }
 fn docker_base(config: &Value) -> Result<String, String> {
     let raw = cfg(config, "api_url").trim_end_matches('/');
@@ -1151,7 +1163,7 @@ fn auth_value(config: &Value) -> Result<String, String> {
     if secret.is_empty() { return Err("token is required".into()); }
     if user.is_empty() { Ok(format!("Bearer {}", secret)) } else { Ok(format!("Basic {}", openwarp_crypto::b64(format!("{}:{}", user, secret).as_bytes()))) }
 }
-async fn bitbucket_list(client: &reqwest::Client, base: &str, workspace: &str, repo: &str, auth: &str) -> Result<Vec<Value>, String> {
+async fn bitbucket_list(client: &crate::http::Client, base: &str, workspace: &str, repo: &str, auth: &str) -> Result<Vec<Value>, String> {
     let mut url = format!("{}/repositories/{}/{}/pipelines_config/variables/?pagelen=100", base, enc(workspace), enc(repo));
     let mut out = Vec::new();
     loop {
@@ -1201,7 +1213,7 @@ pub async fn bitbucket_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- CircleCI ----------
-async fn circleci_list(client: &reqwest::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn circleci_list(client: &crate::http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/project/{}/envvar", base, slug.trim_matches('/'))).header("Circle-Token", token)).await.map_err(|e| format!("CircleCI list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("CircleCI invalid env var list: {}", e))?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1248,7 +1260,7 @@ fn teamcity_scope(config: &Value) -> (String, String) {
     if !cfg(config, "build_type_locator").is_empty() { ("buildTypes".into(), cfg(config, "build_type_locator").to_string()) }
     else { ("projects".into(), { let p = cfg(config, "project_locator"); if p.is_empty() { "_Root".to_string() } else { p.to_string() } }) }
 }
-async fn teamcity_list(client: &reqwest::Client, base: &str, auth: &str, kind: &str, locator: &str) -> Result<Vec<Value>, String> {
+async fn teamcity_list(client: &crate::http::Client, base: &str, auth: &str, kind: &str, locator: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/{}/{}/parameters", base, kind, enc(locator))).header("Authorization", auth).header("Accept", "application/json")).await.map_err(|e| format!("TeamCity list parameters failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("TeamCity invalid parameter list: {}", e))?;
     Ok(value.get("property").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1283,8 +1295,8 @@ pub async fn teamcity_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Travis CI ----------
-async fn travis_list(client: &reqwest::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
-    let text = req(client.get(format!("{}/repo/{}/env_vars", base, slug)).header("Travis-API-Version", "3").header("Authorization", &format!("token {}", token))).await.map_err(|e| format!("Travis CI list failed: {}", e))?;
+async fn travis_list(client: &crate::http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
+    let text = req(client.get(format!("{}/repo/{}/env_vars", base, slug)).header("Travis-API-Version", "3").header("Authorization", format!("token {}", token))).await.map_err(|e| format!("Travis CI list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Travis CI invalid env var list: {}", e))?;
     Ok(value.get("env_vars").and_then(Value::as_array).cloned().unwrap_or_default())
 }
@@ -1301,12 +1313,12 @@ pub async fn travisci_sync(config: &Value, secrets: &[(String, String)], previou
         for (name, value) in &desired {
             match by_name.get(name) {
                 Some((_, Some(old))) if old == value => unchanged += 1,
-                Some((id, _)) => { req(client.patch(format!("{}/{}", root, id)).header("Travis-API-Version", "3").header("Authorization", &format!("token {}", token)).json(&json!({"env_var": {"name": name, "value": value, "public": false}}))).await.map_err(|e| format!("Travis CI update {} failed: {}", name, e))?; updated += 1; }
-                None => { req(client.post(&root).header("Travis-API-Version", "3").header("Authorization", &format!("token {}", token)).json(&json!({"env_var": {"name": name, "value": value, "public": false}}))).await.map_err(|e| format!("Travis CI create {} failed: {}", name, e))?; created += 1; }
+                Some((id, _)) => { req(client.patch(format!("{}/{}", root, id)).header("Travis-API-Version", "3").header("Authorization", format!("token {}", token)).json(&json!({"env_var": {"name": name, "value": value, "public": false}}))).await.map_err(|e| format!("Travis CI update {} failed: {}", name, e))?; updated += 1; }
+                None => { req(client.post(&root).header("Travis-API-Version", "3").header("Authorization", format!("token {}", token)).json(&json!({"env_var": {"name": name, "value": value, "public": false}}))).await.map_err(|e| format!("Travis CI create {} failed: {}", name, e))?; created += 1; }
             }
         }
         if mode == "mirror" { for name in previous_managed { if desired.iter().any(|(n, _)| n == name) || !by_name.contains_key(name) { continue; }
-            if let Some((id, _)) = by_name.get(name) { req(client.delete(format!("{}/{}", root, id)).header("Travis-API-Version", "3").header("Authorization", &format!("token {}", token))).await.map_err(|e| format!("Travis CI delete {} failed: {}", name, e))?; } } }
+            if let Some((id, _)) = by_name.get(name) { req(client.delete(format!("{}/{}", root, id)).header("Travis-API-Version", "3").header("Authorization", format!("token {}", token))).await.map_err(|e| format!("Travis CI delete {} failed: {}", name, e))?; } } }
     } else { for (name, value) in &desired { match by_name.get(name) { Some((_, Some(old))) if old == value => unchanged += 1, Some(_) => updated += 1, None => created += 1 } } }
     let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_name.contains_key(*n)).count();
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
@@ -1320,7 +1332,7 @@ pub async fn travisci_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Terraform Cloud ----------
-async fn tfcloud_list(client: &reqwest::Client, base: &str, token: &str, workspace_id: &str) -> Result<Vec<Value>, String> {
+async fn tfcloud_list(client: &crate::http::Client, base: &str, token: &str, workspace_id: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/workspaces/{}/vars", base, workspace_id)).bearer_auth(token)).await.map_err(|e| format!("Terraform Cloud list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Terraform Cloud invalid variable list: {}", e))?;
     Ok(value.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1366,7 +1378,7 @@ fn qovery_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || org.is_empty() || project.is_empty() || env.is_empty() { return Err("Qovery requires token, organization_id, project_id and environment_id".into()); }
     Ok((format!("{}/organization/{}/project/{}/environment/{}/variable", base, org, project, env), token.to_string()))
 }
-async fn qovery_list(client: &reqwest::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn qovery_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(root).bearer_auth(token)).await.map_err(|e| format!("Qovery list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Qovery invalid variable list: {}", e))?;
     Ok(value.get("results").and_then(Value::as_array).or_else(|| value.as_array()).cloned().unwrap_or_default())
@@ -1413,7 +1425,7 @@ fn forge_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || org.is_empty() || server.is_empty() || site.is_empty() { return Err("Laravel Forge requires token, organization, server_id and site_id".into()); }
     Ok((format!("{}/orgs/{}/servers/{}/sites/{}/environment", base, enc(org), enc(&server), enc(&site)), token.to_string()))
 }
-async fn forge_env(client: &reqwest::Client, root: &str, token: &str) -> Result<String, String> {
+async fn forge_env(client: &crate::http::Client, root: &str, token: &str) -> Result<String, String> {
     let text = req(client.get(root).bearer_auth(token).header("Accept", "application/vnd.api+json")).await.map_err(|e| format!("Laravel Forge read environment failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Laravel Forge invalid environment response: {}", e))?;
     Ok(value.get("data").and_then(|d| d.get("attributes")).and_then(|a| a.get("content")).and_then(Value::as_str).unwrap_or("").to_string())
@@ -1440,7 +1452,7 @@ fn openwarp_remote(config: &Value) -> Result<(String, String, String), String> {
     if base.is_empty() || token.is_empty() || env.is_empty() { return Err("OpenWarp sync requires base_url, token and env_id".into()); }
     Ok((base, token.to_string(), env.to_string()))
 }
-async fn openwarp_list(client: &reqwest::Client, base: &str, token: &str, env: &str) -> Result<Vec<Value>, String> {
+async fn openwarp_list(client: &crate::http::Client, base: &str, token: &str, env: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut offset = 0;
     loop {
         let text = req(client.get(format!("{}/api/envs/{}/secrets?limit=1000&offset={}", base, env, offset)).bearer_auth(token)).await.map_err(|e| format!("OpenWarp list secrets failed: {}", e))?;
@@ -1484,7 +1496,7 @@ fn devin_parts(config: &Value) -> Result<(String, String, String), String> {
     if token.is_empty() || org.is_empty() { return Err("Devin requires token and org_id".into()); }
     Ok((base, token.to_string(), org.to_string()))
 }
-async fn devin_list(client: &reqwest::Client, base: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
+async fn devin_list(client: &crate::http::Client, base: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut after = String::new();
     loop {
         let mut url = format!("{}/v3/organizations/{}/secrets?first=200", base, enc(org));
@@ -1531,7 +1543,7 @@ fn cf_store_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || account.is_empty() || store.is_empty() { return Err("Cloudflare Secrets Store requires token, account_id and store_id".into()); }
     Ok((format!("{}/accounts/{}/secrets_store/stores/{}/secrets", base, enc(account), enc(store)), token.to_string()))
 }
-async fn cf_store_list(client: &reqwest::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn cf_store_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1;
     loop {
         let text = req(client.get(format!("{}?per_page=100&page={}", root, page)).bearer_auth(token)).await.map_err(|e| format!("Cloudflare Secrets Store list failed: {}", e))?;
@@ -1663,7 +1675,7 @@ fn cursor_parts(config: &Value) -> Result<(String, String, String, bool), String
     Ok((base, token.to_string(), env.to_string(), is_env))
 }
 fn cursor_auth(token: &str) -> String { format!("Basic {}", openwarp_crypto::b64(format!("{}:", token).as_bytes())) }
-async fn cursor_list(client: &reqwest::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn cursor_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut cursor = String::new();
     loop {
         let mut url = format!("{}?limit=100", root);
@@ -1714,7 +1726,7 @@ fn northflank_parts(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || project.is_empty() || group.is_empty() { return Err("Northflank requires token, project_id and secret_group_id".into()); }
     Ok((format!("{}/projects/{}/secrets/{}", base, enc(project), enc(group)), token.to_string()))
 }
-async fn northflank_variables(client: &reqwest::Client, root: &str, token: &str) -> Result<HashMap<String, String>, String> {
+async fn northflank_variables(client: &crate::http::Client, root: &str, token: &str) -> Result<HashMap<String, String>, String> {
     let text = req(client.get(format!("{}/details", root)).bearer_auth(token)).await.map_err(|e| format!("Northflank read secret group failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Northflank invalid secret group response: {}", e))?;
     Ok(value.get("data").and_then(|d| d.get("secrets")).and_then(|s| s.get("variables")).and_then(Value::as_object).map(|vars| vars.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default())
@@ -1743,7 +1755,7 @@ fn spacelift_endpoint(config: &Value) -> Result<String, String> {
     let account = cfg(config, "account"); if account.is_empty() { return Err("Spacelift requires base_url or account".into()); }
     Ok(format!("https://{}.app.spacelift.io/graphql", enc(account)))
 }
-async fn spacelift_auth(client: &reqwest::Client, endpoint: &str, config: &Value) -> Result<String, String> {
+async fn spacelift_auth(client: &crate::http::Client, endpoint: &str, config: &Value) -> Result<String, String> {
     let token = cfg(config, "token"); if !token.is_empty() { return Ok(token.to_string()); }
     let id = cfg(config, "api_key_id"); let secret = cfg(config, "api_key_secret");
     if id.is_empty() || secret.is_empty() { return Err("Spacelift requires token, or api_key_id and api_key_secret".into()); }
@@ -1751,7 +1763,7 @@ async fn spacelift_auth(client: &reqwest::Client, endpoint: &str, config: &Value
     let data = spacelift_graphql(client, endpoint, None, query, json!({"id": id, "secret": secret})).await?;
     data.get("apiKeyUser").and_then(|u| u.get("jwt")).and_then(Value::as_str).map(str::to_string).ok_or_else(|| "Spacelift did not return a JWT".to_string())
 }
-async fn spacelift_graphql(client: &reqwest::Client, endpoint: &str, token: Option<&str>, query: &str, variables: Value) -> Result<Value, String> {
+async fn spacelift_graphql(client: &crate::http::Client, endpoint: &str, token: Option<&str>, query: &str, variables: Value) -> Result<Value, String> {
     let mut request = client.post(endpoint);
     if let Some(token) = token { request = request.bearer_auth(token); }
     let text = req(request.json(&json!({"query": query, "variables": variables}))).await.map_err(|e| format!("Spacelift GraphQL request failed: {}", e))?;
@@ -1759,7 +1771,7 @@ async fn spacelift_graphql(client: &reqwest::Client, endpoint: &str, token: Opti
     if let Some(errors) = value.get("errors") { return Err(format!("Spacelift GraphQL error: {}", errors)); }
     Ok(value.get("data").cloned().unwrap_or(json!({})))
 }
-async fn spacelift_element(client: &reqwest::Client, endpoint: &str, token: &str, stack: &str, name: &str) -> Result<Option<Value>, String> {
+async fn spacelift_element(client: &crate::http::Client, endpoint: &str, token: &str, stack: &str, name: &str) -> Result<Option<Value>, String> {
     let query = "query($stack: ID!, $id: ID!) { stack(id: $stack) { configElement(id: $id) { id type value writeOnly description } } }";
     let data = spacelift_graphql(client, endpoint, Some(token), query, json!({"stack": stack, "id": name})).await?;
     Ok(data.get("stack").and_then(|s| s.get("configElement")).filter(|v| !v.is_null()).cloned())
@@ -1817,7 +1829,7 @@ fn rundeck_parts(config: &Value) -> Result<(String, String), String> {
     let base = format!("{}/api/19/storage/keys/project/{}", instance, enc(project));
     Ok((if encoded.is_empty() { base } else { format!("{}/{}", base, encoded) }, token.to_string()))
 }
-async fn rundeck_keys(client: &reqwest::Client, base: &str, token: &str) -> Result<Vec<String>, String> {
+async fn rundeck_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<String>, String> {
     match req(client.get(base).header("X-Rundeck-Auth-Token", token)).await {
         Ok(text) => { let value: Value = serde_json::from_str(&text).map_err(|e| format!("Rundeck invalid key list: {}", e))?;
             Ok(value.get("resources").and_then(Value::as_array).map(|items| items.iter().filter(|r| r.get("type").and_then(Value::as_str) == Some("file")).filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_string)).collect()).unwrap_or_default()) }
@@ -1855,7 +1867,7 @@ fn cloud66_parts(config: &Value) -> Result<(String, String, String), String> {
     if token.is_empty() || stack.is_empty() { return Err("Cloud 66 requires access_token and stack_id".into()); }
     Ok((base, token.to_string(), stack.to_string()))
 }
-async fn cloud66_list(client: &reqwest::Client, base: &str, token: &str, stack: &str) -> Result<Vec<Value>, String> {
+async fn cloud66_list(client: &crate::http::Client, base: &str, token: &str, stack: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let text = req(client.get(format!("{}/3/stacks/{}/environments?page={}&per_page=100", base, enc(stack), page)).bearer_auth(token)).await.map_err(|e| format!("Cloud 66 list failed: {}", e))?;
@@ -1912,7 +1924,7 @@ fn humanitec_parts(config: &Value) -> Result<(String, String, String, String, St
 fn humanitec_values_url(base: &str, org: &str, app: &str, scope: &str, env: &str) -> String {
     if scope == "environment" { format!("{}/orgs/{}/apps/{}/envs/{}/values", base, enc(org), enc(app), enc(env)) } else { format!("{}/orgs/{}/apps/{}/values", base, enc(org), enc(app)) }
 }
-async fn humanitec_list(client: &reqwest::Client, config: &Value) -> Result<Vec<Value>, String> {
+async fn humanitec_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (base, token, org, app, scope, env) = humanitec_parts(config)?;
     let text = req(client.get(humanitec_values_url(&base, &org, &app, &scope, &env)).bearer_auth(&token).header("Accept", "application/json")).await.map_err(|e| format!("Humanitec list failed: {}", e))?;
     serde_json::from_str(&text).map_err(|e| format!("Humanitec invalid values response: {}", e))
@@ -1948,7 +1960,7 @@ pub async fn humanitec_sync(config: &Value, secrets: &[(String, String)], previo
             let source = by_key.get(name).map(|(_, s)| s.as_str()).unwrap_or("");
             if scope == "environment" && source == "app" { continue; }
             let url = if scope == "environment" { format!("{}/{}", env_root, enc(name)) } else { format!("{}/{}", app_root, enc(name)) };
-            if by_key.contains_key(name) { req(client.delete(url).bearer_auth(&token)).await.map_err(|e| format!("Humanitec delete {} failed: {}", name, e))?; } } }
+            if by_key.contains_key(name) { req(client.delete(&url).bearer_auth(&token)).await.map_err(|e| format!("Humanitec delete {} failed: {}", name, e))?; } } }
     } else { for (name, value) in &desired { match by_key.get(name) { Some((old, _)) if old == value => unchanged += 1, Some(_) => updated += 1, None => created += 1 } } }
     let deleted = previous_managed.iter().filter(|n| !desired.iter().any(|(d, _)| d == *n) && by_key.contains_key(*n)).count();
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
@@ -1969,12 +1981,12 @@ fn scaleway_parts(config: &Value) -> Result<(String, String, String, String, Str
     Ok((base(config, "https://api.scaleway.com"), region.to_string(), token.to_string(), project.to_string(), cfg(config, "path").trim_matches('/').to_string()))
 }
 fn scaleway_root(base: &str, region: &str) -> String { format!("{}/secret-manager/v1beta1/regions/{}", base, region) }
-async fn scaleway_list(client: &reqwest::Client, root: &str, token: &str, project: &str, path: &str) -> Result<Vec<Value>, String> {
+async fn scaleway_list(client: &crate::http::Client, root: &str, token: &str, project: &str, path: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let mut url = format!("{}/secrets?project_id={}&scheduled_for_deletion=false&page={}&page_size=100", root, enc(project), page);
         if !path.is_empty() { url.push_str(&format!("&path={}", enc(path))); }
-        let text = req(client.get(url).header("X-Auth-Token", token)).await.map_err(|e| format!("Scaleway list failed: {}", e))?;
+        let text = req(client.get(&url).header("X-Auth-Token", token)).await.map_err(|e| format!("Scaleway list failed: {}", e))?;
         let value: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid secret list: {}", e))?;
         let items = value.get("secrets").and_then(Value::as_array).cloned().unwrap_or_default();
         let count = items.len();
@@ -1986,7 +1998,7 @@ async fn scaleway_list(client: &reqwest::Client, root: &str, token: &str, projec
     }
     Ok(out)
 }
-async fn scaleway_latest(client: &reqwest::Client, root: &str, token: &str, id: &str) -> Result<Option<String>, String> {
+async fn scaleway_latest(client: &crate::http::Client, root: &str, token: &str, id: &str) -> Result<Option<String>, String> {
     match req(client.get(format!("{}/secrets/{}/versions/latest/access", root, enc(id))).header("X-Auth-Token", token)).await {
         Ok(text) => { let value: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid version: {}", e))?;
             let data = value.get("data").and_then(Value::as_str).unwrap_or("");
@@ -2060,15 +2072,15 @@ fn appconfig_sign(method: &str, path_and_query: &str, host: &str, body: &str, id
         ("Authorization".into(), format!("HMAC-SHA256 Credential={}&SignedHeaders=x-ms-date;host;x-ms-content-sha256&Signature={}", id, signature)),
     ])
 }
-fn appconfig_request(client: &reqwest::Client, method: reqwest::Method, url: &str, host: &str, body: &str, id: &str, secret: &str) -> Result<reqwest::RequestBuilder, String> {
+fn appconfig_request(client: &crate::http::Client, method: reqwest::Method, url: &str, host: &str, body: &str, id: &str, secret: &str) -> Result<crate::http::RequestBuilder, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     let path_and_query = match parsed.query() { Some(q) => format!("{}?{}", parsed.path(), q), None => parsed.path().to_string() };
     let mut request = client.request(method.clone(), url);
-    for (name, value) in appconfig_sign(method.as_str(), &path_and_query, host, body, id, secret)? { request = request.header(name, value); }
+    for (name, value) in appconfig_sign(method.as_str(), &path_and_query, host, body, id, secret)? { request = request.header(name.as_str(), value.as_str()); }
     if !body.is_empty() { request = request.header("Content-Type", "application/vnd.microsoft.appconfig.kv+json"); }
     Ok(request.body(body.to_string()))
 }
-async fn appconfig_list(client: &reqwest::Client, endpoint: &str, host: &str, id: &str, secret: &str, label: &str) -> Result<Vec<Value>, String> {
+async fn appconfig_list(client: &crate::http::Client, endpoint: &str, host: &str, id: &str, secret: &str, label: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     let mut path = format!("/kv?key=*&label={}&api-version=1.0", if label.is_empty() { "%00".to_string() } else { enc(label) });
     for _ in 0..100 {
@@ -2127,19 +2139,24 @@ fn ovh_kms_parts(config: &Value) -> Result<(String, String, String), String> {
     }
     Ok((domain, id.to_string(), path.to_string()))
 }
-fn ovh_kms_client(config: &Value) -> Result<reqwest::Client, String> {
+fn ovh_kms_client(config: &Value) -> Result<crate::http::Client, String> {
     let cert = cfg(config, "certificate"); let key = cfg(config, "private_key");
     if cert.is_empty() && key.is_empty() { return Ok(http_client()); }
     if cert.is_empty() || key.is_empty() { return Err("OVHcloud KMS requires both certificate and private_key".into()); }
-    reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
-        .identity(reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("OVHcloud KMS client certificate is invalid: {}", e))?)
-        .build().map_err(|e| e.to_string())
+    #[cfg(target_arch = "wasm32")]
+    { let _ = (cert, key); Err("OVHcloud KMS client certificates are unavailable on Workers".into()) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
+            .identity(reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("OVHcloud KMS client certificate is invalid: {}", e))?)
+            .build().map_err(|e| e.to_string())
+    }
 }
-fn ovh_auth(request: reqwest::RequestBuilder, config: &Value) -> reqwest::RequestBuilder {
+fn ovh_auth(request: crate::http::RequestBuilder, config: &Value) -> crate::http::RequestBuilder {
     let token = cfg(config, "token");
     if token.is_empty() { request } else { request.bearer_auth(token) }
 }
-async fn ovh_kms_bundle(client: &reqwest::Client, config: &Value) -> Result<(bool, HashMap<String, String>, Option<i64>), String> {
+async fn ovh_kms_bundle(client: &crate::http::Client, config: &Value) -> Result<(bool, HashMap<String, String>, Option<i64>), String> {
     let (domain, id, path) = ovh_kms_parts(config)?;
     let response = ovh_auth(client.get(format!("{}/api/{}/v2/secret/{}?includeData=true", domain, enc(&id), enc(&path))), config).send().await.map_err(|e| format!("OVHcloud KMS read failed: {}", e))?;
     let status = response.status(); let text = response.text().await.unwrap_or_default();
@@ -2160,7 +2177,7 @@ pub async fn ovh_kms_sync(config: &Value, secrets: &[(String, String)], previous
     if !dry && (created > 0 || updated > 0 || deleted > 0 || !exists) {
         if exists {
             let url = match version { Some(v) => format!("{}/api/{}/v2/secret/{}?cas={}", domain, enc(&id), enc(&path), v), None => format!("{}/api/{}/v2/secret/{}", domain, enc(&id), enc(&path)) };
-            req(ovh_auth(client.put(url), config).json(&json!({"version": {"data": data}}))).await.map_err(|e| format!("OVHcloud KMS update failed: {}", e))?;
+            req(ovh_auth(client.put(&url), config).json(&json!({"version": {"data": data}}))).await.map_err(|e| format!("OVHcloud KMS update failed: {}", e))?;
         } else {
             req(ovh_auth(client.post(format!("{}/api/{}/v2/secret", domain, enc(&id))), config).json(&json!({"path": path, "version": {"data": data}}))).await.map_err(|e| format!("OVHcloud KMS create failed: {}", e))?;
         }
@@ -2252,10 +2269,12 @@ fn http_date() -> String {
     let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT", day_names[((days + 4).rem_euclid(7)) as usize], d, month_names[(mo - 1) as usize], y, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn iso_after(days: i64) -> String {
     let secs = unix_now() + days * 86400; let d = secs.div_euclid(86400); let rem = secs.rem_euclid(86400); let (y, mo, day) = civil(d);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, day, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_endpoint(config: &Value) -> Result<String, String> {
     let endpoint = cfg(config, "endpoint").trim_end_matches('/');
     if !endpoint.is_empty() { return Ok(endpoint.to_string()); }
@@ -2263,11 +2282,14 @@ fn oci_endpoint(config: &Value) -> Result<String, String> {
     if region.is_empty() { return Err("OCI Vault requires region or endpoint".into()); }
     Ok(format!("https://vaults.{}.oraclecloud.com", region))
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_key_id(config: &Value) -> Result<String, String> {
     let (tenancy, user, fingerprint) = (cfg(config, "tenancy_ocid"), cfg(config, "user_ocid"), cfg(config, "fingerprint"));
     if tenancy.is_empty() || user.is_empty() || fingerprint.is_empty() { return Err("OCI Vault requires tenancy_ocid, user_ocid and fingerprint".into()); }
     Ok(format!("{}/{}/{}", tenancy, user, fingerprint))
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -2280,7 +2302,9 @@ fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     let signature = signing_key.sign(canonical.as_bytes());
     Ok(openwarp_crypto::b64(&signature.to_bytes()))
 }
-async fn oci_request(client: &reqwest::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+async fn oci_request(client: &crate::http::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
     let base = oci_endpoint(config)?; let url = format!("{}{}", base, path_query);
     let parsed = reqwest::Url::parse(&url).map_err(|e| format!("OCI endpoint is invalid: {}", e))?;
     let host = match parsed.port() { Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(""), port), None => parsed.host_str().unwrap_or("").to_string() };
@@ -2301,24 +2325,33 @@ async fn oci_request(client: &reqwest::Client, config: &Value, method: &str, pat
     if !status.is_success() { return Err(format!("OCI Vault request failed: HTTP {}: {}", status, text.chars().take(400).collect::<String>())); }
     if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("OCI Vault invalid response: {}", e)) }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_config_ready(config: &Value) -> Result<(String, String), String> {
     let compartment = cfg(config, "compartment_id"); let vault = cfg(config, "vault_id");
     if compartment.is_empty() || vault.is_empty() { return Err("OCI Vault requires compartment_id and vault_id".into()); }
     Ok((compartment.to_string(), vault.to_string()))
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_name_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) }
-async fn oci_list(client: &reqwest::Client, config: &Value) -> Result<Vec<Value>, String> {
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+async fn oci_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (compartment, vault) = oci_config_ready(config)?;
     let value = oci_request(client, config, "GET", &format!("/20180608/secrets?compartmentId={}&vaultId={}&lifecycleState=ACTIVE&limit=1000", enc(&compartment), enc(&vault)), None).await?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
 }
-async fn oci_bundle(client: &reqwest::Client, config: &Value, id: &str) -> Result<String, String> {
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+async fn oci_bundle(client: &crate::http::Client, config: &Value, id: &str) -> Result<String, String> {
     let value = oci_request(client, config, "GET", &format!("/20180608/secretBundles/{}", enc(id)), None).await?;
     let content = value.get("secretBundleContent").and_then(|c| c.get("content")).and_then(Value::as_str).unwrap_or("");
     let bytes = openwarp_crypto::unb64(content).map_err(|e| format!("OCI secret content is invalid: {}", e))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn oci_content(value: &str) -> Value { json!({"content": openwarp_crypto::b64(value.as_bytes()), "contentType": "BASE64"}) }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let (compartment, vault) = oci_config_ready(config)?; let key_id = cfg(config, "key_id");
     let mode = sync_mode(config, "oci_vault")?; let dry = is_dry(config);
@@ -2347,6 +2380,8 @@ pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previo
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
     Ok((format!("OCI Vault sync{}: created={} updated={} deleted={} (deletions are scheduled 7 days out)", if dry { " (dry-run)" } else { "" }, created, updated, deleted), managed))
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_test(config: &Value) -> Result<String, String> {
     let list = oci_list(&http_client(), config).await?;
     Ok(format!("OCI Vault connection OK: {} active secret(s) visible", list.len()))
@@ -2361,7 +2396,7 @@ fn huggingface_space(config: &Value) -> Result<(String, String, String), String>
     Ok((base(config, "https://huggingface.co"), token.to_string(), format!("/api/spaces/{}/{}/{}", enc(namespace), enc(repo), kind)))
 }
 fn huggingface_key_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 128 && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') }
-async fn huggingface_space_list(client: &reqwest::Client, base_url: &str, token: &str, path: &str) -> Result<HashMap<String, Option<String>>, String> {
+async fn huggingface_space_list(client: &crate::http::Client, base_url: &str, token: &str, path: &str) -> Result<HashMap<String, Option<String>>, String> {
     let text = req(client.get(format!("{}{}", base_url, path)).bearer_auth(token)).await.map_err(|e| format!("Hugging Face list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Hugging Face invalid list response: {}", e))?;
     let object = value.as_object().ok_or("Hugging Face list response is not an object")?;
@@ -2400,8 +2435,12 @@ pub async fn huggingface_test(config: &Value) -> Result<String, String> {
 // ---------- SSH file sync ----------
 // Writes selected secret folders to files on a host over SSH. This is a remote
 // env file, not an account SSH-key store: the host never learns a shell.
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_shell_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
+#[cfg(not(target_arch = "wasm32"))]
 struct SshTarget { host: String, port: u16, user: String, identity: String, known_hosts: String, password: String, askpass: String, timeout: u64 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_target(config: &Value) -> Result<SshTarget, String> {
     let host = cfg(config, "host").trim();
     if host.is_empty() || host.contains([' ', '\n', '\t']) { return Err("ssh requires host".into()); }
@@ -2419,7 +2458,10 @@ fn ssh_target(config: &Value) -> Result<SshTarget, String> {
     let timeout = config_i64(config, "timeout_secs").unwrap_or(20).clamp(1, 120) as u64;
     Ok(SshTarget { host: host.to_string(), port: port as u16, user: user.to_string(), identity, known_hosts, password, askpass: private_key, timeout })
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct SshFile { path: String, format: String, folders: Vec<String>, owner: String, mode: String }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_files(config: &Value) -> Result<Vec<SshFile>, String> {
     let mut out = Vec::new();
     if let Some(items) = config.get("files").and_then(Value::as_array) {
@@ -2447,16 +2489,22 @@ fn ssh_files(config: &Value) -> Result<Vec<SshFile>, String> {
     if let Some(dup) = out.iter().find(|f| !seen.insert(f.path.clone())) { return Err(format!("ssh files must have distinct paths: {:?}", dup.path)); }
     Ok(out)
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_remote_path_ok(path: &str) -> bool { path.starts_with('/') && path.len() <= 512 && !path.contains('\0') && path.bytes().all(|b| !b.is_ascii_whitespace() && b != b'\'' && b != b'"' && b != b'`' && b != b'\\' && b != b'$') }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_folder_matches(folders: &[String], path: &str) -> bool {
     if folders.is_empty() { return true; }
     let path = if path.is_empty() { "/" } else { path };
     folders.iter().any(|f| { let f = if f.is_empty() { "/" } else { f.as_str() }; path == f || path.starts_with(&format!("{}/", f.trim_end_matches('/'))) })
 }
 /// `.env` and `env` are the dotenv format under the name the file usually has.
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_format(raw: &str) -> String { match raw.trim() { "" | "dotenv" | "env" | ".env" => "dotenv".to_string(), other => other.to_string() } }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_synced_at() -> String { chrono_now() }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_csv_cell(value: &str) -> String { if value.contains([',', '"', '\n', '\r']) { format!("\"{}\"", value.replace('"', "\"\"")) } else { value.to_string() } }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_render(format: &str, pairs: &BTreeMap<String, String>, comment: &str) -> String {
     let note = if comment.is_empty() { String::new() } else { format!("# Synced by OpenWarp at {}\n", comment) };
     match format {
@@ -2467,6 +2515,7 @@ fn ssh_render(format: &str, pairs: &BTreeMap<String, String>, comment: &str) -> 
         _ => { let mut out = note; out.push_str(&dotenv_render(pairs)); out }
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_csv_row(line: &str) -> Option<(String, String)> {
     let mut cells = Vec::new(); let mut cur = String::new(); let mut quoted = false; let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
@@ -2480,6 +2529,7 @@ fn ssh_csv_row(line: &str) -> Option<(String, String)> {
     cells.push(cur);
     if cells.len() < 2 { None } else { Some((cells[0].trim().to_string(), cells[1].to_string())) }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_parse(format: &str, text: &str) -> Result<BTreeMap<String, String>, String> {
     match format {
         "json" => { if text.trim().is_empty() { return Ok(BTreeMap::new()); } let value: Value = serde_json::from_str(text).map_err(|e| format!("remote file is not JSON: {}", e))?; let object = value.as_object().ok_or("remote file is not a JSON object")?; Ok(object.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect()) }
@@ -2487,16 +2537,21 @@ fn ssh_parse(format: &str, text: &str) -> Result<BTreeMap<String, String>, Strin
         _ => Ok(dotenv_map(text).into_iter().collect()),
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_binary() -> String { std::env::var("OPENWARP_SSH_BIN").unwrap_or_else(|_| "ssh".to_string()) }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_cleanup(key: &Option<std::path::PathBuf>, hosts: &Option<std::path::PathBuf>) { for path in [key, hosts].into_iter().flatten() { let _ = std::fs::remove_file(path); } }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_stage_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("openwarp-ssh-{}-{:?}", std::process::id(), std::thread::current().id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 // hash_token is base64, and a slash in a filename silently becomes a directory.
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_stage_name(prefix: &str, value: &str) -> String {
     format!("{}-{}", prefix, openwarp_crypto::hash_token(value).replace(['/', '+'], "-").chars().take(12).collect::<String>()) }
+#[cfg(not(target_arch = "wasm32"))]
 fn wait_bounded(child: std::process::Child, budget: std::time::Duration) -> std::io::Result<std::process::Output> {
     let started = std::time::Instant::now();
     let mut child = child;
@@ -2514,6 +2569,8 @@ fn wait_bounded(child: std::process::Child, budget: std::time::Duration) -> std:
 }
 /// Run one remote command. stdout is the file; a non-zero exit is an error
 /// carrying stderr, so a refused host key never looks like an empty file.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<String, String> {
     let mut cmd = std::process::Command::new(ssh_binary());
     cmd.arg("-p").arg(target.port.to_string()).arg("-o").arg(format!("ConnectTimeout={}", target.timeout)).arg("-o").arg("StrictHostKeyChecking=yes").arg("-o").arg("IdentitiesOnly=yes");
@@ -2565,7 +2622,10 @@ fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<S
     if !finished.status.success() { return Err(format!("ssh command failed ({}): {}", finished.status, String::from_utf8_lossy(&finished.stderr).chars().take(400).collect::<String>())); }
     Ok(String::from_utf8_lossy(&finished.stdout).into_owned())
 }
+#[cfg(not(target_arch = "wasm32"))]
 type SshPlan = Vec<(SshFile, BTreeMap<String, String>)>;
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_plan(config: &Value, secrets: &[(String, String, String, String)]) -> Result<SshPlan, String> {
     let files = ssh_files(config)?;
     let include: Vec<String> = config.get("include_keys").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -2587,16 +2647,21 @@ fn ssh_plan(config: &Value, secrets: &[(String, String, String, String)]) -> Res
 }
 /// Remote names this sync would own, stamped with the file so a failed run can
 /// still be pruned later. Empty when the config itself is invalid.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn ssh_owned_names(config: &Value, secrets: &[(String, String, String, String)]) -> Result<Vec<String>, String> {
     let plans = ssh_plan(config, secrets)?;
     let mut out = Vec::new();
     for (file, pairs) in &plans { for name in pairs.keys() { out.push(format!("{}|{}", file.path, name)); } }
     Ok(out)
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_sync(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let config = config.clone(); let secrets = secrets.to_vec(); let previous_managed = previous_managed.to_vec();
     tokio::task::spawn_blocking(move || ssh_file_sync_blocking(&config, &secrets, &previous_managed)).await.map_err(|e| format!("ssh sync task failed: {}", e))?
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let target = ssh_target(config)?; let mode = sync_mode(config, "ssh")?; let dry = is_dry(config);
     let plans = ssh_plan(config, secrets)?;
@@ -2632,14 +2697,20 @@ fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, St
     }
     Ok((format!("SSH sync{}: {}", if dry { " (dry-run)" } else { "" }, reports.join("; ")), managed))
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_test(config: &Value) -> Result<String, String> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || { let target = ssh_target(&config)?; let who = ssh_exec(&target, "whoami", None)?; Ok(format!("SSH connection OK: {}@{}:{} as {}", target.user, target.host, target.port, who.trim())) }).await.map_err(|e| format!("ssh test task failed: {}", e))?
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_pull(config: &Value) -> Result<Vec<(String, String)>, String> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || ssh_file_pull_blocking(&config)).await.map_err(|e| format!("ssh import task failed: {}", e))?
 }
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_file_pull_blocking(config: &Value) -> Result<Vec<(String, String)>, String> {
     let target = ssh_target(config)?; let files = ssh_files(config)?;
     let mut out = Vec::new();
@@ -2667,11 +2738,11 @@ fn vultr_token(config: &Value) -> Result<String, String> {
     if token.is_empty() { return Err("Vultr requires api_key".into()); }
     Ok(token.to_string())
 }
-async fn vultr_keys(client: &reqwest::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn vultr_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut cursor = String::new();
     for _ in 0..100 {
         let url = format!("{}/ssh-keys?per_page=100{}", base, if cursor.is_empty() { String::new() } else { format!("&cursor={}", enc(&cursor)) });
-        let text = req(client.get(url).bearer_auth(token)).await.map_err(|e| format!("Vultr list SSH keys failed: {}", e))?;
+        let text = req(client.get(&url).bearer_auth(token)).await.map_err(|e| format!("Vultr list SSH keys failed: {}", e))?;
         let value: Value = serde_json::from_str(&text).map_err(|e| format!("Vultr invalid SSH key list: {}", e))?;
         if let Some(items) = value.get("ssh_keys").and_then(Value::as_array) { out.extend(items.iter().cloned()); }
         cursor = value.get("meta").and_then(|m| m.get("links")).and_then(|l| l.get("next")).and_then(Value::as_str).unwrap_or("").to_string();
@@ -2713,7 +2784,7 @@ fn hetzner_token(config: &Value) -> Result<String, String> {
     Ok(token.to_string())
 }
 fn hetzner_id(value: &Value) -> Option<String> { value.get("id").and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string))).filter(|s| !s.is_empty()) }
-async fn hetzner_keys(client: &reqwest::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn hetzner_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let text = req(client.get(format!("{}/ssh_keys?page={}&per_page=50", base, page)).bearer_auth(token)).await.map_err(|e| format!("Hetzner list SSH keys failed: {}", e))?;
@@ -2769,11 +2840,11 @@ fn strip_remote_prefix(config: &Value, name: &str, path_prefix: &str) -> String 
     let without_path = if path_prefix.is_empty() { name } else { name.strip_prefix(path_prefix).map(|s| s.trim_start_matches('/')).unwrap_or(name) };
     local_name(config, without_path)
 }
-async fn aws_sm_value(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str) -> Result<Option<String>, String> {
+async fn aws_sm_value(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str) -> Result<Option<String>, String> {
     let value = aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.GetSecretValue", &json!({"SecretId": id})).await?;
     Ok(value.get("SecretString").and_then(Value::as_str).map(str::to_string))
 }
-async fn ssm_values(client: &reqwest::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<(String, String)>, String> {
+async fn ssm_values(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<(String, String)>, String> {
     let path = ssm_path(config);
     let mut out = Vec::new();
     if path.is_empty() {
@@ -2981,7 +3052,10 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
         }
         "linode" => { let list = super::ssh_keys::linode_list(config).await?; Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("label")?.as_str()?, ""), v.get("ssh_key")?.as_str()?.to_string()))).collect()) }
         "digitalocean_ssh" => { let list = super::ssh_keys::digitalocean_list(config).await?; Ok(list.iter().filter_map(|v| Some((strip_remote_prefix(config, v.get("name")?.as_str()?, ""), v.get("public_key")?.as_str()?.to_string()))).collect()) }
+#[cfg(not(target_arch = "wasm32"))]
         "ssh" => ssh_file_pull(config).await,
+        #[cfg(target_arch = "wasm32")]
+        "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => {
             let client = ovh_kms_client(config)?;
             let (_, data, _) = ovh_kms_bundle(&client, config).await?;
@@ -2997,6 +3071,7 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             let list = huggingface_space_list(&http_client(), &base_url, &token, &path).await?;
             Ok(list.into_iter().filter_map(|(k, v)| Some((strip_remote_prefix(config, &k, ""), v?))).collect())
         }
+        #[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => {
             let client = http_client(); let list = oci_list(&client, config).await?;
             let mut out = Vec::new();
@@ -3064,10 +3139,16 @@ pub async fn sync_managed(kind: &str, config: &Value, secrets: &[(String, String
         "hetzner" => hetzner_sync(config, ssh_pairs, previous_managed).await,
         "linode" => super::ssh_keys::linode_sync(config, ssh_pairs, previous_managed).await,
         "digitalocean_ssh" => super::ssh_keys::digitalocean_sync(config, ssh_pairs, previous_managed).await,
+#[cfg(not(target_arch = "wasm32"))]
         "ssh" => ssh_file_sync(config, secrets, previous_managed).await,
+        #[cfg(target_arch = "wasm32")]
+        "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_sync(config, pairs, previous_managed).await,
         "keeper" => keeper_sync(config, pairs, previous_managed).await,
+#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_sync(config, pairs, previous_managed).await,
+        #[cfg(target_arch = "wasm32")]
+        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_sync(config, pairs, previous_managed).await,
         _ => return None,
     };
@@ -3114,10 +3195,16 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "hetzner" => hetzner_test(config).await,
         "linode" => super::ssh_keys::linode_test(config).await,
         "digitalocean_ssh" => super::ssh_keys::digitalocean_test(config).await,
+#[cfg(not(target_arch = "wasm32"))]
         "ssh" => ssh_file_test(config).await,
+        #[cfg(target_arch = "wasm32")]
+        "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_test(config).await,
         "keeper" => keeper_test(config).await,
+#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_test(config).await,
+        #[cfg(target_arch = "wasm32")]
+        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_test(config).await,
         _ => Err(format!("connection test is not implemented for kind {}", kind)),
     }
@@ -3189,8 +3276,8 @@ fn lease_base(config: &Value, default: &str) -> Result<String, String> {
     if url.scheme() != "https" && url.scheme() != "http" { return Err("base_url must be an http(s) URL".into()); }
     let host = url.host_str().ok_or("base_url has no host")?;
     // Production refuses loopback and literal IPs. Tests and local overrides use them.
-    let production = std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) || config.get("require_public_host").and_then(|v| v.as_bool()).unwrap_or(false);
-    let private_ok = std::env::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
+    let production = crate::envcfg::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) || config.get("require_public_host").and_then(|v| v.as_bool()).unwrap_or(false);
+    let private_ok = crate::envcfg::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
     if production && !private_ok && (host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()) {
         return Err("base_url must name a public host; loopback and IP hosts are refused".into());
     }
@@ -4766,3 +4853,25 @@ mod tests {
     }
 
 }
+#[cfg(target_arch = "wasm32")]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn oci_vault_sync(_config: &Value, _secrets: &[(String, String)], _previous: &[String]) -> Result<(String, Vec<String>), String> { Err("OCI Vault sync needs RSA request signing, which requires the native server".into()) }
+#[cfg(target_arch = "wasm32")]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn oci_vault_test(_config: &Value) -> Result<String, String> { Err("OCI Vault needs RSA request signing, which requires the native server".into()) }
+#[cfg(target_arch = "wasm32")]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn ssh_file_sync(_config: &Value, _secrets: &[(String, String, String, String)], _previous: &[String]) -> Result<(String, Vec<String>), String> { Err("SSH file sync needs the native server: a Worker cannot run ssh".into()) }
+#[cfg(target_arch = "wasm32")]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn ssh_file_test(_config: &Value) -> Result<String, String> { Err("SSH file sync needs the native server: a Worker cannot run ssh".into()) }
+#[cfg(target_arch = "wasm32")]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn ssh_file_pull(_config: &Value) -> Result<Vec<(String, String)>, String> { Err("SSH file sync needs the native server: a Worker cannot run ssh".into()) }
+#[cfg(target_arch = "wasm32")]
+pub fn ssh_owned_names(_config: &Value, _secrets: &[(String, String, String, String)]) -> Result<Vec<String>, String> { Err("SSH file sync needs the native server: a Worker cannot run ssh".into()) }

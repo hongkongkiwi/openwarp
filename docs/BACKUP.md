@@ -112,3 +112,14 @@ Record the backup timestamp, restored version, checks, and recovery time. Remove
 Replacing a master key is not a migration or rotation procedure. Keep the original database and key intact while investigating a failed restore.
 
 [Deployment](DEPLOY.md) · [Security model](SECURITY.md) · [Documentation index](README.md)
+
+## Cloudflare Workers
+
+Durable Object SQLite supports point-in-time recovery for the last 30 days
+through the in-object PITR API: `getCurrentBookmark()`,
+`getBookmarkForTime(timestamp)` and `onNextSessionRestoreBookmark(bookmark)`
+followed by `ctx.abort()`. Cloudflare documents that this API does not work
+under `wrangler dev`, so rehearse a restore on a non-production Worker first.
+
+`OPENWARP_MASTER_KEY` is not stored in the object database; keep it as a
+Worker secret and back it up separately, or recovered ciphertext cannot be read.

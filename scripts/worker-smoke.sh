@@ -1,0 +1,56 @@
+#!/usr/bin/env sh
+# Boot the Workers deployment in workerd and exercise the shared API.
+# Requires: worker-build, a Wrangler install, node 18+.
+#   scripts/worker-smoke.sh            # uses npx wrangler
+#   WRANGLER=/path/to/wrangler scripts/worker-smoke.sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PORT=${PORT:-8799}
+ECHO_PORT=$((PORT + 1))
+BASE="http://127.0.0.1:${PORT}"
+WRANGLER=${WRANGLER:-npx --no-install wrangler}
+# The OIDC check runs a loopback identity provider, so the local smoke allows
+# private egress; production keeps the default refusal.
+STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/openwarp-worker-smoke.XXXXXX")
+LOG="${STATE_DIR}/wrangler.log"
+
+cleanup() {
+  if [ -n "${DEV_PID:-}" ]; then kill "${DEV_PID}" 2>/dev/null || true; fi
+  if [ -n "${ECHO_PID:-}" ]; then kill "${ECHO_PID}" 2>/dev/null || true; fi
+  # wrangler spawns workerd as a grandchild; stop both by port scope.
+  pkill -f "wrangler.*dev --port ${PORT}" 2>/dev/null || true
+  pkill -f "workerd serve.*:${PORT}" 2>/dev/null || true
+  rm -rf "${STATE_DIR}"
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -f "${ROOT}/crates/server/build/worker/shim.mjs" ]; then
+  echo "worker bundle missing; run: (cd crates/server && worker-build --release --no-default-features)" >&2
+  exit 2
+fi
+
+MASTER=$(head -c 32 /dev/urandom | base64)
+PORT="${ECHO_PORT}" node "${ROOT}/scripts/smoke-echo.mjs" >"${LOG}.echo" 2>&1 &
+ECHO_PID=$!
+(cd "${ROOT}" && ${WRANGLER} dev --port "${PORT}" --test-scheduled --persist-to "${STATE_DIR}/state" --var "OPENWARP_MASTER_KEY:${MASTER}" --var "OPENWARP_ENV:production" --var "OPENWARP_ALLOW_PRIVATE_EGRESS:1" --var "OPENWARP_ALLOWED_DB_HOSTS:127.0.0.1:5432" --var "OPENWARP_EMAIL_WEBHOOK:http://127.0.0.1:${ECHO_PORT}/mail" >"${LOG}" 2>&1) &
+DEV_PID=$!
+
+i=0
+while [ "${i}" -lt 90 ]; do
+  if curl -fsS "${BASE}/health" >/dev/null 2>&1; then break; fi
+  if ! kill -0 "${DEV_PID}" 2>/dev/null; then
+    echo "wrangler dev exited before becoming ready" >&2
+    tail -n 60 "${LOG}" >&2
+    exit 1
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+if ! curl -fsS "${BASE}/health" >/dev/null 2>&1; then
+  echo "wrangler dev did not answer /health within 90s" >&2
+  tail -n 60 "${LOG}" >&2
+  exit 1
+fi
+
+OPENWARP_SMOKE_BASE="${BASE}" OPENWARP_SMOKE_ECHO="http://127.0.0.1:${ECHO_PORT}" node "${ROOT}/scripts/worker-smoke.mjs"

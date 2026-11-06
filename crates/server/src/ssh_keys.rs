@@ -7,11 +7,14 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-fn http() -> reqwest::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
+#[cfg(not(target_arch = "wasm32"))]
+fn http() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::builder().build().expect("http client")) }
+#[cfg(target_arch = "wasm32")]
+fn http() -> crate::http::Client { crate::http::Client::new() }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
 fn enc(s: &str) -> String { s.bytes().map(|b| match b { b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(), b => format!("%{:02X}", b) }).collect() }
-async fn send(r: reqwest::RequestBuilder) -> Result<String, String> {
+async fn send(r: crate::http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }
