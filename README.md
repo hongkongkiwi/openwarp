@@ -47,6 +47,10 @@ openwarp run     --env <ENV_ID> -- ./your-app   # secrets injected as env vars
 
 Access tokens are refreshed automatically from the saved refresh token when
 one exists; `init` defaults remove the need to pass `--env` on every call.
+Access and refresh tokens are stored in the operating system credential store
+(macOS Keychain, Linux Secret Service) and removed from the config file when
+that succeeds; `OPENWARP_NO_KEYRING=1` forces the 0600 file, and
+`OPENWARP_CONFIG` overrides its path.
 
 ## Sign-in and signups
 

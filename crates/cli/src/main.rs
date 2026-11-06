@@ -31,15 +31,80 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Completion { shell: String },
 }
 
-fn config_path() -> std::path::PathBuf { let home = std::env::var("HOME").unwrap_or_else(|_| ".".into()); std::path::Path::new(&home).join(".openwarp").join("config.json") }
-fn load_config() -> Value { std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
+fn config_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("OPENWARP_CONFIG") { if !p.is_empty() { return std::path::PathBuf::from(p); } }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into()); std::path::Path::new(&home).join(".openwarp").join("config.json") }
+
+// Access and refresh tokens go to the operating system's credential store when
+// one is available; the 0600 config file keeps only non-secret settings. Set
+// OPENWARP_NO_KEYRING=1 to force the file-only behaviour.
+const KEYRING_SERVICE: &str = "openwarp";
+fn keyring_enabled() -> bool {
+    if std::env::var("OPENWARP_NO_KEYRING").map(|v| v == "1").unwrap_or(false) { return false; }
+    cfg!(any(target_os = "macos", target_os = "linux")) }
+#[cfg(target_os = "macos")]
+fn keyring_set_raw(account: &str, value: &str) -> bool {
+    std::process::Command::new("security")
+        .args(["add-generic-password", "-U", "-s", KEYRING_SERVICE, "-a", account, "-w", value])
+        .output().map(|o| o.status.success()).unwrap_or(false) }
+#[cfg(target_os = "linux")]
+fn keyring_set_raw(account: &str, value: &str) -> bool {
+    use std::io::Write; use std::process::Stdio;
+    let mut child = match std::process::Command::new("secret-tool")
+        .args(["store", "--label", KEYRING_SERVICE, "service", KEYRING_SERVICE, "host", account])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() { Ok(c) => c, Err(_) => return false };
+    if let Some(mut stdin) = child.stdin.take() { let _ = stdin.write_all(value.as_bytes()); }
+    child.wait().map(|s| s.success()).unwrap_or(false) }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keyring_set_raw(_account: &str, _value: &str) -> bool { false }
+#[cfg(target_os = "macos")]
+fn keyring_get_raw(account: &str) -> Option<String> {
+    let out = std::process::Command::new("security").args(["find-generic-password", "-s", KEYRING_SERVICE, "-a", account, "-w"]).output().ok()?;
+    if !out.status.success() { return None; }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string(); if s.is_empty() { None } else { Some(s) } }
+#[cfg(target_os = "linux")]
+fn keyring_get_raw(account: &str) -> Option<String> {
+    let out = std::process::Command::new("secret-tool").args(["lookup", "service", KEYRING_SERVICE, "host", account]).output().ok()?;
+    if !out.status.success() { return None; }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string(); if s.is_empty() { None } else { Some(s) } }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keyring_get_raw(_account: &str) -> Option<String> { None }
+#[cfg(target_os = "macos")]
+fn keyring_del_raw(account: &str) { let _ = std::process::Command::new("security").args(["delete-generic-password", "-s", KEYRING_SERVICE, "-a", account]).output(); }
+#[cfg(target_os = "linux")]
+fn keyring_del_raw(account: &str) { let _ = std::process::Command::new("secret-tool").args(["clear", "service", KEYRING_SERVICE, "host", account]).output(); }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keyring_del_raw(_account: &str) {}
+fn keyring_account(host: &str, kind: &str) -> String { format!("{}:{}", host, kind) }
+fn keyring_store(host: &str, kind: &str, value: &str) -> bool {
+    if !keyring_enabled() || value.is_empty() { return false; }
+    keyring_set_raw(&keyring_account(host, kind), value) }
+fn keyring_get(host: &str, kind: &str) -> Option<String> {
+    if !keyring_enabled() { return None; }
+    keyring_get_raw(&keyring_account(host, kind)) }
+fn keyring_delete(host: &str, kind: &str) { if keyring_enabled() { keyring_del_raw(&keyring_account(host, kind)); } }
+
+fn load_config() -> Value {
+    let mut v = std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+    if let Some(host) = v["host"].as_str().map(|s| s.to_string()) {
+        for kind in ["access_token", "refresh_token"] {
+            if v[kind].as_str().map(|s| s.is_empty()).unwrap_or(true) {
+                if let Some(tok) = keyring_get(&host, kind) { v[kind] = json!(tok); } } } }
+    v }
 fn save_config(v: &Value) {
     let p = config_path();
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)); }
     }
-    let data = serde_json::to_string_pretty(v).expect("serialize config");
+    // Move secrets into the keyring first; only remove them from the file for
+    // the entries the keyring actually accepted.
+    let mut stored = v.clone();
+    if let Some(host) = v["host"].as_str().map(|s| s.to_string()) {
+        for kind in ["access_token", "refresh_token"] {
+            match v[kind].as_str() { Some(tok) if !tok.is_empty() => { if keyring_store(&host, kind, tok) { stored[kind] = Value::Null; } }
+                _ => keyring_delete(&host, kind) } } }
+    let data = serde_json::to_string_pretty(&stored).expect("serialize config");
     #[cfg(unix)] {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
