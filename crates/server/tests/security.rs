@@ -354,6 +354,13 @@ async fn env_scoped_token_cannot_escape_through_mcp_or_mint_tokens() {
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[1]), Some(&pat), None).await;
     assert_eq!(r.status, 403, "REST scope escape should already be blocked");
 
+    let r = s.call(Method::GET, &format!("/api/envs/{}/integrations", envs[1]), Some(&pat), None).await;
+    assert_eq!(r.status, 403, "env-scoped token listed another environment's integrations, got {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/dynamic", envs[1]), Some(&pat), Some(json!({"name": "lease"}))).await;
+    assert_eq!(r.status, 403, "env-scoped token created a lease in another environment, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, "/api/search?q=OTHER", Some(&pat), None).await;
+    assert_eq!(r.status, 403, "env-scoped token used global search, got {} {}", r.status, r.text);
+
     let r = s
         .call(
             Method::POST,

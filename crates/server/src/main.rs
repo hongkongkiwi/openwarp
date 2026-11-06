@@ -766,7 +766,20 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
         let scope = db::s(&row, "scope");
         if !scope.split_whitespace().any(|s| s == "*" || s == need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("OAuth token lacks scope {}", need)}))).into_response(); }
     }
+    let scoped = env_scope_of(&st, req.headers());
+    if !scoped.is_empty() && !scope_path_ok(&st, &scoped, &path) { return (StatusCode::FORBIDDEN, Json(json!({"error": "this token is scoped to a different environment"}))).into_response(); }
     next.run(req).await }
+fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
+    if path == "/api/search" { return false; }
+    if let Some(rest) = path.strip_prefix("/api/envs/") { return rest.split('/').next().unwrap_or("") == scope; }
+    let target = path.strip_prefix("/api/secrets/").map(|r| ("secrets", r))
+        .or_else(|| path.strip_prefix("/api/leases/").map(|r| ("leases", r)))
+        .or_else(|| path.strip_prefix("/api/integrations/").map(|r| ("integrations", r)))
+        .or_else(|| path.strip_prefix("/api/rotations/").map(|r| ("rotation_schedules", r)));
+    match target {
+        Some((table, rest)) => { let id = rest.split('/').next().unwrap_or(""); st.db.one(&format!("SELECT env_id FROM {} WHERE id=?", table), &[json!(id)]).ok().flatten().map(|r| db::s(&r, "env_id") == scope).unwrap_or(false) }
+        None => true,
+    } }
 
 // ---------- logout / token management (T04) ----------
 async fn logout(State(st): State<S>, h: HeaderMap) -> Res {
