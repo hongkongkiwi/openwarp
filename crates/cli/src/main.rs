@@ -72,11 +72,11 @@ fn main() {
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
     match &cli.cmd {
         Cmd::Login { token: t, client_id, client_secret } => {
-            if let Some(tok) = t { let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(tok); c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Token saved to {}", config_path().display()); return; }
+            if let Some(tok) = t { let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(tok); c["refresh_token"] = Value::Null; c["client_id"] = Value::Null; c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Token saved to {}", config_path().display()); return; }
             if let (Some(cid), Some(sec)) = (client_id, client_secret) {
                 let d: Value = client.post(format!("{}/api/v1/machine/auth/universal/login", host)).json(&json!({"client_id": cid, "client_secret": sec})).send().expect("req").json().expect("json");
                 let at = d["accessToken"].as_str().unwrap_or_else(|| panic!("machine login failed: {}", d));
-                let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Machine login OK (token expires in {}s)", d["expiresIn"]); return; }
+                let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["refresh_token"] = Value::Null; c["client_id"] = Value::Null; c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Machine login OK (token expires in {}s)", d["expiresIn"]); return; }
             // Browser OAuth 2.1 with PKCE, loopback redirect on an ephemeral port
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port for the OAuth redirect");
             let port = listener.local_addr().expect("loopback address").port();
@@ -107,7 +107,7 @@ fn main() {
             let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(at); c["refresh_token"] = tok["refresh_token"].clone(); c["client_id"] = json!(cid); c["obtained_at"] = json!(now_secs()); save_config(&c);
             println!("Logged in. Credentials saved to {}", config_path().display());
         }
-        Cmd::Logout => { let _ = client.post(format!("{}/api/auth/logout", host)).bearer_auth(&token).send(); let mut c = cfg.clone(); c["access_token"] = Value::Null; c["refresh_token"] = Value::Null; save_config(&c); println!("Logged out"); }
+        Cmd::Logout => { let _ = client.post(format!("{}/api/auth/logout", host)).bearer_auth(&token).send(); let mut c = cfg.clone(); c["access_token"] = Value::Null; c["refresh_token"] = Value::Null; c["client_id"] = Value::Null; save_config(&c); println!("Logged out"); }
         Cmd::Whoami => { println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/me", host))).unwrap()); }
         Cmd::Init { app, env } => { std::fs::write(".openwarp.json", serde_json::to_string_pretty(&json!({"host": host, "app_id": app, "env_id": env})).unwrap()).expect("write .openwarp.json"); println!("Wrote .openwarp.json"); }
         Cmd::Orgs => { println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/orgs", host))).unwrap()); }

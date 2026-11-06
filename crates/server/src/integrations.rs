@@ -108,7 +108,10 @@ pub async fn trigger_sync(config: &Value, secrets: &[(String, String)], previous
             created = bulk.iter().filter(|v| !remote.contains_key(v.get("name").and_then(|x| x.as_str()).unwrap_or(""))).count();
             updated = bulk.len() - created;
             if !bulk.is_empty() { if let Err(e) = req(client.post(format!("{}/import", root)).bearer_auth(&tg.token).json(&json!({"variables": bulk, "override": true}))).await { failures += 1; reports.push(format!("{}/{}: import failed: {}", tg.project_ref, tg.env, e)); continue; } }
-            if mode == "mirror" { for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) { let _ = req(client.delete(format!("{}/{}", root, name)).bearer_auth(&tg.token)).await; deleted += 1; } } }
+            if mode == "mirror" { let mut delete_errors: Vec<String> = Vec::new();
+                for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) {
+                    match req(client.delete(format!("{}/{}", root, name)).bearer_auth(&tg.token)).await { Ok(_) => deleted += 1, Err(e) => delete_errors.push(format!("{}: {}", name, e)) } } }
+                if !delete_errors.is_empty() { failures += 1; reports.push(format!("{}/{}: delete failed: {}", tg.project_ref, tg.env, delete_errors.join("; "))); } }
         } else { for (name, value) in &desired { match remote.get(name) { None => created += 1, Some(old) if old != value => updated += 1, Some(_) => unchanged += 1 } }
             if mode == "mirror" { for name in previous_managed { if !desired.iter().any(|(n, _)| n == name) && remote.contains_key(name) { deleted += 1; } } } }
         for (n, _) in &desired { if !managed.contains(n) { managed.push(n.clone()); } }

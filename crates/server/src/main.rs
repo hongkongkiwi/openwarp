@@ -201,8 +201,12 @@ async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -
 async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?;
     let role = st.require_org(&oid, &uid)?; if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN, "admin required")); }
     let target = st.db.one("SELECT id FROM users WHERE email=?", &[json!(r.email.to_lowercase())]).map_err(|e| bad(&e))?.ok_or_else(|| bad("user must register first"))?;
-    let new_role = if r.role.is_empty() { "developer".to_string() } else { r.role.clone() };
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(oid), json!(db::s(&target,"id")), json!(new_role)]).map_err(|e| bad(&e))?;
+    let tid = db::s(&target, "id");
+    if st.org_role(&oid, &tid).is_some() { return Err(err(StatusCode::CONFLICT, "user is already a member")); }
+    let new_role = if r.role.trim().is_empty() { "developer".to_string() } else { r.role.trim().to_string() };
+    if (new_role == "owner" || new_role == "admin") && role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant the owner or admin role")); }
+    if new_role != "owner" && new_role != "admin" && new_role != "developer" && st.db.one("SELECT id FROM roles WHERE org_id=? AND name=?", &[json!(oid), json!(new_role)]).map_err(|e| bad(&e))?.is_none() { return Err(bad("unknown role for this organisation")); }
+    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(oid), json!(tid), json!(new_role)]).map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "member.invite", &r.email); Ok(j(json!({"ok": true}))) }
 async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?; st.require_org(&oid, &uid)?;
     let aid = id(); st.db.exec("INSERT INTO apps(id,org_id,name,readme,created_at) VALUES(?,?,?,?,?)", &[json!(aid), json!(oid), json!(r.name), json!(r.readme), json!(now())]).map_err(|e| bad(&e))?;
@@ -234,8 +238,8 @@ async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): P
     if target == uid { return Err(bad("use another admin to remove yourself; leaving your own organisation is not supported")); }
     let target_role = st.org_role(&oid, &target).ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
     if target_role == "owner" && role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can remove an owner")); }
-    if target_role == "owner" { let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(oid)]).map_err(|e| bad(&e))?.len(); if owners <= 1 { return Err(bad("cannot remove the last owner")); } }
-    st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=?", &[json!(oid), json!(target)]).map_err(|e| bad(&e))?;
+    let deleted = st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)", &[json!(oid), json!(target), json!(oid)]).map_err(|e| bad(&e))?;
+    if deleted == 0 { return Err(bad("cannot remove the last owner")); }
     st.audit(&oid, "", "", &uid, "member.remove", &target); Ok(j(json!({"ok": true}))) }
 async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h)?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
@@ -577,24 +581,33 @@ async fn scim_delete_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<St
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
     st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).map_err(|e| bad(&e))?; st.db.exec("DELETE FROM teams WHERE id=?", &[json!(tid)]).map_err(|e| bad(&e))?; Ok(j(json!({"deleted": tid}))) }
-async fn scim_put_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q)?; let uid = tid;
+async fn scim_put_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q)?; let caller = st.token_user(&h)?; let uid = tid;
     if !scim_member(&st, &org, &uid) { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
-    if let Some(email) = body.get("userName").and_then(|v| v.as_str()) { st.db.exec("UPDATE users SET email=? WHERE id=?", &[json!(email.to_lowercase()), json!(uid)]).map_err(|e| bad(&e))?; }
-    if let Some(active) = body.get("active").and_then(|v| v.as_bool()) { if !active { scim_deactivate(&st, &org, &uid)?; } }
+    if let Some(email) = body.get("userName").and_then(|v| v.as_str()) {
+        let current = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).map_err(|e| bad(&e))?.map(|r| db::s(&r, "email")).unwrap_or_default();
+        if !email.eq_ignore_ascii_case(&current) {
+            let orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?;
+            for o in &orgs { let r = st.org_role(&db::s(o, "org_id"), &caller).unwrap_or_default(); if r != "owner" && r != "admin" { return Err(err(StatusCode::FORBIDDEN, "changing an account email requires admin rights in every organisation the user belongs to")); } }
+            st.db.exec("UPDATE users SET email=? WHERE id=?", &[json!(email.to_lowercase()), json!(uid)]).map_err(|e| bad(&e))?; } }
+    if let Some(active) = body.get("active").and_then(|v| v.as_bool()) { if !active { scim_deactivate(&st, &org, &uid, &caller)?; } }
     Ok(j(json!({"id": uid, "active": body.get("active").and_then(|v| v.as_bool()).unwrap_or(true)}))) }
-async fn scim_patch_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q)?; let uid = tid;
+async fn scim_patch_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q)?; let caller = st.token_user(&h)?; let uid = tid;
     if !scim_member(&st, &org, &uid) { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
     for op in body.get("Operations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        if op.get("path").and_then(|v| v.as_str()) == Some("active") { if let Some(a) = op.get("value").and_then(|v| v.as_bool()) { if !a { scim_deactivate(&st, &org, &uid)?; } } } }
+        if op.get("path").and_then(|v| v.as_str()) == Some("active") { if let Some(a) = op.get("value").and_then(|v| v.as_bool()) { if !a { scim_deactivate(&st, &org, &uid, &caller)?; } } } }
     Ok(j(json!({"id": uid}))) }
-async fn scim_delete_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q)?;
+async fn scim_delete_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q)?; let caller = st.token_user(&h)?;
     if !scim_member(&st, &org, &tid) { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
-    scim_deactivate(&st, &org, &tid)?; Ok(j(json!({"id": tid, "active": false}))) }
-fn scim_deactivate(st: &S, org: &str, uid: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(uid)]).map_err(|e| bad(&e))?;
+    scim_deactivate(&st, &org, &tid, &caller)?; Ok(j(json!({"id": tid, "active": false}))) }
+fn scim_deactivate(st: &S, org: &str, uid: &str, caller: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let target_role = st.org_role(org, uid).unwrap_or_default();
+    if target_role == "owner" { let caller_role = st.org_role(org, caller).unwrap_or_default(); if caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can remove an owner")); } }
+    let deleted = st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)", &[json!(org), json!(uid), json!(org)]).map_err(|e| bad(&e))?;
+    if deleted == 0 { return Err(bad("cannot remove the last owner")); }
     st.db.exec("DELETE FROM team_members WHERE user_id=? AND team_id IN (SELECT id FROM teams WHERE org_id=?)", &[json!(uid), json!(org)]).map_err(|e| bad(&e))?;
-    st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(uid)]).map_err(|e| bad(&e))?;
-    if let Ok(rows) = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(uid)]) { if rows.is_empty() { let _ = st.db.exec("UPDATE users SET active=0 WHERE id=?", &[json!(uid)]); } }
+    if let Ok(rows) = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(uid)]) { if rows.is_empty() {
+        let _ = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(uid)]);
+        let _ = st.db.exec("UPDATE users SET active=0 WHERE id=?", &[json!(uid)]); } }
     Ok(()) }
 
 
@@ -734,21 +747,34 @@ fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
     let (a, b) = (parse(ip), parse(net)); if a.len() != 4 || b.len() != 4 { return ip == net; }
     let to_u = |v: &Vec<u32>| (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
     let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) }; (to_u(&a) & mask) == (to_u(&b) & mask) }
+fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
+    let seg = |prefix: &str| path.strip_prefix(prefix).and_then(|r| r.split('/').next()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    if let Some(oid) = seg("/api/orgs/") { return Some(oid); }
+    if let Some(aid) = seg("/api/apps/") { return st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).ok().flatten().map(|r| db::s(&r, "org_id")); }
+    if let Some(eid) = seg("/api/envs/") { return st.env_org_app(&eid).ok().map(|(o, _)| o); }
+    for (prefix, table) in [("/api/secrets/", "secrets"), ("/api/leases/", "leases"), ("/api/integrations/", "integrations"), ("/api/rotations/", "rotation_schedules")] {
+        if let Some(id) = seg(prefix) { return st.db.one(&format!("SELECT env_id FROM {} WHERE id=?", table), &[json!(id)]).ok().flatten().and_then(|r| st.env_org_app(&db::s(&r, "env_id")).ok().map(|(o, _)| o)); }
+    }
+    if let Some(caid) = seg("/api/pki/cas/") { return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(caid)]).ok().flatten().map(|r| db::s(&r, "org_id")); }
+    if let Some(cid) = seg("/api/pki/certs/") { return st.db.one("SELECT ca_id FROM pki_certs WHERE id=?", &[json!(cid)]).ok().flatten().and_then(|r| st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(db::s(&r, "ca_id"))]).ok().flatten()).map(|r| db::s(&r, "org_id")); }
+    if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "org_id").map(|(_, v)| v.to_string()); }
+    None }
 async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let protected = path.starts_with("/api/") || path == "/mcp" || path.starts_with("/scim/");
     if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
     let headers = req.headers().clone(); let uid = match st.token_user(&headers) { Ok(u) => u, Err(_) => return next.run(req).await };
-    let orgs = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).unwrap_or_default();
-    let lists: Vec<String> = orgs.iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect();
-    // machine identities: check their org allowlist too
-    let lists = if lists.is_empty() { st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN identities i ON i.org_id=o.id WHERE i.id=?", &[json!(uid)]).unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect::<Vec<_>>() } else { lists };
-    if lists.is_empty() { return next.run(req).await; }
     let trust_proxy = std::env::var("OPENWARP_TRUST_PROXY").map(|v| v == "1").unwrap_or(false);
     let forwarded = if trust_proxy { headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()) } else { None };
     let conn_ip = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string());
     let client_ip = forwarded.or(conn_ip).unwrap_or_default();
-    let allowed = !client_ip.is_empty() && lists.iter().any(|l| l.split(',').any(|c| ip_in_cidr(&client_ip, c)));
+    let query = req.uri().query().unwrap_or("").to_string();
+    let allowed = if client_ip.is_empty() { false } else { match request_org(&st, &path, &query) {
+        Some(oid) => { let list = st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(oid)]).ok().flatten().map(|r| db::s(&r, "ip_allowlist")).unwrap_or_default();
+            list.trim().is_empty() || list.split(',').any(|c| ip_in_cidr(&client_ip, c)) }
+        None => { let mut lists: Vec<String> = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect();
+            if lists.is_empty() { lists = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN identities i ON i.org_id=o.id WHERE i.id=?", &[json!(uid)]).unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect(); }
+            lists.is_empty() || lists.iter().all(|l| l.split(',').any(|c| ip_in_cidr(&client_ip, c))) } } };
     if !allowed { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("source IP {} not in organisation allowlist", client_ip)}))).into_response(); }
     next.run(req).await }
 
@@ -770,15 +796,18 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     if !scoped.is_empty() && !scope_path_ok(&st, &scoped, &path) { return (StatusCode::FORBIDDEN, Json(json!({"error": "this token is scoped to a different environment"}))).into_response(); }
     next.run(req).await }
 fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
-    if path == "/api/search" { return false; }
-    if let Some(rest) = path.strip_prefix("/api/envs/") { return rest.split('/').next().unwrap_or("") == scope; }
+    if path == "/api/me" || path == "/api/auth/logout" { return true; }
+    if let Some(rest) = path.strip_prefix("/api/envs/") {
+        let (eid, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        return eid == scope && !tail.is_empty();
+    }
     let target = path.strip_prefix("/api/secrets/").map(|r| ("secrets", r))
         .or_else(|| path.strip_prefix("/api/leases/").map(|r| ("leases", r)))
         .or_else(|| path.strip_prefix("/api/integrations/").map(|r| ("integrations", r)))
         .or_else(|| path.strip_prefix("/api/rotations/").map(|r| ("rotation_schedules", r)));
     match target {
         Some((table, rest)) => { let id = rest.split('/').next().unwrap_or(""); st.db.one(&format!("SELECT env_id FROM {} WHERE id=?", table), &[json!(id)]).ok().flatten().map(|r| db::s(&r, "env_id") == scope).unwrap_or(false) }
-        None => true,
+        None => false,
     } }
 
 // ---------- logout / token management (T04) ----------
@@ -886,8 +915,7 @@ fn oauth_user(st: &S, h: &HeaderMap) -> Option<String> {
     let bearer = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
     let cookie = cookie_val(h, "ow_session");
     for tok in [bearer, cookie] { if tok.is_empty() { continue; }
-        if let Ok(Some(r)) = st.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(oc::hash_token(&tok))]) { if db::n(&r,"created_at") + 7*86400 >= now() { return Some(db::s(&r,"user_id")); } }
-        if let Ok(Some(r)) = st.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(oc::hash_token(&tok)), json!(now())]) { return Some(db::s(&r,"user_id")); } }
+        if let Ok(Some(r)) = st.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(oc::hash_token(&tok))]) { if db::n(&r,"created_at") + 7*86400 >= now() { return Some(db::s(&r,"user_id")); } } }
     None }
 pub fn oauth_access(st: &S, h: &HeaderMap) -> Option<(String, String, String)> {
     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let tok = auth.strip_prefix("Bearer ").unwrap_or("");
@@ -935,6 +963,7 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, axum::extract::Connec
         if db::n(&row, "active") == 0 { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
         if !oc::verify_password(&password, &db::s(&row, "pass_hash")) { rate_fail(&key); return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(); }
         rate_clear(&key); db::s(&row, "id") };
+    if !st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).ok().flatten().map(|u| db::n(&u, "active") != 0).unwrap_or(true) { return (StatusCode::UNAUTHORIZED, "account deactivated").into_response(); }
     if !otp_ok(&st, &uid, form.get("otp").map(|s| s.as_str()).unwrap_or("")) {
         let page = format!("<html><body style=\"font-family:system-ui;background:#0b1020;color:#fff;padding:40px\"><h1>Two-factor required</h1><p>Enter the code from your authenticator app or a recovery code.</p><form method=post action=\"/oauth/authorize/decision\">{}<input name=otp placeholder=\"authenticator code\" autocomplete=one-time-code required><br><button name=approve value=1 style=\"padding:10px 20px;margin-top:8px\">Continue</button></form></body></html>", hidden_fields(&form));
         return (StatusCode::UNAUTHORIZED, html_csp(page)).into_response();
@@ -962,12 +991,14 @@ async fn oauth_token(State(st): State<S>, axum::extract::Form(form): axum::extra
         let verifier = form.get("code_verifier").cloned().unwrap_or_default();
         use sha2::{Digest, Sha256}; let computed = b64url(&Sha256::digest(verifier.as_bytes()));
         if computed != db::s(&row, "code_challenge") { return (StatusCode::BAD_REQUEST, Json(json!({"error":"PKCE verification failed"}))); }
+        if let Ok(Some(u)) = st.db.one("SELECT active FROM users WHERE id=?", &[json!(db::s(&row, "user_id"))]) { if db::n(&u, "active") == 0 { return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))); } }
         let _ = st.db.exec("DELETE FROM oauth_codes WHERE code_hash=?", &[json!(oc::hash_token(&code))]);
         (StatusCode::OK, Json(issue_oauth_tokens(&st, &client_id, &db::s(&row,"user_id"), &db::s(&row,"scope"), &db::s(&row,"resource"), "")))
     } else if grant == "refresh_token" {
         let rt = form.get("refresh_token").cloned().unwrap_or_default();
         let row = match st.db.one("SELECT * FROM oauth_tokens WHERE token_hash=? AND kind='refresh' AND expires_at>?", &[json!(oc::hash_token(&rt)), json!(now())]) { Ok(Some(r)) => r, _ => return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))) };
         if db::s(&row, "client_id") != client_id { return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))); }
+        if let Ok(Some(u)) = st.db.one("SELECT active FROM users WHERE id=?", &[json!(db::s(&row, "user_id"))]) { if db::n(&u, "active") == 0 { return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))); } }
         let _ = st.db.exec("DELETE FROM oauth_tokens WHERE pair_id=?", &[json!(db::s(&row,"pair_id"))]);
         (StatusCode::OK, Json(issue_oauth_tokens(&st, &client_id, &db::s(&row,"user_id"), &db::s(&row,"scope"), &db::s(&row,"resource"), &db::s(&row,"pair_id"))))
     } else { (StatusCode::BAD_REQUEST, Json(json!({"error":"unsupported_grant_type"}))) } }
@@ -994,7 +1025,7 @@ async fn mcp_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusCode
     if let Some(origin) = h.get("origin").and_then(|v| v.to_str().ok()) { let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !origin.contains(host) { return Err((StatusCode::FORBIDDEN, hdr, Json(json!({"error":"Origin does not match Host"})))); } }
     if let Some((uid, scope, audience)) = oauth_access(st, h) {
-        if !audience.is_empty() && audience != format!("{}/mcp", iss) { return Err((StatusCode::UNAUTHORIZED, hdr, Json(json!({"error":"token audience does not match this MCP endpoint"})))); }
+        if audience != format!("{}/mcp", iss) { return Err((StatusCode::UNAUTHORIZED, hdr, Json(json!({"error":"token audience does not match this MCP endpoint"})))); }
         return Ok((uid, scope)); }
     if let Ok(uid) = st.token_user(h) { return Ok((uid, "secrets:read secrets:write".into())); }
     Err((StatusCode::UNAUTHORIZED, hdr, Json(json!({"error":"unauthorized; OAuth access token required, see /.well-known/oauth-protected-resource"})))) }

@@ -360,6 +360,12 @@ async fn env_scoped_token_cannot_escape_through_mcp_or_mint_tokens() {
     assert_eq!(r.status, 403, "env-scoped token created a lease in another environment, got {} {}", r.status, r.text);
     let r = s.call(Method::GET, "/api/search?q=OTHER", Some(&pat), None).await;
     assert_eq!(r.status, 403, "env-scoped token used global search, got {} {}", r.status, r.text);
+    let r = s.call(Method::DELETE, &format!("/api/apps/{}", app), Some(&pat), None).await;
+    assert_eq!(r.status, 403, "env-scoped token could delete the whole app, got {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(&pat), Some(json!({"name": "escape"}))).await;
+    assert_eq!(r.status, 403, "env-scoped token could mint a machine identity, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(&pat), None).await;
+    assert_eq!(r.status, 403, "env-scoped token reached org routes, got {} {}", r.status, r.text);
 
     let r = s
         .call(
@@ -563,6 +569,112 @@ async fn production_requires_an_external_master_key() {
     let _ = std::fs::remove_dir_all(&dir);
     let status = exited.expect("production start without OPENWARP_MASTER_KEY must fail fast");
     assert!(!status.success(), "production start must refuse to persist a generated master key in the database");
+}
+
+#[tokio::test]
+async fn read_only_oauth_token_cannot_authorize_a_write_grant() {
+    let s = Server::start().await;
+    let u = register(&s, "grant@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let (read_token, _) = oauth_token(&s, token, "secrets:read", &format!("{}/mcp", s.base)).await;
+
+    let r = s.call(Method::POST, "/oauth/register", None, Some(json!({"redirect_uris": ["http://127.0.0.1:8917/callback"], "token_endpoint_auth_method": "none"}))).await;
+    let client_id = r.body["client_id"].as_str().unwrap().to_string();
+    let verifier = "integration-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
+    let challenge = { use sha2::{Digest, Sha256}; base64url(&Sha256::digest(verifier.as_bytes())) };
+    let form = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", client_id),
+        ("redirect_uri", "http://127.0.0.1:8917/callback".to_string()),
+        ("scope", "secrets:read secrets:write".to_string()),
+        ("state", "s".to_string()),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256".to_string()),
+        ("approve", "1".to_string()),
+    ];
+    let r = s.form("/oauth/authorize/decision", &form, Some(&read_token)).await;
+    assert!(r.status >= 400, "a read-only OAuth token must not authorize a write grant, got {} {}", r.status, r.header("location"));
+}
+
+#[tokio::test]
+async fn mcp_rejects_tokens_with_an_empty_audience() {
+    let s = Server::start().await;
+    let u = register(&s, "audience@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let (oat, _) = oauth_token(&s, token, "secrets:read", "").await;
+    let r = s
+        .call(
+            Method::POST,
+            "/mcp",
+            Some(&oat),
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_secrets", "arguments": {"env_id": envs[0]}}})),
+        )
+        .await;
+    assert_eq!(r.status, 401, "empty-audience token must not reach MCP, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn scim_cannot_remove_the_last_owner() {
+    let s = Server::start().await;
+    let owner = register(&s, "owner@test.invalid").await;
+    let admin = register(&s, "admin@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let ou = owner["user_id"].as_str().unwrap();
+    let at = admin["token"].as_str().unwrap();
+    let au = admin["user_id"].as_str().unwrap();
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
+    assert_eq!(r.status, 200, "invite failed: {}", r.text);
+
+    let r = s.call(Method::DELETE, &format!("/scim/v2/Users/{}?org_id={}", ou, org), Some(at), None).await;
+    assert_eq!(r.status, 403, "an admin must not remove an owner over SCIM, got {} {}", r.status, r.text);
+
+    let r = s.call(Method::DELETE, &format!("/scim/v2/Users/{}?org_id={}", au, org), Some(ot), None).await;
+    assert_eq!(r.status, 200, "an owner should be able to remove an admin: {}", r.text);
+
+    let r = s.call(Method::DELETE, &format!("/scim/v2/Users/{}?org_id={}", ou, org), Some(ot), None).await;
+    assert_eq!(r.status, 400, "the last owner must not be removable, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn admin_cannot_invite_an_owner() {
+    let s = Server::start().await;
+    let owner = register(&s, "owner@test.invalid").await;
+    let admin = register(&s, "admin@test.invalid").await;
+    register(&s, "third@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let at = admin["token"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
+    assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(at), Some(json!({"email": "third@test.invalid", "role": "owner"}))).await;
+    assert_eq!(r.status, 403, "an admin must not grant ownership, got {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn allowlist_cannot_be_bypassed_through_another_organisation() {
+    let s = Server::start().await;
+    let u = register(&s, "multi@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org_a = u["org_id"].as_str().unwrap();
+    let (_, envs_a) = app_with_envs(&s, token, org_a).await;
+    let r = s.call(Method::POST, "/api/orgs", Some(token), Some(json!({"name": "second"}))).await;
+    assert_eq!(r.status, 200, "create org failed: {}", r.text);
+    let org_b = r.body["id"].as_str().unwrap();
+    let (_, envs_b) = app_with_envs(&s, token, org_b).await;
+
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org_a), Some(token), Some(json!({"ip_allowlist": "192.0.2.0/24"}))).await;
+    assert_eq!(r.status, 200, "settings failed: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org_b), Some(token), Some(json!({"ip_allowlist": "127.0.0.1/32"}))).await;
+    assert_eq!(r.status, 200, "settings failed: {}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs_a[0]), Some(token), None).await;
+    assert_eq!(r.status, 403, "a permissive second org must not unlock the first org's allowlist, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs_b[0]), Some(token), None).await;
+    assert_eq!(r.status, 200, "the allowing org should still work: {}", r.text);
 }
 
 #[tokio::test]
