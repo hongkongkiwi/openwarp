@@ -322,21 +322,38 @@ impl AppState {
     async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
     // Counters live in the database so a restart, or a second replica behind a
     // load balancer, does not reset an attacker's budget.
+    // MySQL keys rate_limits on a VARCHAR(255), and an email-length suffix can
+    // exceed it. Hash the key so every backend stores a bounded, collision-free
+    // value instead of silently failing the upsert.
+    fn rate_key(key: &str) -> String { oc::hash_token(key) }
     pub(crate) async fn rate_ok(&self, key: &str, max: usize, window: i64) -> bool {
+        let key = Self::rate_key(key);
         let cutoff = now() - window;
-        let count = self.db.one("SELECT count FROM rate_limits WHERE key=? AND window_start>?", &[json!(key), json!(cutoff)]).await
+        let count = self.db.one("SELECT count FROM rate_limits WHERE key=? AND window_start>?", &[json!(&key), json!(cutoff)]).await
             .ok().flatten().map(|r| db::n(&r, "count")).unwrap_or(0);
         (count as usize) < max }
     pub(crate) async fn rate_fail(&self, key: &str, window: i64) {
+        let key = Self::rate_key(key);
         let current = now(); let cutoff = current - window;
+        // MySQL has neither ON CONFLICT nor RETURNING, and `key` is reserved.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.db.backend() == db::Backend::Mysql {
+            let _ = self.db.exec(
+                "INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) \
+                 ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1), \
+                   window_start = IF(window_start <= ?, ?, window_start)",
+                &[json!(&key), json!(current), json!(cutoff), json!(cutoff), json!(current)]).await;
+            return; }
         let _ = self.db.query(
             "INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) \
              ON CONFLICT(key) DO UPDATE SET \
                count = CASE WHEN rate_limits.window_start <= ? THEN 1 ELSE rate_limits.count + 1 END, \
                window_start = CASE WHEN rate_limits.window_start <= ? THEN ? ELSE rate_limits.window_start END \
              RETURNING count",
-            &[json!(key), json!(current), json!(cutoff), json!(cutoff), json!(current)]).await; }
-    pub(crate) async fn rate_clear(&self, key: &str) { let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(key)]).await; }
+            &[json!(&key), json!(current), json!(cutoff), json!(cutoff), json!(current)]).await; }
+    pub(crate) async fn rate_clear(&self, key: &str) {
+        let key = Self::rate_key(key);
+        let _ = self.db.exec("DELETE FROM rate_limits WHERE key=?", &[json!(&key)]).await; }
     // Deactivated users and deleted identities must lose every credential at once.
     async fn principal_active(&self, uid: &str) -> bool {
         match self.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(uid)]).await {
@@ -1745,28 +1762,23 @@ fn issuer_url_ok(issuer: &str) -> bool {
 fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::new()) }
 #[cfg(target_arch = "wasm32")]
 fn http_client() -> crate::http::Client { crate::http::Client::new() }
-// Dynamic Postgres leases dial a host from the request. Nothing may dial unless
+// Dynamic database leases dial a host from the request. Nothing may dial unless
 // the operator named that host: this is the SSRF boundary for the feature.
-fn db_target_allowed(conn: &str) -> Result<(), String> {
+fn db_target_allowed(conn: &str) -> Result<&'static str, String> {
     let allow = crate::envcfg::var("OPENWARP_ALLOWED_DB_HOSTS").unwrap_or_default();
     let entries: Vec<String> = allow.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    if entries.is_empty() { return Err("dynamic Postgres leases are disabled; set OPENWARP_ALLOWED_DB_HOSTS=host[:port],... to enable them".into()); }
-    let rest = conn.split_once("://").map(|x| x.1).ok_or("connection string must be a postgres:// URL")?;
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
-    if authority.contains(',') { return Err("multi-host connection strings are not allowed".into()); }
-    let hostport = authority.rsplit('@').next().unwrap_or("");
-    if hostport.is_empty() { return Err("connection string has no host".into()); }
-    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
-        let (h, tail) = inner.split_once(']').ok_or("invalid IPv6 host")?;
-        (h.to_string(), tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).unwrap_or(5432))
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse::<u16>().unwrap_or(5432)),
-            _ => (hostport.to_string(), 5432) } };
-    if host.is_empty() { return Err("connection string has no host".into()); }
+    if entries.is_empty() { return Err("dynamic database leases are disabled; set OPENWARP_ALLOWED_DB_HOSTS=host[:port],... to enable them".into()); }
+    let lower = conn.to_ascii_lowercase();
+    let (scheme, targets) = if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        ("postgres", crate::pglease::targets(conn)?)
+    } else if lower.starts_with("mysql://") || lower.starts_with("mariadb://") {
+        ("mysql", crate::mysqllease::targets(conn)?)
+    } else { return Err("connection string must be a postgres://, mysql:// or mariadb:// URL".into()) };
+    if targets.len() != 1 { return Err("multi-host connection strings are not allowed".into()); }
+    let (host, port) = &targets[0];
     let target = format!("{}:{}", host, port);
-    if entries.iter().any(|e| *e == host || *e == target) { return Ok(()); }
-    Err(format!("postgres host is not permitted; OPENWARP_ALLOWED_DB_HOSTS must list {} (allowed: {})", target, entries.join(","))) }
+    if entries.iter().any(|e| e == host || e == &target || e == &format!("[{}]:{}", host, port)) { return Ok(scheme); }
+    Err(format!("{} host is not permitted; OPENWARP_ALLOWED_DB_HOSTS must list {} (allowed: {})", scheme, target, entries.join(","))) }
 async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)> {
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
@@ -3260,13 +3272,29 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
     if typ == "postgres" {
         let conn = body.get("config").and_then(|c| c.get("connection")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if conn.is_empty() { return Err(bad("postgres dynamic secret requires config.connection")); }
-        db_target_allowed(&conn).map_err(|e| bad(&e))?;
+        if db_target_allowed(&conn).map_err(|e| bad(&e))? != "postgres" { return Err(bad("postgres dynamic secret requires a postgres:// connection")); }
         let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
         let password = oc::random_token("dyn");
         crate::pglease::create_role(&conn, &username, &password, now() + ttl).await.map_err(|e| bad(&e))?;
         let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"connection":conn,"type":"postgres"}).to_string().as_bytes());
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"postgres"}))); }
+    if typ == "mysql" {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        let conn = config.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if conn.is_empty() { return Err(bad("mysql dynamic secret requires config.connection")); }
+        if db_target_allowed(&conn).map_err(|e| bad(&e))? != "mysql" { return Err(bad("mysql dynamic secret requires a mysql:// or mariadb:// connection")); }
+        let grants: Vec<String> = config.get("grants").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+        if grants.is_empty() || grants.len() > 8 { return Err(bad("mysql dynamic secret requires config.grants, 1 to 8 entries like \"SELECT ON app.*\"")); }
+        let username = format!("dyn_{}", oc::random_token("").chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect::<String>().to_lowercase());
+        let password = oc::random_token("dyn");
+        if let Err(e) = crate::mysqllease::create_account(&conn, &username, &password, &grants).await {
+            // A half-granted account must not outlive the failed request.
+            let _ = crate::mysqllease::drop_account(&conn, &username).await;
+            return Err(bad(&e)); }
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"connection":conn,"type":"mysql","grants":grants}).to_string().as_bytes());
+        st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,username,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes())), json!(username), json!(config_enc), json!(now()+ttl), json!(now())]).await.map_err(|e| bad(&e))?;
+        return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"mysql"}))); }
     if typ == "aws_iam" {
         let config = body.get("config").cloned().unwrap_or(json!({}));
         let creds = integrations::sts_assume_role(&config).await.map_err(|e| bad(&e))?;
@@ -3336,6 +3364,8 @@ async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>
         match cfg.get("type").and_then(|v| v.as_str()) {
             Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 let _ = crate::pglease::drop_role(&conn, &username).await; }
+            Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
+                let _ = crate::mysqllease::drop_account(&conn, &username).await; }
             Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -3720,10 +3750,11 @@ async fn reap_expired_leases(st: &S) {
             if let Ok(key) = st.env_key(&db::s(row, "env_id")).await {
                 if let Ok(plain) = oc::decrypt_symmetric(&key, &db::s(row, "config_enc")) {
                     if let Ok(cfg) = serde_json::from_slice::<Value>(&plain) {
-                        if cfg.get("type").and_then(|v| v.as_str()) == Some("postgres") {
-                            let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("");
-                            let _ = crate::pglease::drop_role(conn, &db::s(row, "username")).await;
-                        }
+                        let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("");
+                        match cfg.get("type").and_then(|v| v.as_str()) {
+                            Some("postgres") => { let _ = crate::pglease::drop_role(conn, &db::s(row, "username")).await; }
+                            Some("mysql") => { let _ = crate::mysqllease::drop_account(conn, &db::s(row, "username")).await; }
+                            _ => {} }
                     }
                 }
             }

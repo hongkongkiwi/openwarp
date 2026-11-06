@@ -103,7 +103,7 @@ Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They ar
 
 Only enable forwarded-IP trust behind a proxy you control. Set `OPENWARP_TRUSTED_PROXIES` to the actual proxy peers; a broad trusted range can weaken IP-based controls.
 
-The current PostgreSQL driver uses `postgres::NoTls`. Do not assume an external database connection is encrypted because the console uses HTTPS. Use an isolated network or a separately configured encrypted transport, and test the deployment's requirements.
+The PostgreSQL driver connects without TLS, and the MySQL/MariaDB driver uses TLS only when the connection URL sets `require_ssl=true`. Do not assume an external database connection is encrypted because the console uses HTTPS. Use an isolated network or a separately configured encrypted transport, and test the deployment's requirements.
 
 Provider integrations receive plaintext SSE values. Their credentials, destination URLs, permissions, and remote retention policy are part of your trust boundary. Integration sync excludes sealed values and user-specific overrides. Do not treat sealed secrets as a mechanism for delivering values to providers.
 

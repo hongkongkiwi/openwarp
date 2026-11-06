@@ -496,22 +496,27 @@ async fn changing_the_oidc_issuer_requires_a_new_client_secret() {
 }
 
 #[tokio::test]
-async fn postgres_leases_are_denied_without_an_allowlist() {
+async fn dynamic_database_leases_are_denied_without_an_allowlist() {
     let s = Server::start().await;
-    let u = register(&s, "pg-lease@test.invalid").await;
+    let u = register(&s, "db-lease@test.invalid").await;
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     let (_, envs) = app_with_envs(&s, token, org).await;
-    let r = s
-        .call(
-            Method::POST,
-            &format!("/api/envs/{}/dynamic", envs[0]),
-            Some(token),
-            Some(json!({"name": "pg", "type": "postgres", "config": {"connection": "postgres://u:p@127.0.0.1:5432/db"}})),
-        )
-        .await;
-    assert_eq!(r.status, 400, "postgres leases must fail closed without OPENWARP_ALLOWED_DB_HOSTS, got {} {}", r.status, r.text);
-    assert!(r.text.contains("ALLOWED_DB_HOSTS"), "the error must name the setting: {}", r.text);
+    for (kind, config) in [
+        ("postgres", json!({"connection": "postgres://u:p@127.0.0.1:5432/db"})),
+        ("mysql", json!({"connection": "mysql://u:p@127.0.0.1:3306/db", "grants": ["SELECT ON app.*"]})),
+    ] {
+        let r = s
+            .call(
+                Method::POST,
+                &format!("/api/envs/{}/dynamic", envs[0]),
+                Some(token),
+                Some(json!({"name": kind, "type": kind, "config": config})),
+            )
+            .await;
+        assert_eq!(r.status, 400, "{} leases must fail closed without OPENWARP_ALLOWED_DB_HOSTS, got {} {}", kind, r.status, r.text);
+        assert!(r.text.contains("ALLOWED_DB_HOSTS"), "the error must name the setting: {}", r.text);
+    }
 }
 
 #[tokio::test]
