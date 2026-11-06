@@ -402,6 +402,67 @@ async fn aws_signed(client: &reqwest::Client, r: AwsReq<'_>) -> Result<String, S
     let auth = format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature={}", ak, scope, sig);
     req(client.post(&url).header("Content-Type","application/x-amz-json-1.1").header("X-Amz-Date",&amzdate).header("X-Amz-Target",target).header("Authorization",auth).body(payload.to_string())).await
 }
+fn form_encode(s: &str) -> String {
+    s.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        _ => format!("%{:02X}", b),
+    }).collect()
+}
+fn xml_tag(text: &str, name: &str) -> String {
+    let open = format!("<{}>", name); let close = format!("</{}>", name);
+    text.find(&open).and_then(|i| {
+        let start = i + open.len();
+        text[start..].find(&close).map(|j| text[start..start + j].to_string())
+    }).unwrap_or_default().replace("&amp;", "&")
+}
+/// Exchange an IAM role for temporary STS credentials.
+pub async fn sts_assume_role(config: &Value) -> Result<Value, String> {
+    let region = cfg(config, "region"); let ak = cfg(config, "access_key_id"); let sk = cfg(config, "secret_access_key");
+    let role_arn = cfg(config, "role_arn"); let session = { let s = cfg(config, "session_name"); if s.is_empty() { "openwarp" } else { s } };
+    if region.is_empty() || ak.is_empty() || sk.is_empty() || role_arn.is_empty() {
+        return Err("aws_iam lease requires region, access_key_id, secret_access_key and role_arn".into());
+    }
+    let duration = config.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(900, 43200);
+    let endpoint = cfg(config, "endpoint");
+    let (url, host_header, path) = if endpoint.is_empty() {
+        (format!("https://sts.{}.amazonaws.com", region), format!("sts.{}.amazonaws.com", region), "/".to_string())
+    } else {
+        let u = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid STS endpoint: {}", e))?;
+        let host = u.host_str().ok_or("STS endpoint has no host")?;
+        let host_header = match u.port() { Some(p) => format!("{}:{}", host, p), None => host.to_string() };
+        (endpoint.trim_end_matches('/').to_string(), host_header, if u.path().is_empty() { "/".into() } else { u.path().to_string() })
+    };
+    let body = format!("Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={}&DurationSeconds={}",
+        form_encode(role_arn), form_encode(session), duration);
+    let amzdate = chrono_now(); let date = amzdate[..8].to_string();
+    let content_type = "application/x-www-form-urlencoded; charset=utf-8";
+    let payload_hash = hex(&Sha256::digest(body.as_bytes()));
+    let canonical = format!("POST\n{}\n\ncontent-type:{}\nhost:{}\nx-amz-date:{}\n\ncontent-type;host;x-amz-date\n{}",
+        path, content_type, host_header, amzdate, payload_hash);
+    let scope = format!("{}/{}/sts/aws4_request", date, region);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amzdate, scope, hex(&Sha256::digest(canonical.as_bytes())));
+    let k_date = hmac(format!("AWS4{}", sk).as_bytes(), date.as_bytes());
+    let k_region = hmac(&k_date, region.as_bytes());
+    let k_service = hmac(&k_region, b"sts");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature = hex(&hmac(&k_signing, to_sign.as_bytes()));
+    let auth = format!("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders=content-type;host;x-amz-date, Signature={}", ak, scope, signature);
+    let text = req(http_client().post(&url).header("Content-Type", content_type).header("X-Amz-Date", &amzdate)
+        .header("Authorization", auth).body(body)).await.map_err(|e| format!("STS AssumeRole failed: {}", e))?;
+    let access_key_id = xml_tag(&text, "AccessKeyId");
+    let secret_access_key = xml_tag(&text, "SecretAccessKey");
+    let session_token = xml_tag(&text, "SessionToken");
+    if access_key_id.is_empty() || secret_access_key.is_empty() || session_token.is_empty() {
+        return Err(format!("STS AssumeRole response is missing credentials: {}", text.chars().take(400).collect::<String>()));
+    }
+    Ok(json!({
+        "access_key_id": access_key_id,
+        "secret_access_key": secret_access_key,
+        "session_token": session_token,
+        "expiration": xml_tag(&text, "Expiration"),
+        "region": region,
+    }))
+}
 fn chrono_now() -> String {
     // YYYYMMDDTHHMMSSZ from unix time without chrono dep
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -456,6 +517,8 @@ mod tests {
                         ("200 OK", envvars.clone().unwrap_or(json!([])).to_string())
                     } else if method == "GET" && path.contains("/environments") {
                         ("200 OK", json!({"environments": [{"id": "env-1", "name": "base", "envContents": "OLD=1\n"}]}).to_string())
+                    } else if method == "POST" && path == "/" {
+                        ("200 OK", "<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>secret-key</SecretAccessKey><SessionToken>session-token</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>".to_string())
                     } else if method == "GET" && path.contains("/secret") {
                         ("200 OK", json!({"items": [{"id": "sec-1", "name": "OLD"}]}).to_string())
                     } else if method == "GET" { ("200 OK", json!({"items": [{"name": "OLD"}]}).to_string()) }
@@ -598,6 +661,23 @@ mod tests {
         let (report, _) = trigger_sync(&config, &secrets, &["NOVALUE".to_string()]).await.expect("trigger sync");
         assert!(report.contains("deleted=1"), "{}", report);
         assert!(calls.lock().unwrap().iter().any(|(m, p, _)| m == "DELETE" && p.ends_with("/NOVALUE")), "a name without a value must still be pruned");
+    }
+
+    #[tokio::test]
+    async fn sts_assume_role_returns_temporary_credentials() {
+        let (base, calls) = start_mock();
+        let config = json!({
+            "region": "us-east-1", "access_key_id": "AKIAEXAMPLEKEY00000", "secret_access_key": "secret",
+            "role_arn": "arn:aws:iam::123456789012:role/openwarp", "session_name": "test", "endpoint": base
+        });
+        let creds = sts_assume_role(&config).await.expect("assume role");
+        assert_eq!(creds["access_key_id"], "ASIAEXAMPLE");
+        assert_eq!(creds["secret_access_key"], "secret-key");
+        assert_eq!(creds["session_token"], "session-token");
+        let calls = calls.lock().unwrap();
+        let call = calls.iter().find(|(m, p, _)| m == "POST" && p == "/").expect("STS call");
+        assert!(call.2.contains("Action=AssumeRole"), "{}", call.2);
+        assert!(call.2.contains("RoleArn=arn%3Aaws%3Aiam"), "{}", call.2);
     }
 
     #[tokio::test]

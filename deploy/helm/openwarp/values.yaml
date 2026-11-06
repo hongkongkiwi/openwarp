@@ -1,0 +1,69 @@
+image:
+  repository: openwarp
+  tag: ""
+  pullPolicy: IfNotPresent
+replicaCount: 2
+nameOverride: ""
+fullnameOverride: ""
+env:
+  OPENWARP_ENV: production
+  OPENWARP_PUBLIC_URL: ""
+existingSecret: openwarp-master
+# Secret keys: master-key, database-url, redis-url, metrics-token.
+databaseUrl: ""
+existingDatabaseSecret: openwarp-database
+redisUrl: ""
+existingRedisSecret: ""
+metrics:
+  existingSecret: ""
+service:
+  type: ClusterIP
+  port: 8080
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: openwarp.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Kubernetes EnvVar entries, including valueFrom.secretKeyRef when needed.
+extraEnv: []

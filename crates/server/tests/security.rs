@@ -47,6 +47,15 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
+    // Parallel test binaries must not hand the same port to two servers.
+    let base = 20000 + (std::process::id() % 30000) as u16;
+    for offset in 0..500u16 {
+        let port = base.saturating_add(offset);
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
+        }
+    }
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()

@@ -270,3 +270,79 @@ create the sandbox with `env` and replace it.
   restrictive CSP; secret keys are character-validated and JS-string-escaped.
 - The CLI stores credentials in the OS keyring by default and exports or runs
   multi-line values without splitting them on newlines.
+
+## Platform pass (2026-11-06)
+
+### Email providers and templates
+
+`OPENWARP_EMAIL_PROVIDER` selects `smtp`, `resend`, `sendgrid`, `twilio`
+(alias for SendGrid), `mailgun`, `postmark`, `cloudflare`, `webhook` or `log`.
+Without an explicit setting the provider is inferred from the credentials that
+are present. SMTP supports `none`, `starttls` (default) and `implicit` TLS.
+Cloudflare is an Email Worker relay, because Email Routing has no transactional
+send API. Built-in verify, reset, invite and test templates are used unless
+`OPENWARP_EMAIL_TEMPLATES_DIR` provides `<kind>.subject.txt`, `<kind>.txt` and
+`<kind>.html` with `{{variable}}` placeholders.
+
+`POST /api/instance/email-test {to}` lets the instance owner verify delivery.
+Mail failures are logged and never expose the message body or credentials.
+
+### Migrations, pooling and master-key rotation
+
+`db.rs` records a baseline and numbered migrations in `schema_migrations`;
+additive column errors that mean "already applied" are recognised, anything
+else aborts boot. Postgres uses an `r2d2` connection pool sized by
+`OPENWARP_PG_POOL_SIZE` (default 8) instead of one serialized client and a
+thread per query. The storage API remains synchronous; a fully async database
+rewrite is still outstanding.
+
+`POST /api/instance/rotate-master {new_key}` is instance-owner only. It
+preflights every master-wrapped value, re-wraps environment keys, OIDC and TOTP
+secrets, CA private keys and log stream secrets, updates the generated master
+key row, then switches the in-process key. A failure anywhere in the preflight
+leaves the old key in place. Operators using `OPENWARP_MASTER_KEY` must update
+the environment and restart with the new key.
+
+### Token scopes, pagination, teams and scanning
+
+Service tokens accept `scopes: "secrets:read"` and/or `"secrets:write"` and
+`expires_in`. A read-only token is rejected on mutations by the scope
+middleware, and `last_used_at` is recorded at most once a minute.
+`GET /api/envs/:id/secrets?limit=&offset=` returns `total`, `limit` and
+`offset`; audit listing accepts the same paging parameters.
+Teams now have member management and `team_env_grants`: a restricted
+environment admits members of a team granted that environment.
+`GET /api/envs/:id/scan` reports high-confidence AWS, GitHub, Slack, Stripe,
+Google and private-key patterns without returning values; deploy responses
+include `scan_findings` for the submitted secrets.
+
+### PKI, AWS leases and HA
+
+`GET /api/pki/cas/:id/crl` returns a signed PEM CRL containing every revoked
+certificate, with the issuer reconstructed from the stored serial.
+Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
+the supplied admin credentials, returns temporary credentials, and never stores
+the admin secret. Postgres lease host allowlisting remains in force.
+Background jobs (rotation and cleanup) use an `instance_leases` row so one
+replica runs them; the HTTP layer itself is stateless and can run behind a
+load balancer with shared Postgres and optional Redis.
+
+### Clients and deployment
+
+- TypeScript SDK: `sdk/typescript`
+- Python SDK: `sdk/python`
+- Go SDK: `sdk/go`
+- Rust SDK: `sdk/rust`
+- Terraform provider scaffold: `terraform-provider-openwarp`
+- Helm chart: `deploy/helm/openwarp` (two replicas, probes, ingress, PDB)
+- Export action: `action/` (`openwarp` environment to dotenv or JSON)
+
+The Python, Go, Helm and action deliverables have runnable local tests. The
+TypeScript, Rust and Terraform sources are not compiled or integration-tested
+in this repository.
+
+### Still not implemented
+
+SAML 2.0 SSO, an OCSP responder, provider-specific secret rotation (the generic
+rotation webhook is not shipped), and a fully asynchronous Postgres API. Do not
+treat CRL support as an OCSP replacement.

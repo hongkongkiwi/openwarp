@@ -48,6 +48,15 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
+    // Parallel test binaries must not hand the same port to two servers.
+    let base = 20000 + (std::process::id() % 30000) as u16;
+    for offset in 0..500u16 {
+        let port = base.saturating_add(offset);
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
+        }
+    }
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()
@@ -928,4 +937,128 @@ async fn scim_discovery_and_paging_are_available() {
     assert!(r.body["totalResults"].as_i64().unwrap_or(0) >= 1, "{}", r.text);
     let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}&filter=userName%20eq%20%22scim-page%40test.invalid%22", org), Some(token), None).await;
     assert_eq!(r.body["totalResults"], 1, "{}", r.text);
+}
+
+#[tokio::test]
+async fn service_token_scopes_and_last_used_are_enforced() {
+    let s = Server::start().await;
+    let u = register(&s, "scoped-token@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (app, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "READABLE", "one").await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(token), Some(json!({"name": "ro", "env_id": envs[0], "scopes": "secrets:read"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let tid = r.body["id"].as_str().unwrap().to_string();
+    let ro = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&ro), None).await;
+    assert_eq!(r.status, 200, "a read-only token must read: {}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(&ro), Some(json!({"secrets": [{"key": "NOPE", "value": "x"}]}))).await;
+    assert_eq!(r.status, 403, "a read-only token must not write, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/api/apps/{}/tokens", app), Some(token), None).await;
+    let row = r.body.as_array().unwrap().iter().find(|x| x["id"] == tid).expect("token row");
+    assert_eq!(row["scopes"], "secrets:read");
+    assert!(row["last_used_at"].as_i64().unwrap_or(0) > 0, "last_used_at should be recorded: {}", r.text);
+}
+
+#[tokio::test]
+async fn team_grants_open_a_restricted_environment() {
+    let s = Server::start().await;
+    let owner = register(&s, "team-owner@test.invalid").await;
+    let member = register(&s, "team-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let mid = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, ot, org, "team-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/teams", org), Some(ot), Some(json!({"name": "platform"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let tid = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/teams/{}/members", org, tid), Some(ot), Some(json!({"user_id": mid}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), Some(ot), Some(json!({"restricted": true}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 403, "a restricted env must deny a non-granted member: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/envs/{}/team-grants", envs[0]), Some(ot), Some(json!({"team_id": tid}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 200, "a team grant must open the env: {}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/orgs/{}/teams/{}/members/{}", org, tid, mid), Some(ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(mt), None).await;
+    assert_eq!(r.status, 403, "removing team membership must revoke access: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn secret_listing_is_paginated() {
+    let s = Server::start().await;
+    let u = register(&s, "page@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    for key in ["ONE", "TWO", "THREE"] { set_secret(&s, token, &envs[0], key, "v").await; }
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets?limit=2&offset=1", envs[0]), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["total"], 3, "{}", r.text);
+    assert_eq!(r.body["secrets"].as_array().unwrap().len(), 2, "{}", r.text);
+    assert_eq!(r.body["limit"], 2, "{}", r.text);
+    assert_eq!(r.body["offset"], 1, "{}", r.text);
+}
+
+#[tokio::test]
+async fn secret_scanning_flags_high_confidence_keys() {
+    let s = Server::start().await;
+    let u = register(&s, "scan@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), Some(token), Some(json!({"secrets": [{"key": "AWS_ACCESS_KEY_ID", "value": "AKIAABCDEFGHIJKLMNOP"}]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["scan_findings"].as_array().unwrap().iter().any(|f| f["rules"].as_array().unwrap().iter().any(|x| x == "aws_access_key")), "deploy should report the finding: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/scan", envs[0]), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body["findings"].as_array().unwrap().iter().any(|f| f["key"] == "AWS_ACCESS_KEY_ID"), "{}", r.text);
+    assert!(!r.text.contains("AKIAABCDEFGHIJKLMNOP"), "the scanned value must not be returned: {}", r.text);
+}
+
+#[tokio::test]
+async fn crl_lists_revoked_certificates() {
+    let s = Server::start().await;
+    let u = register(&s, "crl@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "test-ca"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let ca = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"cn": "service"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let cert = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/pki/certs/{}/revoke", cert), Some(token), Some(json!({}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/pki/cas/{}/crl", ca), Some(token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.header("content-type").contains("pkix-crl"), "{}", r.header("content-type"));
+    assert!(r.text.contains("BEGIN X509 CRL"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn master_key_rotation_keeps_existing_data_readable() {
+    let s = Server::start().await;
+    let u = register(&s, "rotate-master@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+    set_secret(&s, token, &envs[0], "KEEP", "value").await;
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"oidc_issuer": "https://idp.example", "oidc_client_id": "c", "oidc_client_secret": "s"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let new_key = { use base64ct::{Base64, Encoding}; Base64::encode_string(&[7u8; 32]) };
+    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token), Some(json!({"new_key": new_key}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
+    assert!(r.body["secrets"].as_array().unwrap().iter().any(|x| x["key"] == "KEEP" && x["value"] == "value"), "{}", r.text);
+    set_secret(&s, token, &envs[0], "AFTER", "works").await;
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
+    assert_eq!(r.body["oidc_client_secret_set"], true, "{}", r.text);
 }

@@ -1,0 +1,109 @@
+{{- if lt (int .Values.replicaCount) 2 }}
+{{- fail "replicaCount must be at least 2; this chart targets HA deployments" }}
+{{- end }}
+{{- if not (or .Values.databaseUrl .Values.existingDatabaseSecret) }}
+{{- fail "set databaseUrl or existingDatabaseSecret to a shared Postgres database" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openwarp.fullname" . }}
+  labels:
+    {{- include "openwarp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "openwarp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openwarp.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: openwarp
+          image: {{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ADDR
+              value: "0.0.0.0:8080"
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: OPENWARP_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "existingSecret is required for OPENWARP_MASTER_KEY" .Values.existingSecret | quote }}
+                  key: master-key
+                  optional: false
+            - name: DATABASE_URL
+              {{- if .Values.existingDatabaseSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingDatabaseSecret | quote }}
+                  key: database-url
+                  optional: false
+              {{- else }}
+              value: {{ .Values.databaseUrl | quote }}
+              {{- end }}
+            {{- if or .Values.existingRedisSecret .Values.redisUrl }}
+            - name: REDIS_URL
+              {{- if .Values.existingRedisSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingRedisSecret | quote }}
+                  key: redis-url
+                  optional: false
+              {{- else }}
+              value: {{ .Values.redisUrl | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.metrics.existingSecret }}
+            - name: OPENWARP_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metrics.existingSecret | quote }}
+                  key: metrics-token
+                  optional: false
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

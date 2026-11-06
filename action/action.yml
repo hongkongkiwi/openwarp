@@ -1,0 +1,27 @@
+name: OpenWarp export
+description: Export an OpenWarp environment to a dotenv or JSON file
+inputs:
+  base-url:
+    description: OpenWarp server base URL
+    required: true
+  token:
+    description: Bearer token with secrets read access to the environment
+    required: true
+  env-id:
+    description: Environment ID to export
+    required: true
+  output-file:
+    description: Destination file relative to the workspace, or an absolute path
+    default: .env
+  format:
+    description: Output format, dotenv or json
+    default: dotenv
+  mask:
+    description: Mask all exported values in workflow logs
+    default: 'true'
+outputs:
+  count:
+    description: Number of exported secrets
+runs:
+  using: node20
+  main: index.js

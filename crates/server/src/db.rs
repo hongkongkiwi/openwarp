@@ -5,7 +5,7 @@ use std::sync::Mutex;
 pub type Row = HashMap<String, Value>;
 pub enum Db {
     Sqlite(Mutex<rusqlite::Connection>),
-    Postgres(std::sync::Arc<Mutex<postgres::Client>>),
+    Postgres(r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>),
 }
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
@@ -18,8 +18,11 @@ impl Db {
             // `postgres` sync client drives its own runtime; it cannot run inside tokio.
             let url = url.to_string();
             std::thread::spawn(move || {
-                let client = postgres::Client::connect(&url, postgres::NoTls).map_err(|e| e.to_string())?;
-                let db = Db::Postgres(std::sync::Arc::new(Mutex::new(client))); db.migrate()?; Ok(db)
+                let config: postgres::Config = url.parse().map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
+                let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
+                let size = std::env::var("OPENWARP_PG_POOL_SIZE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8).clamp(1, 64);
+                let pool = r2d2::Pool::builder().max_size(size).build(manager).map_err(|e| format!("postgres pool: {}", e))?;
+                let db = Db::Postgres(pool); db.migrate()?; Ok(db)
             }).join().map_err(|_| "postgres connect thread panicked".to_string())?
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
@@ -36,18 +39,20 @@ impl Db {
     pub fn exec(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); exec_sqlite(&conn, sql, params) }
-            Db::Postgres(c) => {
-                let c = c.clone(); let sql = sql.to_string(); let params = params.to_vec();
-                std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql); let pg = PgParams::new(&params); let refs = pg.refs(); client.execute(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())?
+            Db::Postgres(pool) => {
+                let mut client = pool.get().map_err(|e| e.to_string())?;
+                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                client.execute(sql2.as_str(), &refs[..]).map_err(|e| e.to_string())
             }
         }
     }
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
-            Db::Postgres(c) => {
-                let c = c.clone(); let sql_owned = sql.to_string(); let params_owned = params.to_vec();
-                let rows = std::thread::spawn(move || { let mut client = c.lock().unwrap(); let sql2 = pg_sql(&sql_owned); let pg = PgParams::new(&params_owned); let refs = pg.refs(); client.query(sql2.as_str(), &refs[..]).map_err(|e| e.to_string()) }).join().map_err(|_| "pg thread panicked".to_string())??;
+            Db::Postgres(pool) => {
+                let mut client = pool.get().map_err(|e| e.to_string())?;
+                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                let rows = client.query(sql2.as_str(), &refs[..]).map_err(|e| e.to_string())?;
                 let mut out = Vec::new();
                 for r in &rows {
                     let mut m = Row::new();
@@ -85,6 +90,20 @@ impl Db {
             "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
         ] { let _ = self.exec(alter, &[]); }
         for idx in INDEXES { let _ = self.exec(idx, &[]); }
+        // Record the baseline once, then apply numbered additive migrations.
+        if self.one("SELECT version FROM schema_migrations WHERE version=1", &[])?.is_none() {
+            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(now_secs())]);
+        }
+        for (version, statements) in MIGRATIONS {
+            if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)])?.is_some() { continue; }
+            for stmt in *statements {
+                if let Err(e) = self.exec(stmt, &[]) {
+                    let duplicate = e.contains("duplicate column") || e.contains("already exists");
+                    if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
+                }
+            }
+            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(now_secs())])?;
+        }
         // One-time backfill: environments that already had an allowlist keep it.
         if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
             let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
@@ -149,7 +168,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
     "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,scopes TEXT DEFAULT '',last_used_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS integrations(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,config_enc TEXT NOT NULL,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS lockbox(id TEXT PRIMARY KEY,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,max_views BIGINT DEFAULT 1,views BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,name TEXT NOT NULL,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
@@ -176,6 +195,25 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS social_subjects(provider TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(provider,subject))",
     "CREATE TABLE IF NOT EXISTS invites(token_hash TEXT PRIMARY KEY,email TEXT NOT NULL,org_id TEXT NOT NULL,role TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,accepted BIGINT DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,kind TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
+    "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL)",
+];
+
+// Additive migrations applied after the baseline schema. A statement may fail
+// because a fresh database already created the column or table; those errors
+// are recognised and ignored, anything else aborts the boot.
+const MIGRATIONS: &[(i64, &[&str])] = &[
+    (2, &[
+        "ALTER TABLE tokens ADD COLUMN scopes TEXT DEFAULT ''",
+        "ALTER TABLE tokens ADD COLUMN last_used_at BIGINT DEFAULT 0",
+    ]),
+    (3, &[
+        "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
+    ]),
+    (4, &[
+        "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -188,6 +226,8 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_env_members_user ON env_members(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_leases_env ON leases(env_id)",
     "CREATE INDEX IF NOT EXISTS idx_sync_state_integration ON integration_sync_state(integration_id)",
+    "CREATE INDEX IF NOT EXISTS idx_team_env_grants_env ON team_env_grants(env_id)",
+    "CREATE INDEX IF NOT EXISTS idx_instance_leases_expiry ON instance_leases(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_rotations_due ON rotation_schedules(enabled,next_run)",
     "CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)",
     "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",

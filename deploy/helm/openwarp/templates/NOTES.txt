@@ -1,0 +1,9 @@
+OpenWarp service: {{ include "openwarp.fullname" . }}:{{ .Values.service.port }}
+
+Before serving traffic, provision the configured Secrets in namespace {{ .Release.Namespace }}
+and set env.OPENWARP_PUBLIC_URL to your externally reachable HTTPS URL.
+All replicas must share the master key and Postgres database. Configure shared Redis
+for the redis-cache build. This chart does not install either backing service.
+
+Secret changes require a rollout restart; environment variables do not hot reload.
+Consult the chart README for HA and background-job coordination limitations.
