@@ -3184,24 +3184,34 @@ async fn custom_oidc_metadata() -> Result<Value, (StatusCode, Json<Value>)> {
         if !jwks_uri.is_empty() { obj.insert("jwks_uri".into(), json!(jwks_uri)); }
         obj.entry("issuer").or_insert(json!(&issuer)); }
     Ok(disc) }
-async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+fn social_flow_cookie(st: &S, h: &HeaderMap, provider: &str, state: &str, proof: &str) -> HeaderMap {
+    let secure = issuer(st, h).starts_with("https://") || crate::envcfg::var("OPENWARP_SECURE_COOKIES").map(|v| v == "1").unwrap_or(false);
+    let same_site = if provider == "apple" && secure { "None" } else { "Lax" };
+    let cookie = format!("ow_social_{}={}; HttpOnly; Path=/api/auth/social/{}/callback; SameSite={}; Max-Age={}{}",
+        sha256_hex(state.as_bytes()), proof, provider, same_site, if proof.is_empty() { 0 } else { 600 }, if secure { "; Secure" } else { "" });
+    let mut headers = HeaderMap::new(); headers.insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap()); headers }
+async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>) -> Result<(HeaderMap, axum::response::Redirect), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, &provider).await { return Err(err(StatusCode::NOT_FOUND, "this sign-in provider is disabled on this instance")); }
     let (client_id, _) = social_provider(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     let redirect = social_redirect(&st, &h, &provider);
     let state = oc::random_token("sst");
+    let proof = oc::random_token("browser");
+    // Only the browser receives the independent secret; the database key binds it to the public state.
+    let bound_state = hmac_hex(proof.as_bytes(), state.as_bytes());
+    let headers = social_flow_cookie(&st, &h, &provider, &state, &proof);
     if let Some(url) = crate::social_extra::authorize_url(&provider, &client_id, &redirect, &state).map_err(|e| bad(&e))? {
-        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).await.map_err(|e| bad(&e))?;
-        return Ok(axum::response::Redirect::temporary(&url)); }
+        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(&bound_state), json!(&provider), json!(now())]).await.map_err(|e| bad(&e))?;
+        return Ok((headers, axum::response::Redirect::temporary(&url))); }
     if provider == "github" {
-        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(state), json!(&provider), json!(now())]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO social_states(state,provider,created_at) VALUES(?,?,?)", &[json!(&bound_state), json!(&provider), json!(now())]).await.map_err(|e| bad(&e))?;
         let url = format!("{}/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read:user%20user:email&state={}", github_web(), urlencode(&client_id), urlencode(&redirect), state);
-        return Ok(axum::response::Redirect::temporary(&url)); }
+        return Ok((headers, axum::response::Redirect::temporary(&url))); }
     if provider == "x" {
         let verifier = oc::random_token("pkce");
-        st.db.exec("INSERT INTO social_states(state,provider,created_at,code_verifier) VALUES(?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&verifier)]).await.map_err(|e| bad(&e))?;
+        st.db.exec("INSERT INTO social_states(state,provider,created_at,code_verifier) VALUES(?,?,?,?)", &[json!(&bound_state), json!(&provider), json!(now()), json!(&verifier)]).await.map_err(|e| bad(&e))?;
         let url = format!("{}/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
             x_web(), urlencode(&client_id), urlencode(&redirect), urlencode(social_scope("x")), state, pkce_challenge(&verifier));
-        return Ok(axum::response::Redirect::temporary(&url)); }
+        return Ok((headers, axum::response::Redirect::temporary(&url))); }
     let disc = if provider == "oidc" { custom_oidc_metadata().await? } else {
         let issuer = social_issuer(&provider).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
         if !issuer_url_ok(&issuer) || !egress_allowed(&issuer) { return Err(bad("the provider issuer must be https, or http on a loopback address")); }
@@ -3212,22 +3222,27 @@ async fn social_start(State(st): State<S>, h: HeaderMap, Path(provider): Path<St
     let nonce = oc::random_token("n");
     // PKCE wherever the provider supports it; Apple and Slack do not advertise S256.
     let verifier = if social_pkce(&provider, &disc) { oc::random_token("pkce") } else { String::new() };
-    st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier) VALUES(?,?,?,?,?)", &[json!(state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO social_states(state,provider,created_at,nonce,code_verifier) VALUES(?,?,?,?,?)", &[json!(&bound_state), json!(&provider), json!(now()), json!(&nonce), json!(&verifier)]).await.map_err(|e| bad(&e))?;
     let scope = if provider == "oidc" { oidc_custom_scope() } else { social_scope(&provider).to_string() };
     let mut url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect), urlencode(&scope), state, nonce);
     if provider == "apple" { url.push_str("&response_mode=form_post"); }
     if !verifier.is_empty() { url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", pkce_challenge(&verifier))); }
-    Ok(axum::response::Redirect::temporary(&url)) }
-async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    Ok((headers, axum::response::Redirect::temporary(&url))) }
+async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path<String>, Query(q): Query<HashMap<String,String>>, form: Result<axum::extract::Form<HashMap<String,String>>, axum::extract::rejection::FormRejection>) -> Result<(HeaderMap, axum::response::Redirect), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, &provider).await { return Err(err(StatusCode::NOT_FOUND, "this sign-in provider is disabled on this instance")); }
     let (client_id, client_secret) = social_provider(&provider).filter(|_| social_enabled(&provider)).ok_or_else(|| err(StatusCode::NOT_FOUND, "this sign-in provider is not configured on this instance"))?;
     // Apple answers with a form POST; every other provider uses the query string.
     let params = if q.contains_key("code") || q.contains_key("state") { q } else { form.ok().map(|axum::extract::Form(f)| f).unwrap_or_default() };
     let code = params.get("code").cloned().unwrap_or_default(); let state = params.get("state").cloned().unwrap_or_default();
-    let row = st.db.one("SELECT provider,created_at,nonce,code_verifier FROM social_states WHERE state=?", &[json!(state)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
-    let _ = st.db.exec("DELETE FROM social_states WHERE state=?", &[json!(state)]).await;
+    let proof = cookie_val(&h, &format!("ow_social_{}", sha256_hex(state.as_bytes())));
+    if state.is_empty() || proof.is_empty() { return Err(bad("invalid or expired state")); }
+    let bound_state = hmac_hex(proof.as_bytes(), state.as_bytes());
+    let row = st.db.one("SELECT provider,created_at,nonce,code_verifier FROM social_states WHERE state=?", &[json!(&bound_state)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     if db::s(&row, "provider") != provider || db::n(&row, "created_at") + 600 < now() { return Err(bad("invalid or expired state")); }
     if code.is_empty() { return Err(bad("missing authorization code")); }
+    st.db.batch_checked(&[("DELETE FROM social_states WHERE state=?".into(), vec![json!(&bound_state)])], &[0]).await
+        .map_err(|e| if e.contains("version conflict") { bad("invalid or expired state") } else { bad(&e) })?;
+    let headers = social_flow_cookie(&st, &h, &provider, &state, "");
     let redirect = social_redirect(&st, &h, &provider);
     let (subject, email) = if let Some(identity) = crate::social_extra::identity(&provider, &client_id, &client_secret, &redirect, &code).await.map_err(|e| bad(&e))? {
         identity
@@ -3252,9 +3267,9 @@ async fn social_callback(State(st): State<S>, h: HeaderMap, Path(provider): Path
     // factor, so MFA still applies to social sign-in.
     if mfa::required(&st, &uid).await {
         let challenge = mfa::new_challenge(&st, &uid).await?;
-        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}", challenge))); }
+        return Ok((headers, axum::response::Redirect::temporary(&format!("/#mfa={}", challenge)))); }
     let token = make_session(&st, &uid).await?;
-    Ok(axum::response::Redirect::temporary(&format!("/#token={}", token))) }
+    Ok((headers, axum::response::Redirect::temporary(&format!("/#token={}", token)))) }
 async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     let mut out = auth_settings(&st).await;
@@ -4056,7 +4071,7 @@ fn admin_scope_path(method: &axum::http::Method, path: &str) -> bool {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
         if tail.is_empty() { return method != axum::http::Method::GET; }
         let sub = tail.split('/').next().unwrap_or("");
-        return matches!(sub, "members" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "identities" | "runners" | "audit" | "leave" | "transfer");
+        return matches!(sub, "members" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "ssh" | "identities" | "runners" | "audit" | "leave" | "transfer");
     }
     if let Some(rest) = path.strip_prefix("/api/apps/") {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));

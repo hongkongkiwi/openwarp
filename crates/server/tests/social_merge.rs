@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-struct Server { child: Child, base: String, dir: PathBuf, client: Client }
+struct Server { child: Child, base: String, dir: PathBuf, client: Client, social_cookies: Mutex<Vec<String>> }
 impl Drop for Server {
     fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); }
 }
@@ -33,7 +33,7 @@ impl Server {
         drop(listener);
         let child = cmd.spawn().expect("spawn openwarp-server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().unwrap();
-        let server = Self { child, base, dir, client };
+        let server = Self { child, base, dir, client, social_cookies: Mutex::new(Vec::new()) };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(format!("{}/health", server.base)).send().await {
@@ -43,7 +43,15 @@ impl Server {
         }
         panic!("server did not become healthy");
     }
-    async fn get(&self, path: &str) -> Response { self.client.get(format!("{}{}", self.base, path)).send().await.unwrap() }
+    async fn get(&self, path: &str) -> Response {
+        let mut req = self.client.get(format!("{}{}", self.base, path));
+        if path.starts_with("/api/auth/social/") && path.contains("/callback") {
+            req = req.header("cookie", self.social_cookies.lock().unwrap().join("; ")); }
+        let response = req.send().await.unwrap();
+        if path.starts_with("/api/auth/social/") && path.ends_with("/start") {
+            for cookie in response.headers().get_all("set-cookie").iter().filter_map(|h| h.to_str().ok()).filter_map(|h| h.split(';').next()).filter(|c| c.starts_with("ow_social_")) {
+                self.social_cookies.lock().unwrap().push(cookie.to_string()); } }
+        response }
     async fn start_flow(&self, provider: &str) -> Url {
         let r = self.get(&format!("/api/auth/social/{}/start", provider)).await;
         assert_eq!(r.status(), 307, "configured {} must start a login flow", provider);
