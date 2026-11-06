@@ -236,6 +236,12 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (8, &[
         "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
     ]),
+    (9, &[
+        "ALTER TABLE social_states ADD COLUMN link_user TEXT DEFAULT ''",
+        "ALTER TABLE oidc_states ADD COLUMN link_user TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS identity_bindings(issuer TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,provider TEXT DEFAULT '',created_at BIGINT NOT NULL,PRIMARY KEY(issuer,subject))",
+        "CREATE TABLE IF NOT EXISTS logout_replay(jti TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[

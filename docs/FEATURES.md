@@ -36,7 +36,7 @@ Config is stored encrypted under the env key. Secrets are pushed decrypted
 `aws_secrets_manager` + `aws_parameter_store` (SigV4 signed, per-key or
 one-JSON-secret modes), `gcp_secret_manager`, `azure_key_vault`,
 `azure_app_configuration` (HMAC signed key-values), `scaleway_secret_manager`
-(one opaque secret per key), `vultr` and `hetzner` (account SSH public keys), `kubernetes`
+(one opaque secret per key), `vultr`, `hetzner`, `linode` and `digitalocean_ssh` (account SSH public keys, from secrets of type `ssh_key`), `kubernetes`
 (Opaque Secret), `hashicorp_vault`, `webhook` (generic JSON POST, optional
 HMAC signature), `instabox`,
 `boat`, `daytona`, `1password` (Connect; `onepassword` is accepted as an
@@ -44,8 +44,9 @@ alias), `dokploy`, `caprover`, `portainer`
 (stack environment variables), `docker_swarm` (Docker Engine secrets),
 `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`,
 `laravel_forge`, `openwarp` (instance-to-instance), `devin`,
-`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, and `cursor`
-(Cloud Agents environment or team secrets).
+`cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`
+(Cloud Agents environment or team secrets) and `ssh` (folders written to
+files on a host).
 
 Each kind takes `token` plus target ids in `config`, e.g.
 `{"kind":"gitlab","config":{"token":"glpat-...","project_id":"42"}}`.
@@ -171,7 +172,8 @@ secret endpoints. Grok Bot Vault and ChatGPT/Codex cloud environments document
 environment variables and secrets as UI settings, not as a public API. Keeper
 requires Commander in Service Mode. Pandacode's other providers are machine
 lifecycle APIs that accept environment variables or SSH keys only at creation;
-they are not secret-sync destinations.
+they are not secret-sync destinations. An SSH host can still receive files
+through the `ssh` adapter, which writes folders to env files.
 
 Still pending from the wider Infisical-style list: Spacelift, OCI Vault, OVH,
 Northflank, Rundeck, Cloud 66 and Humanitec. Each needs its own auth or API
@@ -428,10 +430,18 @@ child credential:
 | `cloudflare` | `api_token` | `policies` | deletes `/user/tokens/{id}` |
 | `deepgram` | `api_key` | `project_id` | deletes `/v1/projects/{project}/keys/{id}` |
 | `elevenlabs` | `api_key` | `service_account_id` | deletes the service-account key |
+| `deepinfra` | `api_key` | | deletes `/v1/api-tokens/id/{id}` |
+| `baseten` | `api_key` | | deletes `/v1/api_keys/{prefix}` |
+| `fal` | `api_key` | | deletes `/v1/keys/{id}` |
+| `speechmatics` | `management_token` | | deletes `/v1/api-keys/{id}` |
+| `chutes` | `api_key` | | deletes `/api_keys/{id}` |
 
-Fireworks, Mistral, Gemini, Cloudflare and Deepgram set a remote expiry from the
-lease TTL. Perplexity, xAI and ElevenLabs do not, so those children stay usable
-until revoked. Gemini's create call returns a long-running operation; the lease
+Fireworks, Mistral, Gemini, Cloudflare, Deepgram and Baseten set a remote expiry
+from the lease TTL. Baseten personal keys cannot outlive 90 days, so a longer TTL
+is shortened. Speechmatics mints a permanent project key when `project_id` is set
+and a temporary key (60 seconds to 24 hours) otherwise. Perplexity, xAI,
+ElevenLabs, DeepInfra, fal and Chutes do not expire a key themselves, so those children
+stay usable until revoked. Gemini's create call returns a long-running operation; the lease
 fails unless the key is already in the response. Cloudflare `policies` are sent
 as given, so the parent token's `API Tokens Write` permission is what bounds
 them. xAI defaults the child to every model and endpoint the team can use, and

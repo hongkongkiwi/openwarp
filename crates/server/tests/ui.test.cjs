@@ -295,6 +295,14 @@ for (const dismissal of ['Cancel', 'Escape', 'backdrop']) {
   });
 }
 
+test('the integration picker lists the cloud secret stores and the signed webhook hint', () => {
+  const kinds = source.match(/const KINDS=\[([^\]]*)\]/)?.[1] ?? '';
+  for (const kind of ['digitalocean', 'scaleway_secret_manager', 'azure_app_configuration', 'vultr', 'hetzner', 'linode', 'digitalocean_ssh', 'ssh', 'webhook']) {
+    assert.ok(kinds.includes(`'${kind}'`), `${kind} must be selectable`);
+  }
+  assert.match(source, /signing_secret/, 'the webhook hint must mention the signing secret');
+});
+
 test('a valid new secret stages locally and deploys only on explicit Deploy', async () => {
   const ui = await consoleUI();
   await ui.add({ ...draft, key: 'new_config' });

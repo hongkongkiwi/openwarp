@@ -55,7 +55,7 @@ Sync can write remote secrets. Obtain the appropriate approval before executing 
 | Sync | `POST /api/integrations/{id}/sync` |
 | Test | `POST /api/integrations/{id}/test` |
 
-Test is implemented for `trigger`, `instabox`, `boat`, `daytona`, `1password`, `aws_secrets_manager`, `aws_parameter_store`, `dokploy`, `caprover`, `portainer`, `docker_swarm`, `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`, `laravel_forge`, `openwarp`, `devin`, `cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`, `scaleway_secret_manager`, `azure_app_configuration`, `vultr`, and `hetzner`. Other kinds return 501. A sync is not a harmless substitute for Test.
+Test is implemented for `trigger`, `instabox`, `boat`, `daytona`, `1password`, `aws_secrets_manager`, `aws_parameter_store`, `dokploy`, `caprover`, `portainer`, `docker_swarm`, `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`, `laravel_forge`, `openwarp`, `devin`, `cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`, `scaleway_secret_manager`, `azure_app_configuration`, `vultr`, `hetzner`, `linode`, and `digitalocean_ssh`. Other kinds return 501. A sync is not a harmless substitute for Test.
 
 ## Provider configuration
 
@@ -98,10 +98,13 @@ Fields below are the strings consumed by each adapter unless stated otherwise. S
 | `azure_devops` | `organization`, `project`, `group_id`, `token` | Rewrites a pipeline variable group with secret values |
 | `cursor` | `token`; `environment_id` for environment scope, omit it for team scope; optional `secret_type`, `repos` | Cloud Agents environment or team secrets. Values are never returned, so existing names are overwritten |
 | `huggingface` | `token`, `namespace`, `repo`; optional `target` (`secrets`, the default, or `variables`) | One Space secret or variable per key. Secret values are write-only, so existing names are overwritten; variables are readable and unchanged values are skipped. Names must match `[A-Za-z][_A-Za-z0-9]*`. Initial import works for variables only |
+| `ssh` | `host`, `known_hosts`; one of `identity_file`, `private_key` or `password`; optional `user`, `port`, `files` | Writes secret folders to files on the host. See below |
 | `scaleway_secret_manager` | `region` (`fr-par`, `nl-ams` or `pl-waw`), `secret_key`, `project_id`; optional `path` | One opaque secret per key. A changed value adds a version and disables the previous one; payloads are base64 and capped at 64 KiB |
 | `azure_app_configuration` | `endpoint`, `id` (access key id), `secret` (base64 access key value); optional `label` | One key-value per key, written with the HMAC-SHA256 scheme. An empty label targets key-values with no label |
 | `vultr` | `api_key` | Account SSH keys. Each secret value must be a single-line OpenSSH public key; the secret name is the key name. A changed key is patched in place |
-| `hetzner` | `token` | Account SSH keys. Each secret value must be a single-line OpenSSH public key. The API cannot replace key material, so a changed key is deleted and created again and its numeric id changes |
+| `hetzner` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. The API cannot replace key material, so a changed key is deleted and created again and its numeric id changes |
+| `linode` | `token` | Account SSH keys, taken only from secrets of type `ssh_key`. A changed key is deleted and created again, so its id changes |
+| `digitalocean_ssh` | `token` | Account SSH keys at `/v2/account/keys`, taken only from secrets of type `ssh_key`. Distinct from `digitalocean`, which updates an App Platform spec. A changed key is deleted and created again |
 | `gcp_secret_manager` | `token`, `project` | Creates/versions secrets; lowercases names and replaces underscores with hyphens |
 | `azure_key_vault` | `token`, `vault` (or `base_url`) | Writes secret versions; lowercases names and replaces underscores with hyphens |
 | `kubernetes` | `token`, `api_server`, `namespace`, `secret_name` | Writes an Opaque Secret; creates it after a not-found response |
@@ -120,7 +123,7 @@ The `kubernetes` adapter pushes values to the cluster API. For pods that pull va
 
 ## Advanced sync options
 
-The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr and Hetzner) share these options:
+The stateful adapters (Trigger.dev, Instabox, Boat, Daytona, 1Password, both AWS adapters, Dokploy, CapRover, Portainer, Docker Swarm, Bitbucket, CircleCI, TeamCity, Travis CI, Terraform Cloud, Qovery, Laravel Forge, OpenWarp, Devin, Cloudflare Secrets Store, Octopus Deploy, Azure DevOps, Cursor, Scaleway Secret Manager, Azure App Configuration, Vultr, Hetzner and SSH files) share these options:
 
 | Field | Meaning |
 | --- | --- |
@@ -223,13 +226,34 @@ Secret names must be 1-64 characters of letters, digits, underscore, dot or dash
 OpenWarp syncs secrets only where the remote service exposes a secret or environment-variable API. Several machine providers accept environment variables or SSH keys only when a machine is created, then offer no way to update them. Those are not secret-sync destinations.
 
 - Covered by an existing adapter: Daytona, Boat, Instabox, Cloudflare, Railway, Vercel, DigitalOcean App Platform, Docker Swarm.
-- SSH keys only: Vultr and Hetzner Cloud keep account SSH keys but no secret store, so `vultr` and `hetzner` sync public keys rather than secret values. A secret whose value is not an OpenSSH public key is rejected before any request. Hetzner cannot change a key's material, so a changed key is deleted and recreated and its id changes; Vultr patches the material in place.
-- Machine lifecycle only, with no secret or key update API: AWS EC2, Google Compute Engine, DigitalOcean droplets, plain Docker, SSH hosts, E2B, Modal, CodeSandbox, Runloop, Blaxel, Tensorlake, Freestyle, RunPod and AWS AgentCore. The `boxd` provider in pandacode PR 336 belongs to the same group. Linode keeps account SSH keys too, but has no adapter yet.
+- SSH keys only: Vultr, Hetzner Cloud, Linode and DigitalOcean keep account SSH keys but no general secret store. `vultr`, `hetzner`, `linode` and `digitalocean_ssh` sync only secrets whose type is `ssh_key` and ignore every other secret, so a generic secret never reaches a key API. The value must be a single-line OpenSSH public key, and saving one that is not is rejected. Only Vultr can change key material in place; the other three delete and recreate a changed key, which issues a new id.
+- Machine lifecycle only, with no secret or key update API: AWS EC2, Google Compute Engine, DigitalOcean droplets, plain Docker, E2B, Modal, CodeSandbox, Runloop, Blaxel, Tensorlake, Freestyle, RunPod and AWS AgentCore. The `boxd` provider in pandacode PR 336 belongs to the same group. Linode keeps account SSH keys too, but has no adapter yet. An SSH host is reachable as the `ssh` file adapter, which writes files rather than provisioning the machine.
 - Cursor Cloud Agents exposes environment and team secret endpoints, so it is supported as `cursor`.
 - Grok Bot Vault and ChatGPT/Codex cloud environments document their environment variables and secrets as settings, not as a public API. They have no adapter.
 - Keeper requires Keeper Commander running in Service Mode; it has no plain REST secret API in the documented integration path.
 
 Adding the machine-only providers would require a machine-provisioning feature that creates or updates a machine and injects its environment, which is a different product surface from secret sync.
+
+## SSH files
+
+Kind `ssh` logs into a host and writes secret folders to files, which is the remote equivalent of an env file. It needs `host` and `known_hosts`, plus one of `identity_file` (a path to a private key on the server), `private_key` (the PEM itself) or `password`. `known_hosts` is the server's public key line, or a path to a known_hosts file; a host whose key does not match is refused, so the integration cannot be pointed at a different machine by surprise. `user` defaults to `root` and `port` to `22`. Password auth needs `sshpass` on the server.
+
+`files` maps folders to files. Each entry has `path`, `format` (`dotenv`, `json`, `yaml` or `export`) and `folders`, the secret paths that feed it. A folder matches itself and everything under it, so `/app` also takes `/app/web`. One file with no `folders` takes every secret. A key that lands in two files is rejected, because one name cannot carry two values. `file_mode` (octal, for example `600`) and `owner` (`user` or `user:group`) are applied after the write.
+
+With no `files`, `path` and `format` describe the single file. The file is written to a sibling and renamed into place, so a dropped connection does not empty it. Mirror removes only names this integration wrote to that file; other lines in the file survive. `initial_sync` reads the files back.
+
+```json
+{
+  "host": "app.example.invalid",
+  "user": "deploy",
+  "identity_file": "/etc/openwarp/deploy_key",
+  "known_hosts": "app.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleOnly",
+  "files": [
+    {"path": "/srv/app/.env", "format": "dotenv", "folders": ["/app"], "file_mode": "600"},
+    {"path": "/srv/db/env.json", "format": "json", "folders": ["/db"]}
+  ]
+}
+```
 
 ## Kamal
 

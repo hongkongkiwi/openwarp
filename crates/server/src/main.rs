@@ -1,4 +1,4 @@
-mod db; mod integrations; mod mailer; mod ui;
+mod db; mod inference_leases; mod integrations; mod mailer; mod ssh_keys; mod ui;
 use axum::{body::Bytes, extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 use db::{Db, Row};
 use openwarp_crypto as oc;
@@ -573,6 +573,8 @@ fn upsert_secret(st: &S, eid: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> R
     let khash = oc::hash_token(&format!("{}:{}", s.path, kname));
     let existing = st.db.one("SELECT id,version,secret_type FROM secrets WHERE env_id=? AND key_hash=? AND deleted=0", &[json!(eid), json!(khash)]).map_err(|e| bad(&e))?;
     let mut stype = if s.secret_type.is_empty() { "secret".to_string() } else { s.secret_type.clone() };
+    if !matches!(stype.as_str(), "secret" | "sealed" | "ssh_key" | "config") { return Err(bad("secret type must be secret, sealed, ssh_key or config")); }
+    if stype == "ssh_key" && ssh_keys::public_key_error(&kname, &s.value).is_some() { return Err(bad("an ssh_key value must be a single-line OpenSSH public key")); }
     if let Some(row) = &existing { if db::s(row, "secret_type") == "sealed" { if stype != "sealed" { return Err(bad("sealed secrets cannot change type; delete and recreate")); } stype = "sealed".to_string(); } }
     if let Some(row) = existing { let sid = db::s(&row, "id"); let ver = db::n(&row, "version") + 1;
         st.db.exec("UPDATE secrets SET value_enc=?,comment_enc=?,tags=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=?", &[json!(oc::encrypt_symmetric(key, s.value.as_bytes())), json!(oc::encrypt_symmetric(key, s.comment.as_bytes())), json!(s.tags), json!(stype), json!(ver), json!(now()), json!(uid), json!(sid)]).map_err(|e| bad(&e))?;
@@ -802,11 +804,12 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid)?;
-    let pairs: Vec<(String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, _)| (k.clone(), v.clone())).collect();
+    let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
+    let pairs = integrations::secret_keys(&located);
     if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         let prefix = config.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let result = integrations::sync_managed(&kind, &config, &pairs, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
+        let result = integrations::sync_managed(&kind, &config, &located, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
         let (msg, managed) = match result {
             Ok(x) => x,
             Err(e) => {
@@ -814,7 +817,9 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
                     // Some writes may have landed before the failure; keep ownership of them
                     // so a later mirror sync can still prune the remote.
                     let mut union = prev.clone();
-                    for n in integrations::desired_names(&config, &pairs) { if !union.contains(&n) { union.push(n); } }
+                    let mut names = integrations::desired_names(&config, &pairs);
+                    if kind == "ssh" { names = integrations::ssh_owned_names(&config, &located).unwrap_or(names); }
+                    for n in names { if !union.contains(&n) { union.push(n); } }
                     let _ = st.db.exec("DELETE FROM integration_sync_state WHERE integration_id=?", &[json!(iid)]);
                     for n in &union { let base = n.strip_prefix(&prefix).unwrap_or(n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default(); let _ = st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]); }
                 }
@@ -2093,26 +2098,54 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, creds.to_string().as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
-    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface") {
+	    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") {
         let config = body.get("config").cloned().unwrap_or(json!({}));
-        let issued = match typ {
-            "openrouter" => integrations::openrouter_create_key(&config, &name, ttl).await,
-            "resend" => integrations::resend_create_key(&config, &name).await,
-            "huggingface" => integrations::huggingface_create_token(&config, &name).await,
-            _ => integrations::openai_create_key(&config, &name, ttl).await,
-        }.map_err(|e| bad(&e))?;
-        let (secret, remote_id, base_url) = match typ {
-            "openrouter" => (issued["key"].as_str().unwrap_or("").to_string(), issued["hash"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://openrouter.ai/api/v1")),
-            "resend" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.resend.com")),
-            "huggingface" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://huggingface.co")),
-            _ => (issued["value"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.openai.com/v1")),
-        };
+	        let issued = match typ {
+	            "openrouter" => integrations::openrouter_create_key(&config, &name, ttl).await,
+	            "resend" => integrations::resend_create_key(&config, &name).await,
+	            "huggingface" => integrations::huggingface_create_token(&config, &name).await,
+	            "fireworks" => inference_leases::fireworks_create_key(&config, &name, ttl).await,
+	            "mistral" => inference_leases::mistral_create_key(&config, &name, ttl).await,
+	            "perplexity" => inference_leases::perplexity_create_key(&config, &name).await,
+	            "xai" => inference_leases::xai_create_key(&config, &name).await,
+	            "gemini" => inference_leases::gemini_create_key(&config, &name).await,
+	            "cloudflare" => inference_leases::cloudflare_create_token(&config, &name, ttl).await,
+	            "deepgram" => inference_leases::deepgram_create_key(&config, &name, ttl).await,
+	            "elevenlabs" => inference_leases::elevenlabs_create_key(&config, &name).await,
+	            "deepinfra" => inference_leases::deepinfra_create_key(&config, &name).await,
+	            "baseten" => inference_leases::baseten_create_key(&config, &name, ttl).await,
+	            "fal" => inference_leases::fal_create_key(&config, &name).await,
+		            "speechmatics" => inference_leases::speechmatics_create_key(&config, &name, ttl).await,
+		            "chutes" => inference_leases::chutes_create_key(&config, &name).await,
+		            _ => integrations::openai_create_key(&config, &name, ttl).await,
+	        }.map_err(|e| bad(&e))?;
+	        let (secret, remote_id, base_url) = match typ {
+	            "openrouter" => (issued["key"].as_str().unwrap_or("").to_string(), issued["hash"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://openrouter.ai/api/v1")),
+	            "resend" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.resend.com")),
+	            "huggingface" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://huggingface.co")),
+	            "perplexity" => (issued["token"].as_str().unwrap_or("").to_string(), issued["token"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.perplexity.ai")),
+	            "deepinfra" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.deepinfra.com")),
+	            "cloudflare" => (issued["token"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.cloudflare.com/client/v4")),
+	            "gemini" => (issued["key"].as_str().unwrap_or("").to_string(), issued["name"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://apikeys.googleapis.com")),
+		            "fireworks" | "mistral" | "xai" | "deepgram" | "elevenlabs" | "baseten" | "fal" | "speechmatics" | "chutes" => (issued["key"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or(match typ { "fireworks" => "https://api.fireworks.ai", "mistral" => "https://api.mistral.ai", "xai" => "https://management-api.x.ai", "deepgram" => "https://api.deepgram.com", "baseten" => "https://api.baseten.co", "fal" => "https://api.fal.ai", "speechmatics" => "https://mp.speechmatics.com", "chutes" => "https://api.chutes.ai", _ => "https://api.elevenlabs.io" })),
+	            _ => (issued["value"].as_str().unwrap_or("").to_string(), issued["id"].as_str().unwrap_or("").to_string(), config.get("base_url").and_then(|v| v.as_str()).unwrap_or("https://api.openai.com/v1")),
+	        };
         // The parent credential is encrypted for the revoke call only. The response carries the child secret.
         let mut stored = json!({"type": typ, "base_url": base_url, "remote_id": remote_id});
-        let parent = match typ { "openrouter" => config.get("management_key"), "huggingface" => config.get("token"), "resend" => config.get("api_key"), _ => config.get("admin_key") }.and_then(|v| v.as_str()).unwrap_or("");
-        stored["parent"] = json!(parent);
-        if typ == "openai" { stored["project_id"] = json!(config.get("project_id").and_then(|v| v.as_str()).unwrap_or("")); }
-        if typ == "huggingface" { stored["org"] = json!(config.get("org").and_then(|v| v.as_str()).unwrap_or("")); stored["service_account_id"] = json!(config.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("")); }
+	        let parent = match typ {
+	            "openrouter" | "xai" | "speechmatics" => config.get(if typ == "speechmatics" { "management_token" } else { "management_key" }),
+	            "huggingface" => config.get("token"),
+	            "openai" | "mistral" => config.get("admin_key"),
+	            "gemini" => config.get("access_token"),
+	            "cloudflare" => config.get("api_token"),
+	            _ => config.get("api_key"),
+	        }.and_then(|v| v.as_str()).unwrap_or("");
+	        stored["parent"] = json!(parent);
+	        if typ == "openai" { stored["project_id"] = json!(config.get("project_id").and_then(|v| v.as_str()).unwrap_or("")); }
+	        if typ == "huggingface" { stored["org"] = json!(config.get("org").and_then(|v| v.as_str()).unwrap_or("")); stored["service_account_id"] = json!(config.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("")); }
+	        if typ == "fireworks" { stored["account_id"] = json!(config.get("account_id").and_then(|v| v.as_str()).unwrap_or("")); stored["user_id"] = json!(config.get("user_id").and_then(|v| v.as_str()).unwrap_or("")); }
+	        if matches!(typ, "deepgram" | "gemini") { stored["project_id"] = json!(config.get(if typ == "deepgram" { "project_id" } else { "project" }).and_then(|v| v.as_str()).unwrap_or("")); }
+	        if typ == "elevenlabs" { stored["service_account_id"] = json!(config.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("")); }
         let config_enc = oc::encrypt_symmetric(&key, stored.to_string().as_bytes());
         st.db.exec("INSERT INTO leases(id,env_id,name,value_enc,config_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(lid), json!(eid), json!(name), json!(oc::encrypt_symmetric(&key, secret.as_bytes())), json!(config_enc), json!(now()+ttl), json!(now())]).map_err(|e| bad(&e))?;
         return Ok(j(json!({"id": lid, "value": secret, "remote_id": remote_id, "expires_at": now()+ttl, "type": typ})));
@@ -2127,21 +2160,36 @@ async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>
         match cfg.get("type").and_then(|v| v.as_str()) {
             Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 let _ = std::thread::spawn(move || { if let Ok(mut cl) = postgres::Client::connect(&conn, postgres::NoTls) { let _ = cl.execute(&format!("DROP ROLE IF EXISTS \"{}\"", username), &[]); } }).join(); }
-            Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface")) => {
+		            Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let project = cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let hf_org = cfg.get("org").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let service_account = cfg.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+	                let project = cfg.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+	                let hf_org = cfg.get("org").and_then(|v| v.as_str()).unwrap_or("").to_string();
+	                let service_account = cfg.get("service_account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+	                let account_id = cfg.get("account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+	                let user_id = cfg.get("user_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let kind = kind.to_string();
                 // A failed remote delete must not mark the local lease revoked.
-                let remote_result = match kind.as_str() {
-                    "openrouter" => integrations::openrouter_revoke_key(&base, &parent, &remote).await,
-                    "resend" => integrations::resend_revoke_key(&base, &parent, &remote).await,
-                    "huggingface" => integrations::huggingface_revoke_token(&base, &parent, &hf_org, &service_account, &remote).await,
-                    _ => integrations::openai_revoke_key(&base, &parent, &project, &remote).await,
-                };
+	                let remote_result = match kind.as_str() {
+	                    "openrouter" => integrations::openrouter_revoke_key(&base, &parent, &remote).await,
+	                    "resend" => integrations::resend_revoke_key(&base, &parent, &remote).await,
+	                    "huggingface" => integrations::huggingface_revoke_token(&base, &parent, &hf_org, &service_account, &remote).await,
+	                    "fireworks" => inference_leases::fireworks_revoke_key(&base, &parent, &account_id, &user_id, &remote).await,
+	                    "mistral" => inference_leases::mistral_revoke_key(&base, &parent, &remote).await,
+	                    "perplexity" => inference_leases::perplexity_revoke_key(&base, &parent, &remote).await,
+	                    "xai" => inference_leases::xai_revoke_key(&base, &parent, &remote).await,
+	                    "gemini" => inference_leases::gemini_revoke_key(&base, &parent, &remote).await,
+	                    "cloudflare" => inference_leases::cloudflare_revoke_token(&base, &parent, &remote).await,
+	                    "deepgram" => inference_leases::deepgram_revoke_key(&base, &parent, &project, &remote).await,
+	                    "elevenlabs" => inference_leases::elevenlabs_revoke_key(&base, &parent, &service_account, &remote).await,
+	                    "deepinfra" => inference_leases::deepinfra_revoke_key(&base, &parent, &remote).await,
+	                    "baseten" => inference_leases::baseten_revoke_key(&base, &parent, &remote).await,
+	                    "fal" => inference_leases::fal_revoke_key(&base, &parent, &remote).await,
+		                    "speechmatics" => inference_leases::speechmatics_revoke_key(&base, &parent, &remote).await,
+		                    "chutes" => inference_leases::chutes_revoke_key(&base, &parent, &remote).await,
+		                    _ => integrations::openai_revoke_key(&base, &parent, &project, &remote).await,
+	                };
                 remote_result.map_err(|e| bad(&e))?;
             }
             _ => {}
@@ -2708,7 +2756,7 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>
                 let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
                 if !orgs.iter().any(|o| o == org) { continue; }
                 let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
-                if !env.is_empty() { if st.require_env(env, &uid).is_err() { continue; } }
+                if !env.is_empty() && st.require_env(env, &uid).is_err() { continue; }
                 let mut out = v; out["type"] = json!("event");
                 if socket.send(Message::Text(out.to_string().into())).await.is_err() { return; }
             }
