@@ -904,8 +904,14 @@ async fn oidc_does_not_link_an_existing_account_by_email() {
     let idp = start_idp("oidc-victim@test.invalid");
     let state = begin_oidc(&s, at, ao, &idp).await;
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
-    assert_eq!(r.status, 409, "an existing email must be refused, got {} {}", r.status, r.header("location"));
-    assert!(!r.header("location").contains("token="), "no session may be issued for the victim: {}", r.header("location"));
+    assert_eq!(r.status, 307, "an existing email must be offered the proof flow, got {} {}", r.status, r.text);
+    let location = r.header("location");
+    assert!(location.contains("#link="), "the proof challenge must be returned: {}", location);
+    assert!(!location.contains("token="), "no session may be issued for the victim: {}", location);
+    let challenge = location.split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no link challenge in {}", location);
+    let bad = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "not-the-victims-password"}))).await;
+    assert_eq!(bad.status, 401, "a wrong password must not link the victim's identity, got {} {}", bad.status, bad.text);
     let _ = victim;
 }
 

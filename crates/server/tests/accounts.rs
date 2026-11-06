@@ -827,6 +827,124 @@ async fn oidc_group_claims_map_to_org_roles() {
 }
 
 #[tokio::test]
+async fn oidc_group_membership_admits_a_matching_group() {
+    let idp = start_mock_groups("group-member@test.invalid", "test-oidc", &["openwarp-eng"]);
+    let s = Server::start().await;
+    let owner = register(&s, "group-join-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": false, "oidc_allowed_domains": "test.invalid",
+        "oidc_groups_claim": "groups", "oidc_group_roles": "{\"openwarp-eng\":\"developer\"}",
+        "oidc_group_membership": true
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "a matching group must admit the user: {} {}", cb.status, cb.text);
+    let token = cb.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
+    let row = orgs.body.as_array().and_then(|a| a.iter().find(|o| o["id"] == json!(org))).expect("the group member must join the org");
+    assert_eq!(row["role"], json!("developer"), "{}", orgs.text);
+}
+
+#[tokio::test]
+async fn provider_login_with_an_existing_email_offers_account_linking() {
+    let idp = start_mock("proof-owner@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let account = register(&s, "proof-owner@test.invalid").await;
+    let account_token = account.body["token"].as_str().unwrap().to_string();
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    let location = cb.header("location");
+    assert!(location.contains("#link="), "an existing email must offer the proof flow: {}", location);
+    assert!(!location.contains("token="), "no session may be issued before proof: {}", location);
+    let challenge = location.split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let bad = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "wrong-password"}))).await;
+    assert_eq!(bad.status, 401, "a wrong password must not link the identity: {} {}", bad.status, bad.text);
+    let ok = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    let linked = ok.body["token"].as_str().unwrap();
+    let me = s.call(Method::GET, "/api/me", Some(linked), None).await;
+    assert_eq!(me.body["email"], json!("proof-owner@test.invalid"), "{}", me.text);
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&account_token), None).await;
+    assert!(ids.body["social"].as_array().map(|a| a.iter().any(|x| x["provider"] == json!("google"))).unwrap_or(false), "{}", ids.text);
+    let replay = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(replay.status, 400, "a link challenge must be single use: {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn provider_login_can_link_via_a_confirmation_email() {
+    let idp = start_mock("proof-email@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    register(&s, "proof-email@test.invalid").await;
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    let challenge = cb.header("location").split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no proof challenge in {}", cb.header("location"));
+    let sent = s.call(Method::POST, "/api/auth/link/email", None, Some(json!({"token": challenge}))).await;
+    assert_eq!(sent.status, 200, "{}", sent.text);
+    let text = wait_for_mail(&s.inbox, "/api/auth/link/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/link/verify?token=");
+    let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+    let verified = s.get(&path).await;
+    assert_eq!(verified.status, 307, "{} {}", verified.status, verified.text);
+    let token = verified.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("proof-email@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn org_sso_can_link_an_existing_account_after_proof() {
+    let idp = start_mock("org-proof@test.invalid", "test-oidc");
+    let s = Server::start().await;
+    let owner = register(&s, "org-proof-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let existing = register(&s, "org-proof@test.invalid").await;
+    let existing_token = existing.body["token"].as_str().unwrap().to_string();
+    let added = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "org-proof@test.invalid", "role": "developer"}))).await;
+    assert_eq!(added.status, 200, "{}", added.text);
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": false, "oidc_allowed_domains": "test.invalid"
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    let challenge = cb.header("location").split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no proof challenge in {}", cb.header("location"));
+    let ok = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    let session = ok.body["token"].as_str().unwrap();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(session), None).await;
+    assert!(orgs.text.contains(org), "the linked account must keep its membership: {}", orgs.text);
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&existing_token), None).await;
+    assert!(ids.body["oidc"].as_array().map(|a| a.iter().any(|x| x["issuer"] == json!(idp.issuer))).unwrap_or(false), "{}", ids.text);
+}
+
+#[tokio::test]
 async fn account_linking_binds_a_provider_identity_to_an_existing_user() {
     let idp = start_mock("linked-google@test.invalid", "test-google");
     let s = Server::start_env(&[

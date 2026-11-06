@@ -79,8 +79,12 @@ Workspace settings accept `oidc_groups_claim` (default `groups`) and
 `oidc_group_roles`, a JSON object mapping group names to `owner`, `admin` or
 `developer`. On each SSO login a matching group sets the member's role; the
 highest-privileged match wins, no match leaves the current role, and the last
-owner is never demoted. Group claims never create membership: invites or
-auto-provisioning do.
+owner is never demoted.
+
+Set `oidc_group_membership` to let a configured group grant membership even
+without an invite. It is still limited by `oidc_allowed_domains` and instance
+signups, and the mapped role is applied. Without the flag, group claims update
+the role of existing members but never create membership.
 
 ## Identity linking
 
@@ -92,6 +96,14 @@ that account instead of creating or signing in another user. `GET
 removes one. An identity belongs to one account; linking never merges accounts
 or changes the account email. The console exposes the same controls under
 Settings.
+
+When a provider or SSO login presents an email that already belongs to an
+account, the browser is sent to a proof step instead of being rejected. The user
+enters the account password, plus a TOTP or recovery code when MFA is enabled,
+or requests an emailed confirmation link. Only after that proof is the identity
+bound. A wrong password or code links nothing, challenges are single use, and
+they expire after 10 minutes. The endpoints are `POST /api/auth/link/complete`,
+`POST /api/auth/link/email` and `GET /api/auth/link/verify`.
 
 ## Back-channel logout
 

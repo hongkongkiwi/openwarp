@@ -150,6 +150,22 @@ async function acceptInvite(){try{
   let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
   T='';history.replaceState(null,'',location.pathname);enterApp();
 }catch(e){toast(e.message,true)}}
+function showLink(token,provider,org){
+  $('auth').style.display='grid';$('shell').style.display='none';$('authtitle').textContent='Link your sign-in';
+  $('authform').innerHTML=`<p class="mut">An account with this email already exists. Enter that account's password to link ${esc(providerName(provider||'this provider'))}.</p>
+    <div class="field"><label for="link-pw">Password</label><input id="link-pw" type="password" autocomplete="current-password" placeholder="account password"></div>
+    <div class="field"><label for="link-code">Authenticator or recovery code</label><input id="link-code" placeholder="if MFA is enabled"></div>
+    <button class="primary" style="width:100%;padding:11px" onclick="completeLink()">Link account</button>
+    <button class="ghost" style="width:100%;margin-top:6px" onclick="emailLink()">Email me a confirmation link</button>`;
+  $('authform').dataset.link=token;$('authform').dataset.linkorg=org||''}
+async function completeLink(){try{
+  let d=await api('POST','/api/auth/link/complete',{token:$('authform').dataset.link,password:$('link-pw').value,code:$('link-code').value});
+  T=d.token;history.replaceState(null,'',location.pathname);enterApp();
+}catch(e){toast(e.message,true)}}
+async function emailLink(){try{
+  await api('POST','/api/auth/link/email',{token:$('authform').dataset.link});
+  toast('Check your email for a confirmation link');
+}catch(e){toast(e.message,true)}}
 function forgotPrompt(){modal(`<h3>Reset your password</h3><p class="mut">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()">Send link</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Reset password')}
@@ -407,6 +423,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> Allow first-time SSO users to join as developers</label>
   <div class="field"><label for="set-oidc-groups">Groups claim</label><input id="set-oidc-groups" value="${esc(s?.oidc_groups_claim||'')}" placeholder="groups" style="width:100%"></div>
   <div class="field"><label for="set-oidc-roles">Group to role mapping (JSON, managed roles only)</label><textarea id="set-oidc-roles" rows="3" placeholder='{"openwarp-admins":"admin","openwarp-eng":"developer"}'>${esc(s?.oidc_group_roles||'')}</textarea></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-group-join" ${s?.oidc_group_membership?'checked':''}> Allow a matching SSO group to join this workspace</label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()">Save settings</button></div></div>
   ${samlCard}
   <div class="card"><h3>Authenticator app (TOTP)</h3><p>Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator"><button onclick="totpVerify()">Verify and enable</button></div></div>
@@ -417,7 +434,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div id="ident-list" class="mut small">Loading…</div><div id="ident-links" class="row" style="margin-top:10px;flex-wrap:wrap"></div></div>
   <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`;
   renderIdentities(s)}
-async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value,oidc_groups_claim:$('set-oidc-groups').value,oidc_group_roles:$('set-oidc-roles').value};
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value,oidc_groups_claim:$('set-oidc-groups').value,oidc_group_roles:$('set-oidc-roles').value,oidc_group_membership:$('set-oidc-group-join').checked};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
   if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
@@ -425,7 +442,7 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,oidc_aut
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toast('Settings saved')}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toast('Signups '+(d.signups_open?'enabled':'disabled'));renderSettings()}catch(e){toast(e.message,true)}}
 async function saveSaml(){try{let b={idp_entity_id:$('set-saml-entity').value,metadata_url:$('set-saml-url').value,metadata_xml:$('set-saml-xml').value,allow_unsigned_metadata:$('set-saml-unsigned').checked,auto_provision:$('set-saml-auto').checked,allowed_domains:$('set-saml-domains').value};let d=await api('PUT',`/api/orgs/${ORG}/saml`,b);$('saml-out').textContent='SP metadata: '+d.sp_metadata_url;toast('SAML saved')}catch(e){toast(e.message,true)}}
-function providerName(p){if(p.startsWith('oidc:'))return 'SSO';const m=PROVIDERS.find(x=>x[0]===p);return m?m[1]:p}
+function providerName(p){if(p==='oidc'||p.startsWith('oidc:'))return 'SSO';const m=PROVIDERS.find(x=>x[0]===p);return m?m[1]:p}
 async function renderIdentities(s){try{
   let [ids,prov]=await Promise.all([api('GET','/api/me/identities'),api('GET','/api/auth/providers')]);
   let rows=[];
@@ -464,6 +481,7 @@ function boot(){
     history.replaceState(null,'',location.pathname);}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
+  else if(h.startsWith('link=')){let parts=h.slice(5).split('&');let provider='';let org='';for(let p of parts.slice(1)){if(p.startsWith('provider='))provider=p.slice(9);if(p.startsWith('org='))org=p.slice(4);}showLink(decodeURIComponent(parts[0]),decodeURIComponent(provider),decodeURIComponent(org));}
   else if(h.startsWith('linked=')){history.replaceState(null,'',location.pathname);toast('Sign-in identity linked');}
 }
 boot();
