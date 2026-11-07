@@ -64,6 +64,10 @@ pub const MIGRATIONS: &[Migration] = &[
 /// baseline on a slow database, short enough to recover from a killed process.
 const LOCK_STALE_SECS: i64 = 15 * 60;
 
+/// SQL profile used when splitting migration statements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlDialect { Legacy, Sqlite, Postgres, Mysql }
+
 /// A storage backend the runner can drive. Statements are raw: migrations are
 /// not parameterised, and a literal `?` in SQL text must never be rewritten.
 #[allow(async_fn_in_trait)] // awaited inline; these futures are never spawned
@@ -75,6 +79,8 @@ pub trait Target {
     async fn script(&self, statements: &[String]) -> Result<(), String>;
     /// True when a failed `script` left no changes behind.
     fn atomic_ddl(&self) -> bool;
+    /// Defaults to the legacy splitter for existing target implementations.
+    fn sql_dialect(&self) -> SqlDialect { SqlDialect::Legacy }
     /// True when application objects exist outside the migration ledger. A
     /// fresh database has none. A database that predates the ledger does, and
     /// recording the consolidated baseline as squashed there would certify
@@ -88,6 +94,18 @@ impl Target for Db {
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { Db::query(self, sql, &[]).await }
     async fn script(&self, statements: &[String]) -> Result<(), String> { Db::exec_script(self, statements).await }
     fn atomic_ddl(&self) -> bool { Db::script_is_atomic(self) }
+    fn sql_dialect(&self) -> SqlDialect {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(_) => SqlDialect::Sqlite,
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(_) => SqlDialect::Postgres,
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(_) => SqlDialect::Mysql,
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_, _) => SqlDialect::Sqlite,
+        }
+    }
     async fn has_application_schema(&self) -> Result<bool, String> { Db::has_application_schema(self).await }
 }
 
@@ -109,6 +127,7 @@ impl Target for worker::D1Database {
         self.batch(batch).await.map(|_| ()).map_err(|e| e.to_string())
     }
     fn atomic_ddl(&self) -> bool { true }
+    fn sql_dialect(&self) -> SqlDialect { SqlDialect::Sqlite }
     async fn has_application_schema(&self) -> Result<bool, String> {
         // D1 is SQLite underneath: its own bookkeeping tables are `_cf_*` and
         // `d1_*`, alongside SQLite's `sqlite_*`.
@@ -275,6 +294,19 @@ async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: 
             done.insert(migration.version);
         }
         report.squashed = true;
+    } else if rows.len() < SQUASHED_THROUGH as usize
+        && rows[0].version == 1 && rows[0].name == "baseline" && rows[0].success
+        && rows[0].checksum == checksum(migrations[0].sql)
+        && rows.iter().skip(1).enumerate().all(|(index, row)| {
+            row.version == index as i64 + 2 && row.success && row.checksum == "squashed"
+        })
+    {
+        // Only a completed modern baseline followed by squash markers proves
+        // that the missing prefix was covered before an interrupted write.
+        for migration in migrations.iter().filter(|m| m.version > 1 && m.version <= SQUASHED_THROUGH && !done.contains(&m.version)) {
+            insert_squashed(target, migration).await?;
+        }
+        done.extend(2..=SQUASHED_THROUGH);
     }
 
     for migration in migrations {
@@ -295,7 +327,7 @@ async fn apply_one<T: Target>(target: &T, migration: &Migration) -> Result<(), S
         migration.version, crate::clock::now(), sql_literal(migration.name), checksum,
     )).await?;
 
-    let statements = split_sql(migration.sql);
+    let statements = split_sql_with_dialect(migration.sql, target.sql_dialect());
     let outcome = if migration.tolerant {
         exec_tolerant(target, &statements, migration.version <= SQUASHED_THROUGH).await
     } else {
@@ -605,12 +637,15 @@ pub fn all_statements() -> Vec<String> {
     MIGRATIONS.iter().flat_map(|migration| split_sql(migration.sql)).collect()
 }
 
+/// Split using the legacy profile, including SQLite bracket identifiers.
+pub fn split_sql(sql: &str) -> Vec<String> { split_sql_with_dialect(sql, SqlDialect::Legacy) }
+
 /// Split a migration into single statements. Handles quoted strings, quoted
 /// identifiers, line and block comments, PostgreSQL dollar quoting, and the
 /// body of `CREATE TRIGGER`, whose internal semicolons do not end the statement.
-pub fn split_sql(sql: &str) -> Vec<String> {
+pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
     #[derive(Clone, Copy, PartialEq)]
-    enum Mode { Normal, Single, Double, Backtick, Line, Block }
+    enum Mode { Normal, Single, Double, Backtick, Bracket, Line, Block }
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -618,6 +653,10 @@ pub fn split_sql(sql: &str) -> Vec<String> {
     let mut mode = Mode::Normal;
     let mut dollar: Option<&[u8]> = None;
     let mut has_code = false;
+    let mut words = 0;
+    let mut create = false;
+    let mut trigger = false;
+    let mut trigger_depth = 0usize;
 
     while index < bytes.len() {
         if let Some(tag) = dollar {
@@ -630,6 +669,7 @@ pub fn split_sql(sql: &str) -> Vec<String> {
                 if byte == b'\'' { mode = Mode::Single; has_code = true; index += 1; }
                 else if byte == b'"' { mode = Mode::Double; has_code = true; index += 1; }
                 else if byte == b'`' { mode = Mode::Backtick; has_code = true; index += 1; }
+                else if byte == b'[' && matches!(dialect, SqlDialect::Legacy | SqlDialect::Sqlite) { mode = Mode::Bracket; has_code = true; index += 1; }
                 else if byte == b'-' && bytes.get(index + 1) == Some(&b'-') { mode = Mode::Line; index += 2; }
                 else if byte == b'#' { mode = Mode::Line; index += 1; }
                 else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') { mode = Mode::Block; index += 2; }
@@ -638,15 +678,30 @@ pub fn split_sql(sql: &str) -> Vec<String> {
                         Some(tag) => { dollar = Some(tag); index += tag.len(); has_code = true; }
                         None => { index += 1; }
                     }
+                } else if byte.is_ascii_alphabetic() || byte == b'_' {
+                    let word_start = index;
+                    index += 1;
+                    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] == b'$') { index += 1; }
+                    let word = &sql[word_start..index];
+                    if words == 0 { create = word.eq_ignore_ascii_case("CREATE"); }
+                    if words == 1 && create { trigger = word.eq_ignore_ascii_case("TRIGGER"); }
+                    words += 1;
+                    if trigger && (word_start == 0 || bytes[word_start - 1] != b'.') {
+                        if word.eq_ignore_ascii_case("BEGIN") || (trigger_depth > 0 && word.eq_ignore_ascii_case("CASE")) {
+                            trigger_depth += 1;
+                        } else if trigger_depth > 0 && word.eq_ignore_ascii_case("END") {
+                            trigger_depth -= 1;
+                        }
+                    }
+                    has_code = true;
                 } else if byte == b';' {
-                    // A trigger body contains semicolons before its closing
-                    // END; only that final one ends the statement.
-                    let chunk = strip_comments(&sql[start..index]);
-                    let is_trigger = chunk.trim_start().get(..14).is_some_and(|head| head.eq_ignore_ascii_case("CREATE TRIGGER"));
-                    if is_trigger && !ends_with_end(&chunk) { index += 1; continue; }
+                    if trigger_depth > 0 { index += 1; continue; }
                     push_statement(&mut out, &sql[start..index], has_code);
                     start = index + 1;
                     has_code = false;
+                    words = 0;
+                    create = false;
+                    trigger = false;
                     index += 1;
                 } else {
                     if !byte.is_ascii_whitespace() { has_code = true; }
@@ -666,6 +721,10 @@ pub fn split_sql(sql: &str) -> Vec<String> {
             }
             Mode::Backtick => {
                 if byte == b'`' { mode = Mode::Normal; }
+                index += 1;
+            }
+            Mode::Bracket => {
+                if byte == b']' { mode = Mode::Normal; }
                 index += 1;
             }
             Mode::Line => {
@@ -705,10 +764,6 @@ fn trim_leading_comments(text: &str) -> &str {
             return rest;
         }
     }
-}
-
-fn ends_with_end(text: &str) -> bool {
-    text.trim_end().to_ascii_uppercase().ends_with("END")
 }
 
 /// PostgreSQL dollar quote opener at `at`, including both `$` characters.

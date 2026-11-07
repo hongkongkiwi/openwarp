@@ -44,17 +44,34 @@ if [ -z "$ready" ]; then
   exit 1
 fi
 
-first="$(curl -fsS "http://127.0.0.1:${port}/__internal/migrate-d1")"
-second="$(curl -fsS "http://127.0.0.1:${port}/__internal/migrate-d1")"
+request_migration() {
+  local body status
+  body="$(mktemp "$persist/response.XXXXXX")"
+  if ! status="$(curl -sS -o "$body" -w '%{http_code}' "http://127.0.0.1:${port}/__internal/migrate-d1")"; then
+    echo "d1 smoke: migration request failed" >&2
+    tail -60 "$persist/dev.log" >&2
+    return 1
+  fi
+  if [ "$status" != 200 ]; then
+    echo "d1 smoke: migration returned HTTP $status" >&2
+    cat "$body" >&2
+    tail -60 "$persist/dev.log" >&2
+    return 1
+  fi
+  cat "$body"
+}
+
+first="$(request_migration)"
+second="$(request_migration)"
 echo "first:  $first"
 echo "second: $second"
 case "$first" in
   *"applied=[1, 18, 19, 20]"*|*"applied=[1,18,19,20]"*) ;;
-  *) echo "d1 smoke: unexpected first apply result" >&2; exit 1 ;;
+  *) echo "d1 smoke: unexpected first apply result: $first" >&2; tail -60 "$persist/dev.log" >&2; exit 1 ;;
 esac
 case "$second" in
   *"applied=[]"*) ;;
-  *) echo "d1 smoke: the second apply was not a no-op" >&2; exit 1 ;;
+  *) echo "d1 smoke: the second apply was not a no-op: $second" >&2; tail -60 "$persist/dev.log" >&2; exit 1 ;;
 esac
 
 query() {

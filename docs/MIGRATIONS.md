@@ -191,6 +191,18 @@ predate checksums and rows covered by the consolidated baseline, because
 
 5. Run `openwarp-migrate verify` against a copy of a real database.
 
+The runner splits statements using the target's SQL profile. SQLite, Durable
+Object SQLite, and D1 recognise bracket-quoted identifiers; PostgreSQL and
+MySQL do not, so brackets in PostgreSQL array expressions remain SQL syntax.
+Existing custom `Target` implementations default to `SqlDialect::Legacy`, as do
+`split_sql` and `all_statements`. Custom targets for other engines should
+implement `sql_dialect` or use `split_sql_with_dialect` explicitly.
+
+The splitter is not a full procedural SQL parser. It tracks `CREATE TRIGGER`
+`BEGIN`/`END` bodies and nested `CASE` expressions, but does not support every
+procedural dialect or MySQL `DELIMITER` directives. Use supported canonical SQL
+and test migrations on each target engine.
+
 Keep data migrations idempotent. The runner marks completion, but a crash
 between a MySQL DDL statement and the ledger write can leave a schema that a
 human has to reconcile.

@@ -10,7 +10,8 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 |---|---|
 | `crates/server/src/main.rs` | Axum routes, identity and authorisation, secret operations, background work. ~2.3k lines, deliberately dense |
 | `crates/server/src/db.rs` | SQLite/PostgreSQL/MariaDB adapter, statement execution, MySQL DDL rewriting |
-| `crates/server/src/migrate.rs` | Migration runner: ledger, checksums, locking, squash baseline, repair, `openwarp-migrate` |
+| `crates/server/src/migrate.rs` | Migration runner: ledger, checksums, locking, squash baseline and repair |
+| `crates/server/src/bin/migrate.rs` | `openwarp-migrate` operator CLI |
 | `crates/server/migrations/` | Immutable numbered SQL migrations; `0001_baseline.sql` is the consolidated schema |
 | `crates/server/src/ui.rs` | The entire browser console: HTML, CSS and JS in Rust string constants |
 | `crates/server/src/e2e.js` | Browser-side end-to-end cryptography, served at `/e2e.js` |

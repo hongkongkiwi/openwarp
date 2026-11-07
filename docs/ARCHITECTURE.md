@@ -8,7 +8,8 @@ OpenWarp is a Rust workspace with a server, CLI, and cryptographic library. The 
 | --- | --- |
 | [`crates/server/src/main.rs`](../crates/server/src/main.rs) | HTTP routing, authentication, authorisation, secret operations, and background work |
 | [`crates/server/src/db.rs`](../crates/server/src/db.rs) | SQLite, PostgreSQL, MariaDB and Durable Object storage adapter; MySQL DDL rewriting |
-| [`crates/server/src/migrate.rs`](../crates/server/src/migrate.rs) | Versioned migration runner and `openwarp-migrate` operator CLI |
+| [`crates/server/src/migrate.rs`](../crates/server/src/migrate.rs) | Versioned migration runner and ledger checks |
+| [`crates/server/src/bin/migrate.rs`](../crates/server/src/bin/migrate.rs) | `openwarp-migrate` operator CLI |
 | [`crates/server/migrations`](../crates/server/migrations) | Immutable numbered SQL migrations; the consolidated baseline is version 1 |
 | [`crates/server/src/ui.rs`](../crates/server/src/ui.rs) | Embedded browser console |
 | [`crates/server/src/e2e.js`](../crates/server/src/e2e.js) | Browser E2E cryptography |
