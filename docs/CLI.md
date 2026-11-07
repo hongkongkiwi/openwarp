@@ -110,6 +110,23 @@ openwarp run -- sh -c 'printf "%s\n" "$EXAMPLE_GREETING"'
 
 The CLI sets fetched values in the child's environment and propagates its exit status. The `--` separates OpenWarp arguments from the child command. Shell operators require an explicit shell, as in the second example. Do not run untrusted programs with production secrets.
 
+## Template agent
+
+Render a local configuration file from shared SSE secrets:
+
+```bash
+openwarp agent --env ENV_ID --template app.conf.tmpl --out app.conf --once
+openwarp agent --env ENV_ID --template app.conf.tmpl --out app.conf --interval-secs 30 --cache-ttl-secs 30
+```
+
+A template expression such as `{{secret /database/PASSWORD}}` selects the exact folder and key. Use `{{secret /PASSWORD}}` for the root folder. Expressions insert literal values; they do not evaluate shell syntax or execute commands. Missing, ambiguous, sealed or unreadable values stop rendering without replacing the existing output.
+
+The agent accepts HTTP(S) hosts without URL credentials, query strings or fragments and never follows redirects. It uses an explicit token or a saved token only when the saved host exactly matches the selected host. It does not refresh saved OAuth credentials; reauthenticate separately or supply an automation token through `OPENWARP_TOKEN`.
+
+The agent fetches base exports, so personal overrides do not enter configuration files. It caches values only in process memory. Both interval and cache TTL default to 30 seconds; the interval accepts 1-3600 seconds and cache TTL accepts 0-300 seconds. A zero TTL fetches on every iteration. An expired cache is never used after a failed refresh. Authentication, authorization, network and rendering errors stop the agent with a nonzero exit status. A process supervisor can restart it after credentials or connectivity recover.
+
+On Unix, the agent writes a new file with mode 0600 and atomically renames it over the output. It refuses a symlink destination. Use an output directory owned by the agent's operating-system account; file modes do not protect against another process running as that account. Windows needs its own directory ACLs. Rendered files contain plaintext and remain on disk when the agent exits or access is revoked. The cache lifetime bounds refresh delay, not retention of previously written files. E2E and delegated environments are not supported by this SSE export workflow.
+
 ## End-to-end environments
 
 E2E operations use separate endpoints and perform encryption/decryption locally. Do not substitute ordinary `set`, `get`, or `run` for these commands.

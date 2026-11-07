@@ -215,6 +215,7 @@ pub fn validate_rotation_config(config: &Value) -> Result<(), String> {
     if config.as_object().map(|o| o.is_empty()).unwrap_or(true) { return Ok(()); }
     let kind = cfg(config, "kind");
     match kind {
+        "postgres-static" => { if cfg!(target_arch="wasm32") { return Err("static PostgreSQL rotation requires the native server".into()); } crate::pglease::validate_static(cfg(config,"connection"),cfg(config,"username"))?; }
         "" | "webhook" => {
             let url = cfg(config, "rotation_url");
             if url.is_empty() { return Err("rotation config requires kind or rotation_url".into()); }

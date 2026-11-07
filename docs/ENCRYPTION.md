@@ -108,6 +108,32 @@ keys, lockbox values and environment keys all use that same root, so no record
 needs re-encryption. Back up the KMS key: removing it makes the data unreadable
 unless `OPENWARP_MASTER_KEY` still holds the same key.
 
+### Production auto-unseal
+
+On the native server, `OPENWARP_KMS_URL` permits production startup without
+`OPENWARP_MASTER_KEY`. The first boot wraps a newly generated root, or adopts an
+existing development root. Later boots unwrap that same persisted root. A failed
+unwrap, an invalid root length or a missing bridge for a KMS-wrapped database
+stops startup; none is a reason to create a replacement root.
+
+If `OPENWARP_MASTER_KEY` is also supplied, it takes precedence. Adoption of a
+plaintext development root runs only when the master-key variable is absent.
+Test a restart with the configured bridge before removing any recovery copy.
+The bridge credential is itself a deployment secret and must have access to the
+stored key identifiers. This is not Shamir unseal or a recovery-share protocol.
+The native bridge is unavailable on Workers, which still require an external
+master-key binding.
+
+Online instance-root rotation is refused when a KMS is configured or a wrapped
+KMS root is persisted. Changing the external KMS key identifier and rewrapping
+keys is a separate operation. The native SQLite root-rotation path also rewraps
+transit wrapping keys and version-2 authentication keys in the same transaction.
+A lifecycle lock prevents HTTP and maintenance work from persisting old-root
+records during that operation. PostgreSQL online rotation is refused: OpenWarp
+does not provide an offline multi-replica root-rotation command. Keep the existing
+root until a coordinated migration has been designed and verified. Do not change
+a startup key value as a substitute for re-encrypting stored key material.
+
 ## The honest limit on "we cannot read it"
 
 1. **The console still uses the version 1 password flow.** The server exposes
