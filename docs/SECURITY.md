@@ -81,6 +81,18 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## Emergency workspace and project lockdown
+
+A workspace owner can halt the workspace or one project (an application). The console uses `PUT /api/orgs/{org_id}/emergency` or `PUT /api/apps/{app_id}/emergency` with `{"locked":true}` to activate and `{"locked":false}` to restore the selected scope. Both require a cookie-backed database account session and the actual workspace `owner` role. Admins, custom administrative roles and owner-created automation credentials cannot restore access. Member console sessions can read status through `GET` on the same routes. Project status reports `locked` (effective state), `direct_locked` and `workspace_locked`.
+
+A workspace lockdown applies to every project. A direct project lockdown applies only to that project. Either flag denies access, so restoring a workspace preserves direct project locks and restoring a project cannot bypass a workspace lock.
+
+The console permits authorised metadata reads, but no mutations or secret reads, including exports, history and E2E key/ciphertext access. SDK and other automation credentials are denied both reads and writes targeting the halted scope. A Bearer session is an automation credential for this boundary. A service or OAuth token in a cookie does not become a console session. Cookie session authentication identifies the console access class; it cannot prove a human is operating the client.
+
+Activation revokes non-owner workspace members' existing sessions and OAuth credentials, including for a project-only halt. Account sessions are global and unrestricted environments admit workspace members, so revocation cannot be limited to one project. Members must reauthenticate for console inspection or access to an unaffected scope. Owners retain sessions, not secret access. Restoration never resurrects revoked credentials. Sync dispatch and runnable runner payloads remain paused for the effective locked scope.
+
+Lockdown does not rotate credentials or erase remote data. A client may retain plaintext or keys it already received. An operation already past its final access check may finish, and a provider request or runner payload already delivered may still execute. Existing Lockbox shares are not workspace-linked and are outside this control. Revoke external credentials and rotate affected secrets separately.
+
 ## SSH certificate authority
 
 An SSH CA moves part of the trust decision onto the target host: sshd accepts any certificate its `TrustedUserCAKeys` CA signed while the certificate is inside its validity window. OpenWarp therefore does not mediate the login itself, and a host enforces expiry rather than asking the server whether a session is still allowed.

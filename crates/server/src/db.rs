@@ -12,7 +12,7 @@ pub enum Db {
     #[cfg(not(target_arch = "wasm32"))]
     Postgres(deadpool_postgres::Pool),
     #[cfg(target_arch = "wasm32")]
-    DoSqlite(std::rc::Rc<worker::SqlStorage>),
+    DoSqlite(std::rc::Rc<worker::Storage>),
 }
 
 // A Workers isolate has no threads and the Durable Object serialises event
@@ -55,7 +55,7 @@ impl Db {
     }
     /// Wrap the Durable Object SQLite handle used by the Workers deployment.
     #[cfg(target_arch = "wasm32")]
-    pub async fn from_do_sql(storage: worker::SqlStorage) -> Result<Self, String> {
+    pub async fn from_do_sql(storage: worker::Storage) -> Result<Self, String> {
         let db = Db::DoSqlite(std::rc::Rc::new(storage)); db.migrate().await?; Ok(db)
     }
     /// Cheap clone of the Durable Object SQL handle for deferred work.
@@ -79,7 +79,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.sql().exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 Ok(cursor.rows_written() as u64)
             }
         }
@@ -110,7 +110,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.sql().exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
                 for row in cursor.raw() {
@@ -149,12 +149,18 @@ impl Db {
                 }
                 tx.commit().await.map_err(|e| e.to_string())
             }
-            // A Durable Object handles one event at a time and the SQL handle is
-            // synchronous, so a sequential batch cannot interleave with another
-            // request the way two native connections could.
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s) => {
-                for (sql, params) in statements { s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; }
+                use js_sys::wasm_bindgen::{closure::Closure, JsCast, JsValue};
+                let receiver: &JsValue = s.as_raw().as_ref();
+                let transaction = js_sys::Reflect::get(receiver, &JsValue::from_str("transactionSync")).map_err(|e| format!("{:?}", e))?.dyn_into::<js_sys::Function>().map_err(|_| "storage.transactionSync is unavailable".to_string())?;
+                let storage = s.clone(); let statements = statements.to_vec();
+                // Throw on failure so transactionSync rolls back every earlier statement.
+                let callback = Closure::wrap(Box::new(move || -> Result<(), JsValue> {
+                    for (sql, params) in &statements { storage.sql().exec(sql, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?; }
+                    Ok(())
+                }) as Box<dyn FnMut() -> Result<(), JsValue>>);
+                transaction.call1(receiver, callback.as_ref()).map_err(|e| format!("{:?}", e))?;
                 Ok(())
             }
         }
@@ -208,20 +214,20 @@ impl Db {
 impl Db {
     /// Constructor for the Durable Object. Migrations run synchronously because
     /// the object constructor cannot await, and the SQL handle never yields.
-    pub fn from_do_sql_now(storage: worker::SqlStorage) -> Result<Self, String> {
+    pub fn from_do_sql_now(storage: worker::Storage) -> Result<Self, String> {
         let db = Db::DoSqlite(std::rc::Rc::new(storage));
         db.migrate_now()?;
         Ok(db)
     }
     fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::DoSqlite(s) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
+            Db::DoSqlite(s) => { let cursor = s.sql().exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
         }
     }
     fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
             Db::DoSqlite(s) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.sql().exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
                 for row in cursor.raw() {
@@ -501,6 +507,10 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
         "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
     ]),
+    (17, &[
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -534,9 +544,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 16, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 17, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 16, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 17, "each migration must be recorded exactly once");
     }
 }

@@ -233,7 +233,24 @@ impl AppState {
     pub fn db(&self) -> &Db { &self.db }
     pub fn instance_id(&self) -> &str { &self.instance_id }
     pub fn live(&self) -> &LiveSender { &self.live }
+    async fn emergency_locked(&self, org: &str) -> Result<bool, (StatusCode, Json<Value>)> {
+        let row = self.db.one("SELECT emergency_locked FROM orgs WHERE id=?", &[json!(org)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "workspace emergency status unavailable"))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "workspace not found"))?;
+        Ok(db::n(&row, "emergency_locked") != 0) }
+    async fn require_running(&self, org: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.emergency_locked(org).await? { return Err(err(StatusCode::FORBIDDEN, "workspace emergency lockdown is active")); } Ok(()) }
+    async fn app_emergency(&self, app: &str) -> Result<(String, bool, bool), (StatusCode, Json<Value>)> {
+        let row = self.db.one("SELECT a.org_id,a.emergency_locked AS direct_locked,o.emergency_locked AS workspace_locked FROM apps a JOIN orgs o ON o.id=a.org_id WHERE a.id=?", &[json!(app)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "app not found"))?;
+        Ok((db::s(&row, "org_id"), db::n(&row, "direct_locked") != 0, db::n(&row, "workspace_locked") != 0)) }
+    async fn require_app_running(&self, app: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        let (_, direct, workspace) = self.app_emergency(app).await?;
+        if direct || workspace { return Err(err(StatusCode::FORBIDDEN, "project emergency lockdown is active")); } Ok(()) }
+    async fn require_org_running(&self, org: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        self.require_running(org).await?;
+        if self.db.one("SELECT id FROM apps WHERE org_id=? AND emergency_locked<>0 LIMIT 1", &[json!(org)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::FORBIDDEN, "a project emergency lockdown is active")); } Ok(()) }
+    async fn require_env_running(&self, env: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        let (_, app) = self.env_org_app(env).await?; self.require_app_running(&app).await }
     async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
+        self.require_env_running(env_id).await?;
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         let wrapped = db::s(&row, "env_key_wrapped");
         if wrapped.is_empty() { return Err(err(StatusCode::CONFLICT, "this environment is client-encrypted; the server has no key for it")); }
@@ -350,14 +367,14 @@ impl AppState {
     async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
         if let Some(r) = self.org_role(org, user).await { return Ok(r); }
         // machine identities belong to an org directly
-        if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { return Ok(db::s(&idn, "role")); }
+        if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { self.require_running(org).await?; return Ok(db::s(&idn, "role")); }
         Err(err(StatusCode::FORBIDDEN, "not an organisation member")) }
     async fn env_org_app(&self, env_id: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT a.org_id AS org_id, e.app_id AS app_id FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         Ok((db::s(&row, "org_id"), db::s(&row, "app_id")))
     }
     async fn require_env(&self, env_id: &str, user: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
-        let (org, app) = self.env_org_app(env_id).await?; let role = self.require_org(&org, user).await?;
+        let (org, app) = self.env_org_app(env_id).await?; self.require_app_running(&app).await?; let role = self.require_org(&org, user).await?;
         if role == "owner" || role == "admin" { return Ok((org, app)); }
         let env = self.db.one("SELECT restricted FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         let restricted = db::n(&env, "restricted") == 1;
@@ -649,6 +666,7 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r)
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
     let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
+    st.require_running(&org).await?;
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
     let uid = id();
     let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
@@ -665,7 +683,8 @@ async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(
     // A caller can always learn the environment its own credential is confined to.
     let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await); Ok(j(out)) }
 async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
-    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?;
+    let human = emergency_session(&st, &h).await.is_ok();
+    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=? AND (?=1 OR o.emergency_locked=0)", &[json!(uid), json!(if human { 1 } else { 0 })]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; let oid = id();
     st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(r.name), json!(now())]).await.map_err(|e| bad(&e))?;
@@ -736,6 +755,7 @@ async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<
     let hash = oc::hash_token(r.token.trim());
     let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
     let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
+    st.require_running(&org).await?;
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
     let kp = oc::Keypair::generate(); let uid = id();
     // The invite token reached this address, which is the proof a password
@@ -760,7 +780,8 @@ async fn create_env_inner(st: &S, app_id: &str, name: &str) -> Result<String, (S
     };
     st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,created_at) VALUES(?,?,?,?,?)", &[json!(eid), json!(app_id), json!(name), json!(wrapped), json!(now())]).await.map_err(|e| bad(&e))?; Ok(eid) }
 async fn list_apps(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
-    let rows = st.db.query("SELECT id,org_id,name,readme,created_at,reuse_check FROM apps WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?;
+    let human = emergency_session(&st, &h).await.is_ok();
+    let rows = st.db.query("SELECT id,org_id,name,readme,created_at,reuse_check FROM apps WHERE org_id=? AND (?=1 OR emergency_locked=0)", &[json!(oid), json!(if human { 1 } else { 0 })]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "name": db::s(r,"name"), "readme": db::s(r,"readme"), "created_at": db::n(r,"created_at"), "reuse_check": db::n(r,"reuse_check") != 0})).collect::<Vec<_>>()))) }
 async fn create_env(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; let org = db::s(&app,"org_id"); st.require_org(&org, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
@@ -928,6 +949,7 @@ async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     st.audit(&org, &app, &eid, &uid, "secret.deploy", &format!("{} secrets", count)).await;
     let sync_errors = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"deployed": count, "sync_errors": sync_errors, "scan_findings": scan_findings}))) }
 async fn upsert_secret(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &str, s: &SecretIn) -> Result<(), (StatusCode, Json<Value>)> {
+    st.require_env_running(eid).await?;
     let kname = s.key.trim().to_uppercase();
     if !valid_secret_key(&kname) { return Err(bad("secret key must match [A-Za-z0-9_.-]{1,128}")); }
     if !valid_path(&s.path) { return Err(bad("secret path must be 1-256 printable characters")); }
@@ -1129,7 +1151,9 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
 async fn audit_list(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
     let limit = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
     let offset = q.get("offset").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0).max(0);
-    let rows = st.db.query("SELECT * FROM audit WHERE org_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?", &[json!(oid), json!(limit), json!(offset)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let redacted = match st.require_org_running(&oid).await { Ok(()) => false, Err((StatusCode::FORBIDDEN, _)) => true, Err(e) => return Err(e) };
+    let rows = st.db.query("SELECT * FROM audit WHERE org_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?", &[json!(oid), json!(limit), json!(offset)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(|r| { let mut value = db::obj(r); if redacted { value["detail"] = json!(""); } value }).collect::<Vec<_>>()))) }
 async fn create_team(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(oid), json!(r.name)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": tid}))) }
 async fn list_teams(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
@@ -1247,6 +1271,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id");
     let (org, app) = if enforce { st.require_env(&eid, uid).await? } else { st.env_org_app(&eid).await? };
+    st.require_app_running(&app).await?;
     if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
         enqueue_sync(st, &eid, iid, "sync").await?;
         return Ok("queued for the customer runner".into()); }
@@ -1286,6 +1311,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     let items = st.list_secrets_base(&eid).await?;
     let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed")).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
     let pairs = integrations::secret_keys(&located);
+    st.require_app_running(&app).await?;
     if integrations::is_stateful(&kind) {
         let dry = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
         let result = integrations::sync_managed(&kind, &config, &located, &prev).await.unwrap_or_else(|| Err(format!("unsupported sync kind {}", kind)));
@@ -1366,6 +1392,11 @@ async fn get_org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<Str
     let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let row = st.db.one("SELECT ip_allowlist,reuse_check FROM orgs WHERE id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("org not found"))?;
     let ip = db::s(&row,"ip_allowlist");
+    match st.require_org_running(&oid).await {
+        Ok(()) => {},
+        Err((StatusCode::FORBIDDEN, _)) => return Ok(j(json!({"ip_allowlist": ip, "reuse_check": db::n(&row,"reuse_check") != 0}))),
+        Err(e) => return Err(e),
+    }
     let secret = meta_get(&st, &format!("oidc_client_secret:{}", oid)).await;
     Ok(j(json!({
         "ip_allowlist": ip,
@@ -1430,6 +1461,7 @@ async fn delete_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path
     st.db.exec("DELETE FROM rotation_hooks WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
     st.audit(&oid, "", "", &uid, "rotation_hook.delete", "").await; Ok(j(json!({"ok": true}))) }
 async fn fire_rotation_hook(st: &S, org: &str, env: &str, key: &str, value: &str) -> Option<String> {
+    if st.require_running(org).await.is_err() { return Some("workspace emergency lockdown or unavailable status".into()); }
     let hook = match st.db.one("SELECT url,secret_enc FROM rotation_hooks WHERE org_id=?", &[json!(org)]).await { Ok(Some(r)) => r, _ => return None };
     let url = db::s(&hook, "url"); if url.is_empty() { return None; }
     let secret = { let enc = db::s(&hook, "secret_enc"); if enc.is_empty() { String::new() } else { oc::decrypt_symmetric(&st.master(), &enc).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() } };
@@ -1455,6 +1487,7 @@ async fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<
     let uid = st.token_user(h).await?;
     let oid = q.get("org_id").cloned().unwrap_or_default();
     if oid.is_empty() { return Err(bad("org_id query parameter required")); }
+    st.require_running(&oid).await?;
     let role = st.require_org(&oid, &uid).await?;
     if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN, "SCIM requires admin of this organisation")); }
     Ok(oid) }
@@ -1809,6 +1842,7 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     let provision_allowed = pending.is_some() || (auto && domain_ok && signups_open(&st).await);
     let uid = if let Some(bound) = st.db.one("SELECT user_id FROM oidc_subjects WHERE issuer=? AND subject=?", &[json!(issuer_key), json!(subject)]).await.map_err(|e| bad(&e))? { db::s(&bound, "user_id") } else {
         if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity")); }
+        st.require_org_running(&oid).await?;
         if !provision_allowed { return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings")); }
         let kp = oc::Keypair::generate(); let pw = oc::random_token("oidc"); let nid = id();
         // The organisation's IdP asserted this address; no local verification.
@@ -1818,6 +1852,7 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
         nid };
     if let Some(u) = st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))? { if db::n(&u, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); } }
     if st.org_role(&oid, &uid).await.is_none() {
+        st.require_org_running(&oid).await?;
         if let Some(inv) = &pending {
             st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&oid), json!(&uid), json!(db::s(inv, "role"))]).await.map_err(|e| bad(&e))?;
             let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]).await;
@@ -1980,8 +2015,10 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).await.map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
         if !st.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
+        st.require_org(org, &uid).await?;
         return Ok(uid);
     }
+    st.require_org_running(org).await?;
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(email)]).await.map_err(|e| bad(&e))?.is_some() {
         return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password or ask an admin to link this SAML identity"));
     }
@@ -2218,6 +2255,7 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
         if !st.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
         uid
     } else {
+        st.require_org_running(&org).await?;
         if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&user.email)]).await.map_err(|e| bad(&e))?.is_some() {
             return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password, or ask an organisation admin to link this identity"));
         }
@@ -2234,7 +2272,9 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
         claim_instance_owner(&st, &nid).await;
         st.audit(&org, "", "", &nid, "auth.ldap_provision", &format!("{} {} dn={}", audit_safe(&user.email), audit_safe(&user.name), audit_safe(&user.dn))).await;
         nid };
+    let locked = match st.require_org_running(&org).await { Ok(()) => false, Err((StatusCode::FORBIDDEN, _)) => true, Err(e) => return Err(e) };
     if st.org_role(&org, &uid).await.is_none() {
+        st.require_org_running(&org).await?;
         // A bound directory user is re-admitted only through a fresh invite;
         // otherwise removing a member would be undone by their next sign-in.
         if bound.is_some() && pending.is_none() {
@@ -2247,7 +2287,7 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
         // revoke it later. Invite and default roles are not directory-derived.
         let mapped_role = if mapped.is_some() { role } else { String::new() };
         let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]).await;
-    } else {
+    } else if !locked {
         let current = st.org_role(&org, &uid).await.unwrap_or_default();
         if let Some(role) = &mapped {
             // The directory's group mapping stays authoritative, except that it
@@ -2722,6 +2762,7 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
         return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in with your password first")); }
     // A pending invite admits the user even when self-signup is closed.
     let invite = st.db.one("SELECT * FROM invites WHERE email=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(email), json!(now())]).await.map_err(|e| bad(&e))?;
+    if let Some(inv) = &invite { st.require_running(&db::s(inv, "org_id")).await?; }
     if invite.is_none() && !signups_open(st).await { return Err(err(StatusCode::FORBIDDEN, "signups are disabled on this instance; ask an administrator to invite you")); }
     let kp = oc::Keypair::generate(); let pw = oc::random_token("social"); let uid = id();
     // The provider asserted a verified address, so this account needs no
@@ -3077,6 +3118,7 @@ async fn runner_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusC
     if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "runner token required")); }
     let row = st.db.one("SELECT id,org_id FROM runners WHERE token_hash=?", &[json!(oc::hash_token(&token))]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid runner token"))?;
+    st.require_running(&db::s(&row, "org_id")).await?;
     Ok((db::s(&row, "id"), db::s(&row, "org_id"))) }
 async fn runner_for_env(st: &S, eid: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
     let env = st.db.one("SELECT runner_id,mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("env not found"))?;
@@ -3092,6 +3134,7 @@ async fn seal_to_runner(st: &S, eid: &str, iid: &str, config: &Value) -> Result<
     let sealed = oc::encrypt_to(&pubkey, envelope.as_bytes()).map_err(|e| bad(&e))?;
     Ok(format!("owrunner:{}:{}", rid, sealed)) }
 async fn enqueue_sync(st: &S, eid: &str, iid: &str, job_kind: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    st.require_env_running(eid).await?;
     let (rid, _) = runner_for_env(st, eid).await?;
     if st.db.one("SELECT id FROM sync_jobs WHERE integration_id=? AND status IN ('pending','claimed') AND kind=?", &[json!(iid), json!(job_kind)]).await.map_err(|e| bad(&e))?.is_some() { return Ok(()); }
     st.db.exec("INSERT INTO sync_jobs(id,env_id,integration_id,runner_id,kind,created_at) VALUES(?,?,?,?,?,?)",
@@ -3126,11 +3169,11 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
     let (rid, _) = runner_auth(&st, &h).await?;
     // A runner that crashes after claiming a job must not strand it forever.
     let stale = now() - 600;
-    let rows = st.db.query("SELECT * FROM sync_jobs WHERE runner_id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) ORDER BY created_at LIMIT 10", &[json!(&rid), json!(stale)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT sync_jobs.* FROM sync_jobs JOIN envs e ON e.id=sync_jobs.env_id JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE sync_jobs.runner_id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) AND a.emergency_locked=0 AND o.emergency_locked=0 ORDER BY sync_jobs.created_at LIMIT 10", &[json!(&rid), json!(stale)]).await.map_err(|e| bad(&e))?;
     let mut jobs = Vec::new();
     for job in &rows {
         let jid = db::s(job, "id"); let claim = oc::random_token("job"); let claimed_at = now();
-        if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=?,claim_id=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?))", &[json!(claimed_at), json!(&claim), json!(&jid), json!(stale)]).await.unwrap_or(0) == 0 { continue; }
+        if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=?,claim_id=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) AND EXISTS (SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE e.id=sync_jobs.env_id AND o.emergency_locked=0 AND a.emergency_locked=0)", &[json!(claimed_at), json!(&claim), json!(&jid), json!(stale)]).await.unwrap_or(0) == 0 { continue; }
         let eid = db::s(job, "env_id"); let iid = db::s(job, "integration_id");
         let fail = async |msg: &str| { let _ = st.db.exec("UPDATE sync_jobs SET status='failed',detail=? WHERE id=? AND claim_id=?", &[json!(msg), json!(&jid), json!(&claim)]).await; };
         let env = match st.db.one("SELECT runner_id FROM envs WHERE id=?", &[json!(&eid)]).await { Ok(Some(e)) => e, _ => { fail("environment no longer exists").await; continue; } };
@@ -3140,6 +3183,8 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
         // Sealed values are never readable, so a runner job must never carry them.
         let secrets = st.db.query("SELECT key_enc,value_enc,key_hash,path FROM secrets WHERE env_id=? AND deleted=0 AND secret_type<>'sealed'", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
         let prev = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await.unwrap_or_default();
+        if st.require_env_running(&eid).await.is_err() { continue; }
+        if st.db.one("SELECT id FROM sync_jobs WHERE id=? AND status='claimed' AND claim_id=?", &[json!(&jid), json!(&claim)]).await.map_err(|e| bad(&e))?.is_none() { continue; }
         jobs.push(json!({
             "id": jid, "claim": claim, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"),
             "kind": db::s(&integ, "kind"), "config_enc": db::s(&integ, "config_enc"), "wrapped_key": wrapped,
@@ -3147,6 +3192,7 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
             "previous": prev.iter().map(|r| db::s(r, "remote_name")).collect::<Vec<_>>(),
         }));
     }
+    runner_auth(&st, &h).await?;
     Ok(j(json!({"jobs": jobs}))) }
 #[derive(Deserialize)] struct ManagedSecret { name: String, #[serde(default)] value_hash: String }
 #[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] detail: String, #[serde(default)] managed: Vec<ManagedSecret>, #[serde(default)] claim: String }
@@ -3154,10 +3200,11 @@ async fn runner_job_result(State(st): State<S>, h: HeaderMap, Path(jid): Path<St
     let (rid, _) = runner_auth(&st, &h).await?;
     let job = st.db.one("SELECT * FROM sync_jobs WHERE id=? AND runner_id=?", &[json!(&jid), json!(&rid)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "job not found"))?;
+    st.require_env_running(&db::s(&job, "env_id")).await?;
     if db::s(&job, "status") != "claimed" { return Err(err(StatusCode::CONFLICT, "job is not claimed by this runner")); }
     // The claim id is the fencing token: a job reclaimed after the stale window
     // rejects the old runner's late result.
-    let updated = st.db.exec("UPDATE sync_jobs SET status=?,detail=? WHERE id=? AND runner_id=? AND status='claimed' AND claim_id=?",
+    let updated = st.db.exec("UPDATE sync_jobs SET status=?,detail=? WHERE id=? AND runner_id=? AND status='claimed' AND claim_id=? AND EXISTS (SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE e.id=sync_jobs.env_id AND o.emergency_locked=0 AND a.emergency_locked=0)",
         &[json!(if r.ok { "done" } else { "failed" }), json!(&r.detail), json!(&jid), json!(&rid), json!(&r.claim)]).await.map_err(|e| bad(&e))?;
     if updated == 0 { return Err(err(StatusCode::CONFLICT, "this claim was superseded; refresh the job queue")); }
     let eid = db::s(&job, "env_id"); let iid = db::s(&job, "integration_id");
@@ -3206,7 +3253,10 @@ async fn rotate_identity(State(st): State<S>, h: HeaderMap, Path((oid, iid)): Pa
 async fn universal_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let cid = body.get("client_id").and_then(|v| v.as_str()).unwrap_or(""); let secret = body.get("client_secret").and_then(|v| v.as_str()).unwrap_or("");
     let cred = st.db.one("SELECT identity_id FROM identity_credentials WHERE client_id=? AND secret_hash=?", &[json!(cid), json!(oc::hash_token(secret))]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid client credentials"))?;
-    let iid = db::s(&cred, "identity_id"); let token = oc::random_token("owm");
+    let iid = db::s(&cred, "identity_id");
+    let identity = st.db.one("SELECT org_id FROM identities WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "identity not found"))?;
+    st.require_running(&db::s(&identity, "org_id")).await?;
+    let token = oc::random_token("owm");
     st.db.exec("INSERT INTO tokens(id,org_id,name,token_hash,kind,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)", &[json!(id()), json!(""), json!("machine"), json!(oc::hash_token(&token)), json!("machine"), json!(now()+3600), json!(now()), json!(iid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"accessToken": token, "expiresIn": 3600, "tokenType": "Bearer", "identity_id": iid}))) }
 
@@ -3456,6 +3506,118 @@ async fn ca_crl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> 
         Err(e) => bad(&e.to_string()).into_response(),
     } }
 
+
+async fn emergency_session(st: &S, h: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
+    if h.contains_key("authorization") { return Err(err(StatusCode::FORBIDDEN, "a browser cookie session is required")); }
+    let token = cookie_val(h, "ow_session");
+    if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "a browser cookie session is required")); }
+    let uid = st.token_user(h).await?;
+    if st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=? AND created_at>?", &[json!(oc::hash_token(&token)), json!(&uid), json!(now()-7*86400)]).await.map_err(|e| bad(&e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "a browser cookie session is required")); }
+    Ok(uid) }
+async fn emergency_owner(st: &S, h: &HeaderMap, org: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let uid = emergency_session(st, h).await?;
+    if st.org_role(org, &uid).await.as_deref() != Some("owner") { return Err(err(StatusCode::FORBIDDEN, "an owner session is required")); } Ok(uid) }
+async fn get_emergency(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = emergency_session(&st, &h).await?; st.require_org(&oid, &uid).await?;
+    Ok(j(json!({"locked": st.emergency_locked(&oid).await?}))) }
+async fn get_app_emergency(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res {
+    let uid = emergency_session(&st, &h).await?; let (org, direct, workspace) = st.app_emergency(&aid).await?; st.require_org(&org, &uid).await?;
+    Ok(j(json!({"locked": direct || workspace, "direct_locked": direct, "workspace_locked": workspace}))) }
+async fn put_app_emergency(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<EmergencyReq>) -> Res {
+    let (org, _, _) = st.app_emergency(&aid).await?; let uid = emergency_owner(&st, &h, &org).await?;
+    emergency_transition(&st, &org, Some(&aid), r.locked).await?;
+    st.audit(&org, &aid, "", &uid, if r.locked { "app.emergency.lock" } else { "app.emergency.restore" }, "").await;
+    get_app_emergency(State(st), h, Path(aid)).await }
+#[derive(Deserialize)] struct EmergencyReq { locked: bool }
+async fn put_emergency(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<EmergencyReq>) -> Res {
+    let uid = emergency_owner(&st, &h, &oid).await?;
+    emergency_transition(&st, &oid, None, r.locked).await?;
+    st.audit(&oid, "", "", &uid, if r.locked { "org.emergency.lock" } else { "org.emergency.restore" }, "").await;
+    Ok(j(json!({"locked": r.locked}))) }
+async fn emergency_transition(st: &S, oid: &str, app: Option<&str>, locked: bool) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut statements = vec![(format!("UPDATE {} SET emergency_locked=? WHERE id=?", if app.is_some() { "apps" } else { "orgs" }), vec![json!(if locked { 1 } else { 0 }), json!(app.unwrap_or(oid))])];
+    if locked {
+        // Credentials are account-wide. Preserve real workspace owners, not admin-equivalent roles.
+        for table in ["sessions", "oauth_tokens", "oauth_codes", "mfa_challenges", "mfa_passkey_states", "auth_challenges", "step_up_challenges", "step_up_grants"] {
+            statements.push((format!("DELETE FROM {} WHERE user_id IN (SELECT user_id FROM org_members WHERE org_id=? AND role<>'owner')", table), vec![json!(&oid)])); }
+        for table in ["oidc_states", "saml_pending"] { statements.push((format!("DELETE FROM {} WHERE org_id=?", table), vec![json!(&oid)])); }
+        // Reset only the halted target's claims, fencing late results after restoration.
+        statements.push((format!("UPDATE sync_jobs SET status='pending',claim_id='',claimed_at=0 WHERE status='claimed' AND env_id IN (SELECT e.id FROM envs e JOIN apps a ON a.id=e.app_id WHERE {}=?)", if app.is_some() { "a.id" } else { "a.org_id" }), vec![json!(app.unwrap_or(oid))]));
+    }
+    st.db.batch(&statements).await.map_err(|e| bad(&e))?;
+    Ok(()) }
+async fn emergency_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Resource identifiers are generated ASCII. Reject aliases before raw-path tenant resolution.
+    if path.starts_with("/api/") && path.contains('%') { return bad("percent-encoded API paths are not supported").into_response(); }
+    if matches!(path, "/api/instance/rewrap" | "/api/instance/encrypt-metadata" | "/api/instance/rotate-master") {
+        match st.db.one("SELECT id FROM orgs WHERE emergency_locked<>0 UNION ALL SELECT id FROM apps WHERE emergency_locked<>0 LIMIT 1", &[]).await {
+            Ok(None) => {}, Ok(Some(_)) => return err(StatusCode::FORBIDDEN, "workspace emergency lockdown blocks instance-wide key changes").into_response(), Err(e) => return bad(&e).into_response(), }
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    let sso = parts.len() == 6 && parts[1] == "api" && parts[2] == "auth" && ((parts[3] == "oidc" && parts[5] == "start" && req.method() == axum::http::Method::GET) || (parts[3] == "saml" && ((matches!(parts[5], "metadata" | "start") && req.method() == axum::http::Method::GET) || (parts[5] == "acs" && req.method() == axum::http::Method::POST))));
+    if sso { return next.run(req).await; }
+    let org = match emergency_request_org(&st, path, req.uri().query().unwrap_or("")).await { Ok(o) => o, Err(e) => return e.into_response() };
+    if let Some(org) = org {
+        let app = match emergency_request_app(&st, path).await { Ok(a) => a, Err(e) => return e.into_response() };
+        let blocked = if let Some(app) = &app { st.require_app_running(app).await } else { st.require_org_running(&org).await };
+        let discovery = path == format!("/api/orgs/{}/apps", org) && req.method() == axum::http::Method::GET && matches!(st.emergency_locked(&org).await, Ok(false));
+        if let Err(e) = blocked { if discovery { return next.run(req).await; }
+            if e.0 != StatusCode::FORBIDDEN { return e.into_response(); }
+            let org_tail = path.strip_prefix(&format!("/api/orgs/{}/", org)).unwrap_or("");
+            let app_tail = app.as_ref().and_then(|a| path.strip_prefix(&format!("/api/apps/{}/", a))).unwrap_or("");
+            let emergency = org_tail == "emergency" || app_tail == "emergency";
+            let metadata = req.method() == axum::http::Method::GET && (matches!(org_tail, "emergency" | "apps" | "settings" | "audit" | "members" | "roles") || matches!(app_tail, "emergency" | "envs" | "settings"));
+            if !(metadata || (emergency && req.method() == axum::http::Method::PUT)) { return e.into_response(); }
+            if let Err(e) = emergency_session(&st, req.headers()).await { return e.into_response(); }
+        }
+    } else if path == "/api/lockbox" && req.method() == axum::http::Method::POST {
+        if let Ok(uid) = st.token_user(req.headers()).await {
+            match st.db.one("SELECT o.id FROM orgs o WHERE (EXISTS (SELECT 1 FROM org_members m WHERE m.org_id=o.id AND m.user_id=?) OR EXISTS (SELECT 1 FROM identities i WHERE i.org_id=o.id AND i.id=?)) AND (o.emergency_locked<>0 OR EXISTS (SELECT 1 FROM apps a WHERE a.org_id=o.id AND a.emergency_locked<>0))", &[json!(&uid), json!(&uid)]).await {
+                Ok(None) => {}, Ok(Some(_)) => return err(StatusCode::FORBIDDEN, "cannot create unscoped shares during workspace emergency lockdown").into_response(), Err(e) => return bad(&e).into_response(), }
+        }
+    }
+    next.run(req).await }
+async fn emergency_request_app(st: &S, path: &str) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if parts.len() < 3 || parts[0] != "api" { return Ok(None); }
+    let sql = match parts[1] {
+        "apps" => return Ok(Some(parts[2].to_string())),
+        "envs" => "SELECT app_id FROM envs WHERE id=?",
+        "secrets" => "SELECT e.app_id FROM secrets s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "integrations" => "SELECT e.app_id FROM integrations s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "leases" => "SELECT e.app_id FROM leases s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "rotations" => "SELECT e.app_id FROM rotation_schedules s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "proposals" => "SELECT e.app_id FROM proposals s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "access-requests" => "SELECT e.app_id FROM access_requests s JOIN envs e ON e.id=s.env_id WHERE s.id=?",
+        "tokens" => "SELECT app_id FROM tokens WHERE id=?",
+        _ => return Ok(None),
+    };
+    Ok(st.db.one(sql, &[json!(parts[2])]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "app_id")).filter(|a| !a.is_empty())) }
+async fn emergency_request_org(st: &S, path: &str, query: &str) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if parts.first() == Some(&"scim") { let uri = format!("/?{}", query).parse::<axum::http::Uri>().map_err(|_| bad("invalid query"))?; return Ok(Query::<HashMap<String,String>>::try_from_uri(&uri).map_err(|_| bad("invalid query"))?.0.remove("org_id")); }
+    if parts.len() >= 5 && parts[0] == "api" && parts[1] == "auth" && matches!(parts[2], "oidc" | "saml") { return Ok(Some(parts[3].to_string())); }
+    if parts.len() < 3 || parts[0] != "api" { return Ok(None); }
+    let key = parts[2];
+    let sql = match parts[1] {
+        "orgs" => return Ok(Some(key.to_string())),
+        "apps" => "SELECT org_id FROM apps WHERE id=?",
+        "envs" => "SELECT a.org_id FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=?",
+        "secrets" => "SELECT a.org_id FROM secrets s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "integrations" => "SELECT a.org_id FROM integrations s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "leases" => "SELECT a.org_id FROM leases s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "rotations" => "SELECT a.org_id FROM rotation_schedules s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "proposals" => "SELECT a.org_id FROM proposals s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "access-requests" => "SELECT a.org_id FROM access_requests s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
+        "tokens" => "SELECT COALESCE(NULLIF(t.org_id,''),i.org_id) AS org_id FROM tokens t LEFT JOIN identities i ON i.id=t.created_by WHERE t.id=?",
+        "pki" | "ssh" if parts.len() > 3 => {
+            let sql = if parts[2] == "cas" { "SELECT org_id FROM pki_cas WHERE id=?" } else if parts[1] == "ssh" { "SELECT c.org_id FROM ssh_certs s JOIN pki_cas c ON c.id=s.ca_id WHERE s.id=?" } else { "SELECT c.org_id FROM pki_certs s JOIN pki_cas c ON c.id=s.ca_id WHERE s.id=?" };
+            return Ok(st.db.one(sql, &[json!(parts[3])]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "org_id"))); },
+        _ => return Ok(None),
+    };
+    Ok(st.db.one(sql, &[json!(key)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "org_id")).filter(|o| !o.is_empty())) }
 
 // ---------- IP allowlist enforcement (T01) ----------
 fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
@@ -3716,6 +3878,7 @@ async fn reap_expired_leases(st: &S) {
     let Ok(rows) = st.db.query("SELECT id, env_id, username, config_enc FROM leases WHERE revoked=0 AND expires_at<?", &[json!(now())]).await else { return };
     for row in &rows {
         let lid = db::s(row, "id");
+        if st.require_env_running(&db::s(row, "env_id")).await.is_err() { continue; }
         if !db::s(row, "config_enc").is_empty() {
             if let Ok(key) = st.env_key(&db::s(row, "env_id")).await {
                 if let Ok(plain) = oc::decrypt_symmetric(&key, &db::s(row, "config_enc")) {
@@ -3741,6 +3904,7 @@ pub async fn process_rotations(st: &S) {
     let due = st.db.query("SELECT * FROM rotation_schedules WHERE enabled=1 AND next_run<=?", &[json!(now())]).await.unwrap_or_default();
     for r in &due {
         let id = db::s(r,"id"); let eid = db::s(r,"env_id"); let key_name = db::s(r,"key_name");
+        if st.require_env_running(&eid).await.is_err() { continue; }
         let interval = db::n(r,"interval_secs").max(60); let old_next = db::n(r,"next_run");
         // Claim the slot atomically so two replicas cannot rotate the same key twice.
         let claimed = st.db.exec("UPDATE rotation_schedules SET next_run=? WHERE id=? AND next_run=?", &[json!(now()+interval), json!(&id), json!(old_next)]).await.unwrap_or(0);
@@ -4050,14 +4214,19 @@ async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<Stri
     // Subscribing before the upgrade means the poll is already running when the
     // first frame could be missed, and a slow client is dropped rather than blocking.
     let rx = st.live.subscribe();
-    ws.on_upgrade(move |socket| live_socket(st, uid, orgs, missed, rx, socket)) }
+    ws.on_upgrade(move |socket| live_socket(st, uid, h, orgs, missed, rx, socket)) }
 #[cfg(not(target_arch = "wasm32"))]
-async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
+async fn live_socket(st: S, uid: String, h: HeaderMap, orgs: Vec<String>, missed: Vec<db::Row>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
     // Rows already in the table are sent before the live subscription, and the
     // subscription may repeat the newest of them. The client dedupes on id.
     let mut sent = 0i64;
     for r in &missed {
+        if st.token_user(&h).await.is_err() { return; }
+        if st.require_org(&db::s(r, "org_id"), &uid).await.is_err() { continue; }
+        let app = db::s(r, "app_id");
+        if if app.is_empty() { st.require_org_running(&db::s(r, "org_id")).await.is_err() } else { st.require_app_running(&app).await.is_err() } { continue; }
         let env = db::s(r, "env_id");
         if !env.is_empty() && st.require_env(&env, &uid).await.is_err() { continue; }
         sent = db::n(r, "id");
@@ -4066,6 +4235,7 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>
     }
     loop {
         tokio::select! {
+            _ = auth_tick.tick() => { if st.token_user(&h).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,
@@ -4084,6 +4254,10 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>
                 if v.get("id").and_then(|x| x.as_i64()).unwrap_or(0) <= sent { continue; }
                 let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
                 if !orgs.iter().any(|o| o == org) { continue; }
+                if st.token_user(&h).await.is_err() { break; }
+                if st.require_org(org, &uid).await.is_err() { continue; }
+                let app = v.get("app").and_then(|x| x.as_str()).unwrap_or("");
+                if if app.is_empty() { st.require_org_running(org).await.is_err() } else { st.require_app_running(app).await.is_err() } { continue; }
                 let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
                 if !env.is_empty() && st.require_env(env, &uid).await.is_err() { continue; }
                 let mut out = v; out["type"] = json!("event");
@@ -4256,6 +4430,8 @@ pub fn router(state: S) -> Router {
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
+        .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
+        .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
@@ -4287,6 +4463,7 @@ pub fn router(state: S) -> Router {
         .route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host))
         .route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert));
     let app = app
+        .layer(axum::middleware::from_fn_with_state(state.clone(), emergency_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
@@ -4297,6 +4474,7 @@ pub fn router(state: S) -> Router {
         .with_state::<()>(state.clone());
     #[cfg(not(target_arch = "wasm32"))]
     let app = { let live = Router::new().route("/api/live", get(live_ws))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), emergency_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
