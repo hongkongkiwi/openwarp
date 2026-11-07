@@ -78,7 +78,7 @@ pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request,
         ("POST","/api/envs/{eid}/import") | ("GET","/api/envs/{eid}/export") | ("GET","/api/envs/{eid}/scan") |
         ("POST","/api/envs/{eid}/secrets/reuse-check") | ("GET","/api/search") |
         ("DELETE","/api/secrets/{sid}") | ("GET","/api/secrets/{sid}/history") |
-        ("POST","/api/secrets/{sid}/restore/{ver}") | ("POST","/api/secrets/{sid}/override"));
+        ("POST","/api/secrets/{sid}/restore/{ver}") | ("GET","/api/secrets/{sid}/override") | ("POST","/api/secrets/{sid}/override") | ("DELETE","/api/secrets/{sid}/override"));
     if !allowed { return err(StatusCode::FORBIDDEN,"path-restricted principals cannot use this operation").into_response(); }
     next.run(req).await
 }

@@ -1341,7 +1341,8 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     prune_versions(&st, &eid, &sid, new_ver).await?;
     st.audit(&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)).await; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org,&uid,"secrets:write").await?; st.check_secret_path(&sid,&uid,"write").await?;
+    let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?;
+    if st.restricted_env(&eid,&uid).await? { st.check_perm(&org,&uid,"secrets:write").await?; st.check_secret_path(&sid,&uid,"write").await?; }
     let key = st.env_key(&eid).await?; let val = r.secrets.first().map(|s| s.value.clone()).unwrap_or_default();
     let enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, &format!("override:{}", uid)), val.as_bytes());
     if st.db.exec("INSERT INTO overrides(secret_id,user_id,value_enc) VALUES(?,?,?)", &[json!(sid), json!(uid), json!(&enc)]).await.is_err() {
@@ -1351,7 +1352,7 @@ async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>
 
 async fn get_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id,key_enc,version FROM secrets WHERE id=? AND deleted=0", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
-    let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?; st.check_secret_path(&sid,&uid,"read").await?;
     let ov = st.db.one("SELECT value_enc FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no personal override"))?;
     let key = st.env_key(&eid).await?;
     let value = decrypt_secret_value(&key, &eid, &sid, &format!("override:{}", uid), db::n(&row,"version"), &db::s(&ov,"value_enc")).map_err(|e| bad(&e))?;
@@ -1359,7 +1360,7 @@ async fn get_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>
     Ok(j(json!({"key": String::from_utf8_lossy(&key_name), "value": String::from_utf8_lossy(&value)}))) }
 async fn delete_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=? AND deleted=0", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
-    let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?; st.check_secret_path(&sid,&uid,"read").await?;
     let deleted = st.db.exec("DELETE FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(uid)]).await.map_err(|e| bad(&e))?;
     if deleted == 0 { return Err(err(StatusCode::NOT_FOUND, "no personal override")); }
     st.audit(&org,&app,&eid,&uid,"secret.override_delete", &sid).await;
@@ -4124,7 +4125,7 @@ fn admin_scope_path(method: &axum::http::Method, path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/api/envs/") {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
         if tail.is_empty() { return method == axum::http::Method::DELETE; }
-        return tail == "policy" || tail == "team-grants" || tail.starts_with("team-grants/");
+        return tail == "policy" || tail.starts_with("path-policy/") || tail == "team-grants" || tail.starts_with("team-grants/");
     }
     path.starts_with("/api/tokens/") }
 async fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
