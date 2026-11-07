@@ -72,6 +72,11 @@ fn parse() -> Result<Option<Args>, String> {
         return Err(format!("unknown command {}", command));
     }
     if url.trim().is_empty() { return Err("set DATABASE_URL or pass --database-url".to_string()); }
+    // Only apply has a read-only preview. Accepting the flag elsewhere and
+    // ignoring it made `repair --remove --dry-run` look safe while it deleted.
+    if dry_run && command != "apply" {
+        return Err(format!("--dry-run is only supported by apply, not {}", command));
+    }
     if command == "repair" {
         if version.is_none() { return Err("repair needs --version N".to_string()); }
         if repair.is_none() { return Err("repair needs --set-applied, --remove or --accept-checksum".to_string()); }
@@ -80,17 +85,23 @@ fn parse() -> Result<Option<Args>, String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
-    // Inspection never creates a database or writes a ledger. Apply may create
-    // one; repair requires one to exist already.
-    let db = match args.command.as_str() {
-        "status" | "plan" | "verify" => Db::connect_read_only(&args.url).await?,
-        "repair" => Db::connect_existing(&args.url).await?,
-        _ => Db::connect(&args.url).await?,
+    // Inspection never creates a database or writes a ledger. A dry-run apply
+    // is a preview too, so it opens read-only; a real apply may create one and
+    // repair requires one to exist already.
+    let db = if args.command == "apply" && args.dry_run {
+        Db::connect_read_only(&args.url).await?
+    } else {
+        match args.command.as_str() {
+            "status" | "plan" | "verify" => Db::connect_read_only(&args.url).await?,
+            "repair" => Db::connect_existing(&args.url).await?,
+            _ => Db::connect(&args.url).await?,
+        }
     };
     match args.command.as_str() {
         "status" => {
             let status = migrate::status(&db, MIGRATIONS).await?;
-            println!("database: {}", args.url);
+            // The URL can carry credentials; operators know which database
+            // they opened, so it is not repeated in the output.
             println!("current: {}  latest: {}", status.current, status.latest);
             print_ledger(&status);
             print_problems(&status.problems);

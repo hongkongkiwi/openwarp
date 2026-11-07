@@ -31,6 +31,14 @@ plus unique names, on every apply.
   with no ledger applies this file and records versions 2 through 17 as
   `squashed`. The independently shipped main-branch version 17 added objects
   absent from this frozen baseline; version 19 reconciles those histories.
+- Squashing only happens on a genuinely empty database. Before recording the
+  baseline, the runner asks the backend's catalogue whether any tables exist
+  outside `schema_migrations` and `schema_migration_lock`. If they do, the
+  ledger was lost or never created and the run fails closed instead of
+  certifying migrations the schema never received. SQLite, the Durable Object
+  handle and D1 inspect `sqlite_master`; PostgreSQL and MySQL inspect
+  `information_schema`. System tables, D1's `_cf_`/`d1_` bookkeeping and
+  SQLite's `sqlite_` tables are excluded.
 - Versions 2 through 16 are the frozen files that older binaries applied. They
   are kept so a database created by an older release can catch up. They are
   applied tolerantly, because the old boot path also added some of their columns
@@ -81,11 +89,17 @@ Two sentinel values are meaningful:
   because the consolidated baseline is not the file that original database
   applied.
 
+When a migration finishes, the runner writes `success = 1` and then re-reads the
+row, requiring the version, name and checksum it inserted. A row another runner
+removed or rewrote during a stale-lock takeover fails the run instead of being
+reported as applied by this process.
+
 `schema_migration_lock` is a single row that serialises runners. A run takes it
 before reading the ledger and deletes it when finished. A row older than 15
 minutes is treated as abandoned and can be taken over. Long migrations are
 unaffected: the timestamp is checked only when another runner cannot acquire the
-lock.
+lock. `repair` takes the same lock and always releases it, so it cannot rewrite
+history while another runner is applying migrations.
 
 Several replicas can boot at once against one database. Ledger creation is
 idempotent and tolerates the PostgreSQL catalogue race; the loser of the lock
@@ -103,7 +117,9 @@ the reason in the error, when:
 - the database has a version this binary does not contain, so the binary is
   older than the schema;
 - a later version is applied while an earlier one is missing;
-- the ledger has a version outside the manifest.
+- the ledger has a version outside the manifest;
+- application tables exist but the ledger has no rows, so the consolidated
+  baseline cannot be recorded as squashed.
 
 A failed strict migration on SQLite or PostgreSQL is rolled back and its ledger
 row is removed, so the next boot can simply try again. MySQL commits DDL
@@ -133,13 +149,22 @@ SQLite path. Exit code 0 means clean, 1 means a problem was found, and 2 means
 the arguments or the connection failed.
 
 `status`, `plan`, and `verify` open SQLite with `query_only` and refuse a missing
-file, so an inspection cannot create a database or change a ledger. `apply` may
-create a SQLite file. `repair` requires an existing ledger.
+file, so an inspection cannot create a database or change a ledger. `apply --dry-run`
+is a preview too and opens read-only. A real `apply` may create a SQLite file.
+`repair` requires an existing ledger. `status` does not print the database URL,
+which may contain credentials. `--dry-run` is rejected on every command except
+`apply`.
 
 Use `--set-applied` after checking that an interrupted migration really did
-finish its work. Use `--remove` when the schema is unchanged and the migration
-should run again from scratch. Use `--accept-checksum` only after reviewing why a
-frozen file changed; it rewrites the stored hash, not the database.
+finish its work. It only completes a row whose `success` marker is `0`, and it
+verifies that the marker was written. Use `--remove` only for the latest
+recorded version when that row is still interrupted; removing a completed
+migration or an earlier version would leave a history gap and replay DDL that
+already ran. A completed row is deliberately not removable through this
+command. Use `--accept-checksum` only after reviewing why a frozen file
+changed; it rewrites the stored hash, not the database. It refuses rows that
+predate checksums and rows covered by the consolidated baseline, because
+`checksum = ''` and `checksum = 'squashed'` are history markers, not drift.
 
 ## Adding a migration
 

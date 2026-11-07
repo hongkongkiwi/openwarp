@@ -75,6 +75,12 @@ pub trait Target {
     async fn script(&self, statements: &[String]) -> Result<(), String>;
     /// True when a failed `script` left no changes behind.
     fn atomic_ddl(&self) -> bool;
+    /// True when application objects exist outside the migration ledger. A
+    /// fresh database has none. A database that predates the ledger does, and
+    /// recording the consolidated baseline as squashed there would certify
+    /// schema the runner never applied. Every backend answers from its own
+    /// catalogue; there is deliberately no permissive default.
+    async fn has_application_schema(&self) -> Result<bool, String>;
 }
 
 impl Target for Db {
@@ -82,6 +88,7 @@ impl Target for Db {
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { Db::query(self, sql, &[]).await }
     async fn script(&self, statements: &[String]) -> Result<(), String> { Db::exec_script(self, statements).await }
     fn atomic_ddl(&self) -> bool { Db::script_is_atomic(self) }
+    async fn has_application_schema(&self) -> Result<bool, String> { Db::has_application_schema(self).await }
 }
 
 /// Cloudflare D1 has no connection of its own; migrations run in the Worker
@@ -89,7 +96,9 @@ impl Target for Db {
 /// one batch and a failed batch leaves no changes behind.
 #[cfg(target_arch = "wasm32")]
 impl Target for worker::D1Database {
-    async fn exec(&self, sql: &str) -> Result<(), String> { self.exec(sql).await.map(|_| ()).map_err(|e| e.to_string()) }
+    // D1's `exec` splits its input on newlines, which mangles a multi-line
+    // statement. `prepare().run()` executes exactly one statement as written.
+    async fn exec(&self, sql: &str) -> Result<(), String> { self.prepare(sql).run().await.map(|_| ()).map_err(|e| e.to_string()) }
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> {
         let result = self.prepare(sql).all().await.map_err(|e| e.to_string())?;
         let rows: Vec<HashMap<String, serde_json::Value>> = result.results().map_err(|e| e.to_string())?;
@@ -100,6 +109,16 @@ impl Target for worker::D1Database {
         self.batch(batch).await.map(|_| ()).map_err(|e| e.to_string())
     }
     fn atomic_ddl(&self) -> bool { true }
+    async fn has_application_schema(&self) -> Result<bool, String> {
+        // D1 is SQLite underneath: its own bookkeeping tables are `_cf_*` and
+        // `d1_*`, alongside SQLite's `sqlite_*`.
+        let rows = self.query(
+            "SELECT name FROM sqlite_master WHERE type='table' \
+             AND substr(name,1,7)<>'sqlite_' AND substr(name,1,4)<>'_cf_' AND substr(name,1,3)<>'d1_' \
+             AND name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+        ).await?;
+        Ok(!rows.is_empty())
+    }
 }
 
 /// serde-wasm-bindgen represents every JavaScript number as f64, so an integer
@@ -239,6 +258,15 @@ async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: 
 
     let mut done: BTreeSet<i64> = rows.iter().map(|r| r.version).collect();
     if rows.is_empty() {
+        // Squashing records the baseline as applied without running it. That is
+        // only sound on a genuinely empty database: if application tables are
+        // already present, the ledger was lost or never created, and certifying
+        // versions 2..=SQUASHED_THROUGH would mark migrations the schema never
+        // received. Fail closed instead of silently skipping them.
+        if target.has_application_schema().await? {
+            return Err("database contains application tables but no schema_migrations ledger; refusing to record the consolidated baseline as squashed. \
+                        Restore the ledger, or recreate the database, before applying migrations".to_string());
+        }
         apply_one(target, &migrations[0]).await?;
         done.insert(1);
         report.applied.push(1);
@@ -281,7 +309,10 @@ async fn apply_one<T: Target>(target: &T, migration: &Migration) -> Result<(), S
                 "UPDATE schema_migrations SET success=1, execution_ms={} WHERE version={}",
                 elapsed, migration.version,
             )).await?;
-            Ok(())
+            // A runner whose lock went stale can be overtaken while a long
+            // migration finishes. Re-read the row so a row another runner
+            // removed or rewrote cannot be reported as our success.
+            verify_completion(target, migration, &checksum).await
         }
         Err(error) => {
             if migration.tolerant || !target.atomic_ddl() {
@@ -301,6 +332,34 @@ async fn apply_one<T: Target>(target: &T, migration: &Migration) -> Result<(), S
             }
         }
     }
+}
+
+/// Confirm the completion write landed on the row this run inserted. The
+/// version, name and checksum identify that row; `success=1` is its completion
+/// marker. Anything else means concurrent history (for example an operator
+/// repairing after a stale-lock takeover), and reporting success would be a
+/// lie about the schema this binary applied.
+async fn verify_completion<T: Target>(target: &T, migration: &Migration, checksum: &str) -> Result<(), String> {
+    let row = target.query(&format!(
+        "SELECT version, name, checksum, success FROM schema_migrations WHERE version={}",
+        migration.version,
+    )).await?
+        .into_iter().next()
+        .ok_or_else(|| format!(
+            "migration {} ({}) completed but its ledger row is gone; another runner may have removed it. Refusing to report success",
+            migration.version, migration.name,
+        ))?;
+    let version = n(&row, "version");
+    let name = s(&row, "name");
+    let stored = s(&row, "checksum");
+    let success = n(&row, "success") != 0;
+    if version != migration.version || name != migration.name || stored != checksum || !success {
+        return Err(format!(
+            "migration {} ({}) completed but its ledger row was rewritten (version {}, name {:?}, checksum {}, success {}); refusing to report success",
+            migration.version, migration.name, version, name, stored, success,
+        ));
+    }
+    Ok(())
 }
 
 async fn exec_tolerant<T: Target>(target: &T, statements: &[String], legacy: bool) -> Result<(), String> {
@@ -419,22 +478,60 @@ pub async fn repair<T: Target>(target: &T, migrations: &[Migration], action: Rep
         return Err("no schema_migrations ledger in this database; run status or apply first".to_string());
     }
     ensure_ledger(target).await?;
+    // A repair rewrites history, so it takes the same lock as a migration run
+    // and always releases it, including when the repair itself is refused.
+    let lock = Lock::acquire(target).await?;
+    let result = repair_locked(target, migrations, action).await;
+    lock.release().await;
+    result
+}
+
+async fn repair_locked<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
     let version = match action { Repair::SetApplied(v) | Repair::Remove(v) | Repair::AcceptChecksum(v) => v };
     let migration = migrations.iter().find(|m| m.version == version)
         .ok_or_else(|| format!("no migration {} in this binary", version))?;
-    if target.query(&format!("SELECT version FROM schema_migrations WHERE version={}", version)).await?.is_empty() {
-        return Err(format!("migration {} has no ledger row", version));
-    }
+    let row = target.query(&format!("SELECT version, checksum, success FROM schema_migrations WHERE version={}", version)).await?
+        .into_iter().next()
+        .ok_or_else(|| format!("migration {} has no ledger row", version))?;
+    let stored = s(&row, "checksum");
+    let completed = n(&row, "success") != 0;
     match action {
         Repair::SetApplied(_) => {
-            target.exec(&format!("UPDATE schema_migrations SET success=1 WHERE version={}", version)).await?;
+            // Only an interrupted run carries the incomplete marker this
+            // command is allowed to complete. Marking an already-applied or
+            // absent migration would be a guess about the schema.
+            if completed {
+                return Err(format!("migration {} is already marked applied", version));
+            }
+            target.exec(&format!("UPDATE schema_migrations SET success=1 WHERE version={} AND success=0", version)).await?;
+            let marker = target.query(&format!("SELECT success FROM schema_migrations WHERE version={}", version)).await?
+                .into_iter().next().is_some_and(|row| n(&row, "success") != 0);
+            if !marker {
+                return Err(format!("migration {} completion marker did not persist", version));
+            }
             Ok(format!("migration {} marked applied", version))
         }
         Repair::Remove(_) => {
+            // Only an interrupted run may be removed and retried. Deleting a
+            // completed row replays DDL that already succeeded.
+            if completed {
+                return Err(format!("migration {} completed; refusing to remove it and re-run history", version));
+            }
+            let latest = target.query("SELECT MAX(version) AS version FROM schema_migrations").await?
+                .into_iter().next().map(|row| n(&row, "version")).unwrap_or(0);
+            if version != latest {
+                return Err(format!("migration {} is not the latest recorded version ({})", version, latest));
+            }
             target.exec(&format!("DELETE FROM schema_migrations WHERE version={}", version)).await?;
             Ok(format!("migration {} removed from the ledger; the next apply runs it again", version))
         }
         Repair::AcceptChecksum(_) => {
+            if stored.is_empty() {
+                return Err(format!("migration {} predates checksums; its legacy history stays unverified", version));
+            }
+            if stored == "squashed" {
+                return Err(format!("migration {} is covered by the consolidated baseline; the squash marker is not a drifted checksum", version));
+            }
             let checksum = checksum(migration.sql);
             target.exec(&format!("UPDATE schema_migrations SET checksum='{}' WHERE version={}", checksum, version)).await?;
             Ok(format!("migration {} now records checksum {}", version, checksum))

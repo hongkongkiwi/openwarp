@@ -358,6 +358,30 @@ impl Db {
             }
         }
     }
+    /// True when the database holds tables outside the migration ledger and
+    /// its lock. A pre-engine database has application tables but no ledger,
+    /// so the migration runner must refuse to squash its baseline. System,
+    /// extension bookkeeping and D1 internal tables are not application schema.
+    pub async fn has_application_schema(&self) -> Result<bool, String> {
+        // SQLite, the Durable Object handle and D1 all answer from sqlite_master.
+        #[cfg(target_arch = "wasm32")]
+        let sql = "SELECT name FROM sqlite_master WHERE type='table' \
+                   AND substr(name,1,7)<>'sqlite_' AND substr(name,1,4)<>'_cf_' AND substr(name,1,3)<>'d1_' \
+                   AND name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1";        #[cfg(not(target_arch = "wasm32"))]
+        let sql = match self {
+            Db::Sqlite(_) => "SELECT name FROM sqlite_master WHERE type='table' \
+                              AND substr(name,1,7)<>'sqlite_' \
+                              AND name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+            Db::Postgres(_) => "SELECT table_name AS name FROM information_schema.tables \
+                                WHERE table_schema=current_schema() \
+                                AND table_type='BASE TABLE' \
+                                AND table_name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+            Db::Mysql(_) => "SELECT table_name AS name FROM information_schema.tables \
+                             WHERE table_schema=DATABASE() AND table_type='BASE TABLE' \
+                             AND table_name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+        };
+        Ok(!self.query(sql, &[]).await?.is_empty())
+    }
     pub async fn version(&self) -> Result<i64, String> {
         Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations WHERE success=1", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
     async fn migrate(&self) -> Result<(), String> { crate::migrate::run(self).await }
