@@ -4171,8 +4171,11 @@ async fn health(State(st): State<S>) -> impl IntoResponse {
 const LOCKBOX_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 async fn lockbox_page() -> Response {
     let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenWarp lockbox</title><style>body{margin:0;background:#08080c;color:#eceaf8;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh}
-main{width:620px;max-width:92vw;background:#12121b;border:1px solid #23233a;border-radius:14px;padding:24px}pre{white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace}</style></head>
+<title>OpenWarp lockbox</title><script>(function(){try{var p;try{p=localStorage.getItem('ow_theme')}catch(e){}if(p!=='light'&&p!=='dark'&&p!=='system')p='system';var de=document.documentElement;if(!de)return;de.dataset.themePref=p;var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;var ap=function(){de.dataset.theme=p==='system'?((mq&&mq.matches)?'dark':'light'):p};ap();if(mq&&mq.addEventListener)mq.addEventListener('change',ap)}catch(e){}})();
+</script><style>:root{color-scheme:light;--bg:#f4f5f9;--panel:#ffffff;--line:#dcdee9;--text:#1d1c2e;--muted:#5f5d78}
+:root[data-theme=dark]{color-scheme:dark;--bg:#08080c;--panel:#12121b;--line:#23233a;--text:#eceaf8;--muted:#9a97b3}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh}
+main{width:620px;max-width:92vw;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px}pre{white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace}</style></head>
 <body><main><h2>OpenWarp lockbox</h2><p id="out">Loading…</p></main><script>
 (function(){var out=document.getElementById('out');var id=decodeURIComponent(location.pathname.split('/').pop());var key=location.hash.slice(1);
 if(!key){out.textContent='This link is missing its decryption key.';return}
@@ -4245,6 +4248,7 @@ async fn metrics(State(st): State<S>, h: HeaderMap) -> Response {
 pub fn router(state: S) -> Router {
     let app = Router::new()
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
+        .route("/i18n.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("i18n.js")) }))
         .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
         .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))

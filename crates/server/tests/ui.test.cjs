@@ -8,6 +8,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+const i18nSource = fs.readFileSync(path.join(__dirname, '../src/i18n.js'), 'utf8');
 const html = source.match(/r##"([\s\S]*)"##;/)?.[1];
 assert.ok(html, 'the embedded console HTML must be extractable');
 const script = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
@@ -47,6 +48,7 @@ class Element {
       if (at > 0) this.style[decl.slice(0, at).trim()] = decl.slice(at + 1).trim();
     }
   }
+  get childNodes() { return this.children; }
   get id() { return this.getAttribute('id') || ''; }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
@@ -180,8 +182,10 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   document.createElement = tag => new Element(tag, document);
   parse(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style>[\s\S]*?<\/style>/gi, ''), document);
   document.body = document.querySelector('body');
+  document.documentElement = document.querySelector('html');
   document.activeElement = document.body;
-  const calls = [], unexpected = [], confirmations = [], timers = [];
+  const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
+  const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
     '/api/instance': { instance_owner: false },
@@ -203,11 +207,16 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
     '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
+    ...opts.responses,
   };
   const context = vm.createContext({
-    document, console, URL, TextDecoder, TextEncoder,
-    localStorage: { getItem: () => '', setItem() {}, removeItem() {} },
-    navigator: { clipboard: { writeText: async () => {} } },
+    document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
+    localStorage: {
+      getItem: key => (Object.hasOwn(store, key) ? store[key] : ''),
+      setItem: (key, value) => { store[key] = String(value); },
+      removeItem: key => { delete store[key]; },
+    },
+    navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
     setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {},
@@ -241,7 +250,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     },
   });
   const ui = {
-    document, calls, confirmations, confirm: false,
+    document, calls, confirmations, confirm: false, store, media,
+    systemDark(dark) { media.matches = dark; for (const fn of media.listeners) fn({ matches: dark }); },
     el(id) { const el = document.getElementById(id); assert.ok(el, 'missing rendered element #' + id); return el; },
     run(code) { return vm.runInContext(code, context, { timeout: 1000 }); },
     async settle() {
@@ -283,6 +293,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     flushTimers() { const pending = timers.splice(0); for (const fn of pending) fn(); },
   };
   context.window = context;
+  // Browser load order: the i18n runtime executes before the inline console script.
+  vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
   await ui.invoke('enterApp()');
   await ui.invoke("openApp('app-a')");
@@ -695,4 +707,170 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+test('the theme resolves from the system by default and the toggle persists an override', async () => {
+  const ui = await consoleUI();
+  const html = ui.document.documentElement;
+  assert.equal(html.getAttribute('data-theme-pref'), 'system', 'with nothing stored the console follows the system');
+  assert.equal(html.getAttribute('data-theme'), 'light', 'the shim exposes no dark system preference');
+  const toggle = ui.document.querySelector('.topbar [data-themetoggle]');
+  assert.ok(toggle, 'the topbar exposes a theme toggle');
+  assert.ok(ui.document.querySelector('.authprefs [data-themetoggle]'), 'the auth card exposes one too');
+  await ui.click(toggle);
+  assert.equal(ui.store['ow_theme'], 'light', 'cycling from system selects light');
+  assert.equal(html.getAttribute('data-theme'), 'light');
+  await ui.click(ui.document.querySelector('.topbar [data-themetoggle]'));
+  assert.equal(ui.store['ow_theme'], 'dark', 'a second click selects dark');
+  assert.equal(html.getAttribute('data-theme'), 'dark');
+  await ui.click(ui.document.querySelector('.topbar [data-themetoggle]'));
+  assert.equal(ui.store['ow_theme'], 'system', 'a third click returns to following the system');
+  assert.equal(html.getAttribute('data-theme'), 'light', 'system resolves through the (light) shim preference');
+});
+
+test('OS theme changes follow the current choice, not the initial choice', async () => {
+  for (const initial of ['system', 'dark']) {
+    const ui = await consoleUI([saved], [], { store: { ow_theme: initial } });
+    const html = ui.document.documentElement;
+    await ui.invoke("setTheme('light')");
+    ui.systemDark(true);
+    assert.equal(html.dataset.theme, 'light');
+    await ui.invoke("setTheme('dark')");
+    ui.systemDark(false);
+    assert.equal(html.dataset.theme, 'dark');
+    await ui.invoke("setTheme('system')");
+    ui.systemDark(true);
+    assert.equal(html.dataset.theme, 'dark');
+    ui.systemDark(false);
+    assert.equal(html.dataset.theme, 'light');
+  }
+});
+
+test('light and dark are fully tokenized and the i18n runtime is wired', () => {
+  for (const token of ['--bg', '--panel', '--text', '--acc', '--toast-bg', '--sh-auth']) {
+    assert.match(source, new RegExp(`:root{[^}]*${token}:`), `the light theme must define ${token}`);
+    assert.match(source, new RegExp(`:root\\[data-theme=dark\\]{[^}]*${token}:`), `the dark theme must define ${token}`);
+  }
+  assert.match(source, /color-scheme:light/, 'the light root declares color-scheme');
+  assert.match(source, /:root\[data-theme=dark\]{color-scheme:dark/, 'the dark root declares color-scheme');
+  const appSource = fs.readFileSync(path.join(__dirname, '../src/app.rs'), 'utf8');
+  assert.match(appSource, /route\("\/i18n\.js"/, 'the server must serve /i18n.js');
+  assert.match(source, /<script src="\/i18n\.js"/, 'the console must load the i18n runtime before the inline script');
+  assert.match(source, /data-themetoggle/, 'theme toggles must exist in the chrome');
+});
+
+test('every language dictionary carries the same keys and every key exists in the console', () => {
+  const ctx = vm.createContext({ localStorage: { getItem: () => '', setItem() {}, removeItem() {} } });
+  vm.runInContext(i18nSource, ctx, { filename: 'i18n.js' });
+  const langs = vm.runInContext('Object.keys(OW_LANGS)', ctx);
+  assert.ok(langs.length >= 9, 'at least nine locales ship, English included');
+  const keys = vm.runInContext(`Object.keys(OW_I18N['zh-TW']).sort()`, ctx);
+  assert.ok(keys.length > 200, 'the dictionaries are substantive, not a stub');
+  for (const lang of langs.filter(l => l !== 'en')) {
+    assert.deepEqual(vm.runInContext(`Object.keys(OW_I18N[${JSON.stringify(lang)}]).sort()`, ctx), keys,
+      `${lang} must cover the same strings as the other languages`);
+  }
+  const flat = source.replace(/\\'/g, "'").replace(/&amp;/g, '&');
+  const composed = ['Request approved', 'Request rejected', 'Signups enabled', 'Signups disabled',
+    'Theme: system', 'Theme: light', 'Theme: dark'];
+  for (const key of keys) {
+    if (composed.includes(key)) continue;
+    assert.ok(flat.includes(key), `dictionary key missing from the console source: ${key}`);
+  }
+});
+
+test('language changes do not translate app names matching interface labels', async () => {
+  const names = ['Settings', '設定'];
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/apps': names.map((name, i) => ({ id: i ? 'app-b' : 'app-a', name })),
+  } });
+  for (const lang of ['ja', 'fr', 'en']) {
+    await ui.invoke('renderApps()');
+    await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+    assert.deepEqual(ui.el('view').querySelectorAll('.appcard h3').map(el => el.textContent), names,
+      `app cards must preserve names in ${lang}`);
+    for (const [i, name] of names.entries()) {
+      await ui.invoke(`openApp('${i ? 'app-b' : 'app-a'}')`);
+      await ui.invoke('owApply()');
+      assert.equal(ui.el('pagetitle').textContent, name, `the app title must preserve its name in ${lang}`);
+    }
+  }
+});
+
+for (const [label, initial, next] of [['Settings', 'en', 'ja'], ['設定', 'ja', 'en']]) {
+  test(`language changes preserve audit detail ${JSON.stringify(label)} from ${initial} to ${next}`, async () => {
+    const ui = await consoleUI([saved], [], { store: { ow_lang: initial }, responses: {
+      '/api/orgs/org-a/audit': [{ action: 'fixture.event', actor: 'fixture-user', detail: label }],
+    } });
+    await ui.invoke('renderAudit()');
+    assert.equal(ui.el('view').querySelector('tbody tr').querySelectorAll('td')[3].textContent, label);
+    for (const lang of [next, 'fr', initial]) {
+      await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+      assert.equal(ui.el('view').querySelector('tbody tr').querySelectorAll('td')[3].textContent, label,
+        `audit data must remain verbatim after switching to ${lang}`);
+      assert.equal(ui.el('pagetitle').textContent,
+        { en: 'Audit log', ja: '監査ログ', fr: "Journal d'audit" }[lang], 'the surrounding UI still translates');
+    }
+  });
+}
+
+test('language changes preserve label-like access request reasons and translate their controls', async () => {
+  const reasons = ['Settings', '設定'];
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [], '/api/envs/env-a/proposals': [],
+    '/api/envs/env-a/access-requests': reasons.map((reason, i) => ({ id: 'request-' + i, reason, status: 'pending' })),
+  } });
+  await ui.invoke('renderAccess()');
+  for (const [lang, approve] of [['ja', '承認'], ['en', 'Approve']]) {
+    await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+    const cards = ui.el('view').querySelectorAll('.card');
+    const requests = cards.find(card => card.querySelector('button[onclick="requestAccess()"]'));
+    assert.ok(requests, 'the access request card must render');
+    assert.deepEqual(requests.querySelectorAll('.row .small').map(el => el.textContent),
+      reasons.map(reason => reason + ' · pending'), 'request reasons must remain verbatim');
+    assert.equal(requests.querySelector('button').textContent, approve, 'request controls still translate');
+  }
+});
+
+test('the full removed-key-grant security explanation translates and returns to English', async () => {
+  const ui = await consoleUI();
+  ui.run("ENV.mode='e2e'; E2E_DATA[ENV.id]=[]; E2E_META[ENV.id]={rekey_required:true}");
+  await ui.invoke('renderE2eEnv()');
+  const explanation = ui.el('view').querySelector('.card p');
+  assert.ok(explanation, 'removing a grant must expose the rotation explanation');
+  const english = explanation.textContent;
+  assert.match(english, /Rotation cannot take back ciphertext someone already copied\./);
+  await ui.invoke("owSetLang('ja')");
+  assert.equal(explanation.textContent,
+    'メンバーの鍵グラントが削除されましたが、保存された暗号文はまだ古い環境鍵で暗号化されています。鍵をローテーションして、すべてのシークレットを新しい鍵で再暗号化し、現在のメンバーへ包鍵してください。ローテーションでも、すでにコピーされた暗号文は取り戻せません。');
+  await ui.invoke("owSetLang('en')");
+  assert.equal(explanation.textContent, english, 'switching back restores the full security explanation');
+});
+
+test('language reset clears the override and detects the current browser language', async () => {
+  const ui = await consoleUI([saved], [], { languages: ['ja'], store: { ow_lang: 'fr' } });
+  assert.equal(ui.document.documentElement.getAttribute('lang'), 'fr');
+  assert.ok(ui.document.querySelector('select[data-langsel]').querySelector('option[value="system"]'));
+  await ui.invoke("owSetLang('en')");
+  assert.equal(ui.store.ow_lang, 'en');
+  await ui.invoke("owSetLang('system')");
+  assert.equal(ui.store.ow_lang, undefined);
+  assert.equal(ui.document.documentElement.getAttribute('lang'), 'ja');
+  for (const select of ui.document.querySelectorAll('select[data-langsel]')) assert.equal(select.value, 'system');
+});
+
+test('language follows the browser, translates the chrome, and the override persists', async () => {
+  const ui = await consoleUI([saved], [], { languages: ['zh-TW', 'en'] });
+  const html = ui.document.documentElement;
+  assert.equal(html.getAttribute('lang'), 'zh', 'the document language tracks the browser');
+  assert.equal(ui.store['ow_lang'], undefined, 'a detected language writes no override');
+  assert.equal(ui.el('authtitle').textContent, '歡迎回來', 'the static auth screen is translated at boot');
+  await ui.invoke('renderApps(); owApply()');
+  assert.ok(ui.el('view').innerHTML.includes('個應用程式'), 'rendered app counts are translated');
+  await ui.run(`owSetLang('ja')`);
+  assert.equal(ui.store['ow_lang'], 'ja', 'the override persists');
+  assert.equal(html.getAttribute('lang'), 'ja');
+  assert.equal(ui.el('authtitle').textContent, 'おかえりなさい', 'switching languages re-translates the chrome');
+  await ui.run(`owSetLang('en')`);
+  assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
 });

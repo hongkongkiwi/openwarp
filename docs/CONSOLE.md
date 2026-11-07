@@ -14,6 +14,12 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 
 Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority.
 
+## Appearance and languages
+
+The console ships a light and a dark theme. With nothing chosen it follows the system colour scheme and re-resolves when the system changes; a toggle in the top bar (and on the sign-in card) cycles system, light and dark, and the Settings page has an Appearance & language card with explicit picks. The theme preference and explicit language overrides are stored in the browser (`localStorage`), so they apply per device and before signing in; the sign-in screen, console and one-time lockbox page all honour the choice.
+
+The interface is translated into English, Traditional Chinese, Simplified Chinese, Japanese, Korean, Spanish, French, German and Brazilian Portuguese. The language defaults to the browser's own languages and can be overridden from the sign-in card, the top bar or Settings. Select System / browser to remove the override and detect the browser language again. Three limits are deliberate: text that comes from the server (error messages, audit details, provider hints with JSON examples) stays in English; a string a language has not yet translated falls back to English rather than vanishing; and values that come from your data (secret keys, app and environment names) are never rewritten even when they happen to match a UI label.
+
 ## Accounts and recovery
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
