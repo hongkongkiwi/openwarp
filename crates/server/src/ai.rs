@@ -150,7 +150,8 @@ async fn chat(State(st):State<S>,h:HeaderMap,Path(org):Path<String>,Json(r):Json
     }
     if matches!(r.task.as_str(),"incident"|"explain") { let (envs,t)=permitted_envs(&st,&org,&uid,r.env_id.as_deref()).await?; truncated|=t; let allowed:std::collections::HashSet<String>=envs.iter().map(|e| db::s(e,"id")).collect();
         if r.task=="explain" { let f=generate_findings(&st,&org).await?; let wanted=r.finding_id.as_deref().ok_or_else(|| bad("finding_id is required for explanation"))?; let found=f["findings"].as_array().and_then(|fs| fs.iter().find(|v| v["id"]==wanted)).ok_or_else(|| bad("finding is not present in current evidence"))?;
-            let evidence=found["evidence"].as_array().filter(|es| !es.is_empty() && es.iter().all(|e| e["env_id"].as_str().is_some_and(|id| allowed.contains(id)))).ok_or_else(|| err(StatusCode::FORBIDDEN,"finding evidence is outside permitted environment scope"))?;
+            let certificate=matches!(found["rule"].as_str(),Some("expiring_certificate"|"expiring_ssh_certificate"));
+            let evidence=found["evidence"].as_array().filter(|es| !es.is_empty() && es.iter().all(|e| e["env_id"].as_str().is_some_and(|id| allowed.contains(id) || (id.is_empty() && certificate && e["action"]==found["rule"])))).ok_or_else(|| err(StatusCode::FORBIDDEN,"finding evidence is outside permitted environment scope"))?;
             citations.extend(evidence.iter().map(|e| json!({"id":e["id"],"kind":"evidence","env_id":e["env_id"]}))); let mut safe=found.clone(); safe.as_object_mut().unwrap().remove("maintenance_note"); safe.as_object_mut().unwrap().remove("status"); ctx["finding"]=safe; citations.push(json!({"id":wanted,"kind":"finding"}));
         } else { let timeline=st.db.query("SELECT id,action,env_id,created_at FROM ai_activity WHERE org_id=? ORDER BY created_at DESC LIMIT 100",&[json!(&org)]).await.map_err(|_| bad("cannot read incident timeline"))?; let timeline:Vec<_>=timeline.iter().filter(|r| allowed.contains(&db::s(r,"env_id"))).collect(); ctx["timeline"]=json!(timeline.iter().map(|r| db::obj(r)).collect::<Vec<_>>()); citations.extend(timeline.iter().map(|r| json!({"id":db::s(r,"id"),"kind":"activity","env_id":db::s(r,"env_id")}))); }
     }
@@ -293,10 +294,65 @@ pub(crate) async fn rewrap(st:&S,old:&[u8;32],new:&[u8;32]) -> Result<Vec<(Strin
 #[cfg(all(test,not(target_arch="wasm32")))]
 mod tests {
     use super::*;
+    #[tokio::test] async fn certificate_explanations_preserve_evidence_scope() {
+        use std::sync::{Arc,Mutex};
+        async fn complete(State(captured):State<Arc<Mutex<Vec<Value>>>>,Json(body):Json<Value>) -> Json<Value> {
+            captured.lock().unwrap().push(body);
+            Json(json!({"choices":[{"message":{"content":"Certificate guidance"}}]}))
+        }
+        struct Provider(tokio::task::JoinHandle<()>,Option<String>);
+        impl Drop for Provider { fn drop(&mut self) { self.0.abort(); match &self.1 { Some(v)=>std::env::set_var("OPENWARP_AI_ENDPOINTS",v),None=>std::env::remove_var("OPENWARP_AI_ENDPOINTS") } } }
+        let captured=Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let endpoint=format!("http://{}/complete",listener.local_addr().unwrap());
+        let provider=Router::new().route("/complete",post(complete)).with_state(captured.clone());
+        let _provider=Provider(tokio::spawn(async move { axum::serve(listener,provider).await.unwrap(); }),std::env::var("OPENWARP_AI_ENDPOINTS").ok());
+        std::env::set_var("OPENWARP_AI_ENDPOINTS",json!([endpoint]).to_string());
+        let db=db::Db::open_memory().await.unwrap(); let (live,_)=tokio::sync::broadcast::channel(4);
+        let st=app::new_state(db,"sqlite::memory:".into(),"certificate-test".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+        st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES('o','AI',1)",&[]).await.unwrap();
+        for role in ["owner","admin","developer","investigator"] {
+            st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,'unused','unused','unused',1,1)",&[json!(role),json!(format!("{}@certificate.test.invalid",role))]).await.unwrap();
+            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES('o',?,?)",&[json!(role),json!(role)]).await.unwrap();
+            st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)",&[json!(oc::hash_token(role)),json!(role),json!(now())]).await.unwrap();
+        }
+        st.db.exec("INSERT INTO roles(id,org_id,name,permissions) VALUES('investigator','o','investigator',?)",&[json!(json!(["org:admin","secrets:read"]).to_string())]).await.unwrap();
+        let headers=|role:&str| { let mut h=HeaderMap::new(); h.insert("authorization",format!("Bearer {}",role).parse().unwrap()); h };
+        let settings=put_settings(State(st.clone()),headers("owner"),Path("o".into()),Json(json!({"enabled":true,"endpoint":endpoint,"model":"fake","allow_metadata":true}))).await.unwrap(); assert_eq!(settings.0["enabled"],true);
+        st.db.exec("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at) VALUES('ca','o','fake','unused','unused',1),('foreign-ca','other','fake','unused','unused',1)",&[]).await.unwrap();
+        st.db.exec("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at) VALUES('cert','ca','fake','unused','1',?,1),('foreign-cert','foreign-ca','fake','unused','2',?,1)",&[json!(now()+3600),json!(now()+3600)]).await.unwrap();
+        st.db.exec("INSERT INTO ssh_certs(id,ca_id,key_id,principal,public_key,cert,serial,actor,valid_after,valid_before,created_at) VALUES('ssh','ca','fake','fake','unused','unused',1,'owner',1,?,1)",&[json!(now()+3600)]).await.unwrap();
+        let fs=generate_findings(&st,"o").await.unwrap().0;
+        assert_eq!(fs["findings"].as_array().unwrap().len(),2,"other workspace certificates must be excluded");
+        let request=|fid:Value,env:Option<String>| ChatReq { message:"Explain expiry".into(),task:"explain".into(),env_id:env,compare_env_id:None,import_text:None,finding_id:Some(fid.as_str().unwrap().into()) };
+        for f in fs["findings"].as_array().unwrap() {
+            assert_eq!(f["evidence"][0]["env_id"],"");
+            for role in ["owner","admin"] {
+                let result=chat(State(st.clone()),headers(role),Path("o".into()),Json(request(f["id"].clone(),None))).await;
+                assert!(result.is_ok(),"{} must explain {}: {:?}",role,f["rule"],result);
+            }
+            let denied=chat(State(st.clone()),headers("developer"),Path("o".into()),Json(request(f["id"].clone(),None))).await.unwrap_err(); assert_eq!(denied.0,StatusCode::FORBIDDEN);
+        }
+        assert_eq!(captured.lock().unwrap().len(),4);
+        for body in captured.lock().unwrap().iter() {
+            let context:Value=serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert!(matches!(context["context"]["finding"]["rule"].as_str(),Some("expiring_certificate"|"expiring_ssh_certificate")));
+            assert!(!body.to_string().contains("foreign-cert"));
+        }
+        st.db.exec("INSERT INTO apps(id,org_id,name,created_at) VALUES('app','o','fake',1)",&[]).await.unwrap();
+        st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,restricted,created_at) VALUES('restricted','app','private','unused','sse',1,1)",&[]).await.unwrap();
+        for (fid,rule,env,action) in [("empty","expiring_token","","expiring_token"),("restricted","expiring_token","restricted","expiring_token"),("certificate-with-env","expiring_certificate","restricted","expiring_certificate"),("wrong-action","expiring_certificate","","expiring_token")] {
+            let f=finding("o",rule,fid,1,"fake","fake",vec![json!({"id":fid,"action":action,"env_id":env})]);
+            st.db.exec("INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES('o',?,?,?,?)",&[f["id"].clone(),json!(f.to_string()),json!(now()),json!(now())]).await.unwrap();
+            let denied=chat(State(st.clone()),headers("investigator"),Path("o".into()),Json(request(f["id"].clone(),None))).await.unwrap_err(); assert_eq!(denied.0,StatusCode::FORBIDDEN);
+        }
+        let fid=fs["findings"][0]["id"].clone();
+        let denied=chat(State(st.clone()),headers("investigator"),Path("o".into()),Json(request(fid,Some("restricted".into())))).await.unwrap_err(); assert_eq!(denied.0,StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(),4,"denied evidence must never reach inference");
+    }
     #[tokio::test] async fn mysql_ai_schema_upserts_and_lease_claims() {
         use mysql_async::prelude::Queryable;
         let admin=match std::env::var("OPENWARP_TEST_MYSQL_URL") { Ok(url) if !url.trim().is_empty()=>url,_=>return };
-        let name=format!("ow_ai_{}",id().replace('-',""));
+        let name=format!("ow_ai_{}",id().chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase());
         let pool=mysql_async::Pool::new(mysql_async::Opts::from_url(&admin).unwrap());
         let mut conn=pool.get_conn().await.expect("configured MySQL must be reachable");
         conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
@@ -305,7 +361,30 @@ mod tests {
         assert_eq!(db.version().await.unwrap(),18);
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
-        let result=tokio::spawn(async move {
+        let outcome=tokio::spawn(assert_database_ai(st)).await;
+        conn.query_drop(format!("DROP DATABASE `{}`",name)).await.unwrap();
+        drop(conn); pool.disconnect().await.unwrap();
+        outcome.expect("MySQL AI integration assertions must pass");
+    }
+    #[tokio::test] async fn postgres_ai_schema_upserts_and_lease_claims() {
+        let admin=match std::env::var("OPENWARP_TEST_POSTGRES_URL") { Ok(url) if !url.trim().is_empty()=>url,_=>return };
+        let name=format!("ow_ai_{}",id().chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase());
+        let (conn,driver)=tokio_postgres::connect(&admin,tokio_postgres::NoTls).await.expect("configured PostgreSQL must be reachable");
+        let driver=tokio::spawn(async move { driver.await.unwrap(); });
+        conn.batch_execute(&format!("CREATE DATABASE \"{}\"",name)).await.unwrap();
+        let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
+        let outcome=tokio::spawn(async move {
+            let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
+            assert_eq!(db.version().await.unwrap(),18);
+            let (live,_)=tokio::sync::broadcast::channel(4);
+            let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+            assert_database_ai(st).await;
+        }).await;
+        conn.batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)",name)).await.unwrap();
+        drop(conn); driver.await.unwrap();
+        outcome.expect("PostgreSQL AI integration assertions must pass");
+    }
+    async fn assert_database_ai(st:S) {
             st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('u','mysql-ai@example.invalid','unused','unused','unused',1)",&[]).await.unwrap();
             st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES('o','AI',1)",&[]).await.unwrap();
             st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES('o','u','owner')",&[]).await.unwrap();
@@ -313,28 +392,23 @@ mod tests {
             let mut h=HeaderMap::new(); h.insert("authorization","Bearer mysql-ai-session".parse().unwrap());
             for key in ["first","second"] { let response=put_settings(State(st.clone()),h.clone(),Path("o".into()),Json(json!({"api_key":key}))).await.unwrap(); assert_eq!(response.0["has_api_key"],true); }
             let (_,enc)=load(&st,"o").await.unwrap(); assert_eq!(oc::decrypt_symmetric_aad(&st.master(),&key_aad("o"),&enc).unwrap(),b"second");
-            for _ in 0..2 { st.db.exec(dialect(&st.db,"", "INSERT INTO ai_usage(org_id,day) VALUES('o',1) ON DUPLICATE KEY UPDATE org_id=VALUES(org_id)"),&[]).await.unwrap(); }
+            for _ in 0..2 { st.db.exec(dialect(&st.db,"INSERT INTO ai_usage(org_id,day) VALUES('o',1) ON CONFLICT(org_id,day) DO NOTHING", "INSERT INTO ai_usage(org_id,day) VALUES('o',1) ON DUPLICATE KEY UPDATE org_id=VALUES(org_id)"),&[]).await.unwrap(); }
             assert_eq!(db::n(&st.db.one("SELECT COUNT(*) AS n FROM ai_usage",&[]).await.unwrap().unwrap(),"n"),1);
             for value in ["first","second"] {
                 let statements=vec![
-                    (dialect(&st.db,"","INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES('o','f','open',0,?) ON DUPLICATE KEY UPDATE maintenance_note=VALUES(maintenance_note)").into(),vec![json!(value)]),
-                    (dialect(&st.db,"","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES('o','f',?,1,1) ON DUPLICATE KEY UPDATE finding=VALUES(finding)").into(),vec![json!(value)]),
-                    (dialect(&st.db,"","INSERT INTO meta(k,v) VALUES('ai:background:o',?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(value)])];
+                    (dialect(&st.db,"INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES('o','f','open',0,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET maintenance_note=excluded.maintenance_note","INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES('o','f','open',0,?) ON DUPLICATE KEY UPDATE maintenance_note=VALUES(maintenance_note)").into(),vec![json!(value)]),
+                    (dialect(&st.db,"INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES('o','f',?,1,1) ON CONFLICT(org_id,finding_id) DO UPDATE SET finding=excluded.finding","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES('o','f',?,1,1) ON DUPLICATE KEY UPDATE finding=VALUES(finding)").into(),vec![json!(value)]),
+                    (dialect(&st.db,"INSERT INTO meta(k,v) VALUES('ai:background:o',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES('ai:background:o',?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(value)])];
                 st.db.batch(&statements).await.unwrap();
             }
             assert_eq!(db::s(&st.db.one("SELECT finding FROM ai_finding_history WHERE org_id='o'",&[]).await.unwrap().unwrap(),"finding"),"second");
-            for oid in ["first","second"] { st.db.exec("INSERT INTO folders(id,env_id,path,created_at) VALUES(?,'e','/same',1) ON DUPLICATE KEY UPDATE id=id",&[json!(oid)]).await.unwrap(); }
+            for oid in ["first","second"] { st.db.exec(dialect(&st.db,"INSERT INTO folders(id,env_id,path,created_at) VALUES(?,'e','/same',1) ON CONFLICT(env_id,path) DO NOTHING","INSERT INTO folders(id,env_id,path,created_at) VALUES(?,'e','/same',1) ON DUPLICATE KEY UPDATE id=id"),&[json!(oid)]).await.unwrap(); }
             assert_eq!(db::n(&st.db.one("SELECT COUNT(*) AS n FROM folders",&[]).await.unwrap().unwrap(),"n"),1);
             assert!(claim_lease(&st,"ai-test","first",100,45).await.unwrap());
             assert!(!claim_lease(&st,"ai-test","second",144,45).await.unwrap());
             assert!(!claim_lease(&st,"ai-test","first",144,45).await.unwrap());
             assert!(claim_lease(&st,"ai-test","second",145,45).await.unwrap());
             assert_eq!(st.db.exec("DELETE FROM instance_leases WHERE name='ai-test' AND owner='first'",&[]).await.unwrap(),0);
-        });
-        let outcome=result.await;
-        conn.query_drop(format!("DROP DATABASE `{}`",name)).await.unwrap();
-        drop(conn); pool.disconnect().await.unwrap();
-        outcome.expect("MySQL AI integration assertions must pass");
     }
     #[tokio::test] async fn lease_claim_excludes_active_owners_and_stale_release() {
         let db=crate::db::Db::open_memory().await.unwrap(); let (live,_)=tokio::sync::broadcast::channel(4);
