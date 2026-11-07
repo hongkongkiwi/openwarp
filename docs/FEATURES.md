@@ -2,7 +2,8 @@
 
 | Phase feature | Tier in Phase | OpenWarp |
 |---|---|---|
-| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings; explicit invitation consent, public preview and scoped pending list/revoke/resend with rotated seven-day tokens |
+| Workspace creation policy | n/a | instance-owner `PUT /api/instance/workspaces`, separate from signup; `OPENWARP_WORKSPACE_CREATION` override; no personal workspace when disabled, zero-workspace console recovery and last-workspace deletion protection |
 | Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
 | OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
 | Apps + readme | Free | yes |
@@ -14,7 +15,7 @@
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
 | Sign-in methods and second factors | n/a | password, ten social providers, workspace OIDC/SAML and LDAP; TOTP, WebAuthn passkeys and emailed codes; instance switches with `OPENWARP_AUTH_PROVIDERS` |
-| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console still uses v1 |
+| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console uses v2 for new invited accounts and detects v2 login, while normal console registration/reset retain v1 |
 | Encryption modes and KMS | n/a | SSE per-environment keys, external KMS bridge, client-held keys for delegated and E2E environments, `ow2` record-bound ciphertext |
 | Customer-run sync runner | n/a | outbound job queue, runner-sealed provider configs, claim fencing and stale-job recovery |
 | Global search | Free | `GET /api/search?q=` across orgs/apps/envs |

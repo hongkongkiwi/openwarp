@@ -531,6 +531,8 @@ async fn identity_role_cannot_exceed_the_creating_admin() {
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "reader"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept reader invitation failed: {}", accepted.text);
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(mt), Some(json!({"name": "sneaky", "role": "owner"}))).await;
     assert_eq!(r.status, 403, "custom-role member must not create a privileged identity, got {} {}", r.status, r.text);
@@ -554,6 +556,8 @@ async fn mcp_write_tools_respect_custom_role_permissions() {
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "editor"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept editor invitation failed: {}", accepted.text);
 
     let (oat, _) = oauth_token(&s, mt, "secrets:read secrets:write", &format!("{}/mcp", s.base)).await;
     let r = s
@@ -589,6 +593,8 @@ async fn members_can_be_listed_and_removed() {
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "developer"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(member["token"].as_str().unwrap()), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept member invitation failed: {}", accepted.text);
 
     let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
     assert_eq!(r.status, 200, "member listing failed: {}", r.text);
@@ -727,6 +733,8 @@ async fn scim_cannot_remove_the_last_owner() {
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(at), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept admin invitation failed: {}", accepted.text);
 
     let r = s.call(Method::DELETE, &format!("/scim/v2/Users/{}?org_id={}", ou, org), Some(at), None).await;
     assert_eq!(r.status, 403, "an admin must not remove an owner over SCIM, got {} {}", r.status, r.text);
@@ -749,6 +757,8 @@ async fn admin_cannot_invite_an_owner() {
     let at = admin["token"].as_str().unwrap();
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(at), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept admin invitation failed: {}", accepted.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(at), Some(json!({"email": "third@test.invalid", "role": "owner"}))).await;
     assert_eq!(r.status, 403, "an admin must not grant ownership, got {} {}", r.status, r.text);
 }

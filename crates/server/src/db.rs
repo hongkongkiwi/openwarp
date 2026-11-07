@@ -708,6 +708,13 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
         "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
     ]),
+    (18, &[
+        "ALTER TABLE invites ADD COLUMN id TEXT",
+        "ALTER TABLE invites ADD COLUMN invited_by TEXT DEFAULT ''",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_id ON invites(id)",
+        "INSERT INTO meta(k,v) SELECT 'workspace_policy_lock','1' WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k='workspace_policy_lock')",
+        "INSERT INTO meta(k,v) SELECT 'workspace_creation_open','1' WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k='workspace_creation_open')",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -743,10 +750,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 17, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 18, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 17, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 18, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

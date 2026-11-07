@@ -6,6 +6,7 @@ use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, middlew
 #[cfg(not(target_arch = "wasm32"))]
 use axum::{extract::{WebSocketUpgrade, ws::{Message, WebSocket}}};
 use db::{Db, Row};
+#[path = "workspaces.rs"] mod workspaces;
 use openwarp_crypto as oc;
 #[cfg(not(target_arch = "wasm32"))]
 use risaml::{
@@ -501,13 +502,13 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     // A password signup proves nothing about the address until the link is opened.
     // The instance-owner claim in particular waits for verification.
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,0)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
-    let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let oid = workspaces::default_workspace(&st, &uid,  &r.email).await?;
     mfa::note_password_login(&st, &uid).await;
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
-    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))))
+    let mut out = json!({"user_id":uid,"public_key":kp.public,"recovery_kit":kp.secret_b64(),"verification_required":true});
+    if let Some(oid) = oid { out["org_id"] = json!(oid); } Ok((HeaderMap::new(),j(out)))
 }
 pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
@@ -590,8 +591,7 @@ async fn register_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,0,2,?,?,?,?)",
         &[json!(&uid), json!(&email), json!(hash), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)])
         .await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
-    let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(&oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let oid = workspaces::default_workspace(&st, &uid, &email).await?;
     claim_instance_owner(&st, &uid).await;
     // A v2 account never proves a password, so factor management must not ask
     // for one; the session or auth-key proof is the credential.
@@ -599,7 +599,8 @@ async fn register_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&email, "verify", &[("link", &link), ("email", &email)]).await;
-    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": r.public_key, "verification_required": true})))) }
+    let mut out = json!({"user_id":uid,"public_key":r.public_key,"verification_required":true});
+    if let Some(oid) = oid { out["org_id"] = json!(oid); } Ok((HeaderMap::new(),j(out))) }
 #[derive(Deserialize, Default)] struct ChallengeReq { email: String }
 async fn auth_challenge(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ChallengeReq>) -> Res {
     let key = format!("challenge:{}", addr);
@@ -682,8 +683,10 @@ async fn me_auth(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT auth_version,kdf_salt,kdf_iterations,kdf_algo,pubkey,wrapped_privkey FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     Ok(j(json!({"auth_version": db::n(&row,"auth_version"), "kdf_salt": db::s(&row,"kdf_salt"), "kdf_iterations": db::n(&row,"kdf_iterations"), "kdf_algo": db::s(&row,"kdf_algo"), "public_key": db::s(&row,"pubkey"), "wrapped_privkey": db::s(&row,"wrapped_privkey")}))) }
-#[derive(Deserialize, Default)] struct InviteV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
-async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+#[derive(Deserialize, Default)] struct InviteV2Req { token: String, #[serde(default)] salt: String, #[serde(default)] iterations: i64, #[serde(default)] algo: String, #[serde(default)] auth_key: String, #[serde(default)] public_key: String, #[serde(default)] wrapped_privkey: String }
+async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
+    if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
     let rl = format!("invite-accept:{}", addr);
     if !st.rate_ok(&rl, 10, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many invite attempts; try again later")); }
@@ -693,17 +696,16 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r)
     if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
     if !valid_key32(&r.public_key) { return Err(bad("public_key must be 32-byte base64")); }
     if !valid_wrapped_key(&r.wrapped_privkey) { return Err(bad("wrapped_privkey must be an owv2 payload")); }
-    let hash = oc::hash_token(r.token.trim());
-    let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
-    let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
-    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
+    let email = db::s(&row,"email"); let org = db::s(&row,"org_id"); let role = db::s(&row,"role");
     let uid = id();
     let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
     let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)",
-        &[json!(&uid), json!(&email), json!(pass), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    workspaces::invite_batch(&st,&row,&[],&[
+        workspaces::consume(&st,&row,&r.token).await?,
+        ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)".into(),
+            vec![json!(&uid),json!(&email),json!(pass),json!(&r.public_key),json!(&r.wrapped_privkey),json!(now()),json!(&r.salt),json!(r.iterations),json!(&r.algo),json!(auth_key_enc)]),
+        ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(),vec![json!(&org),json!(&uid),json!(&role)]),
+    ],&[0,1,2]).await?;
     claim_instance_owner(&st, &uid).await;
     st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
@@ -774,12 +776,18 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
 async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
     let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
-async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; let oid = id();
-    user_guarded_batch(&st, &[&uid], &[
+async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = workspaces::human(&st,&h).await?; let oid = id();
+    if r.name.trim().is_empty() { return Err(bad("workspace name required")); }
+    if !workspaces::creation_open(&st).await? { return Err(err(StatusCode::FORBIDDEN,"workspace creation is disabled; accept an invitation instead")); }
+    let mut stmts = vec![workspaces::policy_lock()];
+    if crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_err() { stmts.push(workspaces::creation_guard()); }
+    let mut checked: Vec<usize> = (0..stmts.len()).collect(); let offset = stmts.len();
+    stmts.extend([
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&uid)]),
         ("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)".into(), vec![json!(&oid), json!(r.name), json!(now())]),
         ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')".into(), vec![json!(&oid), json!(&uid)]),
-    ], &[0, 2]).await?; Ok(j(json!({"id": oid}))) }
+    ]); checked.extend([offset,offset+2]);
+    user_guarded_batch(&st, &[&uid], &stmts, &checked).await?; Ok(j(json!({"id": oid}))) }
 async fn update_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     if r.name.trim().is_empty() { return Err(bad("organisation name required")); }
@@ -860,7 +868,12 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     stmts.extend(statements.into_iter().map(|sql| (sql, vec![json!(&oid)])));
     for key in ["oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_redirect_uri", "oidc_auto_provision", "oidc_allowed_domains", "audit_webhook"] {
         stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("{}:{}", key, oid))])); }
-    user_guarded_batch(&st, &[&uid], &stmts, &[0, 1, 2]).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed or has unresolved leases; refresh and revoke every lease before deleting it") } else { e })?;
+    let mut guarded = vec![workspaces::policy_lock()];
+    let guard = if crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_ok() {
+        if workspaces::creation_open(&st).await? { "UPDATE meta SET v=v WHERE k='workspace_policy_lock'" } else { "UPDATE meta SET v=v WHERE k='workspace_policy_lock' AND (SELECT COUNT(*) FROM orgs)>1" }
+    } else { "UPDATE meta SET v=v WHERE k='workspace_creation_open' AND (v<>'0' OR (SELECT COUNT(*) FROM orgs)>1)" };
+    guarded.push((guard.into(),vec![])); guarded.extend(stmts);
+    user_guarded_batch(&st, &[&uid], &guarded, &[0, 1, 2, 3, 4]).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed, has unresolved leases, or is the last workspace while creation is disabled; refresh, revoke leases or enable creation first") } else { e })?;
     st.audit("", "", "", &uid, "org.delete", &format!("{} ({})", name, oid)).await;
     Ok(j(json!({"deleted":true, "workspace":name}))) }
 async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
@@ -918,40 +931,32 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     // privilege read cannot race a role being created between the two checks.
     if st.role_privileged(&oid, &new_role).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant a role with admin rights")); }
     if let Some(target) = st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))? {
-        let tid = db::s(&target, "id");
-        if st.org_role(&oid, &tid).await.is_some() { return Err(err(StatusCode::CONFLICT, "user is already a member")); }
-        if new_role == "owner" {
-            user_guarded_batch(&st, &[&uid, &tid], &[
-                ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&tid)]),
-                ("UPDATE org_members SET role=role WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
-                ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')".into(), vec![json!(&oid), json!(&tid)]),
-            ], &[0, 1, 2]).await?;
-        } else {
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(oid), json!(tid), json!(new_role)]).await.map_err(|e| bad(&e))?;
-        }
-        st.audit(&oid, "", "", &uid, "member.invite", &email).await; return Ok(j(json!({"ok": true, "added": true})));
+        if st.org_role(&oid,&db::s(&target,"id")).await.is_some() { return Err(err(StatusCode::CONFLICT,"user is already a member")); }
     }
-    // No account yet: issue a single-use invite the invitee redeems with a
-    // password, or with Google/GitHub when those providers are configured.
-    let token = oc::random_token("inv"); let expires = now() + 7 * 86400;
-    let _ = st.db.exec("DELETE FROM invites WHERE email=? AND org_id=? AND accepted=0", &[json!(&email), json!(&oid)]).await;
-    st.db.exec("INSERT INTO invites(token_hash,email,org_id,role,created_at,expires_at) VALUES(?,?,?,?,?,?)", &[json!(oc::hash_token(&token)), json!(&email), json!(&oid), json!(&new_role), json!(now()), json!(expires)]).await.map_err(|e| bad(&e))?;
-    st.audit(&oid, "", "", &uid, "member.invite", &email).await;
-    Ok(j(json!({"ok": true, "invite_token": token, "expires_at": expires, "note": "single use, valid 7 days; the invitee redeems it at POST /api/auth/accept-invite or by signing in with a configured social provider"}))) }
-#[derive(Deserialize)] struct InviteReq { token: String, password: String }
-async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
-    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
-    if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
-    let hash = oc::hash_token(r.token.trim());
-    let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
-    let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
-    if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
+    if !valid_email(&email) { return Err(bad("email required")); }
+    let token = oc::random_token("inv"); let expires = now()+7*86400; let iid = id();
+    st.db.batch(&[
+        ("DELETE FROM invites WHERE email=? AND org_id=? AND accepted=0".into(),vec![json!(&email),json!(&oid)]),
+        ("INSERT INTO invites(id,token_hash,email,org_id,role,invited_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)".into(),vec![json!(&iid),json!(oc::hash_token(&token)),json!(&email),json!(&oid),json!(&new_role),json!(&uid),json!(now()),json!(expires)]),
+    ]).await.map_err(|e| bad(&e))?;
+    st.audit(&oid,"","",&uid,"member.invite",&email).await;
+    Ok(j(workspaces::share(&st,&iid,&token,expires))) }
+
+#[derive(Deserialize)] struct InviteReq { token: String, #[serde(default)] password: String }
+async fn accept_invite(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
+    if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
+    if !auth_enabled(&st,"password").await { return Err(err(StatusCode::FORBIDDEN,"password sign-in is disabled; sign in with a configured provider to join")); }
+    if r.password.len()<8 { return Err(bad("password (>=8 chars) required")); }
+    let email = db::s(&row,"email"); let org = db::s(&row,"org_id"); let role = db::s(&row,"role");
     let kp = oc::Keypair::generate(); let uid = id();
     // The invite token reached this address, which is the proof a password
     // signup would otherwise obtain by email.
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(&email), json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    workspaces::invite_batch(&st,&row,&[],&[
+        workspaces::consume(&st,&row,&r.token).await?,
+        ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)".into(),vec![json!(&uid),json!(&email),json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?),json!(kp.public),json!(oc::wrap_with_password(&r.password,kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?),json!(now())]),
+        ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(),vec![json!(&org),json!(&uid),json!(&role)]),
+    ],&[0,1,2]).await?;
     claim_instance_owner(&st, &uid).await;
     st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
     let token = make_session(&st, &uid).await?;
@@ -3157,15 +3162,7 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(provider), json!(subject), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid).await;
-    match invite {
-        Some(inv) => {
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(db::s(&inv, "org_id")), json!(uid), json!(db::s(&inv, "role"))]).await.map_err(|e| bad(&e))?;
-            st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(&inv, "token_hash"))]).await.map_err(|e| bad(&e))?; }
-        None => {
-            let oid = id();
-            st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).await.map_err(|e| bad(&e))?; }
-    }
+    if invite.is_none() { workspaces::default_workspace(st,&uid,email).await?; }
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email)).await;
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
@@ -3173,6 +3170,7 @@ async fn auth_providers(State(st): State<S>) -> Res {
     out["ldap"] = json!(cfg!(feature = "ldap"));
     out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
     out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
+    out["workspace_creation_open"] = json!(workspaces::creation_open(&st).await?);
     Ok(j(out)) }
 // Composed from discovery plus optional explicit endpoints, for IdPs that do not
 // publish usable metadata.
@@ -3280,6 +3278,8 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     let mut out = auth_settings(&st).await;
     out["signups_open"] = json!(signups_open(&st).await);
+    out["workspace_creation_open"] = json!(workspaces::creation_open(&st).await?);
+    out["workspace_creation_env_locked"] = json!(crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_ok());
     out["signups_env_locked"] = json!(crate::envcfg::var("OPENWARP_SIGNUPS").is_ok());
     out["instance_owner"] = json!(instance_owner(&st).await.as_deref() == Some(uid.as_str()));
     out["mfa_email"] = json!(mfa::email_available());
@@ -4077,7 +4077,7 @@ fn admin_scope_path(method: &axum::http::Method, path: &str) -> bool {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
         if tail.is_empty() { return method != axum::http::Method::GET; }
         let sub = tail.split('/').next().unwrap_or("");
-        return matches!(sub, "members" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "ssh" | "identities" | "runners" | "audit" | "leave" | "transfer");
+        return matches!(sub, "members" | "invites" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "ssh" | "identities" | "runners" | "audit" | "leave" | "transfer");
     }
     if let Some(rest) = path.strip_prefix("/api/apps/") {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -4818,14 +4818,15 @@ pub fn router(state: S) -> Router {
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
         .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
-        .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
+        .route("/api/auth/invite", get(workspaces::metadata)).route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/workspaces", put(workspaces::set_creation)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org).delete(delete_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
+        .route("/api/orgs/{oid}/invites", get(workspaces::list)).route("/api/orgs/{oid}/invites/{iid}", delete(workspaces::revoke)).route("/api/orgs/{oid}/invites/{iid}/resend", post(workspaces::resend))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
