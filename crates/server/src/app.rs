@@ -1600,6 +1600,7 @@ async fn create_wrap(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
     let key = st.env_key(&eid).await?;
     let env_name = st.db.one("SELECT name FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"name")).unwrap_or_default();
     let wanted: Vec<String> = body.get("keys").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_uppercase()).collect()).unwrap_or_default();
+    // Base exports are unfiltered; restricted principals must never wrap them.
     let items = st.list_secrets_base(&eid).await?;
     let mut secrets = serde_json::Map::new();
     for (k, value, raw) in &items {

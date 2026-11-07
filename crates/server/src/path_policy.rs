@@ -63,8 +63,8 @@ impl AppState {
 pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path=req.uri().path();
     let route=req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("");
-    // Runner credentials have a separate authenticator and cannot impersonate a principal.
-    if matches!((req.method().as_str(),route),("GET","/api/runner/jobs")|("POST","/api/runner/jobs/{jid}/result")) { return next.run(req).await; }
+    // Runner and wrapping credentials have separate authenticators.
+    if matches!((req.method().as_str(),route),("GET","/api/runner/jobs")|("POST","/api/runner/jobs/{jid}/result")|("GET","/api/unwrap")|("POST","/api/unwrap")) { return next.run(req).await; }
     if !path.starts_with("/api/") && !path.starts_with("/scim/") && path!="/mcp" { return next.run(req).await; }
     let uid=match st.token_user(req.headers()).await { Ok(u)=>u,Err(e)=> { if bearer_token(req.headers()).is_empty() && cookie_val(req.headers(),"ow_session").is_empty() { return next.run(req).await; } return e.into_response(); } };
     let restricted=match st.restricted_principal(&uid).await { Ok(v)=>v,Err(e)=>return e.into_response() };
