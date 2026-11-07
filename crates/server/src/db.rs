@@ -159,6 +159,42 @@ impl Db {
             }
         }
     }
+    /// Checked mutations roll back together; secret snapshot guards additionally lock out normal writers.
+    pub async fn checked_batch(&self, statements: &[(String, Vec<Value>, Option<u64>)], lock_secrets: bool) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                let result = (|| {
+                    for (sql, params, expected) in statements {
+                        let count = exec_sqlite(&conn, sql, params)?;
+                        if expected.is_some_and(|n| n != count) { return Err("checked transaction conflict".to_string()); }
+                    }
+                    conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+                })();
+                if result.is_err() { let _ = conn.execute_batch("ROLLBACK"); }
+                let _ = lock_secrets; result
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                if lock_secrets { tx.batch_execute("LOCK TABLE secrets IN SHARE ROW EXCLUSIVE MODE").await.map_err(pg_err)?; }
+                for (sql, params, expected) in statements {
+                    let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                    let count = tx.execute(sql2.as_str(), &refs).await.map_err(pg_err)?;
+                    if expected.is_some_and(|n| n != count) { return Err("checked transaction conflict".into()); }
+                }
+                tx.commit().await.map_err(pg_err)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_) => {
+                let _ = (statements, lock_secrets);
+                Err("atomic checked transactions unavailable on Workers".into())
+            }
+        }
+    }
     pub async fn version(&self) -> Result<i64, String> {
         Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
     async fn migrate(&self) -> Result<(), String> {
@@ -501,6 +537,19 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
         "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
     ]),
+    (17, &[
+        "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
+    ]),
+    (18, &[
+        "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS workload_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN trust_id TEXT DEFAULT ''",
+    ]),
+    (19, &[
+        "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
+        "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -534,9 +583,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 16, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 19, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 16, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 19, "each migration must be recorded exactly once");
     }
 }
