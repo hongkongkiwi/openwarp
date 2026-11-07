@@ -204,6 +204,11 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-d/secrets': { secrets: [] },
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/ssh/cas': [],
+    '/api/orgs/org-a/emergency': { locked: false },
+    '/api/orgs/org-b/emergency': { locked: false },
+    '/api/apps/app-a/emergency': { locked: false, direct_locked: false, workspace_locked: false },
+    '/api/apps/app-b/emergency': { locked: false, direct_locked: false, workspace_locked: false },
+    '/api/apps/app-c/emergency': { locked: false, direct_locked: false, workspace_locked: false },
     '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
     '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
@@ -220,6 +225,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
     setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {},
+    setInterval: () => 1, clearInterval() {},
     requestAnimationFrame: fn => { timers.push(fn); return timers.length; },
     getComputedStyle: computedStyle,
     confirm: message => { confirmations.push(message); return ui.confirm; },
@@ -544,6 +550,59 @@ test('saved-secret history and deletion retain their existing server routes', as
   assert.deepEqual(ui.writes().map(c => [c.method, c.url]), [['DELETE', '/api/secrets/saved-secret']]);
 });
 
+test('emergency lockdown clears cached secrets, drafts and dialogs and blocks browsing', async () => {
+  const ui = await consoleUI();
+  await ui.add();
+  await ui.invoke("E2E_KIT='private-kit';E2E_DATA['e2e']=[{value:'cached'}];E2E_KEYS['e2e']='key';applyEmergency(true)");
+  assert.equal(ui.run('SECRETS.length'), 0);
+  assert.equal(ui.run('Object.keys(DRAFTS).length'), 0);
+  assert.equal(ui.run('Object.keys(E2E_DATA).length'), 0);
+  assert.equal(ui.run('Object.keys(E2E_KEYS).length'), 0);
+  assert.equal(ui.run('E2E_KIT'), '');
+  assert.equal(ui.el('modal').innerHTML, '');
+  assert.ok(hidden(ui.el('deploybar')));
+  assert.match(ui.el('emergency-banner').textContent, /Emergency lockdown active/);
+  await ui.invoke("nav('integrations')");
+  assert.match(ui.el('view').textContent, /Emergency lockdown active/);
+  await assert.rejects(ui.run("api('GET','/api/envs/env-a/secrets')"), /emergency lockdown/);
+  assert.deepEqual(ui.writes(), []);
+});
+
+test('project lockdown leaves metadata readable and blocks secrets and changes', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("VIEW='settings';$('view').innerHTML='<button>Save settings</button>';PROJECT_DIRECT=true;applyEmergency(false,true)");
+  assert.equal(ui.button(ui.el('view'), /^Save settings$/), undefined, 'a newly detected halt must remove existing writable controls');
+  await ui.invoke('renderEnv()');
+  assert.equal(ui.run('EMERGENCY'), false, 'project state must not become a workspace halt');
+  assert.match(ui.el('view').textContent, /Environment names remain visible/);
+  assert.match(ui.el('view').textContent, /Development/);
+  await ui.invoke("api('GET','/api/apps/app-a/envs')");
+  await assert.rejects(ui.run("api('GET','/api/envs/env-a/export')"), /emergency lockdown/);
+  await assert.rejects(ui.run("api('PUT','/api/envs/env-a/secrets',{secrets:[]})"), /emergency lockdown/);
+  assert.deepEqual(ui.writes(), []);
+  await ui.invoke('EMERGENCY_OWNER=false');
+  assert.doesNotMatch(ui.run('emergencyCard(true)'), /onclick="confirmEmergency/);
+  await ui.invoke('EMERGENCY_OWNER=true');
+  assert.match(ui.run('emergencyCard(true)'), /Restore project access/);
+  assert.match(ui.run('emergencyCard()'), /Activate workspace lockdown/);
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.button(ui.el('view'), /^Save settings$/), undefined, 'project lockdown must hide writable workspace settings');
+  assert.match(ui.el('view').textContent, /Restore project access/);
+  await ui.invoke('applyEmergency(true,true)');
+  assert.match(ui.run('emergencyCard(true)'), /workspace lockdown also applies/);
+});
+
+test('an ended session removes plaintext and returns to sign-in', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("E2E_KIT='private-kit';applyEmergency(true);sessionEnded()");
+  assert.equal(ui.el('shell').style.display, 'none');
+  assert.equal(ui.el('auth').style.display, 'grid');
+  assert.equal(ui.el('view').innerHTML, '');
+  assert.equal(ui.run('E2E_KIT'), '');
+  assert.equal(ui.run('AUTH_READY'), false);
+  assert.equal(ui.run('EMERGENCY'), false, 'an ended session must not block the next sign-in');
+});
+
 test('the reset view asks for the kit and an explicit key replacement', async () => {
   const ui = await consoleUI();
   await ui.invoke("showReset('reset-token-1')");
@@ -817,7 +876,8 @@ for (const [label, initial, next] of [['Settings', 'en', 'ja'], ['設定', 'ja',
 test('language changes preserve label-like access request reasons and translate their controls', async () => {
   const reasons = ['Settings', '設定'];
   const ui = await consoleUI([saved], [], { responses: {
-    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [], '/api/envs/env-a/proposals': [],
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [], '/api/orgs/org-a/members': [],
+    '/api/envs/env-a/proposals': [],
     '/api/envs/env-a/access-requests': reasons.map((reason, i) => ({ id: 'request-' + i, reason, status: 'pending' })),
   } });
   await ui.invoke('renderAccess()');

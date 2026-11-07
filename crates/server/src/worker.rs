@@ -56,7 +56,7 @@ impl DurableObject for OpenWarp {
             .and_then(|v| oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string()))
             .and_then(|b| b.try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string()))
             .expect("OPENWARP_MASTER_KEY");
-        let db = Db::from_do_sql_now(state.storage().sql()).expect("apply schema");
+        let db = Db::from_do_sql_now(state.storage()).expect("apply schema");
         let pub_url = envcfg::var("OPENWARP_PUBLIC_URL").unwrap_or_default();
         let store = new_state(db, String::from("durable-object"), oc::random_token("inst"), pub_url, master, crate::LiveSender);
         let app = router(store.clone());
