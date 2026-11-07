@@ -709,6 +709,10 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
     ]),
     (18, &[
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+    ]),
+    (19, &[
         "CREATE TABLE IF NOT EXISTS ai_settings(org_id TEXT PRIMARY KEY,settings TEXT NOT NULL,key_enc TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS ai_plans(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,actor TEXT NOT NULL,operations TEXT NOT NULL,status TEXT NOT NULL,expires_at BIGINT NOT NULL,results TEXT NOT NULL DEFAULT '[]')",
         "CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT NOT NULL,created_at BIGINT NOT NULL)",
@@ -757,10 +761,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 18, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 19, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 18, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 19, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

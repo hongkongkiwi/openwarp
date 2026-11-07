@@ -43,7 +43,7 @@ async fn session(st: &S, h: &HeaderMap, org: &str) -> Result<String, (StatusCode
     let uid = st.token_user(h).await?;
     let row = st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=?", &[json!(oc::hash_token(&effective_token(h))),json!(&uid)]).await.map_err(|_| bad("cannot check account session"))?;
     if row.is_none() { return Err(err(StatusCode::FORBIDDEN,"AI requires an account session")); }
-    st.require_org(org,&uid).await?; Ok(uid)
+    st.require_org(org,&uid).await?; st.require_org_running(org).await?; Ok(uid)
 }
 fn enabled(s: &Settings) -> Result<(), (StatusCode, Json<Value>)> { if s.enabled { Ok(()) } else { Err(err(StatusCode::FORBIDDEN,"AI is disabled for this workspace")) } }
 async fn settings_response(st: &S, org: &str, uid: &str) -> Res {
@@ -172,6 +172,7 @@ async fn chat(State(st):State<S>,h:HeaderMap,Path(org):Path<String>,Json(r):Json
 }
 #[cfg(not(target_arch="wasm32"))]
 async fn infer(st:&S,org:&str,s:&Settings,payload:Value) -> Result<String,(StatusCode,Json<Value>)> {
+    st.require_org_running(org).await?;
     if !endpoints().contains(&s.endpoint) { return Err(bad("endpoint is not on the exact operator allowlist")); }
     let key={ let _guard=st.ai_credentials.lock().await; let (current,enc)=load(st,org).await?; enabled(&current)?; if !current.allow_metadata || current.endpoint!=s.endpoint || current.model!=s.model { return Err(err(StatusCode::FORBIDDEN,"inference policy changed; retry with current settings")); }
     if enc.is_empty() { Vec::new() } else { oc::decrypt_symmetric_aad(&st.master(),&key_aad(org),&enc).map_err(|_| bad("cannot decrypt provider key"))? } };
@@ -186,6 +187,7 @@ async fn infer(st:&S,org:&str,s:&Settings,payload:Value) -> Result<String,(Statu
         if reserved!=1 { return Err(err(StatusCode::TOO_MANY_REQUESTS,"workspace inference budget exhausted")); }
         let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(30)).build().map_err(|_| bad("cannot create bounded inference client"))?;
         let (current,_)=load(st,org).await?; enabled(&current)?; if !current.allow_metadata || current.endpoint!=s.endpoint || current.model!=s.model || !endpoints().contains(&s.endpoint) { return Err(err(StatusCode::FORBIDDEN,"inference policy changed")); }
+        st.require_org_running(org).await?;
         let mut request=client.post(&s.endpoint).header("content-type","application/json").body(bytes); if !key.is_empty() { request=request.bearer_auth(key); }
         let mut response=request.send().await.map_err(|_| err(StatusCode::BAD_GATEWAY,"inference request failed"))?;
         if !response.status().is_success() { return Err(err(StatusCode::BAD_GATEWAY,"inference provider rejected the request; redirects are disabled")); }
@@ -286,7 +288,7 @@ pub(crate) async fn maintenance(st:&S) {
     let Ok(mut rows)=st.db.query("SELECT org_id,settings FROM ai_settings WHERE org_id>? ORDER BY org_id LIMIT 100",&[json!(cursor)]).await else { return };
     if rows.is_empty() { let Ok(first)=st.db.query("SELECT org_id,settings FROM ai_settings ORDER BY org_id LIMIT 100",&[]).await else { return }; rows=first; }
     if let Some(last)=rows.last() { if st.db.exec(dialect(&st.db,"INSERT INTO meta(k,v) VALUES('ai:monitoring_cursor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES('ai:monitoring_cursor',?) ON DUPLICATE KEY UPDATE v=VALUES(v)"),&[json!(db::s(last,"org_id"))]).await.is_err() { return; } }
-    for r in rows { if serde_json::from_str::<Settings>(&db::s(&r,"settings")).map(|s| s.monitoring_enabled).unwrap_or(false) { let org=db::s(&r,"org_id"); match generate_findings(st,&org).await { Ok(Json(v)) => { let mut statements=Vec::new(); if let Some(fs)=v["findings"].as_array() { for f in fs.iter().take(200).filter(|f| f["historical"]!=true) { let mut safe=f.clone(); let object=safe.as_object_mut().unwrap(); object.remove("maintenance_note"); object.remove("status"); object.remove("exception_until"); statements.push((dialect(&st.db,"INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET finding=excluded.finding,last_seen=excluded.last_seen","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE finding=VALUES(finding),last_seen=VALUES(last_seen)").into(),vec![json!(&org),f["id"].clone(),json!(safe.to_string()),json!(now()),json!(now())])); } } statements.push((dialect(&st.db,"INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(format!("ai:background:{}",org)),json!(now().to_string())])); if st.db.batch(&statements).await.is_err() { crate::log::warn("AI monitoring persistence failed"); } }, Err(_) => crate::log::warn("AI deterministic monitoring failed") } } }
+    for r in rows { if serde_json::from_str::<Settings>(&db::s(&r,"settings")).map(|s| s.monitoring_enabled).unwrap_or(false) { let org=db::s(&r,"org_id"); if st.require_org_running(&org).await.is_err() { continue; } match generate_findings(st,&org).await { Ok(Json(v)) => { let mut statements=Vec::new(); if let Some(fs)=v["findings"].as_array() { for f in fs.iter().take(200).filter(|f| f["historical"]!=true) { let mut safe=f.clone(); let object=safe.as_object_mut().unwrap(); object.remove("maintenance_note"); object.remove("status"); object.remove("exception_until"); statements.push((dialect(&st.db,"INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET finding=excluded.finding,last_seen=excluded.last_seen","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE finding=VALUES(finding),last_seen=VALUES(last_seen)").into(),vec![json!(&org),f["id"].clone(),json!(safe.to_string()),json!(now()),json!(now())])); } } statements.push((dialect(&st.db,"INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(format!("ai:background:{}",org)),json!(now().to_string())])); if st.db.batch(&statements).await.is_err() { crate::log::warn("AI monitoring persistence failed"); } }, Err(_) => crate::log::warn("AI deterministic monitoring failed") } } }
     for (sql,p) in [("DELETE FROM ai_finding_history WHERE last_seen<?",now()-30*86400),("DELETE FROM ai_plans WHERE expires_at<?",now()-86400),("DELETE FROM ai_activity WHERE created_at<?",now()-30*86400),("DELETE FROM ai_usage WHERE day<?",now()/86400-30)] { if st.db.exec(sql,&[json!(p)]).await.is_err() { crate::log::warn("AI maintenance cleanup failed"); } }
 }
 #[cfg(not(target_arch="wasm32"))]
@@ -358,7 +360,7 @@ mod tests {
         conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on MySQL");
-        assert_eq!(db.version().await.unwrap(),18);
+        assert_eq!(db.version().await.unwrap(),19);
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
         let outcome=tokio::spawn(assert_database_ai(st)).await;
@@ -375,7 +377,7 @@ mod tests {
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let outcome=tokio::spawn(async move {
             let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
-            assert_eq!(db.version().await.unwrap(),18);
+            assert_eq!(db.version().await.unwrap(),19);
             let (live,_)=tokio::sync::broadcast::channel(4);
             let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
             assert_database_ai(st).await;
