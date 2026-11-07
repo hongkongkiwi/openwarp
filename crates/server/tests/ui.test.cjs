@@ -204,9 +204,11 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
   };
+  const session = new Map();
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
     localStorage: { getItem: () => '', setItem() {}, removeItem() {} },
+    sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     navigator: { clipboard: { writeText: async () => {} } },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },

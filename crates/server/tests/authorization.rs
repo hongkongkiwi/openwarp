@@ -5,6 +5,7 @@ use hmac::Mac;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ struct Server {
     dir: PathBuf,
     client: Client,
     inbox: Arc<Mutex<Vec<Value>>>,
+    sessions: Mutex<HashMap<String, String>>,
     keep: bool,
 }
 
@@ -104,7 +106,7 @@ impl Server {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("http client");
-        let server = Server { child, base, dir, client, inbox, keep: false };
+        let server = Server { child, base, dir, client, inbox, sessions: Mutex::new(HashMap::new()), keep: false };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -223,14 +225,18 @@ async fn register(s: &Server, email: &str) -> Value {
         body["user_id"] = login.body["user_id"].clone();
         body["public_key"] = login.body["public_key"].clone();
     }
+    s.sessions.lock().unwrap().insert(email.trim().to_lowercase(), body["token"].as_str().expect("registered account session").to_string());
     body
 }
 
 async fn invite(s: &Server, owner: &str, org: &str, email: &str, role: &str) {
+    let session = s.sessions.lock().unwrap().get(&email.trim().to_lowercase()).expect("registered invitee session").clone();
     let r = s
         .call(Method::POST, &format!("/api/orgs/{}/members", org), Some(owner), Some(json!({"email": email, "role": role})))
         .await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(&session), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept member invitation failed: {}", accepted.text);
 }
 
 async fn app_with_envs(s: &Server, token: &str, org: &str) -> (String, Vec<String>) {
