@@ -27,13 +27,43 @@ pub fn host_port(conn: &str) -> Result<(String, u16), String> {
     }
 }
 
+pub fn validate_static(conn: &str, username: &str) -> Result<(), String> {
+    if username.is_empty() || username.len()>63 || username.chars().any(char::is_control) { return Err("postgres-static requires an existing login username (1-63 bytes)".into()); }
+    if !(conn.starts_with("postgres://") || conn.starts_with("postgresql://")) { return Err("postgres-static requires a PostgreSQL URL".into()); }
+    let config: tokio_postgres::Config = conn.parse().map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
+    if config.get_hosts().len()!=1 || !config.get_hostaddrs().is_empty() || config.get_ports().len()>1 || config.get_user().is_none_or(str::is_empty) || config.get_password().is_none_or(|p| p.is_empty()) { return Err("postgres-static requires one TCP host and explicit admin credentials; hostaddr is not allowed".into()); }
+    let host = match &config.get_hosts()[0] { tokio_postgres::config::Host::Tcp(h) => h, #[cfg(unix)] _ => return Err("Unix sockets are not allowed".into()) };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let allow=crate::envcfg::var("OPENWARP_ALLOWED_DB_HOSTS").unwrap_or_default();
+    if !allow.split(',').map(str::trim).filter(|s| !s.is_empty()).any(|entry| entry.eq_ignore_ascii_case(host) || entry.eq_ignore_ascii_case(&format!("{}:{}",host,port)) || entry.eq_ignore_ascii_case(&format!("[{}]:{}",host,port))) { return Err("PostgreSQL driver host is not in OPENWARP_ALLOWED_DB_HOSTS".into()); }
+    Ok(())
+}
+pub fn static_target(conn: &str, username: &str) -> Result<String,String> {
+    validate_static(conn,username)?;
+    let config: tokio_postgres::Config=conn.parse().map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
+    let host=match &config.get_hosts()[0] { tokio_postgres::config::Host::Tcp(h)=>h.to_ascii_lowercase(), #[cfg(unix)] _=>return Err("TCP host required".into()) };
+    Ok(openwarp_crypto::hash_token(&serde_json::json!(["postgres-static",host,config.get_ports().first().copied().unwrap_or(5432),username]).to_string()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn rotate_static(conn: &str, username: &str, password: &str) -> Result<(), String> {
+    validate_static(conn,username)?;
+    tokio::time::timeout(std::time::Duration::from_secs(30),async {
+        let client=client(conn).await.map_err(|_| "PostgreSQL connection failed".to_string())?;
+        let sql=format!("ALTER ROLE {} PASSWORD {}",ident(username),literal(password));
+        client.execute(&sql,&[]).await.map_err(|_| "static rotation outcome uncertain".to_string())?;
+        Ok(())
+    }).await.map_err(|_| "static rotation outcome uncertain".to_string())?
+}
+#[cfg(target_arch = "wasm32")]
+pub async fn rotate_static(_conn: &str, _username: &str, _password: &str) -> Result<(), String> { Err("static PostgreSQL rotation requires the native server".into()) }
 /// Every target the driver would dial. The driver parses the URL, so a query
 /// parameter cannot point the connection somewhere the authority did not name.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn targets(conn: &str) -> Result<Vec<(String, u16)>, String> {
     let config: tokio_postgres::Config = conn.parse().map_err(|e| format!("invalid postgres connection string: {}", e))?;
     let hosts = config.get_hosts(); let ports = config.get_ports();
-    if hosts.len() > 1 { return Err("multi-host connection strings are not allowed".into()); }
+    if hosts.len() > 1 || ports.len() > 1 { return Err("multi-host connection strings are not allowed".into()); }
+    if !config.get_hostaddrs().is_empty() { return Err("hostaddr connections are not allowed".into()); }
     let Some(first) = hosts.first() else { return Err("connection string has no host".into()) };
     let host = match first {
         tokio_postgres::config::Host::Tcp(host) => host.clone(),

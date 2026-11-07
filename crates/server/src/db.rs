@@ -256,6 +256,55 @@ impl Db {
             }
         }
     }
+    // Serialize rotation claims and destructive cleanup on the same database row.
+    pub async fn rotation_batch(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)]) -> Result<bool,String> {
+        self.rotation_batch_checked(blocked, params, statements, &[]).await
+    }
+    pub async fn rotation_batch_checked(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)], require_one: &[usize]) -> Result<bool,String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let checked = |index: usize, rows: u64| {
+            if require_one.contains(&index) && rows != 1 { Err("version conflict: concurrent lifecycle change".to_string()) } else { Ok(()) }
+        };
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let mut conn=c.lock().unwrap(); let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                if !query_sqlite(&tx,blocked,params)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { checked(index,exec_sqlite(&tx,sql,p)?)?; }
+                tx.commit().map_err(|e| e.to_string())?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client=pool.get().await.map_err(|e| e.to_string())?; let tx=client.transaction().await.map_err(pg_err)?;
+                tx.query_one("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE",&[]).await.map_err(pg_err)?;
+                let pg=PgParams::new(params); let refs=pg.refs();
+                if !tx.query(pg_sql(blocked).as_str(),&refs).await.map_err(pg_err)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { let pg=PgParams::new(p); let refs=pg.refs(); checked(index,tx.execute(pg_sql(sql).as_str(),&refs).await.map_err(pg_err)?)?; }
+                tx.commit().await.map_err(pg_err)?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client=pool.get_conn().await.map_err(|e| e.to_string())?;
+                let mut tx=client.start_transaction(mysql_async::TxOpts::default()).await.map_err(|e| e.to_string())?;
+                let result = async {
+                    let _: Option<String> = tx.query_first("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE").await.map_err(|e| e.to_string())?;
+                    let rows: Vec<mysql_async::Row> = tx.exec(mysql_sql(blocked),mysql_params(params)).await.map_err(|e| e.to_string())?;
+                    if !rows.is_empty() { return Ok(false); }
+                    for (index,(sql,p)) in statements.iter().enumerate() {
+                        tx.exec_drop(mysql_sql(sql),mysql_params(p)).await.map_err(|e| e.to_string())?;
+                        checked(index,tx.affected_rows())?;
+                    }
+                    Ok(true)
+                }.await;
+                match result { Ok(true) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(true) }, other => { let _ = tx.rollback().await; other } }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_, _) => {
+                if !self.query(blocked,params).await?.is_empty() { return Ok(false); }
+                self.batch_checked(statements,require_one).await?; Ok(true)
+            }
+        }
+    }
     pub async fn version(&self) -> Result<i64, String> {
         Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
     async fn migrate(&self) -> Result<(), String> {
@@ -712,6 +761,20 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
     ]),
+    (19, &[
+        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
+        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
+        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
+        "CREATE TABLE transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX idx_transit_keys_name ON transit_keys(org_id,name)",
+        "CREATE TABLE transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
+        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
+        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
+        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
+        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
+        "INSERT INTO meta(k,v) VALUES('rotation_lifecycle','')",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -747,10 +810,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 18, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 19, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 18, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 19, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

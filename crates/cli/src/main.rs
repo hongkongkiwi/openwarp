@@ -1,3 +1,4 @@
+mod agent;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,8 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
     Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
+    /// Render a local template from base secrets with an in-memory cache
+    Agent { #[arg(long, default_value = "")] env: String, #[arg(long)] template: PathBuf, #[arg(long)] out: PathBuf, #[arg(long, default_value_t = 30)] interval_secs: u64, #[arg(long, default_value_t = 30)] cache_ttl_secs: u64, #[arg(long)] once: bool },
     /// SSH certificates: sign a public key, or mint one and run ssh with it
     Ssh { #[command(subcommand)] cmd: SshCmd },
     E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
@@ -305,7 +308,8 @@ fn main() {
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
     let saved_host = cfg["host"].as_str().map(|s| s.to_string());
-    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
+    let is_agent = matches!(&cli.cmd, Cmd::Agent { .. });
+    if !is_agent && cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
         match refresh_lock() {
             Some(lock) => {
                 let fresh = load_config();
@@ -317,7 +321,9 @@ fn main() {
             None => { std::thread::sleep(std::time::Duration::from_millis(300)); if let Ok(s) = std::fs::read_to_string(config_path()) { if let Ok(v) = serde_json::from_str::<Value>(&s) { cfg = v; } } }
         }
     }
-    let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
+    let token = cli.token.clone().or_else(|| {
+        if is_agent && saved_host.as_deref() != Some(host.as_str()) { None } else { cfg["access_token"].as_str().map(|s| s.to_string()) }
+    }).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
     match &cli.cmd {
@@ -392,6 +398,10 @@ fn main() {
                 if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
             }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
+        Cmd::Agent { env, template, out, interval_secs, cache_ttl_secs, once } => {
+            let env = pick(env, &local, "env_id", "--env");
+            if let Err(e) = agent::run(&host, &token, &env, template, out, *interval_secs, *cache_ttl_secs, *once) { eprintln!("{}", e); std::process::exit(1); }
+        }
         Cmd::Ssh { cmd } => match cmd {
             SshCmd::Cert { ca, principal, key, ttl, out, print, quiet } => {
                 let (key_path, default_cert) = ssh_key_paths(key);

@@ -61,6 +61,17 @@ node --test crates/server/tests/ui.test.cjs
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
+The PostgreSQL recovery regression target is opt-in because it changes login roles in an external database. Use a disposable PostgreSQL database and a test administrator, never deployment credentials:
+
+```bash
+OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
+  cargo test -p openwarp-server --features live-db-tests --test rotation_regressions -- --test-threads=1
+OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
+  cargo test -p openwarp-server --test static_rotation_live -- --test-threads=1
+```
+
+`rotation_regressions` is excluded from default workspace runs and fails if explicitly enabled without its database URL. `static_rotation_live` reports that live checks were not run when the URL is absent. A green default workspace run does not establish live PostgreSQL recovery coverage. Both live targets create uniquely named test roles and remove those roles after their cases.
+
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
 
 ## Container validation
@@ -92,4 +103,4 @@ For documentation-only changes:
 
 Do not publish fake screenshots, invented usage metrics, or unverified compatibility claims. Distinguish an implemented endpoint from a tested integration with a live provider.
 
-[Architecture](ARCHITECTURE.md) · [API reference](API.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Architecture](ARCHITECTURE.md) · [API reference](API.md) · [Documentation index](README.md)

@@ -8,6 +8,7 @@ Integrations push shared secrets from a standard SSE environment to another plat
 - Shared base values are the source. Personal overrides and sealed values are excluded.
 - E2E environments do not provide the server-readable values used by this workflow.
 - Provider operations can partially succeed. Inspect both the sync response and remote state before retrying.
+- Path-restricted callers cannot manage or manually sync integrations. Their secret writes, deletes and restores do not trigger automatic sync. An unrestricted operator must sync separately; filtered subsets are never deployed as full-environment mirrors. See [path policies](WORKLOADS.md#restrict-secret-paths).
 - Key naming (`prefix`, `suffix`, `name_template`) applies to every adapter. Dry-run, key filters and mirror behavior depend on the adapter.
 
 The implementations live in [`integrations.rs`](../crates/server/src/integrations.rs). This guide describes OpenWarp's configured requests, not a guarantee that every provider API version or account plan accepts them. Validate with a non-production target before relying on a destination.
@@ -56,6 +57,45 @@ Sync can write remote secrets. Obtain the appropriate approval before executing 
 | Test | `POST /api/integrations/{id}/test` |
 
 Test is implemented for `trigger`, `instabox`, `boat`, `daytona`, `1password`, `aws_secrets_manager`, `aws_parameter_store`, `dokploy`, `caprover`, `portainer`, `docker_swarm`, `bitbucket`, `circleci`, `teamcity`, `travisci`, `terraform_cloud`, `qovery`, `laravel_forge`, `openwarp`, `devin`, `cloudflare_secrets_store`, `octopus_deploy`, `azure_devops`, `cursor`, `scaleway_secret_manager`, `azure_app_configuration`, `vultr`, `hetzner`, `linode`, and `digitalocean_ssh`. Other kinds return 501. A sync is not a harmless substitute for Test.
+
+## Static PostgreSQL password rotation
+
+This is a rotation schedule, not a sync adapter or a dynamic database lease. It changes the password of an existing PostgreSQL login role, then saves that password to an existing unsealed SSE secret. It does not create roles, grant privileges or support MySQL.
+
+Create with `POST /api/envs/{env_id}/rotations` and `rotations:write` authority:
+
+```json
+{
+  "key": "DATABASE_PASSWORD",
+  "path": "/payments/",
+  "interval_secs": 86400,
+  "config": {
+    "kind": "postgres-static",
+    "connection": "postgres://ADMIN:REPLACE_WITH_PASSWORD@DB_HOST:5432/DB_NAME",
+    "username": "payments_login"
+  }
+}
+```
+
+The example is a request shape, not an executed provider configuration. Use a protected request file, not shell history, for real admin credentials. The server stores configuration encrypted under the environment key. Give the PostgreSQL administrator only the authority needed to change the target role's password. Use an administrator distinct from the role being rotated so retries can still connect after a password change.
+
+The connection URL requires one TCP host and explicit administrator credentials. Unix sockets, `hostaddr` and multi-host connections are refused. The parsed driver's host must match a comma-separated `OPENWARP_ALLOWED_DB_HOSTS` entry, either a hostname/IP or a host-and-port pair. Use explicit ports to narrow the allowance. Native connections use the existing PostgreSQL TLS transport unless `sslmode=disable` is explicitly present. Static PostgreSQL rotation is native-only. Workers reject its configuration and do not claim or execute its schedules. Do not use host aliases to create multiple schedules for the same remote role. The database uniqueness guard identifies targets by configured host, port and username, not DNS equivalence.
+
+The scheduler first persists an encrypted pending password, then issues a fixed, quoted `ALTER ROLE ... PASSWORD ...`, then updates the local secret. It clears the pending password only after local storage succeeds. On an uncertain remote outcome or failed local save, retries reuse the same candidate instead of generating a second password. The scheduler records `rotation.failed_pending_retained` on failure. The remote password may already have changed even when the local value is old.
+
+For recovery, keep the schedule and its encrypted pending state, restore connectivity or local storage, and retry with `POST /api/rotations/{id}/run`. The response `{scheduled:true,id}` means the schedule is due, not that PostgreSQL or provider sync succeeded. Inspect audit records, local secret state and remote login before resuming consumers. Do not delete and recreate a pending schedule, manually replace its pending ciphertext, or restore an old database while consumers keep using the remote database: those actions can lose the candidate needed to reconcile the two sides. Rotation hooks and provider sync run after the local save and are not transactional with the remote password update.
+
+An execution also holds a non-expiring durable `execution_token`. Manual Run can queue another due time but cannot replace that claim. A completed local-storage failure releases its claim and can be retried normally with the same pending password. A remote query error, timeout, interrupted task or crash can retain the claim because PostgreSQL may still be finishing the operation. There is no automatic TTL takeover or API to force-release an active claim. Deleting its schedule, environment or application returns 409 while a pending password or execution claim exists.
+
+For a retained execution claim, first stop every OpenWarp replica and maintenance worker using this database. Verify at the target PostgreSQL server that the old rotation connection and statement are no longer running; terminate that session if necessary and confirm it is gone. Back up the OpenWarp database. Only while all workers remain stopped, clear the exact schedule's claim with an operator SQL session:
+
+```sql
+UPDATE rotation_schedules SET execution_token='' WHERE id='SCHEDULE_ID';
+```
+
+Preserve `pending_enc`, `config_enc` and the target secret. Restart one worker and request Run for that same schedule. Verify the retry reconciles the pending password before restoring other replicas or deleting anything. If remote quiescence cannot be established, leave the claim in place. This manual recovery statement was inspected, not executed against a production database.
+
+`GET /api/envs/{env_id}/rotations` lists metadata without revealing connection credentials or pending passwords. E2E/delegated environments and sealed secrets are not supported. See [API](API.md#rotation-schedules) for schedule endpoints.
 
 ## Provider configuration
 

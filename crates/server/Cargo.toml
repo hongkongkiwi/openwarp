@@ -72,6 +72,12 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
+live-db-tests = []
+
+[[test]]
+name = "rotation_regressions"
+path = "tests/rotation_regressions.rs"
+required-features = ["live-db-tests"]
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
