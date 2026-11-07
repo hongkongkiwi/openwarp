@@ -50,6 +50,7 @@ cargo test -p openwarp-crypto
 cargo test -p openwarp-server --test security -- --test-threads=2
 cargo test -p openwarp-server --test authorization -- --test-threads=2
 cargo test -p openwarp-server --test accounts -- --test-threads=2
+cargo test -p openwarp-server --test migrations -- --test-threads=1
 node --test crates/server/tests/ui.test.cjs
 ```
 
@@ -59,9 +60,16 @@ node --test crates/server/tests/ui.test.cjs
 | `security.rs` | Tenant isolation, scopes, authentication, and protocol boundaries |
 | `authorization.rs` | Roles, administrative gates, environment policy, and related regressions |
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
+| `migrations.rs` | Runner failure modes, legacy catch-up, and live PostgreSQL/MariaDB applies |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
+
+## Schema changes
+
+Schema changes are append-only. Add a numbered file under `crates/server/migrations/` and the matching entry in `crates/server/src/migrate.rs`; never edit a migration that a released binary has applied, because the runner stores a checksum and refuses to boot when it no longer matches. The [schema migrations](MIGRATIONS.md) guide covers the ledger, the consolidated baseline, the MySQL DDL rules, and the repair commands.
+
+`openwarp-migrate status`, `plan`, `verify`, and `repair` inspect a database without starting the server. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines. Run `WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh` to exercise the D1 driver against local workerd.
 
 ## Container validation
 

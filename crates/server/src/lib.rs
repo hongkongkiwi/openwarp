@@ -10,6 +10,7 @@ pub mod inference_leases;
 pub mod integrations;
 pub mod log;
 pub mod mailer;
+pub mod migrate;
 pub mod mysqllease;
 pub mod pglease;
 pub mod pki;

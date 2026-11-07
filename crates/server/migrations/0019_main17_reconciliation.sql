@@ -1,0 +1,9 @@
+ALTER TABLE envs ADD COLUMN max_versions BIGINT DEFAULT 0;
+ALTER TABLE leases ADD COLUMN attempted_at BIGINT DEFAULT 0;
+ALTER TABLE audit ADD COLUMN seq BIGINT DEFAULT 0;
+ALTER TABLE audit ADD COLUMN prev_hash TEXT DEFAULT '';
+ALTER TABLE audit ADD COLUMN hash TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS audit_heads(org_id TEXT PRIMARY KEY,seq BIGINT NOT NULL,hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS wrap_tokens(token_hash TEXT PRIMARY KEY,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq);
+CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at);
