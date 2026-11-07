@@ -1,6 +1,7 @@
 //! The OpenWarp server library. The native binary and the Cloudflare Worker
 //! share one application module; `integrations` and `ssh_keys` also link into
 //! the customer-run sync runner so provider code lives in one place.
+pub mod ai;
 pub mod app;
 pub mod clock;
 pub mod db;

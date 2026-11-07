@@ -108,6 +108,14 @@ Proxy trust requires both enabling the flag and matching the connection peer. It
 
 Private egress is an intentional exception, not a general recommendation. Do not assume one setting constrains every provider-specific request. Apply network-layer egress policy and give integrations only the credentials they need.
 
+## AI endpoints
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `OPENWARP_AI_ENDPOINTS` | Empty | JSON array of exact allowed chat-completion URLs. Workspace administrators can select only these destinations, including explicitly trusted private endpoints |
+
+AI is off per workspace until an administrator enables it. Provider keys are encrypted and write-only. Metadata disclosure, confirmed actions, and local value matching have separate switches. Native inference refuses redirects and ambient proxies; Workers inference is unavailable. BYOK does not imply local processing: the configured endpoint receives permitted context and the question. See [assistant and security insights](AI.md) for the disclosure policy and limits.
+
 ## Workspace settings
 
 Workspace administrators manage these through `GET`/`PUT /api/orgs/{org_id}/settings` rather than process variables:

@@ -59,13 +59,15 @@ pub struct AppState {
     instance_id: String,
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) ai_credentials: tokio::sync::Mutex<()>,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch = "wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// The root KMS is installed once at boot by the native entrypoint. The
 /// Workers build has no blocking HTTP client, so its slot stays empty.
@@ -233,7 +235,7 @@ impl AppState {
     pub fn db(&self) -> &Db { &self.db }
     pub fn instance_id(&self) -> &str { &self.instance_id }
     pub fn live(&self) -> &LiveSender { &self.live }
-    async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
+    pub(crate) async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         let wrapped = db::s(&row, "env_key_wrapped");
         if wrapped.is_empty() { return Err(err(StatusCode::CONFLICT, "this environment is client-encrypted; the server has no key for it")); }
@@ -300,7 +302,7 @@ impl AppState {
     async fn org_role(&self, org: &str, user: &str) -> Option<String> {
         self.db.one("SELECT role FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(user)]).await.ok().flatten().map(|r| db::s(&r, "role"))
     }
-    async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if let Ok(Some(row)) = self.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(oc::hash_token(token))]).await { let scope = db::s(&row, "env_id"); if !scope.is_empty() && scope != env_id { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
         Ok(()) }
@@ -315,11 +317,11 @@ impl AppState {
     // every owner-only grant has to test permissions, not the label.
     async fn role_privileged(&self, org: &str, role: &str) -> bool {
         self.role_perms(org, role).await.iter().any(|p| p == "*" || p == "org:admin") }
-    async fn check_perm(&self, org: &str, user: &str, action: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) async fn check_perm(&self, org: &str, user: &str, action: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let role = self.require_org(org, user).await?;
         let perms = self.role_perms(org, &role).await;
         if perms.iter().any(|p| p == "*" || p == action) { Ok(()) } else { Err(err(StatusCode::FORBIDDEN, &format!("role {} lacks permission {}", role, action))) } }
-    async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
+    pub(crate) async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
     // Counters live in the database so a restart, or a second replica behind a
     // load balancer, does not reset an attacker's budget.
     pub(crate) async fn rate_ok(&self, key: &str, max: usize, window: i64) -> bool {
@@ -347,7 +349,7 @@ impl AppState {
             Ok(None) => self.db.one("SELECT id FROM identities WHERE id=?", &[json!(uid)]).await.ok().flatten().is_some(),
             Err(_) => false,
         } }
-    async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    pub(crate) async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
         if let Some(r) = self.org_role(org, user).await { return Ok(r); }
         // machine identities belong to an org directly
         if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { return Ok(db::s(&idn, "role")); }
@@ -356,7 +358,7 @@ impl AppState {
         let row = self.db.one("SELECT a.org_id AS org_id, e.app_id AS app_id FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         Ok((db::s(&row, "org_id"), db::s(&row, "app_id")))
     }
-    async fn require_env(&self, env_id: &str, user: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    pub(crate) async fn require_env(&self, env_id: &str, user: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
         let (org, app) = self.env_org_app(env_id).await?; let role = self.require_org(&org, user).await?;
         if role == "owner" || role == "admin" { return Ok((org, app)); }
         let env = self.db.one("SELECT restricted FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
@@ -415,7 +417,7 @@ impl AppState {
 // included in the key/path/tags fields: restore and point-in-time recovery copy
 // those, and a version binding would make the copy unreadable. Value and
 // comment are bound to the version and re-encrypted when restored.
-fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
+pub(crate) fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
 // A deterministic index is still needed to look a secret up. HMAC under the
 // environment key removes the offline dictionary attack a bare SHA-256 allows.
 fn key_index(env_key: &[u8;32], path: &str, key: &str) -> String { hmac_hex(env_key, format!("ow-key-index:v1|{}|{}", path, key).as_bytes()) }
@@ -425,7 +427,7 @@ fn lease_aad(env: &str, lid: &str, field: &str) -> Vec<u8> { format!("ow-lease:v
 fn proposal_aad(env: &str, pid: &str, field: &str) -> Vec<u8> { format!("ow-proposal:v1|{}|{}|{}", env, pid, field).into_bytes() }
 // Version rows are bound to their version, but value and comment ciphertext
 // written before that binding (or by an earlier release) must stay readable.
-fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
     if payload.starts_with("ow2:") {
         if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad_v(env, sid, field, version), payload) { return Ok(v); }
         if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad(env, sid, field), payload) { return Ok(v); }
@@ -911,6 +913,7 @@ async fn list_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>
     let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(500).clamp(1, 1000);
     let offset = q.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let page: Vec<Value> = items.iter().skip(offset).take(limit).map(|x| x.2.clone()).collect();
+    crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"secret.list","",page.len()).await;
     Ok(j(json!({"secrets": page, "total": total, "limit": limit, "offset": offset}))) }
 async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?; st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     let policy = st.db.one("SELECT require_approval FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
@@ -1083,6 +1086,7 @@ async fn export_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, 
     // base=1 skips the caller's personal overrides. Deployments must not pick up
     // whichever stand-in values the token owner happens to keep locally.
     let items = if q.get("base").map(|v| v == "1" || v == "true").unwrap_or(false) { st.list_secrets_base(&eid).await? } else { st.list_secrets_decrypted(&eid,&uid).await? };
+    crate::ai::activity(&st,(&org,"",&eid),&uid,&h,"secret.export","",items.len()).await;
     let text = items.iter().map(|(k,v,_)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n"); Ok(j(json!({"text": text, "secrets": items.iter().map(|x| x.2.clone()).collect::<Vec<_>>()}))) }
 // An environment-scoped token cannot list workspaces, so it needs a way to name
 // the one environment it is confined to. The path also passes scope_path_ok.
@@ -1125,6 +1129,7 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
     let scopes = scopes.join(" ");
     let expires_at = if r.expires_in > 0 { now() + r.expires_in.clamp(60, 365 * 86400) } else { 0 };
     st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+    crate::ai::activity(&st,(&org,&aid,&r.env_id),&uid,&h,"token.create",&tid,1).await;
     Ok(j(json!({"id": tid, "token": token, "expires_at": expires_at, "scopes": scopes}))) }
 async fn audit_list(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
     let limit = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
@@ -1191,13 +1196,16 @@ async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<S
     let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, &config).await? }
         else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
     st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).await.map_err(|e| bad(&e))?;
+    crate::ai::activity(&st,(&org,"",&eid),&uid,&h,"integration.create",&iid,1).await;
     Ok(j(json!({"id": iid}))) }
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let rows = st.db.query("SELECT id,env_id,kind,name,created_at FROM integrations WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn sync_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
-    let msg = sync_one(&st, &iid, &uid).await?; Ok(j(json!({"ok": true, "detail": msg}))) }
+    let result = sync_one(&st, &iid, &uid).await;
+    crate::ai::activity(&st,(&org,"",&db::s(&row,"env_id")),&uid,&h,if result.is_ok() { "integration.sync" } else { "integration.sync_failed" },&iid,1).await;
+    let msg = result?; Ok(j(json!({"ok": true, "detail": msg}))) }
 async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -1207,7 +1215,9 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let key = st.env_key(&eid).await?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, &iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
-    if integrations::has_test(&kind) { let msg = integrations::test(&kind, &config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
+    if integrations::has_test(&kind) { let result = integrations::test(&kind, &config).await;
+        crate::ai::activity(&st,(&org,"",&eid),&uid,&h,if result.is_ok() { "integration.test" } else { "integration.test_failed" },&iid,1).await;
+        let msg = result.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
 async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
@@ -1221,7 +1231,8 @@ async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
         let enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, config).await? }
             else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
         st.db.exec("UPDATE integrations SET config_enc=? WHERE id=?", &[json!(enc), json!(&iid)]).await.map_err(|e| bad(&e))?; }
-    st.audit(&org,&app,&eid,&uid,"integration.update",&iid).await; Ok(j(json!({"ok": true}))) }
+    st.audit(&org,&app,&eid,&uid,"integration.update",&iid).await;
+    crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"integration.update",&iid,1).await; Ok(j(json!({"ok": true}))) }
 async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -2914,7 +2925,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
     let new_key = body.get("new_key").and_then(|v| v.as_str()).unwrap_or("");
     let new: [u8; 32] = oc::unb64(new_key).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    let _ai_guard = st.ai_credentials.lock().await;
     let old = st.master();
+    let ai_updates = crate::ai::rewrap(&st, &old, &new).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     // Preflight every encrypted value before touching the database.
     let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
@@ -2975,16 +2988,15 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let updates = tokio::task::spawn_blocking(move || {
         let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| bad(&e.to_string()))?;
-        let result = runtime.block_on(async {
-            for (id, wrapped) in &env_updates { st2.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(wrapped), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (k, value) in &meta_updates { st2.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(k)]).await.map_err(|e| bad(&e))?; }
-            for (id, key_enc) in &ca_updates { st2.db.exec("UPDATE pki_cas SET key_enc=? WHERE id=?", &[json!(key_enc), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (id, secret) in &stream_updates { st2.db.exec("UPDATE log_streams SET secret=? WHERE id=?", &[json!(secret), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (org, key_enc) in &saml_updates { st2.db.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?", &[json!(key_enc), json!(org)]).await.map_err(|e| bad(&e))?; }
-            for (org, secret) in &hook_updates { st2.db.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?", &[json!(secret), json!(org)]).await.map_err(|e| bad(&e))?; }
-            if generated_master { st2.db.exec("UPDATE meta SET v=? WHERE k='master'", &[json!(oc::b64(&new))]).await.map_err(|e| bad(&e))?; }
-            Ok::<(), (StatusCode, Json<Value>)>(())
-        });
+        let mut statements = ai_updates;
+        for (id, wrapped) in env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(id)])); }
+        for (k, value) in meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value), json!(k)])); }
+        for (id, key_enc) in ca_updates { statements.push(("UPDATE pki_cas SET key_enc=? WHERE id=?".into(), vec![json!(key_enc), json!(id)])); }
+        for (id, secret) in stream_updates { statements.push(("UPDATE log_streams SET secret=? WHERE id=?".into(), vec![json!(secret), json!(id)])); }
+        for (org, key_enc) in saml_updates { statements.push(("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?".into(), vec![json!(key_enc), json!(org)])); }
+        for (org, secret) in hook_updates { statements.push(("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?".into(), vec![json!(secret), json!(org)])); }
+        if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))])); }
+        let result = runtime.block_on(st2.db.batch(&statements)).map_err(|e| bad(&e));
         if result.is_ok() { *guard = new; }
         result
     }).await.map_err(|e| bad(&e.to_string()))?;
@@ -3700,6 +3712,7 @@ pub async fn process_maintenance(st: &S) {
     process_rotations(st).await;
     retry_stale_deliveries(st).await;
     reap_expired_leases(st).await;
+    crate::ai::maintenance(st).await;
 }
 
 async fn retry_stale_deliveries(st: &S) {
@@ -4287,6 +4300,7 @@ pub fn router(state: S) -> Router {
         .route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host))
         .route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert));
     let app = app
+        .merge(crate::ai::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
