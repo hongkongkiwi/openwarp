@@ -46,7 +46,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.empty{padding:48px 20px;text-align:center;color:var(--faint);border:1px dashed var(--line2);border-radius:14px}.empty .big{font-size:22px;margin-bottom:6px}
 .mut{color:var(--muted)}.small{font-size:12.5px}.val{font-family:var(--mono);font-size:12.5px;word-break:break-all}
 #navtoggle{display:none}
-@media(max-width:820px){#shell{grid-template-columns:1fr}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:0 0 60px rgba(0,0,0,.7)}aside.open{display:flex}.content{padding:16px 14px 100px}}
+@media(max-width:820px){#shell{grid-template-columns:1fr}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:0 0 60px rgba(0,0,0,.7)}aside.open{display:flex}.content{padding:16px 14px 100px}.members-table,.members-table tbody{display:block;width:100%}.members-table thead{display:none}.members-table tr{display:flex;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.members-table td{display:block;border:0;padding:6px 0;min-width:0}.members-table td:first-child{width:100%;overflow-wrap:anywhere}.members-table td:last-child{display:flex;flex-wrap:wrap;gap:8px;width:100%}.members-table select{max-width:100%}}
 </style></head>
 <body>
 <div id="auth">
@@ -95,7 +95,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null,
+let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
@@ -105,6 +105,9 @@ const $=id=>document.getElementById(id);
 const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
 async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
+// Keep the error body for deletion's ownership and credential warnings.
+async function apiRaw(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+  return {ok:r.ok,status:r.status,body:d}}
 function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // For values interpolated into an inline handler's JS string literal. HTML
@@ -134,7 +137,7 @@ document.addEventListener('keydown',e=>{
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
   let btns=[];
-  for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X']]){
+  for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X'],['discord','Discord'],['linkedin','LinkedIn'],['workos','WorkOS']]){
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">Continue with ${name}</button>`)}
   if(p.oidc)btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start'">Continue with ${esc(p.oidc_name||'SSO')}</button>`);
   if(p.ldap)btns.push(`<button style="flex:1 1 45%" onclick="ldapPrompt()">Sign in with directory (LDAP)</button>`);
@@ -202,11 +205,12 @@ async function doAuth(){try{
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
 async function logout(){aiReset();closeModal();try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
-  let me=await api('GET','/api/me');$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+  let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
   $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
   $('orgs').value=ORG;
   await nav('apps')}
+async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG}
 async function switchOrg(){aiReset();closeModal();ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
 
 // ---------- navigation ----------
@@ -214,6 +218,7 @@ function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open
 async function nav(v){VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
   $('topaction').style.display=(v==='apps')?'':'none';
   if(v!=='assistant')AI_PLAN=null;
+  updateDeployBar();
   await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,assistant:renderAssistant,insights:renderInsights,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
   updateDeployBar()}
 
@@ -618,9 +623,14 @@ async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export
 function needAppEnv(){if(!APP){toast('Open an app first',true);nav('apps');return false} return true}
 async function renderAccess(){if(!ORG)return;$('pagetitle').textContent='Members & access';$('crumb').textContent='';
   let teams=await api('GET',`/api/orgs/${ORG}/teams`).catch(()=>[]);let roles=await api('GET',`/api/orgs/${ORG}/roles`).catch(()=>[]);
+  let members=await api('GET',`/api/orgs/${ORG}/members`).catch(()=>[]);let myRole=members.find(m=>m.id===ME?.id)?.role||'';
   let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
   let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
   $('view').innerHTML=`
+  <div class="card"><h3>Members</h3><p>Owners can transfer ownership; admins manage roles. A workspace always keeps at least one owner.</p>
+  <table class="members-table"><thead><tr><th>Member</th><th>Role</th><th></th></tr></thead><tbody>
+  ${members.map(m=>`<tr><td>${esc(m.email)}${m.id===ME?.id?' <span class="chip">you</span>':''}</td><td><select aria-label="Role for ${esc(m.email)}" onchange="setMemberRole('${jsq(m.id)}',this.value)">${roles.map(r=>`<option value="${esc(r.name)}"${r.name===m.role?' selected':''}>${esc(r.name)}</option>`).join('')}</select></td><td>${m.role!=='owner'&&myRole==='owner'?`<button onclick="transferOwner('${jsq(m.id)}','${jsq(m.email)}')">Make owner</button> `:''}${m.id!==ME?.id?`<button class="danger" onclick="removeMember('${jsq(m.id)}','${jsq(m.email)}')">Remove</button>`:''}</td></tr>`).join('')||'<tr><td colspan="3" class="mut">No members</td></tr>'}
+  </tbody></table></div>
   <div class="card"><h3>Invite member</h3><p>Existing accounts are added immediately. New addresses get a single-use link, valid for seven days, to set a password or sign in with a configured provider.</p><div class="row"><label class="small mut" for="inv-email">Email</label><input id="inv-email" type="email" placeholder="teammate@company.com" style="min-width:240px"><label class="small mut" for="inv-role">Role</label><select id="inv-role">${roles.map(r=>`<option value="${esc(r.name)}"${r.name==='developer'?' selected':''}>${esc(r.name)}</option>`).join('')}</select><button class="primary" onclick="invite()">Invite</button></div></div>
   <div class="card"><h3>Custom roles</h3><p>Comma-separated permissions, for example <span class="mono">secrets:read</span> or <span class="mono">*</span>.</p><div class="row"><input id="role-name" placeholder="deployer"><input id="role-perms" placeholder="secrets:read,secrets:write" style="min-width:260px"><button onclick="mkRole()">Create role</button></div><div>${roles.map(r=>`<span class="chip">${esc(r.name)}: ${esc((r.permissions||[]).join(', '))}${r.managed?' (managed)':''}</span>`).join('')}</div></div>
   <div class="card"><h3>Teams</h3><div class="row"><input id="team-name" placeholder="platform-team"><button onclick="mkTeam()">Create team</button></div><div>${teams.map(t=>`<span class="chip">${esc(t.name)}</span>`).join('')||'<span class="mut">No teams yet</span>'}</div></div>
@@ -637,6 +647,9 @@ async function invite(){try{let d=await api('POST',`/api/orgs/${ORG}/members`,{e
     modal(`<h3>Invitation created</h3><p class="mut">Send this single-use link to ${esc($('inv-email').value)}. It expires in 7 days.</p><textarea rows="3" readonly>${esc(link)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toast('Invite link copied')">Copy link</button><button class="primary" onclick="closeModal()">Done</button></div>`);}
   else toast('Member added');
   $('inv-email').value='';renderAccess()}catch(e){toast(e.message,true)}}
+async function setMemberRole(uid,role){try{await api('PATCH',`/api/orgs/${ORG}/members/${uid}`,{role});toast('Role updated');renderAccess()}catch(e){toast(e.message,true);renderAccess()}}
+async function removeMember(uid,email){if(!confirm(`Remove ${email} from this workspace?`))return;try{await api('DELETE',`/api/orgs/${ORG}/members/${uid}`);toast('Member removed');renderAccess()}catch(e){toast(e.message,true)}}
+async function transferOwner(uid,email){if(!confirm(`Make ${email} the owner? You become an admin and lose owner controls.`))return;try{await api('POST',`/api/orgs/${ORG}/transfer`,{user_id:uid});toast('Ownership transferred');await refreshOrgs();renderAccess()}catch(e){toast(e.message,true)}}
 async function mkRole(){try{await api('POST',`/api/orgs/${ORG}/roles`,{name:$('role-name').value,permissions:$('role-perms').value.split(',').map(s=>s.trim()).filter(Boolean)});toast('Role created');renderAccess()}catch(e){toast(e.message,true)}}
 async function mkTeam(){try{await api('POST',`/api/orgs/${ORG}/teams`,{name:$('team-name').value});toast('Team created');renderAccess()}catch(e){toast(e.message,true)}}
 async function decideProp(id,a){try{let d=await api('POST',`/api/proposals/${id}/${a}`,{});toast('Proposal '+d.status);renderAccess()}catch(e){toast(e.message,true)}}
@@ -657,7 +670,7 @@ async function renderIntegrations(){if(!needAppEnv())return;setTimeout(kindHint,
   <p class="small" id="ikind-hint"></p><textarea id="icfg" rows="4" placeholder='{"token":"…"}'></textarea>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="mkIntegration()">Add integration</button></div></div>
   <div class="card"><h3>Configured ${ENV?('· '+esc(ENV.name)):''}</h3>${ints.length?ints.map(i=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span><b>${esc(i.kind)}</b> <span class="mut small">${esc(i.name||'')}</span></span><span><button onclick="testInt('${i.id}')">Test</button> <button class="primary" onclick="syncInt('${i.id}')">Sync now</button> <button class="danger" onclick="delInt('${i.id}')">Delete</button></span></div>`).join(''):'<span class="mut">None yet</span>'}</div>
-  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><select id="lease-type"><option value="generic">generic</option><option value="openrouter">openrouter</option><option value="resend">resend</option><option value="openai">openai</option><option value="huggingface">huggingface</option><option value="fireworks">fireworks</option><option value="mistral">mistral</option><option value="perplexity">perplexity</option><option value="xai">xai</option><option value="gemini">gemini</option><option value="cloudflare">cloudflare</option><option value="deepgram">deepgram</option><option value="elevenlabs">elevenlabs</option><option value="deepinfra">deepinfra</option><option value="baseten">baseten</option><option value="fal">fal</option><option value="speechmatics">speechmatics</option><option value="chutes">chutes</option><option value="aws_iam">aws_iam</option><option value="postgres">postgres</option></select><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><textarea id="lease-cfg" rows="2" placeholder='provider config, e.g. {"management_key":"…","limit":5}'></textarea><pre class="val" id="leases"></pre>
+  <div class="card"><h3>Dynamic secrets &amp; rotation</h3><div class="row"><input id="lease-name" placeholder="lease name"><select id="lease-type"><option value="generic">generic</option><option value="openrouter">openrouter</option><option value="resend">resend</option><option value="openai">openai</option><option value="huggingface">huggingface</option><option value="fireworks">fireworks</option><option value="mistral">mistral</option><option value="perplexity">perplexity</option><option value="xai">xai</option><option value="gemini">gemini</option><option value="cloudflare">cloudflare</option><option value="deepgram">deepgram</option><option value="elevenlabs">elevenlabs</option><option value="deepinfra">deepinfra</option><option value="baseten">baseten</option><option value="fal">fal</option><option value="speechmatics">speechmatics</option><option value="chutes">chutes</option><option value="aws_iam">aws_iam</option><option value="postgres">postgres</option><option value="mysql">mysql</option></select><button onclick="mkLease()">New lease (1h)</button><button onclick="loadLeases()">Show leases</button></div><textarea id="lease-cfg" rows="2" placeholder='provider config, e.g. {"management_key":"…"} or {"connection":"mysql://…","grants":["SELECT ON app.*"]}'></textarea><pre class="val" id="leases"></pre>
   <div class="row"><input id="rot-key" placeholder="KEY_TO_ROTATE"><span class="row"><input id="rot-int" value="86400" size="8"><span class="mut small">seconds between rotations</span></span><button onclick="mkRotation()">Schedule rotation</button></div></div>
   <div class="card"><h3>Lockbox: one-time secret sharing</h3><div class="row"><input id="lb-val" placeholder="value to share once" style="min-width:280px"><button onclick="mkLockbox()">Create link</button></div><pre class="val" id="lb-out"></pre></div>`}
 const KIND_HINTS={trigger:'Trigger.dev: {"token":"tr_pat_… or tr_prod_sk_…","project_ref":"proj_…","target_env":"prod"}',github:'GitHub: {"token":"ghp_…","owner":"org","repo":"repo"}',gitlab:'GitLab: {"token":"glpat-…","project_id":"42"}',webhook:'Webhook: {"url":"https://…","token":"optional bearer","signing_secret":"optional HMAC key"}',azure_app_configuration:'Azure App Configuration: {"endpoint":"https://store.azconfig.io","id":"access key id","secret":"base64 access key","label":"optional"}',scaleway_secret_manager:'Scaleway Secret Manager: {"region":"fr-par","secret_key":"…","project_id":"…","path":"/app"}',vultr:'Vultr SSH keys: {"api_key":"…"} (each secret value must be an OpenSSH public key)',hetzner:'Hetzner SSH keys: {"token":"…"} (syncs secrets of type ssh_key; a changed key is recreated)',linode:'Linode SSH keys: {"token":"…"} (syncs secrets of type ssh_key; a changed key is recreated)',digitalocean_ssh:'DigitalOcean account SSH keys: {"token":"…"} (syncs secrets of type ssh_key; distinct from digitalocean, which updates an App Platform spec)',ssh:'SSH file: {"host":"app.example.com","user":"deploy","identity_file":"/keys/deploy","known_hosts":"ssh-ed25519 AAAA…","files":[{"path":"/srv/app/.env","format":"dotenv","folders":["/app"]}]}',kubernetes:'Kubernetes: {"api_server":"https://…","token":"…","namespace":"default","secret_name":"app-secrets"}',aws_secrets_manager:'AWS Secrets Manager: {"region":"us-east-1","access_key_id":"…","secret_access_key":"…","mapping":"one_to_one"} or add "secret_id":"app/prod" for one JSON secret',aws_parameter_store:'AWS Parameter Store: {"region":"us-east-1","access_key_id":"…","secret_access_key":"…","path_prefix":"/app/prod"}','1password':'1Password Connect: {"connect_url":"https://connect.example.com","token":"…","vault_id":"…","value_label":"value"}',dokploy:'Dokploy: {"base_url":"https://dokploy.example.com","api_key":"…","application_id":"…"} or "compose_id"',caprover:'CapRover: {"base_url":"https://captain.example.com","password":"…","app_name":"app"}',portainer:'Portainer: {"base_url":"https://portainer.example.com:9443","api_key":"…","endpoint_id":1,"stack_id":1}',docker_swarm:'Docker Swarm: {"api_url":"https://docker.example.com:2376","ca_cert":"PEM","client_cert":"PEM","client_key":"PEM"}',bitbucket:'Bitbucket: {"workspace":"…","repo_slug":"…","token":"…"}',circleci:'CircleCI: {"project_slug":"gh/org/repo","token":"…"}',teamcity:'TeamCity: {"base_url":"https://teamcity.example.com","token":"…","project_locator":"_Root"}',travisci:'Travis CI: {"repo":"owner/repo","token":"…"}',terraform_cloud:'Terraform Cloud: {"token":"…","workspace_id":"ws-…","category":"env"}',qovery:'Qovery: {"token":"…","organization_id":"…","project_id":"…","environment_id":"…"}',laravel_forge:'Laravel Forge: {"token":"…","organization":"org","server_id":1,"site_id":1}',openwarp:'OpenWarp: {"base_url":"https://other-openwarp.example.com","token":"…","env_id":"…"}',devin:'Devin: {"token":"cog_…","org_id":"org-…"}',cloudflare_secrets_store:'Cloudflare Secrets Store: {"token":"…","account_id":"…","store_id":"…","scopes":["workers"]}',octopus_deploy:'Octopus Deploy: {"base_url":"https://octopus.example.com","api_key":"API-…","space_id":"Spaces-1","project_id":"Projects-123"}',azure_devops:'Azure DevOps: {"organization":"org","project":"project","group_id":"1","token":"PAT"}',cursor:'Cursor: {"token":"…","environment_id":"…"} (omit environment_id for team secrets)',northflank:'Northflank: {"token":"…","project_id":"…","secret_group_id":"…"}',spacelift:'Spacelift: {"token":"…","stack_id":"…"} (or "account":"…")',rundeck:'Rundeck: {"instance_url":"https://rundeck.example.com","api_token":"…","project":"proj"}',cloud66:'Cloud 66: {"access_token":"…","stack_id":"…"}',humanitec:'Humanitec: {"api_token":"…","org":"org","app":"app","scope":"application"}',ovh_kms:'OVHcloud KMS: {"okms_domain":"https://kms.example.com","okms_id":"…","token":"…","path":"app"}',keeper:'Keeper: {"instance_url":"https://keeper.example.com","api_key":"…","folder_uid":"…"}',huggingface:'Hugging Face Space: {"token":"hf_…","namespace":"org","repo":"space","target":"secrets"} (or "variables")',oci_vault:'OCI Vault: {"tenancy_ocid":"…","user_ocid":"…","fingerprint":"…","private_key":"PEM","region":"us-ashburn-1","compartment_id":"…","vault_id":"…","key_id":"…"}',instabox:'Instabox: {"api_key":"ibk_…","org":"team","hosts":["api.example.com"],"delivery":"proxy"}',boat:'Boat: {"api_key":"boat_…","environment":"base","upgrade":true}',daytona:'Daytona: {"api_key":"…","organization_id":"…","hosts":["api.example.com"]}'};
@@ -682,6 +695,7 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
   let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
+  let orgs=await api('GET','/api/orgs').catch(()=>[]);let myOrg=orgs.find(o=>o.id===ORG)||{};
   let samlCard=`<div class="card"><h3>SAML SSO</h3><p>Service provider metadata: <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
     <div class="field"><label for="set-saml-entity">IdP entity ID</label><input id="set-saml-entity" value="${esc(saml?.idp_entity_id||'')}" placeholder="https://idp.example/metadata"></div>
     <div class="field"><label for="set-saml-url">IdP metadata URL</label><input id="set-saml-url" placeholder="https://idp.example/metadata.xml" style="width:100%"></div>
@@ -706,7 +720,9 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3>Instance</h3><p>Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> Allow self signup</label>
     <p class="small mut">When off, new users join only by invitation. ${inst.signups_env_locked?'Locked by OPENWARP_SIGNUPS.':''}</p>
-    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button></div>`:'';
+    <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button>
+    <div class="row" style="margin-top:12px"><label for="set-instance-owner">New instance owner email</label><input id="set-instance-owner" type="email" style="min-width:260px"><button onclick="transferInstance()">Transfer instance</button></div>
+    <p class="small mut" style="margin-top:6px">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
   $('view').innerHTML=`${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
@@ -724,7 +740,9 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID"><button class="primary" onclick="loadE2E()">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
   <div class="card"><h3>PKI</h3><p>Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()">Create CA</button></div><pre class="val" id="ca-out"></pre>
   <div class="row" style="margin-top:10px"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()">Create SSH CA</button></div><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>
-  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>`;loadSshCAs()}
+  <div class="card"><h3>Session</h3><div class="row"><button onclick="loadTokensSettings()">My tokens</button><button class="danger" onclick="logout()">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>
+  ${myOrg.role==='owner'?`<div class="card"><h3>Delete workspace</h3><p>Type <span class="mono">${esc(myOrg.name||'')}</span> to confirm. Every app, environment, secret, token and identity in this workspace is removed.</p><div class="row"><label for="del-org-name">Workspace name</label><input id="del-org-name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')">Delete workspace</button></div></div>`:''}
+  <div class="card"><h3>Account</h3><p>Signed in as <span class="mono">${esc(ME?.email||'')}</span>. Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</p><button class="danger" onclick="deleteAccount()">Delete account</button></div>`;loadSshCAs()}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
@@ -784,6 +802,32 @@ async function loadSshCerts(id){let host=$('ssh-certs');if(!host)return;try{let 
 async function revokeSshCert(cid,ca){if(!confirm('Revoke this certificate? A host only enforces it once its RevokedKeys file is refreshed.'))return;
   try{await api('POST',`/api/ssh/certs/${cid}/revoke`,{});toast('Revoked');openSshCA(ca)}catch(e){toast(e.message,true)}}
 async function loadTokensSettings(){$('sess-out').textContent='Use openwarp login / MCP OAuth clients for programmatic access. Service tokens live under Members & access.'}
+async function transferInstance(){let email=$('set-instance-owner').value.trim();if(!email){toast('Enter the new owner email',true);return}if(!confirm(`Transfer instance control to ${email}? You will lose instance owner controls.`))return;try{await api('PUT','/api/instance/owner',{email});toast('Instance ownership transferred');renderSettings()}catch(e){toast(e.message,true)}}
+async function deleteWorkspace(name){try{
+  if($('del-org-name').value!==name){toast('Type the workspace name exactly to confirm',true);return}
+  if(!confirm(`Delete ${name} and everything in it? This cannot be undone.`))return;
+  let r=await apiRaw('DELETE',`/api/orgs/${ORG}?confirm=true`);
+  if(r.ok){toast('Workspace deleted');location.reload();return}
+  toast(r.body.error||'Could not delete workspace',true)
+}catch(e){toast(e.message,true)}}
+async function deleteAccount(){try{
+  if(!confirm('Delete your account? This revokes every key, ends all sessions and cannot be undone.'))return;
+  let r=await apiRaw('DELETE','/api/me');
+  if(r.ok){T='';location.reload();return}
+  if(r.body.workspaces&&r.body.workspaces.length){
+    modal(`<h3>Transfer ownership first</h3><p>You own these workspaces. Another member must become the owner before this account can be deleted, or you can delete the workspace from Settings.</p><ul>${r.body.workspaces.map(w=>`<li class="mono">${esc(w.name)}</li>`).join('')}</ul><div class="row" style="margin-top:12px"><button class="primary" onclick="closeModal();nav('access')">Open Members &amp; access</button><button class="ghost" onclick="closeModal()">Close</button></div>`,'Transfer ownership first');
+    return}
+  if((r.body.error||'').includes('instance ownership')){
+    modal(`<h3>Transfer instance ownership first</h3><p>${esc(r.body.error)}</p><p class="small mut">Use Transfer instance above before deleting this account.</p><div class="row" style="margin-top:12px"><button class="primary" onclick="closeModal()">Close</button></div>`,'Transfer instance ownership first');
+    return}
+  if(r.body.confirmation_required){
+    let what=[r.body.api_keys?r.body.api_keys+' API key'+(r.body.api_keys===1?'':'s'):'',r.body.oauth_sessions?r.body.oauth_sessions+' CLI/OAuth session'+(r.body.oauth_sessions===1?'':'s'):''].filter(Boolean).join(' and ');
+    if(!confirm(`This account still has ${what}. Deleting it revokes them immediately, and anything using them stops working. Delete anyway?`))return;
+    let r2=await apiRaw('DELETE','/api/me?confirm=true');
+    if(r2.ok){T='';location.reload();return}
+    toast(r2.body.error||'Could not delete account',true);return}
+  toast(r.body.error||'Could not delete account',true)
+}catch(e){toast(e.message,true)}}
 
 let AI_SETTINGS=null, AI_CONTEXT={envs:[],integrations:[]}, AI_PLAN=null, AI_REFS=[], AI_OPS=[], AI_DRAFTS=[], AI_FINDINGS=[], AI_EPOCH=0;
 function aiReset(){AI_EPOCH++;AI_SETTINGS=null;AI_CONTEXT={envs:[],integrations:[]};AI_PLAN=null;AI_REFS=[];AI_OPS=[];AI_DRAFTS=[];AI_FINDINGS=[]}

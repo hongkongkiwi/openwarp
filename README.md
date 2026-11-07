@@ -119,12 +119,12 @@ flowchart LR
     Console[Browser console] --> Server[OpenWarp server]
     CLI[CLI and applications] --> Server
     MCP[MCP clients] --> Server
-    Server --> DB[(SQLite or PostgreSQL)]
+    Server --> DB[(SQLite, PostgreSQL or MySQL/MariaDB)]
     Server -. optional session cache .-> Redis[(Redis)]
     Server --> Providers[Sync destinations]
 ```
 
-The server hosts the console and API. SQLite keeps local setup small; PostgreSQL is available for deployed instances. Redis is optional. Secrets in standard environments are encrypted under per-environment keys wrapped by the instance master key. End-to-end environments keep decryption in the client.
+The server hosts the console and API. SQLite keeps local setup small; PostgreSQL and MySQL/MariaDB are available for deployed instances. Redis is optional. Secrets in standard environments are encrypted under per-environment keys wrapped by the instance master key. End-to-end environments keep decryption in the client.
 
 ## Documentation
 

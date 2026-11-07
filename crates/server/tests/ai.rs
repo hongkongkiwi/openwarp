@@ -195,7 +195,7 @@ async fn all_ai_routes_reject_service_machine_and_oauth_credentials() {
         f.state.db().exec("INSERT INTO tokens(id,org_id,name,token_hash,role,created_at,created_by,kind) VALUES(?, 'org-a', ?, ?, 'admin', ?, 'owner', ?)", &[json!(kind), json!(kind), json!(openwarp_crypto::hash_token(token)), json!(clock::now()), json!(kind)]).await.unwrap();
     }
     let oauth = "ow_fake_ai_oauth";
-    f.state.db().exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,kind,expires_at,created_at) VALUES(?,'fake-client','owner','*','access',?,?)", &[json!(openwarp_crypto::hash_token(oauth)), json!(clock::now()+3600), json!(clock::now())]).await.unwrap();
+    f.state.db().exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,kind,expires_at,created_at,resource) VALUES(?,'fake-client','owner','*','access',?,?,'http://127.0.0.1:8080')", &[json!(openwarp_crypto::hash_token(oauth)), json!(clock::now()+3600), json!(clock::now())]).await.unwrap();
     let pid = f.plan(OWNER, "/session-only").await;
     for token in ["", "ow_fake_ai_service", "ow_fake_ai_machine", oauth] {
         if !token.is_empty() { f.call(Method::GET, "/api/me", token, None).await.ok(); }

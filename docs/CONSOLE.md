@@ -24,6 +24,14 @@ Save the recovery kit shown during account creation. It is your private key, not
 
 Enable TOTP MFA from settings and keep the recovery codes somewhere other than your authenticator device. If verification email or reset delivery fails, contact your instance operator; a generic success message does not prove the relay sent the email.
 
+## Delete an account or workspace
+
+Settings includes Delete account. Only a signed-in account session can use it, not a service key or OAuth token. Transfer or delete every workspace you own first, even if it has another owner. If issued API keys or live CLI/OAuth sessions remain, the console shows their counts and asks for confirmation before revoking credentials and deleting the account.
+
+Members & access lists members, role controls, removal and Make owner. Ownership can move only to an active, verified member; the previous owner becomes an admin. The instance owner must separately use Transfer instance in Settings to hand control to another active, verified account. The last usable account may delete itself after deleting its workspaces.
+
+A workspace owner can use Delete workspace in Settings after typing its exact name and confirming. This removes the workspace's stored applications, secrets, grants, identities, runners, certificates and configuration. It does not erase copies already delivered to clients or providers, or uninstall an SSH CA from hosts. The local deletion batch rolls back on database failure, including on Workers. Provider operations are separate from the local transaction. Revoke dynamic leases first; an unresolved lease prevents workspace deletion. Failed issuance can leave a pending reservation that requires operator reconciliation.
+
 ## Workspaces and applications
 
 Select the workspace before changing membership or application data. Create an application from Apps and give it a descriptive name. Application readme content can record ownership, purpose, and operational notes; do not put plaintext credentials there.

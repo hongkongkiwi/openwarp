@@ -3,11 +3,13 @@
 | Phase feature | Tier in Phase | OpenWarp |
 |---|---|---|
 | Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
+| OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
 | Apps + readme | Free | yes |
 | Environments | 3 / 10 / unlimited | **unlimited custom envs**, name `^[a-zA-Z0-9-_]{1,32}$` |
 | Secrets: secret/sealed/config types | Free | yes; sealed never read back |
 | Folders/paths, tags, comments | Free | yes (key unique per env+path) |
-| Versioning, history diff, one-click restore | Free | `GET /api/secrets/:id/history`, `POST .../restore/:ver` |
+| Versioning, history diff, one-click restore | Free | `GET /api/secrets/:id/history`, `POST .../restore/:ver`, plus check-and-set writes, `max_versions` retention and permanent destroy |
 | Secret referencing `${KEY}`, `${/path/KEY}` | Free | resolved server-side, 5-deep |
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
@@ -24,8 +26,8 @@
 | Network policies | Pro | `PUT /api/orgs/:id/settings {ip_allowlist}` stored per org |
 | Point-in-time recovery | Pro | `POST /api/envs/:id/restore-point {timestamp}` |
 | Automated rotation | Pro | `POST /api/envs/:id/rotate {key}` (new random or given value) |
-| Audit logs + forwarding | Pro/Ent | per-org audit table, webhook forwarding via settings |
-| Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default) |
+| Audit logs + forwarding | Pro/Ent | per-org audit table with a hash chain and `GET /api/orgs/:id/audit/verify`, webhook forwarding via settings |
+| Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default); expiry revokes the remote credential |
 | OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, `id_token` verified against provider JWKS with RS/PS/ES signatures and iss/aud/exp/nonce checks, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. Instance-level sign-in with any OIDC provider is configured by `OPENWARP_OIDC_*` (PKCE, optional client secret, discovery or explicit endpoints; see [configuration](CONFIGURATION.md)). SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
 | LDAP directory sign-in | Enterprise | **Per-org LDAPS directory**: admin `GET/PUT/DELETE /api/orgs/:id/ldap` stores the URL, service bind DN and encrypted password, base DN, user filter, attribute names and group map; `POST /api/auth/ldap {org_id, username, password}` searches with the service account (RFC 4515 escaping), then binds as the found entry. Only `ldaps://` is accepted, so no password crosses the wire unencrypted. Invite or auto-provision plus allowed-domain gating, `Group=role` mapping, TOTP parity and audit entries. Absent from builds without the `ldap` cargo feature (Workers/WASM) |
 | External KMS | Enterprise | master key via `OPENWARP_MASTER_KEY` (BYO KMS/HSM wrapper point) |
@@ -76,9 +78,10 @@ key. It stores only ciphertext it cannot decrypt. Clients that omit
 
 ## Storage
 
-`DATABASE_URL=sqlite://file.db` (default, testing) or
-`postgres://...` (production). One portable SQL dialect layer translates
-`?` placeholders to `$n` for Postgres. `REDIS_URL` optionally caches session lookups (1h TTL, verified against a Redis-protocol server: SETEX on first auth, GET hits after); absent Redis, sessions live only in the DB.
+`DATABASE_URL=sqlite://file.db` (default, testing), `postgres://...`, or
+`mysql://...`/`mariadb://...` (production). One portable SQL dialect layer translates
+`?` placeholders to `$n` for Postgres and rewrites the DDL for MySQL/MariaDB.
+`REDIS_URL` optionally caches session lookups (1h TTL, verified against a Redis-protocol server: SETEX on first auth, GET hits after); absent Redis, sessions live only in the DB.
 
 ## Takeaways from Phase + Infisical source review (implemented)
 
@@ -104,12 +107,13 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
   retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
 - Machine identities with Universal Auth, secret-change proposals with
-  admin approval, access requests, dynamic Postgres leases (real roles,
-  dropped on revoke), and a basic PKI (CA, issue, revoke) came from the
-  Infisical feature set.
+  admin approval, access requests, dynamic database leases (real PostgreSQL
+  roles, MySQL and MariaDB accounts, dropped on revoke), and a basic PKI
+  (CA, issue, revoke) came from the Infisical feature set.
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
-secret-change proposals, and Postgres dynamic roles are not Phase features.
+secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
+Phase features.
 Deferred by design: CLI parity (separate effort), a Kubernetes operator (the
 Helm chart's External Secrets Operator bridge covers controller-driven delivery,
 see [Kubernetes](KUBERNETES.md)), SDKs, AWS-IAM dynamic secrets, Phase
@@ -171,8 +175,12 @@ Shared behavioural options:
   1Password, Dokploy, CapRover, Portainer, Bitbucket, TeamCity, Travis CI,
   Terraform Cloud, Qovery, Laravel Forge, Octopus Deploy, Azure DevOps and
   OpenWarp. Adapters that never return values reject import explicitly.
-- AWS integrations accept `role_arn` plus optional `sts_endpoint`; the adapter
-  assumes the role and signs with the temporary credentials.
+- AWS integrations accept `role_arn` plus optional `external_id` and
+  `sts_endpoint`; the adapter assumes the role and signs with temporary credentials.
+- Server-managed sync supports path selection and deletion suppression. AWS Secrets
+  Manager, Azure Key Vault and GCP Secret Manager support metadata tags. Azure
+  can write one JSON blob or disable absent managed names. Delegated runner sync
+  does not yet support those path, metadata or managed Azure options.
 
 Kamal has no server API or central secret store, so there is no `kamal` adapter.
 Use `openwarp export --format dotenv` or `openwarp run -- kamal deploy` to feed
@@ -541,8 +549,8 @@ accepts `qps`, `qpm` and `tpm`. ElevenLabs defaults `permissions` to `"all"`.
 
 The parent credential is encrypted on the lease so revoke can authenticate; the
 response returns only the child secret. A failed remote delete leaves the lease
-active. Expiry does not revoke the remote key by itself: call revoke, or rely
-on the provider expiry where one was set at creation. Resend keys have no
+active and retries after a minute. The background lease sweeper revokes expired
+remote credentials through the same path as manual revoke. Resend keys have no
 remote expiry. Anthropic's Admin API can list and deactivate keys but has no
 documented create call, so it is not a lease provider. Groq, Together, Cohere,
 DeepSeek, Cerebras, SambaNova, Voyage and AssemblyAI only mint keys from their
@@ -579,6 +587,15 @@ this route.
 
 CI compiles the TypeScript, Rust and Terraform deliverables and runs their
 live-server tests against the built binary.
+
+### Vault-style secret and lease semantics (2026-11-06)
+
+- Check-and-set writes: a secret accepts `expected_version` (`0` = create only, `n` = the version the caller last saw). A stale write returns 409 with the current version instead of overwriting.
+- Version retention: `PUT /api/envs/:id/policy {"max_versions": n}` keeps the newest `n` versions per secret (0 = unlimited, maximum 1000). Older rows are pruned on write and restore.
+- `POST /api/secrets/:id/undelete` reverses the recoverable delete tombstone. `POST /api/secrets/:id/destroy` removes the value, its history and personal overrides permanently; point-in-time recovery cannot bring it back.
+- Response wrapping: `POST /api/envs/:id/wrap {"ttl_secs":300,"keys":["API_KEY"]}` returns a single-use `owwrap_...` Bearer token. Redeem it once at `POST /api/unwrap`; `GET /api/unwrap` looks it up without consuming it. The token is not an API credential and works only on `/api/unwrap`. Sealed and client-encrypted values are excluded.
+- Lease expiry revokes: the background leader sweeps expired leases and performs the same remote revoke as `DELETE /api/leases/:id`. A failed remote delete leaves the lease active, audits `lease.expire_failed`, and retries after a minute. `GET /api/leases/:id` reports type, expiry, revocation and renewability without returning the value.
+- Audit chain: audit rows carry `seq`, `prev_hash` and `hash`; `GET /api/orgs/:id/audit/verify` recomputes the chain and reports `first_bad`. Rows written before migration 17 report as `unchained`.
 
 ### Still not implemented
 

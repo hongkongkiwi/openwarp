@@ -15,6 +15,17 @@ const MAX_RESPONSE: usize = 65536;
 struct Settings { enabled: bool, endpoint: String, model: String, allow_metadata: bool, allow_actions: bool, allow_local_search: bool, monitoring_enabled: bool, request_limit: i64, token_limit: i64, max_output_tokens: i64 }
 impl Default for Settings { fn default() -> Self { Self { enabled:false, endpoint:String::new(), model:String::new(), allow_metadata:false, allow_actions:false, allow_local_search:false, monitoring_enabled:false, request_limit:100, token_limit:100000, max_output_tokens:1024 } } }
 fn key_aad(org: &str) -> Vec<u8> { format!("ow-ai-key:v1|{}", org).into_bytes() }
+fn dialect<'a>(db:&db::Db, standard:&'a str, mysql:&'a str) -> &'a str {
+    #[cfg(not(target_arch="wasm32"))] if db.backend()==db::Backend::Mysql { return mysql; }
+    let _=(db,mysql); standard
+}
+async fn claim_lease(st:&S,name:&str,owner:&str,current:i64,ttl:i64) -> Result<bool,(StatusCode,Json<Value>)> {
+    if st.db.exec("UPDATE instance_leases SET owner=?,expires_at=? WHERE name=? AND expires_at<=?",&[json!(owner),json!(current+ttl),json!(name),json!(current)]).await.map_err(|_| bad("cannot acquire AI lease"))?==1 { return Ok(true); }
+    match st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?)",&[json!(name),json!(owner),json!(current+ttl)]).await {
+        Ok(1) => Ok(true),
+        _ => { if st.db.one("SELECT owner FROM instance_leases WHERE name=?",&[json!(name)]).await.map_err(|_| bad("cannot check AI lease"))?.is_some() { Ok(false) } else { Err(bad("cannot acquire AI lease")) } }
+    }
+}
 fn endpoints() -> Vec<String> {
     crate::envcfg::var("OPENWARP_AI_ENDPOINTS").ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default().into_iter().filter(|s| {
         crate::http::Url::parse(s).map(|u| matches!(u.scheme(), "https"|"http") && u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.fragment().is_none()).unwrap_or(false)
@@ -58,7 +69,7 @@ async fn put_settings(State(st): State<S>, h: HeaderMap, Path(org): Path<String>
     if clear==Some(json!(true)) || s.endpoint!=previous_endpoint { key.clear(); }
     if let Some(Value::String(raw))=new_key { if raw.len()>4096 || raw.chars().any(char::is_control) { return Err(bad("invalid provider key")); }
     if !raw.is_empty() { key=oc::encrypt_symmetric_aad(&st.master(),&key_aad(&org),raw.as_bytes()); } }
-    st.db.exec("INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES(?,?,?,?) ON CONFLICT(org_id) DO UPDATE SET settings=excluded.settings,key_enc=excluded.key_enc,updated_at=excluded.updated_at", &[json!(&org),json!(serde_json::to_string(&s).map_err(|_| bad("invalid settings"))?),json!(key),json!(now())]).await.map_err(|_| bad("cannot save AI settings"))?;
+    st.db.exec(dialect(&st.db,"INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES(?,?,?,?) ON CONFLICT(org_id) DO UPDATE SET settings=excluded.settings,key_enc=excluded.key_enc,updated_at=excluded.updated_at","INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE settings=VALUES(settings),key_enc=VALUES(key_enc),updated_at=VALUES(updated_at)"), &[json!(&org),json!(serde_json::to_string(&s).map_err(|_| bad("invalid settings"))?),json!(key),json!(now())]).await.map_err(|_| bad("cannot save AI settings"))?;
     settings_response(&st,&org,&uid).await
 }
 async fn permitted_envs(st:&S, org:&str, uid:&str, selected:Option<&str>) -> Result<(Vec<db::Row>,bool),(StatusCode,Json<Value>)> {
@@ -166,10 +177,10 @@ async fn infer(st:&S,org:&str,s:&Settings,payload:Value) -> Result<String,(Statu
     let key=String::from_utf8(key).map_err(|_| bad("invalid provider key"))?;
     let bytes=payload.to_string(); if bytes.len()>MAX_CONTEXT+8192 { return Err(bad("request exceeds inference byte limit")); }
     let units=bytes.len() as i64+s.max_output_tokens; let day=now()/86400; let claim=id();
-    let lease=format!("ai-inference:{}",org); let acquired=st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE instance_leases.expires_at<=?",&[json!(&lease),json!(&claim),json!(now()+45),json!(now())]).await.map_err(|_| bad("cannot acquire inference lease"))?;
-    if acquired!=1 { return Err(err(StatusCode::TOO_MANY_REQUESTS,"another workspace inference request is active")); }
+    let lease=format!("ai-inference:{}",org); let acquired=claim_lease(st,&lease,&claim,now(),45).await?;
+    if !acquired { return Err(err(StatusCode::TOO_MANY_REQUESTS,"another workspace inference request is active")); }
     let result=async {
-        st.db.exec("INSERT INTO ai_usage(org_id,day) VALUES(?,?) ON CONFLICT(org_id,day) DO NOTHING",&[json!(org),json!(day)]).await.map_err(|_| bad("cannot initialize inference budget"))?;
+        st.db.exec(dialect(&st.db,"INSERT INTO ai_usage(org_id,day) VALUES(?,?) ON CONFLICT(org_id,day) DO NOTHING","INSERT INTO ai_usage(org_id,day) VALUES(?,?) ON DUPLICATE KEY UPDATE org_id=VALUES(org_id)"),&[json!(org),json!(day)]).await.map_err(|_| bad("cannot initialize inference budget"))?;
         let reserved=st.db.exec("UPDATE ai_usage SET requests=requests+1,units=units+? WHERE org_id=? AND day=? AND requests<? AND units+?<=?",&[json!(units),json!(org),json!(day),json!(s.request_limit),json!(units),json!(s.token_limit)]).await.map_err(|_| bad("cannot reserve inference budget"))?;
         if reserved!=1 { return Err(err(StatusCode::TOO_MANY_REQUESTS,"workspace inference budget exhausted")); }
         let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(30)).build().map_err(|_| bad("cannot create bounded inference client"))?;
@@ -216,7 +227,7 @@ async fn execute(State(st):State<S>,h:HeaderMap,Path((org,pid)):Path<(String,Str
     if st.db.exec("UPDATE ai_plans SET status='executing' WHERE id=? AND org_id=? AND actor=? AND status='pending' AND expires_at>?",&[json!(&pid),json!(&org),json!(&uid),json!(now())]).await.map_err(|_| bad("cannot claim plan"))?!=1 { return Err(bad("plan already claimed or expired")); }
     let mut results=Vec::new(); for op in ops { let mut result=serde_json::to_value(&op).map_err(|_| bad("invalid operation"))?;
         let action=async { let (current,_)=load(&st,&org).await?; enabled(&current)?; if !current.allow_actions { return Err(err(StatusCode::FORBIDDEN,"action consent revoked")); } validate_operation(&st,&org,&uid,&op).await?;
-            let mut oid=id(); match &op { Operation::CreateFolder{env_id,path} => { st.db.exec("INSERT INTO folders(id,env_id,path,created_at) VALUES(?,?,?,?) ON CONFLICT(env_id,path) DO NOTHING",&[json!(&oid),json!(env_id),json!(path),json!(now())]).await.map_err(|_| bad("cannot create folder"))?; oid=st.db.one("SELECT id FROM folders WHERE env_id=? AND path=?",&[json!(env_id),json!(path)]).await.map_err(|_| bad("cannot read created folder"))?.map(|r| db::s(&r,"id")).ok_or_else(|| bad("created folder is unavailable"))?; }, Operation::DraftIntegration{env_id,provider_kind,name} => { st.db.exec("INSERT INTO integration_drafts(id,org_id,env_id,provider_kind,name,created_at) VALUES(?,?,?,?,?,?)",&[json!(&oid),json!(&org),json!(env_id),json!(provider_kind),json!(name),json!(now())]).await.map_err(|_| bad("cannot create integration draft"))?; } } Ok::<String,(StatusCode,Json<Value>)>(oid) }.await;
+            let mut oid=id(); match &op { Operation::CreateFolder{env_id,path} => { st.db.exec(dialect(&st.db,"INSERT INTO folders(id,env_id,path,created_at) VALUES(?,?,?,?) ON CONFLICT(env_id,path) DO NOTHING","INSERT INTO folders(id,env_id,path,created_at) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE id=id"),&[json!(&oid),json!(env_id),json!(path),json!(now())]).await.map_err(|_| bad("cannot create folder"))?; oid=st.db.one("SELECT id FROM folders WHERE env_id=? AND path=?",&[json!(env_id),json!(path)]).await.map_err(|_| bad("cannot read created folder"))?.map(|r| db::s(&r,"id")).ok_or_else(|| bad("created folder is unavailable"))?; }, Operation::DraftIntegration{env_id,provider_kind,name} => { st.db.exec("INSERT INTO integration_drafts(id,org_id,env_id,provider_kind,name,created_at) VALUES(?,?,?,?,?,?)",&[json!(&oid),json!(&org),json!(env_id),json!(provider_kind),json!(name),json!(now())]).await.map_err(|_| bad("cannot create integration draft"))?; } } Ok::<String,(StatusCode,Json<Value>)>(oid) }.await;
         match action { Ok(oid) => { result["status"]=json!("completed"); result["id"]=json!(oid); }, Err((_,e)) => { result["status"]=json!("failed"); result["error"]=e.0["error"].clone(); } } results.push(result);
     }
     let status=if results.iter().any(|r| r["status"]=="failed") { "completed_with_errors" } else { "completed" };
@@ -231,7 +242,7 @@ pub(crate) async fn activity(st:&S,scope:(&str,&str,&str),actor:&str,h:&HeaderMa
     let (org,app,env)=scope;
     let credential=app::hmac_hex(&st.master(),format!("ow-ai-credential:v1|{}|{}",org,effective_token(h)).as_bytes());
     let result=st.db.exec("INSERT INTO ai_activity(id,org_id,app_id,env_id,actor,credential,action,resource,count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",&[json!(id()),json!(org),json!(app),json!(env),json!(actor),json!(credential),json!(action),json!(resource),json!(count as i64),json!(now())]).await;
-    if result.is_err() { let marker=format!("ai:telemetry_gap:{}",org); if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",&[json!(marker),json!(now().to_string())]).await.is_err() { crate::log::warn("AI activity and coverage marker persistence failed"); } }
+    if result.is_err() { let marker=format!("ai:telemetry_gap:{}",org); if st.db.exec(dialect(&st.db,"INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)"),&[json!(marker),json!(now().to_string())]).await.is_err() { crate::log::warn("AI activity and coverage marker persistence failed"); } }
 }
 fn finding(org:&str,rule:&str,resource:&str,bucket:i64,title:&str,rationale:&str,evidence:Vec<Value>) -> Value { let severity=match rule { "read_export_burst"=>"high", "integration_change_sync"|"volume_baseline"|"token_export_sequence"|"overdue_rotation"=>"medium", _=>"low" }; json!({"id":oc::hash_token(&format!("ow-ai-finding:v1|{}|{}|{}|{}",org,rule,resource,bucket)).replace('+',"-").replace('/',"_").trim_end_matches('='),"rule":rule,"severity":severity,"title":title,"rationale":rationale,"evidence":evidence,"status":"open","exception_until":0,"maintenance_note":""}) }
 async fn generate_findings(st:&S,org:&str) -> Res {
@@ -266,15 +277,15 @@ async fn generate_findings(st:&S,org:&str) -> Res {
 async fn findings(State(st):State<S>,h:HeaderMap,Path(org):Path<String>) -> Res { let uid=session(&st,&h,&org).await?; st.check_admin(&org,&uid).await?; generate_findings(&st,&org).await }
 #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct FindingReq { status:String, #[serde(default)] exception_until:i64, #[serde(default)] maintenance_note:String }
 async fn finding_state(State(st):State<S>,h:HeaderMap,Path((org,fid)):Path<(String,String)>,Json(r):Json<FindingReq>) -> Res { let uid=session(&st,&h,&org).await?; st.check_admin(&org,&uid).await?; if !matches!(r.status.as_str(),"open"|"acknowledged"|"exception") || r.maintenance_note.len()>1000 || (r.status=="exception" && (r.exception_until<=now() || r.exception_until>now()+30*86400)) { return Err(bad("invalid status, note, or exception expiry (maximum 30 days)")); } let current=generate_findings(&st,&org).await?.0; if !current["findings"].as_array().is_some_and(|fs| fs.iter().any(|f| f["id"]==fid)) { return Err(bad("finding is not present in current evidence")); }
-    st.db.exec("INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET status=excluded.status,exception_until=excluded.exception_until,maintenance_note=excluded.maintenance_note",&[json!(org),json!(fid),json!(r.status),json!(r.exception_until),json!(r.maintenance_note)]).await.map_err(|_| bad("cannot save finding state"))?; Ok(j(json!({"saved":true}))) }
+    st.db.exec(dialect(&st.db,"INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET status=excluded.status,exception_until=excluded.exception_until,maintenance_note=excluded.maintenance_note","INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),exception_until=VALUES(exception_until),maintenance_note=VALUES(maintenance_note)"),&[json!(org),json!(fid),json!(r.status),json!(r.exception_until),json!(r.maintenance_note)]).await.map_err(|_| bad("cannot save finding state"))?; Ok(j(json!({"saved":true}))) }
 pub(crate) async fn maintenance(st:&S) {
     let current=now();
-    if st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES('ai-monitoring',?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE instance_leases.expires_at<=?",&[json!(st.instance_id()),json!(current+300),json!(current)]).await.unwrap_or(0)!=1 { return; }
+    if !claim_lease(st,"ai-monitoring",st.instance_id(),current,300).await.unwrap_or(false) { return; }
     let cursor=match st.db.one("SELECT v FROM meta WHERE k='ai:monitoring_cursor'",&[]).await { Ok(r)=>r.map(|r| db::s(&r,"v")).unwrap_or_default(),Err(_)=>return };
     let Ok(mut rows)=st.db.query("SELECT org_id,settings FROM ai_settings WHERE org_id>? ORDER BY org_id LIMIT 100",&[json!(cursor)]).await else { return };
     if rows.is_empty() { let Ok(first)=st.db.query("SELECT org_id,settings FROM ai_settings ORDER BY org_id LIMIT 100",&[]).await else { return }; rows=first; }
-    if let Some(last)=rows.last() { if st.db.exec("INSERT INTO meta(k,v) VALUES('ai:monitoring_cursor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",&[json!(db::s(last,"org_id"))]).await.is_err() { return; } }
-    for r in rows { if serde_json::from_str::<Settings>(&db::s(&r,"settings")).map(|s| s.monitoring_enabled).unwrap_or(false) { let org=db::s(&r,"org_id"); match generate_findings(st,&org).await { Ok(Json(v)) => { let mut statements=Vec::new(); if let Some(fs)=v["findings"].as_array() { for f in fs.iter().take(200).filter(|f| f["historical"]!=true) { let mut safe=f.clone(); let object=safe.as_object_mut().unwrap(); object.remove("maintenance_note"); object.remove("status"); object.remove("exception_until"); statements.push(("INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET finding=excluded.finding,last_seen=excluded.last_seen".into(),vec![json!(&org),f["id"].clone(),json!(safe.to_string()),json!(now()),json!(now())])); } } statements.push(("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v".into(),vec![json!(format!("ai:background:{}",org)),json!(now().to_string())])); if st.db.batch(&statements).await.is_err() { crate::log::warn("AI monitoring persistence failed"); } }, Err(_) => crate::log::warn("AI deterministic monitoring failed") } } }
+    if let Some(last)=rows.last() { if st.db.exec(dialect(&st.db,"INSERT INTO meta(k,v) VALUES('ai:monitoring_cursor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES('ai:monitoring_cursor',?) ON DUPLICATE KEY UPDATE v=VALUES(v)"),&[json!(db::s(last,"org_id"))]).await.is_err() { return; } }
+    for r in rows { if serde_json::from_str::<Settings>(&db::s(&r,"settings")).map(|s| s.monitoring_enabled).unwrap_or(false) { let org=db::s(&r,"org_id"); match generate_findings(st,&org).await { Ok(Json(v)) => { let mut statements=Vec::new(); if let Some(fs)=v["findings"].as_array() { for f in fs.iter().take(200).filter(|f| f["historical"]!=true) { let mut safe=f.clone(); let object=safe.as_object_mut().unwrap(); object.remove("maintenance_note"); object.remove("status"); object.remove("exception_until"); statements.push((dialect(&st.db,"INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(org_id,finding_id) DO UPDATE SET finding=excluded.finding,last_seen=excluded.last_seen","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE finding=VALUES(finding),last_seen=VALUES(last_seen)").into(),vec![json!(&org),f["id"].clone(),json!(safe.to_string()),json!(now()),json!(now())])); } } statements.push((dialect(&st.db,"INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v","INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(format!("ai:background:{}",org)),json!(now().to_string())])); if st.db.batch(&statements).await.is_err() { crate::log::warn("AI monitoring persistence failed"); } }, Err(_) => crate::log::warn("AI deterministic monitoring failed") } } }
     for (sql,p) in [("DELETE FROM ai_finding_history WHERE last_seen<?",now()-30*86400),("DELETE FROM ai_plans WHERE expires_at<?",now()-86400),("DELETE FROM ai_activity WHERE created_at<?",now()-30*86400),("DELETE FROM ai_usage WHERE day<?",now()/86400-30)] { if st.db.exec(sql,&[json!(p)]).await.is_err() { crate::log::warn("AI maintenance cleanup failed"); } }
 }
 #[cfg(not(target_arch="wasm32"))]
@@ -282,6 +293,61 @@ pub(crate) async fn rewrap(st:&S,old:&[u8;32],new:&[u8;32]) -> Result<Vec<(Strin
 #[cfg(all(test,not(target_arch="wasm32")))]
 mod tests {
     use super::*;
+    #[tokio::test] async fn mysql_ai_schema_upserts_and_lease_claims() {
+        use mysql_async::prelude::Queryable;
+        let admin=match std::env::var("OPENWARP_TEST_MYSQL_URL") { Ok(url) if !url.trim().is_empty()=>url,_=>return };
+        let name=format!("ow_ai_{}",id().replace('-',""));
+        let pool=mysql_async::Pool::new(mysql_async::Opts::from_url(&admin).unwrap());
+        let mut conn=pool.get_conn().await.expect("configured MySQL must be reachable");
+        conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
+        let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
+        let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on MySQL");
+        assert_eq!(db.version().await.unwrap(),18);
+        let (live,_)=tokio::sync::broadcast::channel(4);
+        let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+        let result=tokio::spawn(async move {
+            st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('u','mysql-ai@example.invalid','unused','unused','unused',1)",&[]).await.unwrap();
+            st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES('o','AI',1)",&[]).await.unwrap();
+            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES('o','u','owner')",&[]).await.unwrap();
+            st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'u',?)",&[json!(oc::hash_token("mysql-ai-session")),json!(now())]).await.unwrap();
+            let mut h=HeaderMap::new(); h.insert("authorization","Bearer mysql-ai-session".parse().unwrap());
+            for key in ["first","second"] { let response=put_settings(State(st.clone()),h.clone(),Path("o".into()),Json(json!({"api_key":key}))).await.unwrap(); assert_eq!(response.0["has_api_key"],true); }
+            let (_,enc)=load(&st,"o").await.unwrap(); assert_eq!(oc::decrypt_symmetric_aad(&st.master(),&key_aad("o"),&enc).unwrap(),b"second");
+            for _ in 0..2 { st.db.exec(dialect(&st.db,"", "INSERT INTO ai_usage(org_id,day) VALUES('o',1) ON DUPLICATE KEY UPDATE org_id=VALUES(org_id)"),&[]).await.unwrap(); }
+            assert_eq!(db::n(&st.db.one("SELECT COUNT(*) AS n FROM ai_usage",&[]).await.unwrap().unwrap(),"n"),1);
+            for value in ["first","second"] {
+                let statements=vec![
+                    (dialect(&st.db,"","INSERT INTO ai_finding_states(org_id,finding_id,status,exception_until,maintenance_note) VALUES('o','f','open',0,?) ON DUPLICATE KEY UPDATE maintenance_note=VALUES(maintenance_note)").into(),vec![json!(value)]),
+                    (dialect(&st.db,"","INSERT INTO ai_finding_history(org_id,finding_id,finding,first_seen,last_seen) VALUES('o','f',?,1,1) ON DUPLICATE KEY UPDATE finding=VALUES(finding)").into(),vec![json!(value)]),
+                    (dialect(&st.db,"","INSERT INTO meta(k,v) VALUES('ai:background:o',?) ON DUPLICATE KEY UPDATE v=VALUES(v)").into(),vec![json!(value)])];
+                st.db.batch(&statements).await.unwrap();
+            }
+            assert_eq!(db::s(&st.db.one("SELECT finding FROM ai_finding_history WHERE org_id='o'",&[]).await.unwrap().unwrap(),"finding"),"second");
+            for oid in ["first","second"] { st.db.exec("INSERT INTO folders(id,env_id,path,created_at) VALUES(?,'e','/same',1) ON DUPLICATE KEY UPDATE id=id",&[json!(oid)]).await.unwrap(); }
+            assert_eq!(db::n(&st.db.one("SELECT COUNT(*) AS n FROM folders",&[]).await.unwrap().unwrap(),"n"),1);
+            assert!(claim_lease(&st,"ai-test","first",100,45).await.unwrap());
+            assert!(!claim_lease(&st,"ai-test","second",144,45).await.unwrap());
+            assert!(!claim_lease(&st,"ai-test","first",144,45).await.unwrap());
+            assert!(claim_lease(&st,"ai-test","second",145,45).await.unwrap());
+            assert_eq!(st.db.exec("DELETE FROM instance_leases WHERE name='ai-test' AND owner='first'",&[]).await.unwrap(),0);
+        });
+        let outcome=result.await;
+        conn.query_drop(format!("DROP DATABASE `{}`",name)).await.unwrap();
+        drop(conn); pool.disconnect().await.unwrap();
+        outcome.expect("MySQL AI integration assertions must pass");
+    }
+    #[tokio::test] async fn lease_claim_excludes_active_owners_and_stale_release() {
+        let db=crate::db::Db::open_memory().await.unwrap(); let (live,_)=tokio::sync::broadcast::channel(4);
+        let st=app::new_state(db,"sqlite::memory:".into(),"unit".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+        assert!(claim_lease(&st,"ai-test","first",100,45).await.unwrap());
+        assert!(!claim_lease(&st,"ai-test","second",144,45).await.unwrap());
+        assert!(!claim_lease(&st,"ai-test","first",144,45).await.unwrap());
+        assert!(claim_lease(&st,"ai-test","second",145,45).await.unwrap());
+        assert_eq!(st.db.exec("DELETE FROM instance_leases WHERE name=? AND owner=?",&[json!("ai-test"),json!("first")]).await.unwrap(),0);
+        assert!(!claim_lease(&st,"ai-test","third",146,45).await.unwrap());
+        assert_eq!(st.db.exec("DELETE FROM instance_leases WHERE name=? AND owner=?",&[json!("ai-test"),json!("second")]).await.unwrap(),1);
+        assert!(claim_lease(&st,"ai-test","third",146,45).await.unwrap());
+    }
     #[test] fn typed_operations_reject_authority_and_credentials() {
         for v in [json!({"kind":"sync","env_id":"e"}),json!({"kind":"create_folder","env_id":"e","path":"/x","confirm":true}),json!({"kind":"draft_integration","env_id":"e","provider_kind":"webhook","name":"x","config":{"token":"not-allowed"}})] { assert!(serde_json::from_value::<Operation>(v).is_err()); }
         assert!(serde_json::from_value::<ExecuteReq>(json!({"confirm":true,"operations":[]})).is_err());
