@@ -204,14 +204,14 @@ impl Server {
         self.status(token, org, locked).await;
     }
 
-    async fn oauth(&self, session: &str) -> String {
+    async fn oauth(&self, session: &str, resource: &str) -> String {
         let r = self.call(Method::POST, "/oauth/register", None, Some(json!({"redirect_uris": ["http://127.0.0.1:8917/callback"], "token_endpoint_auth_method": "none", "scope": "secrets:read secrets:write"}))).await;
         assert_eq!(r.status, 201, "OAuth client setup"); let client = field(&r.body, "client_id");
         let verifier = "integration-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
         let form = [("response_type", "code".to_string()), ("client_id", client.clone()),
             ("redirect_uri", "http://127.0.0.1:8917/callback".to_string()), ("scope", "secrets:read secrets:write".to_string()),
             ("state", "emergency".to_string()), ("code_challenge", Base64UrlUnpadded::encode_string(&Sha256::digest(verifier.as_bytes()))),
-            ("code_challenge_method", "S256".to_string()), ("resource", format!("{}/mcp", self.base)), ("approve", "1".to_string())];
+            ("code_challenge_method", "S256".to_string()), ("resource", resource.to_string()), ("approve", "1".to_string())];
         let r = Self::finish(self.client.post(format!("{}/oauth/authorize/decision", self.base)).bearer_auth(session).form(&form).send().await.unwrap()).await;
         let location = r.headers.get("location").expect("OAuth redirect").to_str().unwrap();
         let url = reqwest::Url::parse(location).expect("OAuth redirect URL");
@@ -221,6 +221,8 @@ impl Server {
         let r = Self::finish(self.client.post(format!("{}/oauth/token", self.base)).form(&form).send().await.unwrap()).await;
         assert_eq!(r.status, 200, "OAuth token setup"); field(&r.body, "access_token")
     }
+    async fn oauth_api(&self, session: &str) -> String { self.oauth(session, &self.base).await }
+    async fn oauth_mcp(&self, session: &str) -> String { self.oauth(session, &format!("{}/mcp", self.base)).await }
 
     async fn mcp(&self, token: &str, tool: &str, arguments: Value) -> Resp {
         self.call(Method::POST, "/mcp", Some(token), Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}))).await
@@ -248,7 +250,7 @@ async fn emergency_transitions_require_an_owner_interactive_session() {
     let (app, env) = s.app(&ot, &org).await;
     let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&ot), Some(json!({"name": "owner-service"}))).await;
     assert_eq!(r.status, 200, "service token setup"); let service = field(&r.body, "token");
-    let oauth = s.oauth(&ot).await;
+    let oauth = s.oauth_api(&ot).await;
     for token in [&service, &oauth] {
         assert_eq!(s.call(Method::GET, &format!("/api/envs/{}/secrets", env), Some(token), None).await.status, 200, "automation credentials must be valid before lockdown");
     }
@@ -338,7 +340,7 @@ async fn emergency_blocks_owner_and_token_secret_reads_and_workspace_mutations()
     assert_eq!(r.status, 200); let sid = field(&r.body["secrets"][0], "id");
     let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&ot), Some(json!({"name": "service"}))).await;
     assert_eq!(r.status, 200); let service = field(&r.body, "token");
-    let oauth = s.oauth(&ot).await;
+    let oauth = s.oauth_api(&ot).await; let oauth_mcp = s.oauth_mcp(&ot).await;
     let key = openwarp_crypto::random_key();
     let wrapped = openwarp_crypto::encrypt_to(owner["public_key"].as_str().unwrap(), &key).unwrap();
     let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&ot), Some(json!({"name": "e2e", "wrapped_key": wrapped}))).await;
@@ -347,9 +349,11 @@ async fn emergency_blocks_owner_and_token_secret_reads_and_workspace_mutations()
     assert_eq!(s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", e2e), Some(&ot), Some(ciphertext.clone())).await.status, 200);
     let original_e2e = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", e2e), Some(&ot), None).await;
     assert_eq!(original_e2e.status, 200); assert_eq!(original_e2e.body["wrapped_key"], json!(wrapped));
-    for token in [&ot, &service, &oauth] {
+    for token in [&ot, &service, &oauth_mcp] {
         let r = s.mcp(token, "list_secrets", json!({"env_id": env})).await;
         assert_eq!(r.status, 200); assert!(r.body.to_string().contains(SECRET), "MCP credential setup must really read the secret");
+    }
+    for token in [&ot, &service, &oauth] {
         let r = s.call(Method::GET, &format!("/api/envs/{}/export", env), Some(token), None).await;
         assert_eq!(r.status, 200, "export credential setup");
     }
@@ -368,6 +372,8 @@ async fn emergency_blocks_owner_and_token_secret_reads_and_workspace_mutations()
             denied(&r, &path); assert!(!r.body.to_string().contains(SECRET), "denial must not include plaintext");
         }
         denied(&s.deploy(token, &env, "blocked").await, "secret deploy");
+    }
+    for token in [&ot, &service, &oauth_mcp, &machine] {
         rpc_denied(&s.mcp(token, "list_secrets", json!({"env_id": env})).await);
         rpc_denied(&s.mcp(token, "set_secret", json!({"env_id": env, "key": "PASSWORD", "value": "blocked"})).await);
     }
@@ -464,7 +470,7 @@ async fn project_emergency_layers_persist_and_cookie_metadata_keeps_role_boundar
     assert_eq!(s.deploy(&ot, &sibling_env, "sibling").await.status, 200);
     let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&ot), Some(json!({"name": "project-service"}))).await;
     assert_eq!(r.status, 200); let service = field(&r.body, "token");
-    let oauth = s.oauth(&ot).await; let machine = s.machine(&ot, &org).await;
+    let oauth = s.oauth_api(&ot).await; let oauth_mcp = s.oauth_mcp(&ot).await; let machine = s.machine(&ot, &org).await;
     let metadata = format!("/api/apps/{}/envs", app);
     for token in [&ot, &service, &oauth, &machine] {
         assert_eq!(s.call(Method::GET, &metadata, Some(token), None).await.status, 200, "valid project metadata credential setup");
@@ -494,8 +500,10 @@ async fn project_emergency_layers_persist_and_cookie_metadata_keeps_role_boundar
         denied(&s.call(Method::GET, &metadata, Some(token), None).await, "project bearer metadata read");
         denied(&s.call(Method::GET, &format!("/api/envs/{}/export", env), Some(token), None).await, "project automation export");
         denied(&s.deploy(token, &env, "blocked").await, "project automation write");
-        rpc_denied(&s.mcp(token, "list_secrets", json!({"env_id": env})).await);
         if token != &ot { denied(&s.cookie(Method::GET, &metadata, token, None).await, "project automation disguised as cookie"); }
+    }
+    for token in [&ot, &service, &oauth_mcp, &machine] {
+        rpc_denied(&s.mcp(token, "list_secrets", json!({"env_id": env})).await);
     }
     for token in [&ot, &oauth, &machine] {
         assert_eq!(s.call(Method::GET, &format!("/api/envs/{}/secrets", sibling_env), Some(token), None).await.status, 200, "project lock must not block sibling project automation");

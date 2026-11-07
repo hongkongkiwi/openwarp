@@ -6,7 +6,7 @@ Back up the database, the matching master key, and deployment configuration. Use
 
 | Item | Why it matters |
 | --- | --- |
-| SQLite database or PostgreSQL dump | Accounts, encrypted secrets, wrapped keys, policies, history, and integration state |
+| SQLite database, PostgreSQL dump, or MySQL/MariaDB dump | Accounts, encrypted secrets, wrapped keys, policies, history, and integration state |
 | Original `OPENWARP_MASTER_KEY` | Decrypts server-managed data for that database |
 | User recovery kits | Preserve private keys needed for E2E access |
 | Deployment configuration and secrets | Restore public URLs, database credentials, sign-in providers, mail relay, and network policy |
@@ -59,6 +59,20 @@ docker compose exec -T db sh -c \
 ```
 
 Check the exit status and protect the resulting file. A file's existence is not proof of a complete dump. Avoid `docker compose down -v`: it removes named volumes, including database storage.
+
+## MySQL/MariaDB backup
+
+Use `mariadb-dump` (or `mysqldump` for MySQL) with a user that can read every table:
+
+```bash
+mkdir -p /backups
+chmod 700 /backups
+mariadb-dump --single-transaction --routines \
+  --result-file="/backups/openwarp-$(date +%F).sql" \
+  openwarp
+```
+
+`--single-transaction` keeps InnoDB tables consistent while writes continue. Restore into an empty database with the server stopped, and keep the matching master key alongside the dump.
 
 ## Rehearse a restore
 

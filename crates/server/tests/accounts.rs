@@ -34,6 +34,7 @@ struct Server {
     dir: PathBuf,
     client: Client,
     inbox: Arc<Mutex<Vec<Value>>>,
+    social_cookies: Mutex<Vec<String>>,
 }
 
 impl Drop for Server {
@@ -102,7 +103,7 @@ impl Server {
         }
         let child = cmd.spawn().expect("spawn openwarp-server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().expect("http client");
-        let server = Server { child, base, dir, client, inbox };
+        let server = Server { child, base, dir, client, inbox, social_cookies: Mutex::new(Vec::new()) };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -117,9 +118,14 @@ impl Server {
 
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, self.url(path));
+        if path.starts_with("/api/auth/social/") && path.contains("/callback") {
+            req = req.header("cookie", self.social_cookies.lock().unwrap().join("; ")); }
         if let Some(t) = token { req = req.bearer_auth(t); }
         if let Some(b) = body { req = req.json(&b); }
         let response = req.send().await.expect("http request");
+        if path.starts_with("/api/auth/social/") && path.ends_with("/start") {
+            for cookie in response.headers().get_all("set-cookie").iter().filter_map(|h| h.to_str().ok()).filter_map(|h| h.split(';').next()).filter(|c| c.starts_with("ow_social_")) {
+                self.social_cookies.lock().unwrap().push(cookie.to_string()); } }
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
@@ -130,7 +136,10 @@ impl Server {
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
 
     async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Resp {
-        let response = self.client.post(self.url(path)).form(form).send().await.expect("http form request");
+        let mut req = self.client.post(self.url(path)).form(form);
+        if path.starts_with("/api/auth/social/") && path.contains("/callback") {
+            req = req.header("cookie", self.social_cookies.lock().unwrap().join("; ")); }
+        let response = req.send().await.expect("http form request");
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let text = response.text().await.unwrap_or_default();
