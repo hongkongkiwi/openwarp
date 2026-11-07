@@ -104,7 +104,7 @@ async fn transit_rewrap_requires_encrypt_and_decrypt_scopes_for_service_and_oaut
             if kind == "service" {
                 f.state.db().exec("INSERT INTO tokens(id,org_id,name,token_hash,scopes,created_at,created_by) VALUES(?,'org',?,?,?,?,'owner')", &[json!(&token), json!(&token), json!(oc::hash_token(&token)), json!(scope), json!(now())]).await.unwrap();
             } else {
-                f.state.db().exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,expires_at,created_at) VALUES(?,'local-test','owner',?,?,?)", &[json!(oc::hash_token(&token)), json!(scope), json!(now()+300), json!(now())]).await.unwrap();
+                f.state.db().exec("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,expires_at,created_at,resource) VALUES(?,'local-test','owner',?,?,?,'https://openwarp.test')", &[json!(oc::hash_token(&token)), json!(scope), json!(now()+300), json!(now())]).await.unwrap();
             }
         }
         let decrypt_only = format!("{}-decrypt", kind);
