@@ -101,7 +101,7 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 | --- | --- | --- |
 | `OPENWARP_TRUST_PROXY` | Disabled | `1` enables forwarded client-IP handling from trusted peers |
 | `OPENWARP_TRUSTED_PROXIES` | `127.0.0.1/32,::1` | Comma-separated proxy IPs or CIDRs |
-| `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits private/loopback destinations for the production checks applied to OIDC, audit webhooks, and log streams |
+| `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits trusted private/loopback destinations where egress checks apply; native event webhooks also use it to permit HTTP and private resolved addresses |
 | `OPENWARP_ALLOWED_DB_HOSTS` | Empty | Comma-separated `host[:port]` allowlist for dynamic PostgreSQL leases; empty disables that capability |
 
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.
@@ -112,13 +112,13 @@ Private egress is an intentional exception, not a general recommendation. Do not
 
 Workspace administrators manage these through `GET`/`PUT /api/orgs/{org_id}/settings` rather than process variables:
 
-- IP allowlist and audit forwarding settings.
+- IP allowlist and legacy audit forwarding configuration (legacy dispatch is disabled; use the [webhook endpoints](WEBHOOKS.md) for active subscriptions).
 - OIDC issuer, client ID, encrypted client secret, and redirect URI.
 - OIDC automatic provisioning and allowed-domain policy.
 
 Changing an OIDC issuer without a replacement client secret clears the stored secret. Settings reads do not return the plaintext OIDC secret. Environment restriction and approval requirements have their own policy endpoint.
 
-See [API](API.md) and [console](CONSOLE.md) for the related operations.
+See the [feature reference](FEATURES.md) and [console guide](CONSOLE.md) for the related operations.
 
 ## CLI environment
 
@@ -156,9 +156,9 @@ The backup helper's database default differs from the server's local default. Al
 
 | Limit | Current value |
 | --- | --- |
-| Request body | 8 MiB |
+| Request body | 8 MiB; incoming integration webhooks are limited to 64 KiB |
 | HTTP handler timeout | 300 seconds |
-| Provider request timeout | 30 seconds |
+| Provider request timeout | 30 seconds; event webhook HTTP attempts use 10 seconds plus a 5-second DNS budget, and incoming sync execution has a 90-second overall limit |
 | Password session lifetime | 7 days |
 | Machine token lifetime | 1 hour |
 | Dynamic lease TTL | Default 1 hour, clamped between 60 seconds and 30 days |
@@ -168,4 +168,4 @@ The backup helper's database default differs from the server's local default. Al
 
 These are implementation constraints, not paid tiers. Provider-specific limits also apply.
 
-[Deployment](DEPLOY.md) · [Security](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Deployment](DEPLOY.md) · [Security](SECURITY.md) · [Development checks](DEVELOPMENT.md) · [Documentation index](README.md)

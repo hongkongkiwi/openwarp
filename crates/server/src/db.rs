@@ -2,6 +2,9 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 pub type Row = HashMap<String, Value>;
+#[path = "db_webhooks.rs"]
+mod webhooks;
+pub use webhooks::WebhookTx;
 
 /// Storage backend. Native builds use SQLite or a PostgreSQL pool; the Workers
 /// build uses the synchronous SQLite handle of a Durable Object, which is
@@ -501,6 +504,22 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
         "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
     ]),
+    (17, &[
+        "CREATE TABLE webhook_serialization(id BIGINT PRIMARY KEY,master_hash TEXT NOT NULL DEFAULT '')",
+        "INSERT INTO webhook_serialization(id) VALUES(1)",
+        "CREATE TABLE webhook_subscriptions(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT NOT NULL DEFAULT '',name TEXT NOT NULL,url TEXT NOT NULL,events TEXT NOT NULL,enabled BIGINT NOT NULL DEFAULT 1,secret_enc TEXT NOT NULL,version BIGINT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL,enqueue_failures BIGINT NOT NULL DEFAULT 0,last_enqueue_error_at BIGINT NOT NULL DEFAULT 0)",
+        "CREATE TABLE incoming_webhooks(id TEXT PRIMARY KEY,integration_id TEXT NOT NULL,org_id TEXT NOT NULL,env_id TEXT NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,enabled BIGINT NOT NULL DEFAULT 1,secret_enc TEXT NOT NULL,creator_id TEXT NOT NULL,credential_hash TEXT NOT NULL,source_ip TEXT NOT NULL,version BIGINT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE TABLE webhook_deliveries(id TEXT PRIMARY KEY,webhook_id TEXT NOT NULL,event_id TEXT NOT NULL,payload TEXT NOT NULL,version BIGINT NOT NULL,status TEXT NOT NULL,attempts BIGINT NOT NULL DEFAULT 0,http_status BIGINT NOT NULL DEFAULT 0,duration_ms BIGINT NOT NULL DEFAULT 0,error_code TEXT NOT NULL DEFAULT '',next_attempt_at BIGINT NOT NULL,claim_id TEXT NOT NULL DEFAULT '',lease_until BIGINT NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE TABLE webhook_receipts(id TEXT PRIMARY KEY,webhook_id TEXT NOT NULL,message_id TEXT NOT NULL,body_hash TEXT NOT NULL,version BIGINT NOT NULL,status TEXT NOT NULL,source_ip TEXT NOT NULL,attempts BIGINT NOT NULL DEFAULT 0,http_status BIGINT NOT NULL DEFAULT 0,duration_ms BIGINT NOT NULL DEFAULT 0,error_code TEXT NOT NULL DEFAULT '',next_attempt_at BIGINT NOT NULL,claim_id TEXT NOT NULL DEFAULT '',lease_until BIGINT NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL,UNIQUE(webhook_id,message_id))",
+        "CREATE INDEX idx_webhook_subscriptions_org ON webhook_subscriptions(org_id,enabled)",
+        "CREATE INDEX idx_webhook_incoming_integration ON incoming_webhooks(integration_id)",
+        "CREATE INDEX idx_webhook_deliveries_due ON webhook_deliveries(status,next_attempt_at)",
+        "CREATE INDEX idx_webhook_receipts_due ON webhook_receipts(status,next_attempt_at)",
+        "CREATE INDEX idx_webhook_delivery_history ON webhook_deliveries(webhook_id,created_at)",
+        "CREATE INDEX idx_webhook_receipt_history ON webhook_receipts(webhook_id,created_at)",
+        "CREATE TABLE webhook_attempts(id TEXT PRIMARY KEY,delivery_id TEXT NOT NULL,claim_id TEXT NOT NULL,status TEXT NOT NULL,http_status BIGINT NOT NULL DEFAULT 0,duration_ms BIGINT NOT NULL DEFAULT 0,error_code TEXT NOT NULL DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE INDEX idx_webhook_attempts_delivery ON webhook_attempts(delivery_id,created_at)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -534,9 +553,9 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 16, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 17, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 16, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 17, "each migration must be recorded exactly once");
     }
 }

@@ -28,6 +28,16 @@ func main() {
 
 The base URL is the server root, without `/api`. All methods take `context.Context` as their first argument and return `(result, error)`. A nil `HTTPClient` uses a shared client with a 30-second timeout. Set `HTTPClient` to customize timeout or TLS configuration; HTTPS certificate verification is enabled by default.
 
+## Generic management requests
+
+`API(ctx, method, segments, body, query, stepUp...)` returns `(json.RawMessage, error)`. Segments are relative to `/api` and encoded individually; `query` is `url.Values` and preserves repeated values. For example, `client.API(ctx, "GET", []string{"capabilities"}, nil, nil)` discovers public route templates. Use `[]string{"envs", envID, "integrations"}` to list an environment's integrations, or pass a JSON-compatible body with POST, PUT or PATCH.
+
+Supported methods are GET, POST, PUT, PATCH, DELETE, HEAD and OPTIONS. Empty success responses return nil data. HTTP failures retain status and raw body in `APIError`. Generic requests reject malformed encoding, controls, backslashes, URL-like segments and traversal, including repeatedly encoded traversal. Redirects are disabled using a copy of the configured HTTP client; its original redirect policy is not mutated. Named wrappers retain their existing behavior.
+
+The server applies the same scopes, roles, environment restrictions and workspace membership as direct HTTP requests. Workspace management with OAuth additionally requires `org:admin`; discovery does not grant access. Do not log response bodies containing credentials.
+
+The optional final variadic argument accepts at most one existing verification grant. It sends `X-OpenWarp-Step-Up` for that request only and must contain 1-512 printable ASCII characters. The Bearer credential and the configured HTTP client are unchanged. The SDK does not complete or bypass verification.
+
 Methods, with the context argument omitted here:
 
 - `Me()` returns `map[string]any`.

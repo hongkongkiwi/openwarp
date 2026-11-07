@@ -399,7 +399,7 @@ async fn oauth_read_scope_cannot_write_over_rest() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     let (_, envs) = app_with_envs(&s, token, org).await;
-    let (oat, _) = oauth_token(&s, token, "secrets:read", &format!("{}/mcp", s.base)).await;
+    let (oat, _) = oauth_token(&s, token, "secrets:read", &format!("{}/api", s.base)).await;
 
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&oat), None).await;
     assert_eq!(r.status, 200, "read scope should allow reads: {}", r.text);

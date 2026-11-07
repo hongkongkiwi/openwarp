@@ -2,8 +2,13 @@
 
 import json
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class OpenWarpError(Exception):
@@ -26,15 +31,56 @@ class OpenWarp:
     def _segment(value):
         return quote(str(value), safe="")
 
-    def _request(self, method, path, body=None):
+    def api(self, method, segments, body=None, query=None, step_up=None):
+        """Call an API route with separately encoded path segments and query."""
+        if step_up is not None and (not isinstance(step_up, str) or not step_up
+                or len(step_up) > 512 or any(ord(c) < 32 or ord(c) > 126 for c in step_up)):
+            raise ValueError("invalid step-up grant")
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            raise ValueError("unsupported HTTP method")
+        base = urlsplit(self.base_url)
+        if (base.scheme not in {"http", "https"} or not base.hostname
+                or base.username is not None or base.password is not None
+                or "?" in self.base_url or "#" in self.base_url):
+            raise ValueError("base_url must be an HTTP(S) URL without credentials, query, or fragment")
+        if not isinstance(segments, (list, tuple)) or not segments:
+            raise ValueError("segments must be a non-empty list or tuple")
+        for segment in segments:
+            if not isinstance(segment, str) or not segment:
+                raise ValueError("path segments must be non-empty strings")
+            decoded = segment
+            for _ in range(len(segment) + 1):
+                if (any(part in {".", ".."} for part in decoded.split("/")) or "\\" in decoded
+                        or any(ord(c) < 32 or ord(c) == 127 for c in decoded)
+                        or "://" in decoded or decoded.startswith("//")):
+                    raise ValueError("unsafe path segment")
+                for index, char in enumerate(decoded):
+                    if char == "%" and (index + 2 >= len(decoded)
+                            or any(c not in "0123456789abcdefABCDEF" for c in decoded[index + 1:index + 3])):
+                        raise ValueError("invalid percent escape")
+                following = unquote(decoded, errors="strict")
+                if following == decoded:
+                    break
+                decoded = following
+            else:
+                raise ValueError("invalid path encoding")
+        path = "/api/" + "/".join(self._segment(s) for s in segments)
+        if query:
+            path += "?" + urlencode(query, doseq=True)
+        return self._request(method, path, body, _opener=build_opener(_NoRedirect()), _step_up=step_up)
+
+    def _request(self, method, path, body=None, *, _opener=None, _step_up=None):
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        if _step_up is not None:
+            headers["X-OpenWarp-Step-Up"] = _step_up
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = Request(self.base_url + path, data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            open_request = _opener.open if _opener is not None else urlopen
+            with open_request(request, timeout=self.timeout) as response:
                 status = response.status
                 raw = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:

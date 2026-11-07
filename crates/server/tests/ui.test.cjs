@@ -199,6 +199,20 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-c/secrets': { secrets: [] },
     '/api/envs/env-d/secrets': { secrets: [] },
     '/api/secrets/saved-secret/history': [],
+    '/api/orgs/org-a/webhooks': [{ id: 'hook-1', name: '<script>fixture</script>', url: 'https://receiver.example.invalid/events', app_id: 'app-a', events: ['secret.update'], enabled: true }, { id: 'hook/workspace', name: 'Workspace hook', url: 'https://receiver.example.invalid/workspace', app_id: '', events: ['*'], enabled: false }],
+    '/api/orgs/org-b/webhooks': [],
+    '/api/envs/env-a/integrations': [{ id: 'integration/ #', kind: 'webhook', name: 'Encoded integration' }],
+    '/api/envs/env-a/rotations': [],
+    '/api/envs/env-a/dynamic': [],
+    '/api/integrations/integration%2F%20%23/webhooks': [{ id: 'incoming/ #', name: '<img src=x onerror=bad()>', enabled: true }],
+    '/api/incoming-webhooks/incoming%2F%20%23/receipts?limit=25&offset=0': [{ id: 'receipt/ #', message_id: 'message-encoded', status: 'queued', attempts: 1, body: 'RAW_REQUEST_BODY', response_body: 'RAW_RESPONSE_BODY', headers: { authorization: 'RAW_AUTHORIZATION' } }],
+    'PATCH /api/incoming-webhooks/incoming%2F%20%23': { ok: true },
+    'POST /api/incoming-webhooks/incoming%2F%20%23/reauthorize': { id: 'incoming/ #', enabled: true },
+    'PATCH /api/webhooks/hook-1': { id: 'hook-1', enabled: false },
+    'POST /api/integrations/integration%2F%20%23/webhooks': { id: 'incoming-new', secret: 'whsec_created-incoming', url: 'https://console.invalid/hooks/integrations/incoming-new' },
+    '/api/webhooks/hook-1/deliveries?limit=25&offset=0': [{ id: 'delivery-1', event_id: 'event-1', status: 'dead_lettered', attempts: 5, http_status: 503, duration_ms: 25, updated_at: 1800000000, error_code: 'http_error' }],
+    '/api/integrations/integration-1/webhooks': [{ id: 'incoming-1', name: 'Deployment trigger', enabled: true, url: 'https://console.invalid/hooks/integrations/incoming-1' }],
+    '/api/incoming-webhooks/incoming-1/receipts?limit=25&offset=0': [{ id: 'receipt-1', message_id: 'message-1', status: 'queued', attempts: 0 }],
     '/api/orgs/org-a/ssh/cas': [],
     '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
     '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
@@ -235,6 +249,9 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'POST' && url === '/api/ssh/certs/ssh-cert-1/revoke') body = { revoked: 'ssh-cert-1' };
       else if (options.method === 'POST' && url === '/api/ssh/cas/ca-ssh-1/hosts') body = { id: 'host-2', hostname: call.body.hostname, fingerprint: 'SHA256:newhost' };
       else if (options.method === 'DELETE' && url === '/api/ssh/cas/ca-ssh-1/hosts/host-1') body = { deleted: 'host-1' };
+      else if (options.method === 'POST' && /\/webhooks\/hook-1\/rotate$/.test(url)) body = { id: 'hook-1', secret: 'whsec_fixture-one-time-key' };
+      else if (options.method === 'POST' && url === '/api/webhook-deliveries/delivery-1/retry') body = { ok: true };
+      else if (Object.hasOwn(responses, options.method + ' ' + url)) body = responses[options.method + ' ' + url];
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -289,6 +306,143 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   calls.length = 0;
   return ui;
 }
+
+test('Webhooks navigation lists workspace and app scopes and follows the selected workspace', async () => {
+  const ui = await consoleUI();
+  await ui.click(ui.document.querySelector('[data-nav="webhooks"]'));
+  assert.equal(ui.el('pagetitle').textContent, 'Webhooks');
+  assert.ok(ui.calls.some(c => c.url === '/api/orgs/org-a/webhooks'));
+  const rows = ui.el('view').querySelectorAll('tbody tr');
+  assert.ok(rows.some(r => r.textContent.includes('First app') && r.textContent.includes('Enabled')));
+  assert.ok(rows.some(r => r.textContent.includes('Workspace hook') && r.textContent.includes('Workspace') && r.textContent.includes('Paused')));
+  await ui.click(ui.button(ui.el('view'), /^Create outgoing webhook$/));
+  assert.deepEqual(ui.el('hook-app').querySelectorAll('option').map(o => [o.value, o.textContent]), [['', 'Entire workspace'], ['app-a', 'First app'], ['app-b', 'Second app']]);
+  await ui.invoke("closeModal(); ORG='org-b'; nav('webhooks')");
+  assert.ok(ui.calls.some(c => c.url === '/api/orgs/org-b/webhooks'));
+  assert.match(ui.el('view').textContent, /No outgoing webhooks/);
+  assert.ok(!ui.el('view').textContent.includes('Workspace hook'));
+});
+
+test('outgoing webhook names are escaped and delivery history renders metadata only', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('webhooks')");
+  assert.ok(ui.el('view').textContent.includes('<script>fixture</script>'));
+  assert.equal(ui.el('view').querySelector('script'), null);
+  await ui.click(ui.button(ui.el('view'), /^Deliveries$/));
+  const history = ui.el('hook-history');
+  for (const value of ['event-1', 'dead_lettered', '5', '503', '25 ms', 'http_error']) assert.ok(history.textContent.includes(value), value);
+  assert.ok(ui.button(history, /^Retry delivery$/));
+  assert.match(history.textContent, /deduplicate event IDs/);
+  assert.deepEqual(ui.writes(), []);
+});
+
+test('declining webhook rotation, test and delivery replay makes no network requests', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('webhooks')");
+  await ui.click(ui.button(ui.el('view'), /^Deliveries$/));
+  ui.calls.length = 0;
+  await ui.click(ui.button(ui.el('view'), /^Rotate key$/));
+  await ui.click(ui.button(ui.el('view'), /^Send test$/));
+  await ui.click(ui.button(ui.el('hook-history'), /^Retry delivery$/));
+  assert.equal(ui.confirmations.length, 3);
+  assert.match(ui.confirmations[0], /existing key stops working/);
+  assert.match(ui.confirmations[2], /already have processed/);
+  assert.deepEqual(ui.calls, []);
+});
+
+test('one-time webhook keys are scrubbed by Escape, backdrop and explicit close', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('webhooks')");
+  ui.confirm = true;
+  for (const dismissal of ['Escape', 'backdrop', 'explicit']) {
+    await ui.click(ui.button(ui.el('view'), /^Rotate key$/));
+    const input = ui.el('hook-key');
+    assert.equal(input.value, 'whsec_fixture-one-time-key');
+    assert.equal(input.getAttribute('type'), 'password');
+    if (dismissal === 'Escape') ui.key('Escape');
+    else if (dismissal === 'backdrop') ui.el('modalwrap').dispatchEvent({ type: 'click', target: ui.el('modalwrap') });
+    else await ui.click(ui.button(ui.el('modal'), /^I saved the key$/));
+    assert.equal(input.value, '', dismissal + ' must clear retained input references');
+    assert.equal(ui.document.querySelector('#hook-key'), null);
+    assert.ok(!ui.el('modalwrap').classList.contains('show'));
+    assert.ok(!ui.document.textContent.includes('whsec_fixture-one-time-key'));
+    assert.ok(!ui.document.innerHTML.includes('whsec_fixture-one-time-key'));
+  }
+});
+
+test('integration incoming hooks encode IDs and pause only the selected integration trigger', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('integrations')");
+  await ui.click(ui.button(ui.el('view'), /^Incoming hooks$/));
+  assert.ok(ui.calls.some(c => c.url === '/api/integrations/integration%2F%20%23/webhooks'));
+  assert.ok(ui.el('modal').textContent.includes('<img src=x onerror=bad()>'));
+  assert.equal(ui.el('modal').querySelector('img'), null);
+  await ui.click(ui.button(ui.el('modal'), /^Receipts$/));
+  const receipts = ui.el('incoming-receipts');
+  assert.match(receipts.textContent, /message-encoded/);
+  assert.match(receipts.textContent, /queued/);
+  for (const forbidden of ['RAW_REQUEST_BODY', 'RAW_RESPONSE_BODY', 'RAW_AUTHORIZATION']) assert.ok(!ui.el('modal').innerHTML.includes(forbidden));
+  assert.equal(ui.button(receipts, /^Retry delivery$/), undefined);
+  await ui.click(ui.button(ui.el('modal'), /^Pause$/));
+  assert.deepEqual(ui.writes(), [{ method: 'PATCH', url: '/api/incoming-webhooks/incoming%2F%20%23', body: { enabled: false } }]);
+  assert.equal(ui.calls.at(-1).url, '/api/integrations/integration%2F%20%23/webhooks');
+});
+
+test('incoming webhook creation keeps the integration ID and shows its key only once', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('integrations')");
+  await ui.click(ui.button(ui.el('view'), /^Incoming hooks$/));
+  ui.el('incoming-name').value = '  Deploy selected integration  ';
+  await ui.click(ui.button(ui.el('modal'), /^Create incoming webhook$/));
+  assert.deepEqual(ui.writes(), [{ method: 'POST', url: '/api/integrations/integration%2F%20%23/webhooks', body: { name: 'Deploy selected integration', enabled: true } }]);
+  assert.equal(ui.el('hook-key').value, 'whsec_created-incoming');
+  assert.equal(ui.el('hook-endpoint').value, 'https://console.invalid/hooks/integrations/incoming-new');
+  await ui.click(ui.button(ui.el('modal'), /^I saved the key$/));
+  assert.equal(ui.document.querySelector('#hook-key'), null);
+  assert.ok(!ui.document.innerHTML.includes('whsec_created-incoming'));
+});
+
+test('incoming reauthorization requires consent and reloads only the selected integration without exposing keys', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('integrations')");
+  await ui.click(ui.button(ui.el('view'), /^Incoming hooks$/));
+  ui.calls.length = 0;
+  await ui.click(ui.button(ui.el('modal'), /^Reauthorize$/));
+  assert.deepEqual(ui.calls, [], 'refusing consent must make no API request');
+  assert.equal(ui.confirmations.length, 1);
+  assert.match(ui.confirmations[0], /current credential/);
+  assert.match(ui.confirmations[0], /Pending sync requests are cancelled/);
+  assert.match(ui.confirmations[0], /URL and signing key stay the same/);
+  ui.confirm = true;
+  await ui.click(ui.button(ui.el('modal'), /^Reauthorize$/));
+  assert.deepEqual(ui.calls, [
+    { method: 'POST', url: '/api/incoming-webhooks/incoming%2F%20%23/reauthorize', body: {} },
+    { method: 'GET', url: '/api/integrations/integration%2F%20%23/webhooks', body: undefined },
+  ]);
+  assert.equal(ui.document.querySelector('#hook-key'), null);
+  assert.equal(ui.document.querySelector('#hook-endpoint'), null);
+  assert.ok(!ui.document.innerHTML.includes('whsec_'));
+  assert.ok(!ui.el('modal').innerHTML.includes('https://console.invalid/hooks/'));
+});
+
+test('outgoing webhook edit preserves explicit app scope and sends only editable fields', async () => {
+  const ui = await consoleUI();
+  await ui.invoke("nav('webhooks')");
+  await ui.click(ui.button(ui.el('view'), /^Edit$/));
+  assert.equal(ui.el('hook-app').value, 'app-a');
+  ui.el('hook-name').value = '  Revised subscription  ';
+  ui.el('hook-url').value = '  https://receiver.example.invalid/revised  ';
+  ui.el('hook-events').value = ' secret.deploy, integration.sync, ';
+  ui.el('hook-enabled').checked = false;
+  ui.calls.length = 0;
+  await ui.click(ui.button(ui.el('modal'), /^Save webhook$/));
+  assert.deepEqual(ui.writes(), [{ method: 'PATCH', url: '/api/webhooks/hook-1', body: {
+    name: 'Revised subscription', url: 'https://receiver.example.invalid/revised',
+    app_id: 'app-a', events: ['secret.deploy', 'integration.sync'], enabled: false,
+  } }]);
+  assert.deepEqual(ui.calls.slice(1).map(c => c.url), ['/api/orgs/org-a/webhooks', '/api/orgs/org-a/apps']);
+  assert.equal(ui.document.querySelector('#hook-key'), null);
+});
 
 function assertDraftDeploy(ui) {
   const writes = ui.writes();

@@ -1,0 +1,53 @@
+# Webhooks
+
+Webhooks require the native server. Cloudflare Workers returns 501 for creation, test dispatch, delivery retry and incoming invocation. It does not accept work that has no dispatcher. `GET /api/capabilities` reports the runtime capability and API route catalog.
+
+## Outgoing subscriptions
+
+Workspace administrators create subscriptions at `POST /api/orgs/{oid}/webhooks` with `name`, an HTTPS `url`, `events` (an array of exact audit action names or `*`), optional `app_id`, and `enabled` (boolean). An application must belong to that workspace. Application scope can be updated, subject to the same workspace ownership validation; an update cancels outstanding deliveries. A workspace has at most 100 subscriptions.
+
+List through the same collection URL. Read, patch or delete `/api/webhooks/{wid}`. Rotate the signing key through `POST /api/webhooks/{wid}/rotate`. Creation and rotation return `secret` once as `whsec_` followed by standard base64 encoding of 32 random bytes. Other responses exclude signing material. Keys are encrypted with the instance master key and subscription-specific associated data. Instance master-key rotation rewraps them without changing receiver signing keys. On the native server an asynchronous request barrier excludes API mutations throughout rotation preflight, database commit and in-memory key publication. This barrier is process-local. Drain other replicas before master rotation and restart them with the new master key before restoring traffic; it is not a global guarantee for ordinary environment-key writers. Webhook key writes additionally use the database master-key fingerprint fence.
+
+Management requires workspace administrative permission and an unscoped credential. OAuth and explicitly scoped personal tokens additionally need `org:admin`. OAuth read and write scopes still apply. This scope is advertised for explicit consent; existing default scopes are unchanged.
+
+Events contain only `id`, `type`, `timestamp`, `workspace_id`, `app_id`, `env_id` and `actor_id`. Audit detail and secret values are excluded. Matching subscriptions share a stable event ID. `POST /api/webhooks/{wid}/test` queues a metadata-only test event for an enabled subscription.
+
+Signatures follow the Standard Webhooks framing. The exact persisted request bytes are signed as `webhook-id + "." + webhook-timestamp + "." + body`, using HMAC-SHA256 under the decoded key. Headers are `webhook-id`, `webhook-timestamp` (Unix seconds), and `webhook-signature` (`v1,` followed by base64 HMAC). Receivers should check timestamp freshness and deduplicate event IDs.
+
+Delivery is at least once. Enqueue is not transactional with the original secret write; queue failure is logged with the subscription ID, and does not roll back the local write. Subscription inspection exposes `enqueue_failures` and `last_enqueue_error_at` when the database remains available to record the failure. Receivers must not infer exactly-once processing.
+
+## Incoming integration triggers
+
+Create or list through `/api/integrations/{iid}/webhooks`. Creation accepts a name and enabled flag, and returns the invocation URL and one-time signing secret. Patch or delete `/api/incoming-webhooks/{wid}`; rotate through its `/rotate` endpoint. Management requires the existing integration permission, credential scope and environment access.
+
+Incoming triggers currently require server-encrypted environments. E2E and delegated environments are rejected rather than creating a server plaintext path or a runner job without revocation enforcement.
+
+POST raw bytes to `/hooks/integrations/{wid}` with the same Standard Webhooks headers and framing. The timestamp window is 300 seconds in either direction. Bodies are limited to 64 KiB. Message IDs contain 1-128 ASCII letters, digits, underscores or hyphens. A repeated ID with the same body hash returns `200` with `duplicate: true`; changed bytes return 409. A new accepted receipt returns 202. There are at most 60 new accepted messages per minute per hook. Before subscription lookup or key decryption, a separate source-IP budget permits 180 requests per minute, including invalid signatures. Duplicate checks occur before quota charging.
+
+The body cannot select integrations, destinations, configuration or values. A receipt requests a manual sync of its fixed integration, even when `auto_sync` is false. Receipt storage excludes raw bodies. Creator account, original credential validity, transport scope, role, environment access and workspace source IP policy are checked at admission and execution. Logging out or revoking that credential stops the hook; another login does not resurrect it. An authorized integration manager can POST `/api/incoming-webhooks/{wid}/reauthorize` to bind their current credential and source IP without changing the URL or signing key. Reauthorization cancels outstanding work and is audited. Incoming file-based `ssh` integrations are rejected until their blocking adapter supports cancellation; changing an existing target to `ssh` also prevents invocation and execution. Cloud SSH key-provider APIs are unaffected. Invocation source IP is also rechecked when work executes. Forwarded headers are trusted only under the server's configured trusted-proxy rules.
+
+## History and scheduling
+
+Outgoing history is `GET /api/webhooks/{wid}/deliveries`; incoming history is `GET /api/incoming-webhooks/{wid}/receipts`. Both return arrays, accept `limit` (default 25, maximum 100) and `offset` (maximum 100000), and expose IDs, status, attempts, HTTP status, elapsed milliseconds, update time, next attempt time and safe error codes. They never include response bodies, request headers, provider credentials or raw incoming bodies.
+
+Per-attempt outgoing records are available at `GET /api/webhook-deliveries/{did}/attempts` with the same administrator boundary and pagination. They include HTTP status, duration and safe failure codes, including expired claims, but no response bodies. Attempt records are retained for seven days.
+
+Native polling uses conditional row claims, random claim IDs, 120-second leases and fenced finalization. Expired claims are recoverable. A process handles work serially, up to ten outgoing and ten incoming rows per poll. Failed work retries up to eight attempts with capped exponential delay plus jitter. HTTP 429 and 503 can extend the delay through numeric Retry-After, capped at one hour. Failed and dead-lettered outgoing deliveries can be explicitly retried through `POST /api/webhook-deliveries/{did}/retry`, preserving the event ID and bytes. Retry resets the attempt budget.
+
+Each hook admits at most 1000 outstanding rows. Completed, cancelled and dead-lettered rows are retained for seven days. Pending work is not silently pruned. Duplicate identity is retained with its receipt for that period, not forever.
+
+Disable, update, rotate or delete invalidates outstanding work. An already transmitted request cannot be recalled. A change during an in-flight sync can likewise occur after a provider has received the request.
+
+Every outgoing attempt resolves DNS, rejects prohibited address sets, pins the approved addresses, disables redirects and ignores ambient HTTP proxies. HTTPS is required unless the operator explicitly sets `OPENWARP_ALLOW_PRIVATE_EGRESS=1`. That override permits trusted local testing and broadens the network trust boundary.
+
+Legacy `audit_webhook` settings and log-stream dispatch are disabled, including retry of their old pending records. Existing configuration and history remain readable for migration, but do not send. Replace them with signed subscriptions. This avoids retaining an unsigned, redirect-following forwarding path.
+
+## Management through MCP
+
+`api_routes` returns the same catalog as the authenticated capability endpoint. It lists explicit registered methods, not implicit HEAD/OPTIONS behavior or request schemas; disabled LDAP routes are omitted. `api_request` accepts `method`, a same-origin `/api/` path (including query parameters), optional JSON `body`, and optional `step_up` string. The latter forwards only `X-OpenWarp-Step-Up`. The only permitted `/api/auth/` routes are `/api/auth/step-up/start` and `/api/auth/step-up/verify`; their real identity and grant checks still apply. It invokes the real internal API router with the original credential and peer address. It cannot accept replacement headers, other authentication routes, absolute URLs or traversal segments. HTTP results appear in `structuredContent` and the equivalent text envelope as `{status, body}`; non-success results set `isError`.
+
+An MCP OAuth token remains bound to its MCP audience. The internal dispatch marker is request-local and cannot be supplied as a header; using that token directly against REST remains unauthorized. Browser, step-up and client-crypto requirements still apply to their routes.
+
+## Verification
+
+The frozen HTTP suites were executed before backend edits: management had one pass and two failures, and webhooks had five failures. Subsequent results and remaining coverage are reported with the change; documentation is not evidence of a live provider delivery or a Workers build.

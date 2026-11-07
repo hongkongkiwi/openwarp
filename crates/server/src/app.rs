@@ -6,6 +6,10 @@ use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, middlew
 #[cfg(not(target_arch = "wasm32"))]
 use axum::{extract::{WebSocketUpgrade, ws::{Message, WebSocket}}};
 use db::{Db, Row};
+#[cfg(all(test,feature="redis-cache",not(target_arch="wasm32")))]
+include!("webhook_execution_tests.rs");
+#[cfg(all(test,not(target_arch="wasm32")))]
+include!("master_publication_tests.rs");
 use openwarp_crypto as oc;
 #[cfg(not(target_arch = "wasm32"))]
 use risaml::{
@@ -54,18 +58,18 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 
 pub struct AppState {
     pub(crate) db: Db,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    db_url: String,
     instance_id: String,
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
+    #[cfg(not(target_arch="wasm32"))]
+    key_lifecycle: Arc<tokio::sync::RwLock<()>>,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
-pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
+    Arc::new(AppState { db, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] key_lifecycle: Arc::new(tokio::sync::RwLock::new(())), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// The root KMS is installed once at boot by the native entrypoint. The
 /// Workers build has no blocking HTTP client, so its slot stays empty.
@@ -136,10 +140,6 @@ fn hidden_fields(form: &HashMap<String, String>) -> String {
     ["client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method", "resource"]
         .iter().filter_map(|k| form.get(*k).map(|v| format!("<input type=hidden name=\"{}\" value=\"{}\">", esc(k), esc(v)))).collect() }
 fn bearer_token(h: &HeaderMap) -> String { h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").strip_prefix("Bearer ").unwrap_or("").to_string() }
-#[cfg(not(target_arch = "wasm32"))]
-static DELIVERY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_DELIVERY_THREADS: usize = 16;
 // Managed roles keep their historic breadth; custom roles are exactly their
 // stored permission list, deny by default.
 const DEVELOPER_PERMS: &[&str] = &["secrets:read","secrets:write","secrets:delete","integrations:write","leases:write","rotations:write","proposals:write","tokens:create","access:request"];
@@ -180,16 +180,8 @@ fn def_path() -> String { "/".into() }
 
 impl AppState {
     pub(crate) async fn audit(&self, org: &str, app: &str, env: &str, actor: &str, action: &str, detail: &str) {
-        // log streams (T10): persist delivery then send with retries in a thread
-        if let Ok(streams) = self.db.query("SELECT id,url,secret FROM log_streams WHERE org_id=?", &[json!(org)]).await { for srow in &streams {
-            let did = id(); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}).to_string();
-            let _ = self.db.exec("INSERT INTO log_deliveries(id,stream_id,event,payload,status,created_at) VALUES(?,?,?,?,'pending',?)", &[json!(did), json!(db::s(srow,"id")), json!(action), json!(payload), json!(now())]).await;
-            let raw_secret = db::s(srow,"secret");
-            let secret = if raw_secret.is_empty() { raw_secret } else {
-                oc::decrypt_symmetric(&self.master(), &raw_secret).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or(raw_secret) };
-            self.dispatch_log(db::s(srow,"url"), secret, payload, now(), did);
-        } }
-        if let Ok(Some(wh)) = self.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("audit_webhook:{}", org))]).await { let url = db::s(&wh, "v"); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}); self.dispatch_webhook(url, payload.to_string()); }
+        // Legacy audit forwarding is disabled; only metadata enters the signed queue.
+        webhooks::emit(self, org, app, env, actor, action).await;
         let _ = self.db.exec("INSERT INTO audit(id,org_id,app_id,env_id,actor,action,detail,created_at) VALUES(?,?,?,?,?,?,?,?)", &[json!(id()), json!(org), json!(app), json!(env), json!(actor), json!(action), json!(detail), json!(now())]).await;
         // Names and actions only. Values stay in the encrypted tables, so a
         // replica can forward the event without ever seeing plaintext.
@@ -200,35 +192,6 @@ impl AppState {
             if self.db.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq), json!(org), json!(app), json!(env), json!(action), json!(detail), json!(now())]).await.is_ok() { break; }
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn dispatch_log(&self, url: String, secret: String, payload: String, signed_at: i64, did: String) {
-        if DELIVERY_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) >= MAX_DELIVERY_THREADS {
-            DELIVERY_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst); return; }
-        let db_url = self.db_url.clone();
-        std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5)).build();
-            let mut status = "failed"; let mut attempts = 0;
-            if let Ok(client) = client {
-                for i in 0..3 { attempts = i + 1; let mut req = client.post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({})));
-                    if !secret.is_empty() { let sig = hmac_hex(secret.as_bytes(), format!("{}.{}", signed_at, payload).as_bytes()); req = req.header("X-OpenWarp-Timestamp", signed_at.to_string()).header("X-OpenWarp-Signature", format!("t={},v1={}", signed_at, sig)); }
-                    if let Ok(r) = req.send() { if r.status().is_success() { status = "delivered"; break; } } std::thread::sleep(std::time::Duration::from_millis(200)); } }
-            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                if let Ok(db2) = runtime.block_on(Db::open(&db_url)) {
-                    let _ = runtime.block_on(db2.exec("UPDATE log_deliveries SET status=?,attempts=? WHERE id=?", &[json!(status), json!(attempts), json!(&did)]));
-                }
-            }
-            DELIVERY_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst); });
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn dispatch_webhook(&self, url: String, payload: String) {
-        std::thread::spawn(move || { if let Ok(c) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5)).build() { let _ = c.post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({}))).send(); } });
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn dispatch_log(&self, url: String, secret: String, payload: String, signed_at: i64, did: String) {
-        push_job(Job::Log { url, secret, payload, signed_at, delivery_id: did });
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn dispatch_webhook(&self, url: String, payload: String) { push_job(Job::Webhook { url, payload }); }
 
     pub fn db(&self) -> &Db { &self.db }
     pub fn instance_id(&self) -> &str { &self.instance_id }
@@ -264,11 +227,18 @@ impl AppState {
         let mut token = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
         // The browser console keeps its session in the HttpOnly cookie, so an
         // injected script cannot read it. API clients keep using Bearer tokens.
-        if token.is_empty() { token = cookie_val(headers, "ow_session"); }
+        let session_only = token.is_empty();
+        if session_only { token = cookie_val(headers, "ow_session"); }
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
         let hash = oc::hash_token(&token);
         #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
         if self.cache_revoked(&hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
+        if session_only {
+            let row = self.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "cookie requires an account session"))?;
+            let uid = db::s(&row, "user_id");
+            if db::n(&row, "created_at") + 7 * 86400 < now() || !self.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "session expired or inactive")); }
+            return Ok(uid);
+        }
         // OAuth 2.1 access tokens (CLI / MCP clients)
         if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await.map_err(|e| bad(&e))? {
             let uid = db::s(&row, "user_id");
@@ -1235,16 +1205,18 @@ async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<S
     let mut errors = Vec::new();
     if let Ok(rows) = st.db.query("SELECT id FROM integrations WHERE env_id=?", &[json!(eid)]).await {
         for r in &rows { let iid = db::s(r, "id");
-            if let Err((_, Json(v))) = sync_one_inner(st, &iid, uid, enforce, false).await {
+            if let Err((_, Json(v))) = sync_one_inner(st, &iid, uid, enforce, false, false).await {
                 let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("integration sync failed").to_string();
                 if let Ok((org, app)) = st.env_org_app(eid).await { st.audit(&org, &app, eid, uid, "integration.sync_failed", &format!("{}: {}", iid, msg)).await; }
                 errors.push(format!("{}: {}", iid, msg)); } }
     }
     errors
 }
-async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true).await }
-async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: bool) -> Result<String, (StatusCode, Json<Value>)> {
+async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true, false).await }
+async fn sync_one_for_webhook(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true, true).await }
+async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: bool, webhook: bool) -> Result<String, (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
+    if webhook && db::s(&row,"kind")=="ssh" { return Err(err(StatusCode::CONFLICT,"incoming SSH sync requires a cancellation-aware adapter")); }
     let eid = db::s(&row, "env_id");
     let (org, app) = if enforce { st.require_env(&eid, uid).await? } else { st.env_org_app(&eid).await? };
     if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
@@ -2914,6 +2886,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
     let new_key = body.get("new_key").and_then(|v| v.as_str()).unwrap_or("");
     let new: [u8; 32] = oc::unb64(new_key).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    let rotation_permit = st.key_lifecycle.clone().write_owned().await;
     let old = st.master();
     if old == new { return Err(bad("new_key is the current key")); }
     // Preflight every encrypted value before touching the database.
@@ -2967,25 +2940,33 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     }
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
 
-    // Block new encryptions with the old key while the database is updated.
-    // The write guard lives inside a blocking task so it never crosses an
-    // await point in this handler's future.
+    // Database fencing serializes key writes; publish only after commit without
+    // holding the standard master lock while database drivers need the runtime.
     let counts = (env_updates.len(), meta_updates.len(), ca_updates.len(), stream_updates.len(), saml_updates.len(), hook_updates.len());
-    let st2 = st.clone();
+    let st2 = st.clone(); let handle=tokio::runtime::Handle::current();
     let updates = tokio::task::spawn_blocking(move || {
-        let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| bad(&e.to_string()))?;
-        let result = runtime.block_on(async {
-            for (id, wrapped) in &env_updates { st2.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(wrapped), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (k, value) in &meta_updates { st2.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(k)]).await.map_err(|e| bad(&e))?; }
-            for (id, key_enc) in &ca_updates { st2.db.exec("UPDATE pki_cas SET key_enc=? WHERE id=?", &[json!(key_enc), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (id, secret) in &stream_updates { st2.db.exec("UPDATE log_streams SET secret=? WHERE id=?", &[json!(secret), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (org, key_enc) in &saml_updates { st2.db.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?", &[json!(key_enc), json!(org)]).await.map_err(|e| bad(&e))?; }
-            for (org, secret) in &hook_updates { st2.db.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?", &[json!(secret), json!(org)]).await.map_err(|e| bad(&e))?; }
-            if generated_master { st2.db.exec("UPDATE meta SET v=? WHERE k='master'", &[json!(oc::b64(&new))]).await.map_err(|e| bad(&e))?; }
-            Ok::<(), (StatusCode, Json<Value>)>(())
-        });
-        if result.is_ok() { *guard = new; }
+        let _rotation_permit = rotation_permit;
+        if st2.master() != old {return Err(err(StatusCode::CONFLICT,"master key changed during preflight; retry"));}
+        let result = handle.block_on(st2.db.webhook_atomic(move |tx| {
+            webhooks::master_fence(tx,&old)?;
+            for table in ["webhook_subscriptions","incoming_webhooks"] {
+                for row in tx.query(&format!("SELECT id,secret_enc FROM {}",table),&[])? {
+                    let wid=db::s(&row,"id"); let aad=format!("webhook:{}",wid);
+                    let plain=oc::decrypt_symmetric_aad(&old,aad.as_bytes(),&db::s(&row,"secret_enc")).map_err(|_|"webhook key cannot be decrypted; refusing master rotation")?;
+                    tx.exec(&format!("UPDATE {} SET secret_enc=? WHERE id=?",table),&[json!(oc::encrypt_symmetric_aad(&new,aad.as_bytes(),&plain)),json!(wid)])?;
+                }
+            }
+            for (id,wrapped) in &env_updates {tx.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?",&[json!(wrapped),json!(id)])?;}
+            for (k,value) in &meta_updates {tx.exec("UPDATE meta SET v=? WHERE k=?",&[json!(value),json!(k)])?;}
+            for (id,key_enc) in &ca_updates {tx.exec("UPDATE pki_cas SET key_enc=? WHERE id=?",&[json!(key_enc),json!(id)])?;}
+            for (id,secret) in &stream_updates {tx.exec("UPDATE log_streams SET secret=? WHERE id=?",&[json!(secret),json!(id)])?;}
+            for (org,key_enc) in &saml_updates {tx.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?",&[json!(key_enc),json!(org)])?;}
+            for (org,secret) in &hook_updates {tx.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?",&[json!(secret),json!(org)])?;}
+            if generated_master {tx.exec("UPDATE meta SET v=? WHERE k='master'",&[json!(oc::b64(&new))])?;}
+            tx.exec("UPDATE webhook_serialization SET master_hash=? WHERE id=1",&[json!(oc::hash_token(&oc::b64(&new)))])?;
+            Ok(())
+        })).map_err(|e|err(StatusCode::CONFLICT,&e));
+        if result.is_ok() { *st2.master.write().unwrap_or_else(|e| e.into_inner()) = new; }
         result
     }).await.map_err(|e| bad(&e.to_string()))?;
     updates?;
@@ -3467,6 +3448,10 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
 
     let seg = |prefix: &str| path.strip_prefix(prefix).and_then(|r| r.split('/').next()).filter(|s| !s.is_empty()).map(|s| s.to_string());
     if let Some(oid) = seg("/api/orgs/") { return Some(oid); }
+    for (prefix, table) in [("/api/webhooks/", "webhook_subscriptions"), ("/api/incoming-webhooks/", "incoming_webhooks")] {
+        if let Some(wid) = seg(prefix) { return st.db.one(&format!("SELECT org_id FROM {} WHERE id=?", table), &[json!(wid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
+    }
+    if let Some(did) = seg("/api/webhook-deliveries/") { return st.db.one("SELECT s.org_id AS org_id FROM webhook_deliveries d JOIN webhook_subscriptions s ON s.id=d.webhook_id WHERE d.id=?", &[json!(did)]).await.ok().flatten().map(|r| db::s(&r,"org_id")); }
     if let Some(aid) = seg("/api/apps/") { return st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
     if let Some(eid) = seg("/api/envs/") { return st.env_org_app(&eid).await.ok().map(|(o, _)| o); }
     for (prefix, table) in [("/api/secrets/", "secrets"), ("/api/leases/", "leases"), ("/api/integrations/", "integrations"), ("/api/rotations/", "rotation_schedules")] {
@@ -3490,8 +3475,22 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
     }
     if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "org_id").map(|(_, v)| v.to_string()); }
     None }
+fn canonical_policy_path(path: &str) -> Result<String, ()> {
+    let mut out=Vec::new();
+    for component in path.split('/') { let mut bytes=Vec::new(); let raw=component.as_bytes(); let mut i=0;
+        while i<raw.len() { if raw[i]==b'%' { if i+2>=raw.len() {return Err(());} let part=std::str::from_utf8(&raw[i+1..i+3]).map_err(|_|())?; bytes.push(u8::from_str_radix(part,16).map_err(|_|())?); i+=3; } else {bytes.push(raw[i]);i+=1;} }
+        if bytes==b"." || bytes==b".." || bytes.iter().any(|b|matches!(b,b'/'|b'\\'|b'%'|0..=31|127)) {return Err(());} out.push(String::from_utf8(bytes).map_err(|_|())?);
+    } Ok(out.join("/"))
+}
+fn administrative_transport(path: &str, method: &axum::http::Method) -> bool {
+    if path.starts_with("/api/webhooks/") || path.starts_with("/api/webhook-deliveries/") || path.ends_with("/webhooks") && path.starts_with("/api/orgs/") { return true; }
+    if !path.starts_with("/api/orgs/") {return false;}
+    let tail=path.split('/').skip(4).collect::<Vec<_>>().join("/");
+    if matches!(*method,axum::http::Method::GET|axum::http::Method::HEAD|axum::http::Method::OPTIONS) { return tail=="settings" || tail=="saml" || tail=="ldap" || tail=="rotation-hook" || tail=="members" || tail.starts_with("members/"); }
+    !matches!(tail.as_str(),"apps"|"leave")
+}
 async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
-    let path = req.uri().path().to_string();
+    let path = match canonical_policy_path(req.uri().path()) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
     let protected = path.starts_with("/api/") || path == "/mcp" || path.starts_with("/scim/");
     if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
     let headers = req.headers().clone(); let uid = match st.token_user(&headers).await { Ok(u) => u, Err(_) => return next.run(req).await };
@@ -3517,12 +3516,17 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
 // OAuth access tokens carry explicit scopes; REST reads need secrets:read and
 // mutations need secrets:write. Sessions, PATs and machine tokens are unchanged.
 async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
-    let path = req.uri().path().to_string();
+    let path = match canonical_policy_path(req.uri().path()) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
     // SCIM is governed too: an environment-scoped credential must not be able to
     // deprovision users just because the route lives outside /api.
     if !(path.starts_with("/api/") || path.starts_with("/scim/")) || path == "/api/auth/logout" { return next.run(req).await; }
     let token = bearer_token(req.headers());
     if token.is_empty() { return next.run(req).await; }
+    if let Some((_, _, audience)) = oauth_access(&st, req.headers()).await {
+        if administrative_transport(&path, req.method()) && webhooks::transport_admin(&st, req.headers()).await.is_err() { return err(StatusCode::FORBIDDEN, "org:admin transport scope required").into_response(); }
+        let expected = format!("{}/{}", issuer(&st, req.headers()), if req.extensions().get::<McpDispatch>().is_some() { "mcp" } else { "api" });
+        if audience != expected { return err(StatusCode::UNAUTHORIZED, "token audience does not match endpoint").into_response(); }
+    }
     let hash = oc::hash_token(&token);
     if let Ok(Some(row)) = st.db.one("SELECT scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await {
         let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
@@ -3531,6 +3535,7 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
         if !scope.split_whitespace().any(|s| s == "*" || s == need) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("OAuth token lacks scope {}", need)}))).into_response(); }
     } else if let Ok(Some(row)) = st.db.one("SELECT scopes FROM tokens WHERE token_hash=?", &[json!(&hash)]).await {
         let scope = db::s(&row, "scopes");
+        if !scope.is_empty() && administrative_transport(&path, req.method()) && !scope.split_whitespace().any(|s| s == "*" || s == "org:admin") { return err(StatusCode::FORBIDDEN, "org:admin transport scope required").into_response(); }
         if !scope.is_empty() {
             let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
             let need = if read { "secrets:read" } else { "secrets:write" };
@@ -3541,7 +3546,8 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     if !scoped.is_empty() && !scope_path_ok(&st, &scoped, &path).await { return (StatusCode::FORBIDDEN, Json(json!({"error": "this token is scoped to a different environment"}))).into_response(); }
     next.run(req).await }
 async fn scope_path_ok(st: &S, scope: &str, path: &str) -> bool {
-    if path == "/api/me" || path == "/api/auth/logout" { return true; }
+    if path == "/api/me" || path == "/api/auth/logout" || path == "/api/capabilities" { return true; }
+    if let Some(rest) = path.strip_prefix("/api/incoming-webhooks/") { return st.db.one("SELECT env_id FROM incoming_webhooks WHERE id=?", &[json!(rest.split('/').next().unwrap_or(""))]).await.ok().flatten().map(|r| db::s(&r,"env_id") == scope).unwrap_or(false); }
     if let Some(rest) = path.strip_prefix("/api/envs/") {
         let (eid, tail) = rest.split_once('/').unwrap_or((rest, ""));
         return eid == scope && !tail.is_empty();
@@ -3698,19 +3704,12 @@ pub async fn try_leader(st: &S, name: &str, owner: &str, ttl: i64) -> bool {
     st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?)", &[json!(name), json!(owner), json!(expires)]).await.is_ok() }
 pub async fn process_maintenance(st: &S) {
     process_rotations(st).await;
-    retry_stale_deliveries(st).await;
+    // Existing log-stream records remain inspectable but are never dispatched.
     reap_expired_leases(st).await;
 }
 
-async fn retry_stale_deliveries(st: &S) {
-    let cutoff = now() - 120;
-    let Ok(rows) = st.db.query("SELECT d.id AS did, d.payload AS payload, s.url AS url, s.secret AS secret FROM log_deliveries d JOIN log_streams s ON s.id=d.stream_id WHERE d.status='pending' AND d.created_at<? LIMIT 20", &[json!(cutoff)]).await else { return };
-    for row in &rows {
-        let raw = db::s(row, "secret");
-        let secret = if raw.is_empty() { raw } else { oc::decrypt_symmetric(&st.master(), &raw).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or(raw) };
-        st.dispatch_log(db::s(row, "url"), secret, db::s(row, "payload"), now(), db::s(row, "did"));
-    }
-}
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn process_webhooks(st: &S) { webhooks::process(st).await; }
 
 async fn reap_expired_leases(st: &S) {
     let Ok(rows) = st.db.query("SELECT id, env_id, username, config_enc FROM leases WHERE revoked=0 AND expires_at<?", &[json!(now())]).await else { return };
@@ -3830,9 +3829,9 @@ pub async fn oauth_access(st: &S, h: &HeaderMap) -> Option<(String, String, Stri
     if tok.is_empty() { return None; }
     st.db.one("SELECT user_id,scope,resource FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(oc::hash_token(tok)), json!(now())]).await.ok().flatten().map(|r| (db::s(&r,"user_id"), db::s(&r,"scope"), db::s(&r,"resource"))) }
 async fn prm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
-    Json(json!({"resource": format!("{}/mcp", iss), "authorization_servers": [iss], "scopes_supported": ["secrets:read","secrets:write","mcp"], "bearer_methods_supported": ["header"]})) }
+    Json(json!({"resource": format!("{}/mcp", iss), "authorization_servers": [iss], "scopes_supported": ["secrets:read","secrets:write","mcp","org:admin"], "bearer_methods_supported": ["header"]})) }
 async fn asm(State(st): State<S>, h: HeaderMap) -> impl IntoResponse { let iss = issuer(&st, &h);
-    Json(json!({"issuer": iss, "authorization_endpoint": format!("{}/oauth/authorize", iss), "token_endpoint": format!("{}/oauth/token", iss), "registration_endpoint": format!("{}/oauth/register", iss), "revocation_endpoint": format!("{}/oauth/revoke", iss), "response_types_supported": ["code"], "grant_types_supported": ["authorization_code","refresh_token"], "code_challenge_methods_supported": ["S256"], "token_endpoint_auth_methods_supported": ["client_secret_post","none"], "scopes_supported": ["secrets:read","secrets:write","mcp"], "revocation_endpoint_auth_methods_supported": ["client_secret_post","none"]})) }
+    Json(json!({"issuer": iss, "authorization_endpoint": format!("{}/oauth/authorize", iss), "token_endpoint": format!("{}/oauth/token", iss), "registration_endpoint": format!("{}/oauth/register", iss), "revocation_endpoint": format!("{}/oauth/revoke", iss), "response_types_supported": ["code"], "grant_types_supported": ["authorization_code","refresh_token"], "code_challenge_methods_supported": ["S256"], "token_endpoint_auth_methods_supported": ["client_secret_post","none"], "scopes_supported": ["secrets:read","secrets:write","mcp","org:admin"], "revocation_endpoint_auth_methods_supported": ["client_secret_post","none"]})) }
 async fn oauth_register(State(st): State<S>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let redirects = body.get("redirect_uris").cloned().unwrap_or(json!([]));
     if !redirects.as_array().map(|a| !a.is_empty()).unwrap_or(false) { return (StatusCode::BAD_REQUEST, Json(json!({"error":"redirect_uris required"}))); }
@@ -3842,7 +3841,7 @@ async fn oauth_register(State(st): State<S>, Json(body): Json<Value>) -> (Status
     match st.db.exec("INSERT INTO oauth_clients(client_id,client_secret_hash,name,redirect_uris,scopes,created_at) VALUES(?,?,?,?,?,?)", &[json!(client_id), json!(if secret.is_empty(){String::new()}else{oc::hash_token(&secret)}), json!(body.get("client_name").and_then(|v| v.as_str()).unwrap_or("client")), json!(redirects.to_string()), json!(scope), json!(now())]).await {
         Ok(_) => { let mut out = json!({"client_id": client_id, "redirect_uris": redirects, "scope": scope, "token_endpoint_auth_method": auth_method}); if !secret.is_empty() { out["client_secret"] = json!(secret); } (StatusCode::CREATED, Json(out)) }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))) } }
-const KNOWN_SCOPES: &[&str] = &["secrets:read", "secrets:write", "mcp"];
+const KNOWN_SCOPES: &[&str] = &["secrets:read", "secrets:write", "mcp", "org:admin"];
 async fn authorize_params_ok(st: &S, q: &HashMap<String, String>) -> Result<(String, String, String), String> {
     let client_id = q.get("client_id").cloned().unwrap_or_default(); let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
     let client = st.db.one("SELECT redirect_uris,scopes FROM oauth_clients WHERE client_id=?", &[json!(client_id)]).await.ok().flatten().ok_or("unknown client_id")?;
@@ -3985,6 +3984,8 @@ async fn oauth_revoke(State(st): State<S>, axum::extract::Form(form): axum::extr
 
 // ---------- MCP server (Streamable HTTP, OAuth protected) ----------
 fn mcp_tools() -> Value { json!([
+ {"name":"api_routes","description":"Discover API routes and methods","inputSchema":{"type":"object","additionalProperties":false}},
+ {"name":"api_request","description":"Call a same-origin API route with the original credential and policy checks","inputSchema":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"body":{},"step_up":{"type":"string"}},"required":["method","path"],"additionalProperties":false}},
  {"name":"list_envs","description":"List environments the caller can access","inputSchema":{"type":"object","properties":{"app_id":{"type":"string"}}}},
  {"name":"list_secrets","description":"List secrets (names and values) in an environment","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"}},"required":["env_id"]}},
  {"name":"get_secret","description":"Get one secret value by key","inputSchema":{"type":"object","properties":{"env_id":{"type":"string"},"key":{"type":"string"}},"required":["env_id","key"]}},
@@ -4007,7 +4008,7 @@ async fn mcp_auth(st: &S, h: &HeaderMap) -> Result<(String, String), (StatusCode
         return Ok((uid, scope)); }
     if let Ok(uid) = st.token_user(h).await { return Ok((uid, "secrets:read secrets:write".into())); }
     Err((StatusCode::UNAUTHORIZED, hdr, Json(json!({"error":"unauthorized; OAuth access token required, see /.well-known/oauth-protected-resource"})))) }
-async fn mcp_post(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+async fn mcp_post(State(st): State<S>, peer: PeerAddr, h: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
     let (uid, scope) = match mcp_auth(&st, &h).await { Ok(x) => x, Err(e) => return e.into_response() };
     let id = body.get("id").cloned().unwrap_or(Value::Null); let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = body.get("params").cloned().unwrap_or(json!({}));
@@ -4021,6 +4022,8 @@ async fn mcp_post(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) ->
         "prompts/list" => Ok(json!({"prompts": []})),
         "resources/list" => mcp_resources(&st, &uid, &h).await,
         "resources/read" => mcp_resource_read(&st, &uid, &h, &params).await,
+        "tools/call" if params["name"] == "api_request" => api_request(&st, &h, peer, &params["arguments"]).await,
+        "tools/call" if params["name"] == "api_routes" => Ok(management_result(route_catalog(), false)),
         "tools/call" => mcp_call(&st, &uid, &h, &params).await,
         _ => Err(format!("method not found: {}", method)),
     };
@@ -4195,6 +4198,23 @@ async fn peer_middleware(mut req: axum::extract::Request, next: Next) -> Respons
     next.run(req).await }
 #[cfg(target_arch = "wasm32")]
 async fn peer_middleware(req: axum::extract::Request, next: Next) -> Response { next.run(req).await }
+async fn key_lifecycle_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    #[cfg(not(target_arch="wasm32"))] {
+        let path=match canonical_policy_path(req.uri().path()) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
+        let mutation=!matches!(*req.method(),axum::http::Method::GET|axum::http::Method::HEAD|axum::http::Method::OPTIONS);
+        if path.starts_with("/api/") && mutation {
+            if path=="/api/instance/rotate-master" {
+                let uid=match st.token_user(req.headers()).await {Ok(v)=>v,Err(e)=>return e.into_response()};
+                if instance_owner(&st).await.as_deref()!=Some(uid.as_str()) {return err(StatusCode::FORBIDDEN,"only the instance owner can rotate the master key").into_response();}
+                return next.run(req).await;
+            }
+            let _permit=st.key_lifecycle.read().await;
+            return next.run(req).await;
+        }
+    }
+    #[cfg(target_arch="wasm32")] let _=st;
+    next.run(req).await
+}
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
@@ -4242,8 +4262,64 @@ async fn metrics(State(st): State<S>, h: HeaderMap) -> Response {
 
 
 
+#[derive(Clone)]
+struct McpDispatch;
+fn management_result(value: Value, failed: bool) -> Value { json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":failed}) }
+fn route_catalog() -> Value {
+    let mut routes = Vec::new();
+    for source in [include_str!("app.rs"), include_str!("webhooks.rs")] {
+        for segment in source.split(".route(\"").skip(1) {
+            let Some((path, handler)) = segment.split_once('\"') else { continue };
+            if !path.starts_with("/api/") { continue; }
+            if !cfg!(feature="ldap") && (path=="/api/auth/ldap" || path.ends_with("/ldap")) {continue;}
+            let handler = handler.split(".route(").next().unwrap_or(handler).split(';').next().unwrap_or(handler);
+            for (name, method) in [("get(","GET"),("post(","POST"),("put(","PUT"),("patch(","PATCH"),("delete(","DELETE")] {
+                if handler.contains(name) { routes.push(json!({"method":method,"path":path})); }
+            }
+        }
+    }
+    routes.sort_by_key(Value::to_string); routes.dedup();
+    json!({"routes":routes,"webhooks":{"dispatch":if cfg!(target_arch="wasm32") { "unsupported" } else { "native" }}})
+}
+async fn api_capabilities(State(st): State<S>, h: HeaderMap) -> Res { st.token_user(&h).await?; Ok(j(route_catalog())) }
+async fn api_request(st: &S, h: &HeaderMap, peer: PeerAddr, args: &Value) -> Result<Value, String> {
+    use tower::ServiceExt;
+    let a = args.as_object().ok_or("arguments must be an object")?;
+    if a.keys().any(|k| !["method","path","body","step_up"].contains(&k.as_str())) { return Err("unsupported request argument".into()); }
+    let method = args["method"].as_str().ok_or("method required")?;
+    if !["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"].contains(&method) { return Err("unsupported method".into()); }
+    let path = args["path"].as_str().ok_or("path required")?;
+    if !path.starts_with("/api/") || (path.starts_with("/api/auth/") && !["/api/auth/step-up/start","/api/auth/step-up/verify"].contains(&path)) || path.len()>4096 || path.bytes().any(|b| b<=32 || b>=127 || b==b'\\' || b==b'#') { return Err("invalid API path".into()); }
+    let route_path = path.split('?').next().unwrap_or(path);
+    for component in route_path.split('/') {
+        let bytes = component.as_bytes(); let mut decoded = Vec::new(); let mut i=0;
+        while i<bytes.len() { if bytes[i]==b'%' { if i+2>=bytes.len() { return Err("invalid escape".into()); } let n=u8::from_str_radix(&component[i+1..i+3],16).map_err(|_| "invalid escape")?; decoded.push(n); i+=3; } else { decoded.push(bytes[i]); i+=1; } }
+        if decoded==b"." || decoded==b".." || decoded.iter().any(|b| matches!(b,b'/'|b'\\'|b'%'|0..=31|127)) { return Err("invalid API segment".into()); }
+    }
+    let payload = args.get("body").map(Value::to_string).unwrap_or_default();
+    if payload.len()>8*1024*1024 { return Err("body too large".into()); }
+    let mut req = axum::http::Request::builder().method(method).uri(path).body(axum::body::Body::from(payload)).map_err(|e|e.to_string())?;
+    *req.headers_mut()=h.clone(); req.headers_mut().remove("content-length"); req.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+    if let Some(grant)=args.get("step_up") { let grant=grant.as_str().ok_or("step_up must be a string")?; if grant.len()>1024 {return Err("step_up too long".into());} req.headers_mut().insert("x-openwarp-step-up",grant.parse().map_err(|_|"invalid step_up")?); }
+    req.extensions_mut().insert(peer); req.extensions_mut().insert(McpDispatch);
+    let response = api_router(st.clone()).oneshot(req).await.map_err(|e|e.to_string())?;
+    let status=response.status(); let bytes=axum::body::to_bytes(response.into_body(),8*1024*1024).await.map_err(|e|e.to_string())?;
+    let body=serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_|json!(String::from_utf8_lossy(&bytes)));
+    Ok(management_result(json!({"status":status.as_u16(),"body":body}), !status.is_success()))
+}
+#[path = "webhooks.rs"]
+mod webhooks;
+
 pub fn router(state: S) -> Router {
+    let mcp = Router::new().route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
+        .layer(axum::middleware::from_fn(peer_middleware)).with_state(state.clone());
+    api_router(state).merge(mcp)
+}
+fn api_router(state: S) -> Router {
     let app = Router::new()
+        .route("/api/capabilities", get(api_capabilities))
+        .merge(webhooks::routes())
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
@@ -4254,7 +4330,7 @@ pub fn router(state: S) -> Router {
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
-        .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
+        .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
@@ -4287,6 +4363,7 @@ pub fn router(state: S) -> Router {
         .route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host))
         .route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert));
     let app = app
+        .layer(axum::middleware::from_fn_with_state(state.clone(), key_lifecycle_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))

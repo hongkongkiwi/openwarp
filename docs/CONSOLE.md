@@ -9,6 +9,7 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Apps | Create applications, select environments, manage secrets |
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
+| Webhooks | Configure workspace or app event subscriptions and inspect delivery metadata |
 | Audit log | Inspect workspace activity |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
@@ -61,7 +62,7 @@ Standard environment reads can resolve references such as `${KEY}` and `${/path/
 
 Import accepts dotenv text. Review both the destination and any keys that already exist before applying it. Export produces plaintext, which needs the same protection as the original credentials.
 
-Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [API reference](API.md) for the implementation surface when a task is not available in the console.
+Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [feature reference](FEATURES.md) for the implementation surface when a task is not available in the console.
 
 ## Members and automation access
 
@@ -78,6 +79,16 @@ Select the source environment and destination before creating an integration. Sy
 Only supported providers understand dry-run and mirror options. Mirror can delete previously managed remote names. Review the [integration guide](INTEGRATIONS.md) before using it.
 
 Lockbox provides a one-time sharing flow. The complete link is sensitive, including its fragment. Share it only with the intended recipient and avoid preview services that might consume it.
+
+## Webhooks
+
+The Webhooks area manages signed outgoing event subscriptions for the selected workspace. Choose the entire workspace or one application, select event types, and set an HTTPS destination. Workspace administration is required. Creating or rotating a signing key displays it once; closing the dialog removes it from the page. Store it in the receiver's secret configuration.
+
+Delivery history shows status, attempt count, HTTP status, timing and safe failure codes. Attempts opens the recorded delivery metadata. Retrying a failed delivery can repeat an event the receiver already processed, so the console asks for confirmation. Enqueue failures appear beside the subscription when the server could record them.
+
+Incoming hooks belong to an existing integration. Select its app and environment, open Integrations, then choose Incoming hooks. Create, pause, rotate or delete a trigger there and inspect its receipts. Reauthorize explicitly binds a trigger to your current authorized credential while preserving its URL and signing key; pending sync requests are cancelled. Expired or revoked creator credentials do not renew automatically. The body cannot supply a destination or credentials. Current incoming dispatch requires a server-encrypted environment; delegated and E2E environments are rejected. The file-based `ssh` integration is also rejected until its blocking execution supports cancellation; cloud SSH-key API integrations are distinct. Webhook dispatch requires the native runtime.
+
+Legacy audit log streams no longer send. Their old delivery history remains readable under Audit log. Configure replacement subscriptions under Webhooks. See the [webhook reference](WEBHOOKS.md) for signing, retries, authorization and runtime limits.
 
 ## End-to-end environments
 
@@ -97,4 +108,4 @@ Register hosts here too: a host certificate is only issued for a hostname and pu
 
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 
-[Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Development checks](DEVELOPMENT.md) · [Documentation index](README.md)

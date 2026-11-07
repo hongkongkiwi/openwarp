@@ -33,6 +33,7 @@ async fn main() {
     let (live, _) = broadcast::channel(256);
     let state = new_state(db, db_url.clone(), oc::random_token("inst"), pub_url, master, live, #[cfg(feature = "redis-cache")] redis_conn);
     install_kms(&state, kms);
+    { let st2 = state.clone(); tokio::spawn(async move { loop { openwarp_server::process_webhooks(&st2).await; tokio::time::sleep(std::time::Duration::from_secs(1)).await; } }); }
     { let st2 = state.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     { let st2 = state.clone(); tokio::spawn(async move { loop { tokio::time::sleep(std::time::Duration::from_secs(30)).await; if try_leader(&st2, "background", st2.instance_id(), 60).await { process_maintenance(&st2).await; } } }); }
     // One poll for the whole process. With no sockets subscribed it only reads

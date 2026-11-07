@@ -26,6 +26,8 @@ OpenWarp is a self-hosted secrets manager with a browser console, a Rust CLI, an
 | Goal | Guide |
 | --- | --- |
 | Push secrets to another platform | [Integrations](INTEGRATIONS.md) |
+| Send workspace events or trigger integration sync | [Webhooks](WEBHOOKS.md) |
+| Read the inspected upstream webhook practices and limits | [Webhook source review](WEBHOOK_REVIEW.md) |
 | Inject secrets into Kubernetes pods or worker nodes | [Kubernetes](KUBERNETES.md) |
 | See the HTTP routes, auth methods, and limits | [Feature reference](FEATURES.md) |
 | Understand the crates and data flow | [Architecture](ARCHITECTURE.md) |
