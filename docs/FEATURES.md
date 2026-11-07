@@ -482,10 +482,22 @@ endpoints stay closed to it.
 
 `GET /api/orgs/:id/pki/expiring?days=30` lists unrevoked device certificates in
 the window with 7/14/30 day counts. A daily background job records a `pki.expiry`
-audit event for each workspace with certificates in that window, so existing log
-streams and audit webhooks receive the alert. `POST
-/api/pki/devices/:id/renew` mints a code that revokes the previous certificate
-after the replacement attaches.
+audit event for each workspace with certificates in that window. The configured
+mailer also sends one daily summary to each verified, active workspace owner and
+admin. Failed delivery stays retryable. An owner or admin can trigger pending
+mail with `POST /api/orgs/:id/pki/expiry-notify`; it returns sent and failed counts.
+`POST /api/pki/devices/:id/renew` mints a replacement enrollment code.
+
+Devices can renew without an administrator or an application mTLS listener:
+`POST /api/pki/renew/challenge` takes a device id and a new PEM CSR. It returns an
+exact challenge text and id, valid for five minutes. The device signs that text
+with its current active certificate's private key and submits the padded base64
+signature to `POST /api/pki/renew`. Supported proofs are P-256 ECDSA SHA-256,
+P-384 ECDSA SHA-384 (ASN.1 DER), Ed25519 and RSA PKCS1 SHA-256. The new CSR signature proves possession of the
+replacement key. Current hook and attestation policy still apply; use the
+challenge id as the attestation nonce. Challenge consumption, replacement
+issuance and old-certificate revocation share one transaction. Expired, revoked
+or superseded credentials cannot renew.
 
 Bulk operations: `POST /api/pki/cas/:id/devices/import` accepts up to 1000
 device objects and can mint one code per device, `POST
@@ -518,6 +530,18 @@ device returns a compact JWS from the configured issuer with `aud: openwarp-pki`
 `hardware_backed: true`. ES256 and RS256 are supported. A required but missing or
 invalid assertion blocks enrollment without consuming the code, and an accepted
 assertion marks the device as hardware attested.
+
+For built-in TPM verification, set the CA attestation `mode` to `tpm2`. A managed
+workspace owner or admin provisions each device through
+`PUT /api/pki/devices/:id/tpm` with `ak_public` (padded base64 TPM2B_PUBLIC) and
+`pcr_digest` (hex SHA-256 of concatenated SHA-256 PCR values 0 through 7).
+The AK pin must come from an authenticated provisioning process; an AK supplied
+in evidence cannot establish its own trust. Enrollment or renewal then accepts
+`tpm_evidence` containing Certify and Quote attestations. The verifier supports
+RSA 2048/3072/4096, RSASSA SHA-256, SHA-256 object Names and precisely PCRs 0
+through 7. It checks that the certified TPM public key matches the CSR and that
+both signed attestations bind the enrollment nonce and CSR SPKI hash. See the
+[TPM protocol](SECURITY.md#built-in-tpm-profile) for byte encodings and limitations.
 
 A broker that trusts the CA validates the certificate directly. Register the CA
 certificate returned by `GET /api/orgs/:id/pki/cas` as its trust anchor (EMQX,

@@ -7686,6 +7686,210 @@
           }
         ]
       }
+    },
+    "/api/pki/renew/challenge": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Create a five-minute renewal challenge for an active device certificate",
+        "security": [],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "description": "Request device_id and new PEM CSR. Returns challenge_id, exact challenge text and expires_at. A proof must use the existing active certificate key, not the CSR key."
+      }
+    },
+    "/api/pki/renew": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Renew with a detached proof signed by the active certificate key",
+        "security": [],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "description": "Request challenge_id and padded base64 detached signature of the exact returned challenge text. P256 ECDSA SHA256 or P384 ECDSA SHA384 ASN.1 DER, Ed25519, or RSA PKCS1 SHA256. Optional attestation JWT or tpm_evidence follows the current CA policy, with nonce equal to challenge_id. Replacement issuance and previous-certificate revocation commit atomically."
+      }
+    },
+    "/api/pki/devices/{did}/tpm": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Read the trusted TPM AK and PCR policy",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Provision a trusted TPM AK public area and PCR policy",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ak_public",
+                  "pcr_digest"
+                ],
+                "properties": {
+                  "ak_public": {
+                    "type": "string",
+                    "description": "Padded base64 exact TPM2B_PUBLIC, provisioned out of band"
+                  },
+                  "pcr_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{64}$",
+                    "description": "SHA256 of concatenated SHA256 PCR values 0 through 7"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/pki/expiry-notify": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Send pending expiry email to verified active workspace owners and admins",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "oid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        }
+      }
     }
   }
 }

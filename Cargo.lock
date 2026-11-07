@@ -2682,6 +2682,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

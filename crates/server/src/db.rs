@@ -10,7 +10,7 @@ pub enum Db {
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
-    out
+    out.replace("OW_NOW()", "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
 }
 fn pg_err(error: tokio_postgres::Error) -> String {
     match error.as_db_error() {
@@ -87,16 +87,16 @@ impl Db {
                 Ok(counts)
             }
             Db::Postgres(pool) => {
-                let client = pool.get().await.map_err(|e| e.to_string())?;
-                client.batch_execute("BEGIN").await.map_err(pg_err)?;
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let transaction = client.transaction().await.map_err(pg_err)?;
                 let mut counts = Vec::with_capacity(statements.len());
                 for (sql, params) in statements {
                     let index = counts.len();
                     let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
-                    match client.execute(sql2.as_str(), &refs[..]).await {
-                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = client.batch_execute("ROLLBACK").await; return Err(e); } }
-                        Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } } }
-                if let Err(e) = client.batch_execute("COMMIT").await { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); }
+                    match transaction.execute(sql2.as_str(), &refs[..]).await {
+                        Ok(n) => { counts.push(n); verify(index, n, expect)?; }
+                        Err(e) => return Err(pg_err(e)), } }
+                transaction.commit().await.map_err(pg_err)?;
                 Ok(counts)
             }
         }
@@ -124,21 +124,21 @@ impl Db {
                 Ok(counts)
             }
             Db::Postgres(pool) => {
-                let client = pool.get().await.map_err(|e| e.to_string())?;
-                client.batch_execute("BEGIN").await.map_err(pg_err)?;
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let transaction = client.transaction().await.map_err(pg_err)?;
                 let locked_sql = format!("{} FOR UPDATE", lock_sql); let sql2 = pg_sql(&locked_sql);
                 let pg = PgParams::new(lock_params); let refs = pg.refs();
-                let rows = match client.query(sql2.as_str(), &refs[..]).await { Ok(r) => r, Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } };
+                let rows = transaction.query(sql2.as_str(), &refs[..]).await.map_err(pg_err)?;
                 let first = rows.first().map(pg_row);
-                if !first.as_ref().map(ok).unwrap_or(false) { let _ = client.batch_execute("ROLLBACK").await; return Err("lock condition failed".into()); }
+                if !first.as_ref().map(ok).unwrap_or(false) { return Err("lock condition failed".into()); }
                 let mut counts = Vec::with_capacity(statements.len());
                 for (sql, params) in statements {
                     let index = counts.len();
                     let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
-                    match client.execute(sql2.as_str(), &refs[..]).await {
-                        Ok(n) => { counts.push(n); if let Err(e) = verify(index, n, expect) { let _ = client.batch_execute("ROLLBACK").await; return Err(e); } }
-                        Err(e) => { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); } } }
-                if let Err(e) = client.batch_execute("COMMIT").await { let _ = client.batch_execute("ROLLBACK").await; return Err(pg_err(e)); }
+                    match transaction.execute(sql2.as_str(), &refs[..]).await {
+                        Ok(n) => { counts.push(n); verify(index, n, expect)?; }
+                        Err(e) => return Err(pg_err(e)), } }
+                transaction.commit().await.map_err(pg_err)?;
                 Ok(counts)
             }
         }
@@ -226,7 +226,8 @@ fn sqlite_val(v: &rusqlite::types::Value) -> Value {
     match v { V::Null => Value::Null, V::Integer(n) => Value::Number((*n).into()), V::Real(f) => serde_json::json!(*f), V::Text(s) => Value::String(s.clone()), V::Blob(b) => Value::String(openwarp_crypto::b64(b)) }
 }
 fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<u64, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = sql.replace("OW_NOW()", "CAST(strftime('%s','now') AS INTEGER)");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let n = stmt.execute(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     Ok(n as u64)
 }
@@ -394,6 +395,90 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
         "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
     ]),
+    // Keep published feature migrations intact. Replay each schema family after
+    // main's versions so databases from either lineage converge additively.
+    (16, &[
+        "ALTER TABLE envs ADD COLUMN runner_id TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN path_enc TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN tags_enc TEXT DEFAULT ''",
+        "ALTER TABLE secrets ADD COLUMN key_index TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN auth_version BIGINT DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN kdf_salt TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN kdf_iterations BIGINT DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN kdf_algo TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN auth_key_enc TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT DEFAULT '',credential_id TEXT NOT NULL,credential_json TEXT NOT NULL,sign_count BIGINT DEFAULT 0,created_at BIGINT NOT NULL,last_used_at BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS passkey_registrations(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS mfa_passkey_states(mfa_token TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS email_codes(user_id TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,attempts BIGINT DEFAULT 0,PRIMARY KEY(user_id,purpose))",
+        "CREATE TABLE IF NOT EXISTS runners(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,pubkey TEXT NOT NULL,token_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS runner_env_keys(runner_id TEXT NOT NULL,env_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(runner_id,env_id))",
+        "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0,claim_id TEXT DEFAULT '')",
+        "CREATE TABLE IF NOT EXISTS auth_challenges(id_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,challenge TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_secrets_key_index ON secrets(env_id,key_index)",
+        "CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_passkeys_credential ON passkeys(credential_id)",
+        "CREATE INDEX IF NOT EXISTS idx_runners_token ON runners(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_pending ON sync_jobs(status,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
+    ]),
+    (17, &[
+        "ALTER TABLE pki_cas ADD COLUMN kind TEXT DEFAULT 'x509'",
+        "ALTER TABLE pki_cas ADD COLUMN allow_forwarding BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS ssh_principal_grants(ca_id TEXT NOT NULL,role TEXT NOT NULL,principals TEXT NOT NULL,max_ttl BIGINT DEFAULT 900,PRIMARY KEY(ca_id,role))",
+        "CREATE TABLE IF NOT EXISTS ssh_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,key_id TEXT NOT NULL,principal TEXT NOT NULL,public_key TEXT NOT NULL,cert TEXT NOT NULL,serial BIGINT NOT NULL,actor TEXT NOT NULL,revoked BIGINT DEFAULT 0,valid_after BIGINT NOT NULL,valid_before BIGINT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_ssh_certs_ca ON ssh_certs(ca_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ssh_grants_ca ON ssh_principal_grants(ca_id)",
+        "ALTER TABLE ssh_certs ADD COLUMN cert_type TEXT DEFAULT 'user'",
+        "CREATE TABLE IF NOT EXISTS ssh_hosts(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,hostname TEXT NOT NULL,public_key TEXT NOT NULL,fingerprint TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_hosts_key ON ssh_hosts(ca_id,hostname,fingerprint)",
+        "CREATE TABLE IF NOT EXISTS step_up_challenges(challenge_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,need_totp BIGINT DEFAULT 0,need_email BIGINT DEFAULT 0,email_code_hash TEXT DEFAULT '',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS step_up_grants(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+    ]),
+    (18, &[
+        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
+        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
+        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
+    ]),
+    (19, &[
+        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN kind TEXT DEFAULT 'root'",
+        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
+        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
+        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
+        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
+        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
+        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN ca_kind TEXT DEFAULT 'root'",
+        "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
+        "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
+    ]),
+    (20, &[
+        "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
+        "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -427,10 +512,38 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 15, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 20, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 15, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 20, "each migration must be recorded exactly once");
+    }
+    #[tokio::test]
+    async fn canonical_main_and_feature_migrations_converge() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in SCHEMA { conn.execute_batch(sql).unwrap(); }
+        for (version, statements) in MIGRATIONS.iter().filter(|(version, _)| *version < 14) {
+            for sql in *statements { let _ = conn.execute_batch(sql); }
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,0)", [version]).unwrap(); }
+        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(1,0)", []).unwrap();
+        conn.execute_batch(include_str!("../tests/fixtures/main-a633106-migrations.sql")).unwrap();
+        for version in [14, 15, 16] { conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,0)", [version]).unwrap(); }
+        conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','ssh','','',0,'ssh')", []).unwrap();
+        let db = Db::Sqlite(Mutex::new(conn));
+        db.migrate().await.unwrap();
+        let ssh = db.one("SELECT kind,ca_kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap();
+        assert_eq!(s(&ssh,"kind"), "ssh", "migration must preserve SSH CA discriminator");
+        db.exec("INSERT INTO pki_devices(id,org_id,ca_id,name,created_at,updated_at) VALUES('d','o','c','sensor',0,0)", &[]).await.unwrap();
+        db.exec("INSERT INTO pki_renew_challenges(id,device_id,cert_id,csr,challenge,expires_at) VALUES('r','d','c','csr','challenge',1)", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(),20);
+    }
+    #[tokio::test]
+    async fn legacy_feature_ca_kind_is_preserved() {
+        let db = Db::open_memory().await.unwrap();
+        db.exec("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,parent_id,kind) VALUES('legacy','o','factory','','',0,'root','intermediate')", &[]).await.unwrap();
+        db.exec("DELETE FROM schema_migrations WHERE version>=19", &[]).await.unwrap();
+        db.migrate().await.unwrap();
+        let row=db.one("SELECT kind,ca_kind FROM pki_cas WHERE id='legacy'", &[]).await.unwrap().unwrap();
+        assert_eq!(s(&row,"kind"),"x509"); assert_eq!(s(&row,"ca_kind"),"intermediate");
     }
     #[tokio::test]
     async fn checked_transaction_rolls_back_on_a_lost_race() {

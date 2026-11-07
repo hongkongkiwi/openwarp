@@ -215,6 +215,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
       let body;
+      if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
       else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
         if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
@@ -227,6 +228,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
       else if (options.method === 'POST' && url === '/api/auth/mfa') body = { token: 'session-token' };
+      else if (opts.pki && options.method === 'POST' && url === '/api/pki/cas/ca-a/devices/codes') body = { codes: call.body.device_ids.map(id => id === 'dev-b' ? { id, error: 'device no longer available' } : { id, name: 'sensor-a', code: 'test-code', nonce: 'test-nonce', expires_at: 1900000000 }) };
+      else if (options.method === 'GET' && opts.responses && Object.hasOwn(opts.responses, url)) body = opts.responses[url];
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -646,4 +649,60 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {
+  let releaseMint, releaseRender, holdRender=false;
+  const opts={pki:true,responses:{
+    '/api/orgs/org-a/pki/cas':[{id:'ca-a',name:'A',kind:'root',certificate:'A-CERT'}],
+    '/api/orgs/org-b/pki/cas':[{id:'ca-b',name:'B',kind:'root',certificate:'B-CERT'}],
+    '/api/orgs/org-b/settings':{}, '/api/orgs/org-b/saml':{configured:false},
+    '/api/pki/cas/ca-a/devices':[{id:'dev-a',name:'sensor-a'}], '/api/pki/cas/ca-b/devices':[],
+    '/api/pki/cas/ca-a/groups':[], '/api/pki/cas/ca-b/groups':[],
+    '/api/orgs/org-a/pki/expiring?days=30':{counts:{7:0,14:0,30:0}}, '/api/orgs/org-b/pki/expiring?days=30':{counts:{7:0,14:0,30:0}},
+    '/api/pki/cas/ca-a/hook':{url:''}, '/api/pki/cas/ca-b/hook':{url:''},
+    '/api/pki/cas/ca-a/attestation':{}, '/api/pki/cas/ca-b/attestation':{},
+  },fetchOverride:call=>{
+    if(call.url==='/api/pki/cas/ca-a/devices/codes')return new Promise(resolve=>{releaseMint=resolve});
+    if(holdRender&&call.url==='/api/orgs/org-a/pki/cas')return new Promise(resolve=>{releaseRender=resolve});
+  }};
+  const ui=await consoleUI([saved],[],opts);await ui.invoke('renderSettings()');await ui.invoke('selectAllPki()');
+  ui.run('pendingMint=mintSelectedPki()');await ui.settle();holdRender=true;ui.run('pendingRender=renderPki()');await ui.settle();
+  await ui.invoke("ORG='org-b';renderSettings()");
+  releaseRender(opts.responses['/api/orgs/org-a/pki/cas']);await ui.invoke('pendingRender');
+  releaseMint({codes:[{id:'dev-a',name:'sensor-a',code:'A-SECRET-CODE',nonce:'a'}]});await ui.invoke('pendingMint');
+  assert.equal(ui.run('PKI_CA'),'ca-b');assert.equal(ui.el('pki-codes-out').textContent,'');
+  assert.ok(ui.el('pki-download-codes').disabled);assert.ok(!ui.el('view').textContent.includes('A-SECRET-CODE'));
+});
+
+test('PKI bulk codes use explicit selection and show partial failures', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('pki-mint-selected').disabled);
+  await ui.invoke('selectAllPki()');
+  assert.equal(ui.el('pki-selection-count').textContent, '2 selected');
+  await ui.click(ui.el('pki-mint-selected'));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/codes');
+  assert.deepEqual(Array.from(call.body.device_ids), ['dev-a', 'dev-b']);
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.match(ui.el('pki-codes-out').textContent, /device no longer available/);
+  assert.equal(ui.el('pki-download-codes').disabled, false);
+  await ui.invoke('clearPkiSelection()');
+  assert.equal(ui.el('pki-mint-selected').disabled, true);
+  opts.responses['/api/orgs/org-a/pki/cas'] = [{ id: 'ca-b', name: 'Other root', kind: 'root', certificate: 'OTHER PUBLIC CERT' }];
+  opts.responses['/api/pki/cas/ca-b/devices'] = [];
+  opts.responses['/api/pki/cas/ca-b/groups'] = [];
+  opts.responses['/api/pki/cas/ca-b/hook'] = { url: '' };
+  opts.responses['/api/pki/cas/ca-b/attestation'] = { issuer: '', algorithm: 'ES256' };
+  await ui.invoke("PKI_CODE_RESULTS=[{code:'stale'}];PKI_SELECTED.add('dev-a');renderPki()");
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
 });

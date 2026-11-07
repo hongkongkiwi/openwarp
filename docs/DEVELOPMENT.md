@@ -63,6 +63,26 @@ node --test crates/server/tests/ui.test.cjs
 
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
 
+### Device PKI validation
+
+Set `OPENWARP_TEST_POSTGRES_URL` to a disposable local admin database and run
+`cargo test -p openwarp-server --test postgres_backend -- --test-threads=2`.
+The suite creates and drops its own databases. It exercises transaction errors,
+affected-row checks, cancellation, pool reuse and enrollment/revocation races.
+Without the variable, live PostgreSQL checks are not executed.
+
+`device_remaining` checks the public renewal proof protocol, and
+`device_delivery` checks expiry email and TPM enrollment policy. The
+`tpm_attestation` and `tpm_boundaries` suites use synthetic evidence;
+`tpm_interoperability` checks unmodified swtpm evidence from tpm2-tools.
+
+Migration compatibility tests cover databases carrying canonical main's versions
+14-16 and the older device branch's versions 14-15. Published statements stay
+intact; additive convergence migrations 16-19 replay missing schema families.
+The CA protocol discriminator remains `kind` (`x509` or `ssh`); X.509 hierarchy
+uses `ca_kind` (`root` or `intermediate`). Migration 20 adds renewal challenges,
+notification delivery state and TPM provisioning fields.
+
 ## Container validation
 
 CI builds the [`Dockerfile`](../Dockerfile), starts the resulting image, checks `/health`, and executes `openwarp --help` inside it. Building an image alone cannot catch every runtime library mismatch.
