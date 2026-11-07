@@ -202,6 +202,16 @@ X uses OAuth 2.0 with PKCE rather than OIDC:
 
 Set `OPENWARP_X_CLIENT_ID` and, for a confidential client, `OPENWARP_X_CLIENT_SECRET`. The X app must request `users.read` and `users.email`, and the account needs a confirmed email; sign-in fails rather than inventing one when X returns no address.
 
+Discord, LinkedIn and WorkOS each need their `OPENWARP_<PROVIDER>_CLIENT_ID` and `OPENWARP_<PROVIDER>_CLIENT_SECRET`, with `DISCORD`, `LINKEDIN` or `WORKOS` substituted for `<PROVIDER>`. Register the matching callback:
+
+```text
+{OPENWARP_PUBLIC_URL}/api/auth/social/discord/callback
+{OPENWARP_PUBLIC_URL}/api/auth/social/linkedin/callback
+{OPENWARP_PUBLIC_URL}/api/auth/social/workos/callback
+```
+
+Discord uses OAuth with `identify email`; `OPENWARP_DISCORD_API` overrides its API base. LinkedIn uses OIDC; `OPENWARP_LINKEDIN_ISSUER` overrides its default issuer. WorkOS uses its User Management authorization and authentication endpoints; `OPENWARP_WORKOS_API` overrides its API base. `OPENWARP_WORKOS_PROVIDER` selects the provider (default `authkit`); `OPENWARP_WORKOS_CONNECTION_ID`, when set, takes precedence over that selection. Discord and WorkOS require a verified email in the provider response. API and issuer overrides pass the same URL and egress checks as other identity providers: use HTTPS, or HTTP on loopback for local testing. In production, the egress check rejects localhost and private or local IP literals unless the operator sets `OPENWARP_ALLOW_PRIVATE_EGRESS=1`; outside production, that check permits private destinations. Hostnames are not checked against their resolved addresses, so use network egress controls to restrict them. A refused URL or destination prevents sign-in rather than falling back to another endpoint.
+
 Workspace OIDC is configured separately in workspace settings through `oidc_issuer`, `oidc_client_id`, `oidc_client_secret`, and `oidc_redirect_uri`. Set provisioning and allowed-domain policy deliberately. Changing the issuer without supplying a replacement secret clears the old secret. SCIM provisioning requires workspace context and administrative credentials; see the [API reference](API.md).
 
 ## Run the native server
@@ -221,7 +231,7 @@ ADDR=127.0.0.1:8080 \
   ./target/release/openwarp-server
 ```
 
-This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL, set `DATABASE_URL` to your database connection string instead. Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
+This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL or MySQL/MariaDB, set `DATABASE_URL` to your database connection string instead (`mysql://` or `mariadb://`). Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
 
 OpenWarp is a native service. Cloudflare Workers cannot run this binary as-is; the storage and networking layers would need a separate port.
 
@@ -274,8 +284,14 @@ production.
 What works on Workers: registration with emailed verification, password and
 GitHub sign-in, OIDC login (pure-Rust JWT verification), TOTP, SCIM, tokens,
 E2E and SSE secrets, approvals, log streams, audit webhooks, integrations,
-PKI CA and certificate issuance, dynamic PostgreSQL leases, and the rotation
-and delivery maintenance cron.
+PKI CA and certificate issuance, dynamic PostgreSQL, MySQL and MariaDB leases,
+and the rotation and delivery maintenance cron.
+
+The MySQL lease client is built into the Worker because no MySQL library
+compiles for wasm; it speaks the protocol directly over the socket and uses TLS
+when the lease URL sets `require_ssl=true`. MySQL is a lease target only on
+Workers: the deployment's own storage stays in the Durable Object, and a
+`DATABASE_URL` of `mysql://` is native-only.
 
 Answers 501 with a clear error on Workers: LDAP sign-in, SAML, SSH file sync,
 SMTP (use the HTTP relay), OCI Vault (RSA request signing), and the WebSocket

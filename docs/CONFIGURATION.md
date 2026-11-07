@@ -8,7 +8,7 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `DATABASE_URL` | `sqlite://openwarp.db` | SQLite file or PostgreSQL connection URL |
+| `DATABASE_URL` | `sqlite://openwarp.db` | SQLite file, PostgreSQL connection URL, or MySQL/MariaDB URL (`mysql://`, `mariadb://`) |
 | `ADDR` | `0.0.0.0:8080` | Listen IP and port; use loopback for private local development |
 | `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key or a configured KMS bridge and activates production-specific checks |
 | `OPENWARP_MASTER_KEY` | Generated/stored in development without KMS | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
@@ -18,12 +18,17 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | `REDIS_URL` | Unset | Optional session cache with the default `redis-cache` build feature |
 | `OPENWARP_PUBLIC_URL` | Derived from request context where needed | Canonical public origin for issuer metadata, redirects, and links; configure explicitly in deployed instances |
 | `OPENWARP_PG_POOL_SIZE` | `8` | Postgres connections per process, clamped to 1..64. Multiply by the replica count before sizing the database |
+| `OPENWARP_MYSQL_POOL_SIZE` | `8` | MySQL/MariaDB connections per process, clamped to 1..64 |
 | `OPENWARP_SECURE_COOKIES` | Unset | `1` forces Secure cookies; an HTTPS public URL also enables the flag |
 | `OPENWARP_METRICS_TOKEN` | Unset | Enables `/metrics`; callers must supply this bearer token |
 
 The SQLite path is relative to the process working directory unless absolute, for example `sqlite:///var/lib/openwarp/openwarp.db`. Create the parent directory and grant the service account access.
 
 The PostgreSQL adapter uses `NoTls`. A connection string does not add TLS support to that adapter. Use an isolated network or separately configured secure transport.
+
+The MySQL/MariaDB adapter targets MySQL 8.0.13+ or MariaDB 10.6+. It creates tables with `utf8mb4_bin` collation so hash and token lookups stay case-sensitive, and it rewrites keyed `TEXT` columns to `VARCHAR(255)`. TLS is used only when the URL asks for it with `require_ssl=true`; host identity is then verified unless you also pass `verify_identity=false`. Without `require_ssl` the connection is plaintext.
+
+That storage adapter is native-only: a Workers deployment keeps its data in the Durable Object. MySQL and MariaDB are still available there as dynamic lease targets, through a protocol client built into the Worker.
 
 Generate a master key only for a new database:
 
@@ -105,7 +110,7 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 | `OPENWARP_TRUST_PROXY` | Disabled | `1` enables forwarded client-IP handling from trusted peers |
 | `OPENWARP_TRUSTED_PROXIES` | `127.0.0.1/32,::1` | Comma-separated proxy IPs or CIDRs |
 | `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits private/loopback destinations for the production checks applied to OIDC, audit webhooks, and log streams |
-| `OPENWARP_ALLOWED_DB_HOSTS` | Empty | Comma-separated `host[:port]` allowlist for dynamic PostgreSQL leases; empty disables that capability |
+| `OPENWARP_ALLOWED_DB_HOSTS` | Empty | Comma-separated `host[:port]` allowlist for dynamic database leases (PostgreSQL, MySQL and MariaDB); empty disables that capability |
 
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.
 

@@ -16,7 +16,10 @@ pub(super) async fn put(State(st): State<S>, h: HeaderMap, Path((eid,role)): Pat
     let rules: Vec<Rule>=serde_json::from_value(b["rules"].clone()).map_err(|_| bad("rules array required"))?;
     if rules.len()>256 || rules.iter().any(|r| !canonical(&r.prefix) || r.capabilities.is_empty() || r.capabilities.iter().any(|c| !matches!(c.as_str(),"read"|"write"|"delete"))) { return Err(bad("invalid canonical prefix or capabilities")); }
     let raw=serde_json::to_string(&rules).map_err(|_| bad("invalid rules"))?;
-    st.db.exec("INSERT INTO path_policies(env_id,role,rules) VALUES(?,?,?) ON CONFLICT(env_id,role) DO UPDATE SET rules=excluded.rules", &[json!(eid),json!(role),json!(raw)]).await.map_err(|e| bad(&e))?;
+    let sql = "INSERT INTO path_policies(env_id,role,rules) VALUES(?,?,?) ON CONFLICT(env_id,role) DO UPDATE SET rules=excluded.rules";
+    #[cfg(not(target_arch = "wasm32"))]
+    let sql = if st.db.backend() == db::Backend::Mysql { "INSERT INTO path_policies(env_id,role,rules) VALUES(?,?,?) ON DUPLICATE KEY UPDATE rules=VALUES(rules)" } else { sql };
+    st.db.exec(sql, &[json!(eid),json!(role),json!(raw)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"rules":rules})))
 }
 pub(super) async fn get(State(st): State<S>, h: HeaderMap, Path((eid,role)): Path<(String,String)>) -> Res {

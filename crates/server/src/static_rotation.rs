@@ -40,7 +40,7 @@ pub(super) async fn rotate(st: &S, schedule: &Row, config: &Value, key: &[u8;32]
     let password=String::from_utf8(raw).map_err(|_| bad("invalid pending rotation password"))?;
     crate::pglease::rotate_static(connection,username,&password).await.map_err(|e| if e=="static rotation outcome uncertain" { err(StatusCode::GATEWAY_TIMEOUT,"static rotation outcome uncertain; execution claim retained") } else { bad(&e) })?;
     // Retain the same password after uncertain remote or local outcomes. Retrying is idempotent.
-    let input=SecretIn{key:name.clone(),value:password.clone(),path:path.clone(),comment:"scheduled PostgreSQL password rotation".into(),tags:String::new(),secret_type:stype.into()};
+    let input=SecretIn{key:name.clone(),value:password.clone(),path:path.clone(),comment:"scheduled PostgreSQL password rotation".into(),tags:String::new(),secret_type:stype.into(),expected_version:None};
     upsert_secret(st,&eid,org,key,"rotation-scheduler",&input).await?;
     st.db.exec("UPDATE rotation_schedules SET pending_enc='' WHERE id=? AND pending_enc=?", &[json!(rid),json!(pending)]).await.map_err(|e| bad(&e))?;
     if let Ok((org,app))=st.env_org_app(&eid).await { st.audit(&org,&app,&eid,"rotation-scheduler","secret.rotate",&name).await; if let Some(e)=fire_rotation_hook(st,&org,&eid,&name,&password).await { st.audit(&org,&app,&eid,"rotation-scheduler","rotation_hook_failed",&e).await; } }

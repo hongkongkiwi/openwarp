@@ -18,7 +18,10 @@ pub(super) async fn manage(State(st): State<S>, h: HeaderMap, Path((oid,iid)): P
         destination(url)?; destination(issuer)?;
         let ttl = b.get("max_ttl_secs").map(|v| v.as_i64().unwrap_or(0)).unwrap_or(300);
         if !(1..=300).contains(&ttl) { return Err(bad("max_ttl_secs must be 1-300")); }
-        st.db.exec("INSERT INTO workload_bindings(identity_id,org_id,revision,issuer,jwks_url,audience,subject,max_ttl_secs) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(identity_id) DO UPDATE SET org_id=excluded.org_id,revision=excluded.revision,issuer=excluded.issuer,jwks_url=excluded.jwks_url,audience=excluded.audience,subject=excluded.subject,max_ttl_secs=excluded.max_ttl_secs", &[json!(iid),json!(oid),json!(id()),json!(issuer),json!(url),json!(audience),json!(subject),json!(ttl)]).await.map_err(|e| bad(&e))?;
+        let sql = "INSERT INTO workload_bindings(identity_id,org_id,revision,issuer,jwks_url,audience,subject,max_ttl_secs) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(identity_id) DO UPDATE SET org_id=excluded.org_id,revision=excluded.revision,issuer=excluded.issuer,jwks_url=excluded.jwks_url,audience=excluded.audience,subject=excluded.subject,max_ttl_secs=excluded.max_ttl_secs";
+        #[cfg(not(target_arch = "wasm32"))]
+        let sql = if st.db.backend() == db::Backend::Mysql { "INSERT INTO workload_bindings(identity_id,org_id,revision,issuer,jwks_url,audience,subject,max_ttl_secs) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE org_id=VALUES(org_id),revision=VALUES(revision),issuer=VALUES(issuer),jwks_url=VALUES(jwks_url),audience=VALUES(audience),subject=VALUES(subject),max_ttl_secs=VALUES(max_ttl_secs)" } else { sql };
+        st.db.exec(sql, &[json!(iid),json!(oid),json!(id()),json!(issuer),json!(url),json!(audience),json!(subject),json!(ttl)]).await.map_err(|e| bad(&e))?;
     }
     st.db.exec("DELETE FROM tokens WHERE created_by=? AND workload_revision<>''", &[json!(iid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"ok":true})))
