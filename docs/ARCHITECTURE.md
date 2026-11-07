@@ -53,9 +53,11 @@ Accounts can participate in multiple workspaces. Workspace membership and instan
 
 ## Database adapter
 
-The async database API has a common row representation. Native SQLite uses a synchronous connection protected by a mutex, with WAL and foreign keys enabled. Native PostgreSQL uses an async connection pool and translates `?` placeholders into numbered parameters. Its application-storage connection uses `NoTls`, so deployment must address database transport security.
+The async database API uses native SQLite, PostgreSQL or MySQL/MariaDB behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. MySQL keeps `?` and rewrites the canonical DDL where its rules differ: keyed or indexed `TEXT` columns become `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX` loses `IF NOT EXISTS`, and tables use a binary collation.
 
-On Workers, the same API executes queries against the synchronous SQLite handle in one Durable Object. It does not use a local database file or D1. Both deployments apply the shared schema and numbered migrations through the adapter.
+Native SQLite uses a synchronous connection behind a mutex; PostgreSQL and MySQL/MariaDB use async pools (`deadpool-postgres`, `mysql_async`). This is not a claim of throughput characteristics. The PostgreSQL client does not enable TLS, and the MySQL/MariaDB client enables it only when the URL requests `require_ssl=true`, so transport security must be addressed in deployment.
+
+On Workers, the same API executes queries against the synchronous SQLite handle in one Durable Object. It does not use a local database file or D1. Both deployments apply the shared schema and numbered migrations through the adapter. Native batches use database transactions; Workers batches use `transactionSync`, with exact affected-row guards for conditional writes.
 
 Redis is an optional native revocation cache, not an authority for accepting a session. The database holds account state and rate limits. Workers excludes Redis.
 

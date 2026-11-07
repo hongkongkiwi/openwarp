@@ -9,6 +9,28 @@
 pub use inner::*;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "provider response could not be read")? {
+        if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn read_bounded(response: Response, limit: usize) -> Result<Vec<u8>, String> {
+    response.bounded_bytes(limit).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn provider_post_bounded(request: RequestBuilder, limit: usize) -> Result<Vec<u8>, String> {
+    let response = request.send().await.map_err(|_| "provider request failed")?;
+    if !response.status().is_success() { return Err("provider request failed".into()); }
+    read_bounded(response, limit).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 mod inner {
     pub use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 }
@@ -46,6 +68,34 @@ mod inner {
         pub fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.request(method, url.as_ref())) }
     }
 
+    pub async fn provider_post_bounded(request: RequestBuilder, limit: usize) -> Result<Vec<u8>, String> {
+        SendFuture::new(async move {
+            use futures_util::StreamExt;
+            use worker::wasm_bindgen::JsValue;
+            let request = request.0.build().map_err(|_| "provider request failed")?;
+            let headers = worker::Headers::new();
+            for (name, value) in request.headers() {
+                headers.set(name.as_str(), value.to_str().map_err(|_| "provider request failed")?).map_err(|_| "provider request failed")?;
+            }
+            let body = request.body().and_then(|body| body.as_bytes()).ok_or("provider request failed")?;
+            let mut init = worker::RequestInit::new();
+            init.with_method(worker::Method::Post).with_headers(headers)
+                .with_redirect(worker::RequestRedirect::Error)
+                .with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
+            let request = worker::Request::new_with_init(request.url().as_str(), &init).map_err(|_| "provider request failed")?;
+            let mut response = worker::Fetch::Request(request).send().await.map_err(|_| "provider request failed")?;
+            if !(200..300).contains(&response.status_code()) { return Err("provider request failed".into()); }
+            let mut stream = response.stream().map_err(|_| "provider response could not be read")?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| "provider response could not be read")?;
+                if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        }).await
+    }
+
     pub struct RequestBuilder(reqwest::RequestBuilder);
 
     impl RequestBuilder {
@@ -80,14 +130,47 @@ mod inner {
         pub async fn bytes(self) -> Result<Vec<u8>, String> {
             SendFuture::new(async move { self.0.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string()) }).await
         }
+        pub async fn bounded_bytes(self, limit: usize) -> Result<Vec<u8>, String> {
+            SendFuture::new(async move {
+                use futures_util::StreamExt;
+                let stream = self.0.bytes_stream();
+                futures_util::pin_mut!(stream);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|_| "provider response could not be read")?;
+                    if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes)
+            }).await
+        }
     }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    // The Worker entrypoint copies header values through `HeaderValue`, which
-    // rejects control bytes only. Base64 session tokens contain `=` and `+`,
-    // so this guards against a filter that would drop the session cookie.
+    #[tokio::test]
+    async fn provider_posts_do_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for status in [307, 308] {
+            let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = destination.local_addr().unwrap();
+            let url = format!("http://{}/token", source.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = source.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: http://{target}/stolen\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let request = crate::app::http_client().post(&url).form(&[("client_secret", "dummy"), ("code", "dummy")]);
+            assert!(super::provider_post_bounded(request, 1024 * 1024).await.is_err());
+            server.await.unwrap();
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept()).await.is_err());
+        }
+    }
+
     #[test]
     fn base64_cookie_values_survive_header_conversion() {
         let cookie = "ow_session=ow_ab+/cd==; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800; Secure";

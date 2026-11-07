@@ -22,8 +22,21 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: openwarp
+          MARIADB_DATABASE: openwarp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       OPENWARP_TEST_POSTGRES_URL: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
+      OPENWARP_TEST_MYSQL_URL: mysql://root:openwarp@127.0.0.1:3306/mysql
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,6 +70,21 @@ jobs:
 
   worker:
     runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: openwarp
+          MARIADB_DATABASE: openwarp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OPENWARP_SMOKE_MYSQL_URL: mysql://root:openwarp@127.0.0.1:3306/openwarp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
