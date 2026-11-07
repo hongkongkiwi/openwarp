@@ -18,10 +18,11 @@ LOG="${STATE_DIR}/wrangler.log"
 cleanup() {
   if [ -n "${DEV_PID:-}" ]; then kill "${DEV_PID}" 2>/dev/null || true; fi
   if [ -n "${ECHO_PID:-}" ]; then kill "${ECHO_PID}" 2>/dev/null || true; fi
-  # wrangler spawns workerd as a grandchild; stop both by port scope.
-  pkill -f "wrangler.*dev --port ${PORT}" 2>/dev/null || true
-  pkill -f "workerd serve.*:${PORT}" 2>/dev/null || true
-  rm -rf "${STATE_DIR}"
+  if [ "${SUCCESS:-0}" = 1 ]; then
+    rm -rf "${STATE_DIR}"
+  else
+    echo "Smoke logs retained in ${STATE_DIR}" >&2
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -30,10 +31,12 @@ if [ ! -f "${ROOT}/crates/server/build/worker/shim.mjs" ]; then
   exit 2
 fi
 
+mkdir "${STATE_DIR}/config"
+node "${ROOT}/scripts/worker-config-smoke.mjs" "${STATE_DIR}/config"
 MASTER=$(head -c 32 /dev/urandom | base64)
 PORT="${ECHO_PORT}" node "${ROOT}/scripts/smoke-echo.mjs" >"${LOG}.echo" 2>&1 &
 ECHO_PID=$!
-(cd "${ROOT}" && ${WRANGLER} dev --port "${PORT}" --test-scheduled --persist-to "${STATE_DIR}/state" --var "OPENWARP_MASTER_KEY:${MASTER}" --var "OPENWARP_ENV:production" --var "OPENWARP_ALLOW_PRIVATE_EGRESS:1" --var "OPENWARP_ALLOWED_DB_HOSTS:127.0.0.1:5432" --var "OPENWARP_EMAIL_WEBHOOK:http://127.0.0.1:${ECHO_PORT}/mail" >"${LOG}" 2>&1) &
+(cd "${ROOT}" && exec ${WRANGLER} dev --local --config "${STATE_DIR}/config/wrangler.toml" --port "${PORT}" --test-scheduled --persist-to "${STATE_DIR}/state" --var "OPENWARP_MASTER_KEY:${MASTER}" --var "OPENWARP_ENV:development" --var "OPENWARP_PUBLIC_URL:${BASE}" --var "OPENWARP_ALLOW_PRIVATE_EGRESS:1" --var "OPENWARP_ALLOWED_DB_HOSTS:127.0.0.1:5432" --var "OPENWARP_EMAIL_WEBHOOK:http://127.0.0.1:${ECHO_PORT}/mail" >"${LOG}" 2>&1) &
 DEV_PID=$!
 
 i=0
@@ -54,3 +57,4 @@ if ! curl -fsS "${BASE}/health" >/dev/null 2>&1; then
 fi
 
 OPENWARP_SMOKE_BASE="${BASE}" OPENWARP_SMOKE_ECHO="http://127.0.0.1:${ECHO_PORT}" node "${ROOT}/scripts/worker-smoke.mjs"
+SUCCESS=1

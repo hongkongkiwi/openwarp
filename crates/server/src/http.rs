@@ -38,27 +38,28 @@ mod inner {
 
     impl Client {
         pub fn new() -> Self { Self(reqwest::Client::new()) }
-        pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.get(url.as_ref())) }
-        pub fn post(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.post(url.as_ref())) }
-        pub fn put(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.put(url.as_ref())) }
-        pub fn patch(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.patch(url.as_ref())) }
-        pub fn delete(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.delete(url.as_ref())) }
-        pub fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder(self.0.request(method, url.as_ref())) }
+        pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.get(url.as_ref())) }
+        pub fn post(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.post(url.as_ref())) }
+        pub fn put(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.put(url.as_ref())) }
+        pub fn patch(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.patch(url.as_ref())) }
+        pub fn delete(&self, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.delete(url.as_ref())) }
+        pub fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> RequestBuilder { RequestBuilder::new(self.0.request(method, url.as_ref())) }
     }
 
     pub struct RequestBuilder(reqwest::RequestBuilder);
 
     impl RequestBuilder {
-        pub fn header(mut self, name: &str, value: impl AsRef<str>) -> Self { self.0 = self.0.header(name, value.as_ref()); self }
+        fn new(request: reqwest::RequestBuilder) -> Self { Self(request.timeout(std::time::Duration::from_secs(30))) }
+        pub fn header(mut self, name: &str, value: impl ToString) -> Self { self.0 = self.0.header(name, value.to_string()); self }
         pub fn bearer_auth(mut self, token: impl AsRef<str>) -> Self { self.0 = self.0.bearer_auth(token.as_ref()); self }
         pub fn basic_auth(mut self, user: &str, password: Option<&str>) -> Self { self.0 = self.0.basic_auth(user, password); self }
         pub fn json<T: Serialize + ?Sized>(mut self, value: &T) -> Self { self.0 = self.0.json(value); self }
         pub fn form<T: Serialize + ?Sized>(mut self, value: &T) -> Self { self.0 = self.0.form(value); self }
         pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self { self.0 = self.0.body(body); self }
         pub fn query<T: Serialize + ?Sized>(mut self, value: &T) -> Self { self.0 = self.0.query(value); self }
-        /// The Workers fetch client has no per-request timeout; the platform
-        /// enforces request duration, so the native deadline is dropped here.
-        pub fn timeout(self, _timeout: std::time::Duration) -> Self { self }
+        /// Reqwest's wasm AbortController spans fetch and response body reads;
+        /// dropping its response or request future aborts and clears the timer.
+        pub fn timeout(mut self, timeout: std::time::Duration) -> Self { self.0 = self.0.timeout(timeout); self }
         pub async fn send(self) -> Result<Response, String> {
             SendFuture::new(async move { self.0.send().await.map_err(|e| e.to_string()).map(Response::new) }).await
         }

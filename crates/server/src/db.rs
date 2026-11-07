@@ -12,7 +12,15 @@ pub enum Db {
     #[cfg(not(target_arch = "wasm32"))]
     Postgres(deadpool_postgres::Pool),
     #[cfg(target_arch = "wasm32")]
-    DoSqlite(std::rc::Rc<worker::SqlStorage>),
+    DoSqlite(std::rc::Rc<DoSqlite>),
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct DoSqlite { sql: worker::SqlStorage, storage: Option<worker::Storage> }
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Deref for DoSqlite {
+    type Target = worker::SqlStorage;
+    fn deref(&self) -> &Self::Target { &self.sql }
 }
 
 // A Workers isolate has no threads and the Durable Object serialises event
@@ -56,7 +64,7 @@ impl Db {
     /// Wrap the Durable Object SQLite handle used by the Workers deployment.
     #[cfg(target_arch = "wasm32")]
     pub async fn from_do_sql(storage: worker::SqlStorage) -> Result<Self, String> {
-        let db = Db::DoSqlite(std::rc::Rc::new(storage)); db.migrate().await?; Ok(db)
+        let db = Db::DoSqlite(std::rc::Rc::new(DoSqlite { sql: storage, storage: None })); db.migrate().await?; Ok(db)
     }
     /// Cheap clone of the Durable Object SQL handle for deferred work.
     #[cfg(target_arch = "wasm32")]
@@ -149,14 +157,18 @@ impl Db {
                 }
                 tx.commit().await.map_err(|e| e.to_string())
             }
-            // A Durable Object handles one event at a time and the SQL handle is
-            // synchronous, so a sequential batch cannot interleave with another
-            // request the way two native connections could.
             #[cfg(target_arch = "wasm32")]
-            Db::DoSqlite(s) => {
-                for (sql, params) in statements { s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; }
-                Ok(())
-            }
+            Db::DoSqlite(s) => { s.transaction_sync(statements) }
+        }
+    }
+    pub fn master_rotation_supported(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(_) => false,
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(_) => true,
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_) => true,
         }
     }
     pub async fn version(&self) -> Result<i64, String> {
@@ -205,14 +217,44 @@ impl Db {
 }
 
 #[cfg(target_arch = "wasm32")]
+impl DoSqlite {
+    fn transaction_sync(&self, statements: &[(String, Vec<Value>)]) -> Result<(), String> {
+        use worker::wasm_bindgen::{JsCast, JsValue};
+        let storage = self.storage.as_ref().ok_or("atomic batches require Durable Object storage")?;
+        let raw = storage.as_raw().as_ref();
+        let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync"))
+            .map_err(|e| format!("transactionSync unavailable: {:?}", e))?
+            .dyn_into::<js_sys::Function>().map_err(|_| "transactionSync is not a function")?;
+        let statements = statements.to_vec();
+        let sql = self.sql.clone();
+        let callback = worker::wasm_bindgen::closure::Closure::wrap(Box::new(move || -> Result<(), JsValue> {
+            for (statement, params) in &statements {
+                sql.exec(statement, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            }
+            Ok(())
+        }) as Box<dyn FnMut() -> Result<(), JsValue>>);
+        // The runtime rolls back the whole batch when the callback throws.
+        transaction.call1(raw, callback.as_ref()).map_err(|e| format!("atomic batch failed: {:?}", e))?;
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 impl Db {
-    /// Constructor for the Durable Object. Migrations run synchronously because
-    /// the object constructor cannot await, and the SQL handle never yields.
-    pub fn from_do_sql_now(storage: worker::SqlStorage) -> Result<Self, String> {
-        let db = Db::DoSqlite(std::rc::Rc::new(storage));
+    pub fn from_do_storage_now(storage: worker::Storage) -> Result<Self, String> {
+        let sql = storage.sql();
+        let db = Db::DoSqlite(std::rc::Rc::new(DoSqlite { sql, storage: Some(storage) }));
         db.migrate_now()?;
         Ok(db)
     }
+    /// Constructor for the Durable Object. Migrations run synchronously because
+    /// the object constructor cannot await, and the SQL handle never yields.
+    pub fn from_do_sql_now(storage: worker::SqlStorage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(DoSqlite { sql: storage, storage: None }));
+        db.migrate_now()?;
+        Ok(db)
+    }
+    pub(crate) fn exec_sync(&self, sql: &str, params: &[Value]) -> Result<u64, String> { self.exec_now(sql, params) }
     fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
             Db::DoSqlite(s) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }

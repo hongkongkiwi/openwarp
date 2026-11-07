@@ -17,15 +17,7 @@ pub mod ssh_keys;
 pub mod ui;
 #[cfg(feature = "ldap")]
 pub mod ldap;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod kms;
-#[cfg(target_arch = "wasm32")]
-#[path = "kms_wasm.rs"]
-pub mod kms;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod mfa;
-#[cfg(target_arch = "wasm32")]
-#[path = "mfa_wasm.rs"]
 pub mod mfa;
 #[cfg(target_arch = "wasm32")]
 pub mod worker;

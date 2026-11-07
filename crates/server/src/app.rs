@@ -1,13 +1,11 @@
 use crate::{db, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
 #[cfg(feature = "ldap")] use crate::ldap;
-#[cfg(not(target_arch = "wasm32"))]
 use axum::body::Bytes;
 use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 #[cfg(not(target_arch = "wasm32"))]
 use axum::{extract::{WebSocketUpgrade, ws::{Message, WebSocket}}};
 use db::{Db, Row};
 use openwarp_crypto as oc;
-#[cfg(not(target_arch = "wasm32"))]
 use risaml::{
     AcsEndpoint, AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, FormField,
     IdpDescriptor, MetadataTrustPolicy, Pending, PendingSnapshot, PrivateKeyPem, RelayStateParam,
@@ -17,15 +15,13 @@ use risaml::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}};
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::broadcast;
 
-/// Live event fan-out. Workers has no long-lived WebSocket route, so the wasm
-/// build has a no-op sender and the /api/live route answers 501.
+/// Native replicas poll persisted events; Workers drains them to hibernating sockets after each request.
 #[cfg(not(target_arch = "wasm32"))]
 pub type LiveSender = broadcast::Sender<Arc<str>>;
 #[cfg(target_arch = "wasm32")]
@@ -60,16 +56,18 @@ pub struct AppState {
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
+    key_gate: tokio::sync::RwLock<()>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
-/// The root KMS is installed once at boot by the native entrypoint. The
-/// Workers build has no blocking HTTP client, so its slot stays empty.
-pub fn install_kms(st: &S, kms: Option<kms::Kms>) { let _ = st.kms.set(kms); }
+/// Install the validated bridge before serving requests on either runtime.
+pub fn install_kms(st: &S, kms: Option<kms::Kms>) { assert!(st.kms.set(kms).is_ok(), "KMS already initialized"); }
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn initialize_master(st: &S, master: [u8; 32]) { *st.master.write().unwrap_or_else(|e| e.into_inner()) = master; }
 pub type Res = Result<Json<Value>, (StatusCode, Json<Value>)>;
 fn issuer(st: &S, h: &HeaderMap) -> String { if !st.pub_url.is_empty() { return st.pub_url.trim_end_matches('/').to_string(); } let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8080"); format!("http://{}", host) }
 fn cookie_val(h: &HeaderMap, name: &str) -> String { h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").split(';').filter_map(|p| p.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.to_string()).unwrap_or_default() }
@@ -195,7 +193,8 @@ impl AppState {
         // replica can forward the event without ever seeing plaintext.
         #[cfg(not(target_arch = "wasm32"))]
         let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
+        let start = self.db.one("SELECT COALESCE(MAX(id),0) AS cursor FROM live_events", &[]).await.ok().flatten().map(|r| db::n(&r, "cursor") + 1).unwrap_or(1).max(now() * 1_000_000);
         for seq in (start..).take(4) {
             if self.db.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq), json!(org), json!(app), json!(env), json!(action), json!(detail), json!(now())]).await.is_ok() { break; }
         }
@@ -239,13 +238,13 @@ impl AppState {
         if wrapped.is_empty() { return Err(err(StatusCode::CONFLICT, "this environment is client-encrypted; the server has no key for it")); }
         if wrapped.starts_with("owkms:") {
             let kms = self.kms().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "this environment is wrapped by a KMS that is not configured"))?;
-            let raw = kms.unwrap(&wrapped, &format!("env:{}", env_id)).map_err(|e| bad(&format!("KMS could not unwrap the environment key: {}", e)))?;
+            let raw = kms.unwrap(&wrapped, &format!("env:{}", env_id)).await.map_err(|e| bad(&format!("KMS could not unwrap the environment key: {}", e)))?;
             return raw.try_into().map_err(|_| bad("bad env key")); }
         // A row written before KMS was enabled is rewrapped on first use. The
         // legacy master stays valid for every other root-encrypted record.
         let raw = oc::decrypt_symmetric(&self.master(), &wrapped).map_err(|e| bad(&e))?;
         if let Some(kms) = self.kms() {
-            if let Ok(rewrapped) = kms.wrap(&raw, &format!("env:{}", env_id)) {
+            if let Ok(rewrapped) = kms.wrap(&raw, &format!("env:{}", env_id)).await {
                 let _ = self.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(rewrapped), json!(&env_id)]).await;
             }
         }
@@ -266,9 +265,11 @@ impl AppState {
         // injected script cannot read it. API clients keep using Bearer tokens.
         if token.is_empty() { token = cookie_val(headers, "ow_session"); }
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
-        let hash = oc::hash_token(&token);
+        self.token_user_by_hash(&oc::hash_token(&token)).await
+    }
+    async fn token_user_by_hash(&self, hash: &str) -> Result<String, (StatusCode, Json<Value>)> {
         #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
-        if self.cache_revoked(&hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
+        if self.cache_revoked(hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
         // OAuth 2.1 access tokens (CLI / MCP clients)
         if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await.map_err(|e| bad(&e))? {
             let uid = db::s(&row, "user_id");
@@ -302,7 +303,9 @@ impl AppState {
     }
     async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if let Ok(Some(row)) = self.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(oc::hash_token(token))]).await { let scope = db::s(&row, "env_id"); if !scope.is_empty() && scope != env_id { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
+        self.check_scope_by_hash(&oc::hash_token(token), env_id).await }
+    async fn check_scope_by_hash(&self, hash: &str, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        if let Some(row) = self.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))? { let scope = db::s(&row, "env_id"); if !scope.is_empty() && scope != env_id { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); } }
         Ok(()) }
     async fn role_perms(&self, org: &str, role: &str) -> Vec<String> {
         match role {
@@ -755,7 +758,7 @@ async fn create_app(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
 async fn create_env_inner(st: &S, app_id: &str, name: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let eid = id(); let key = oc::random_key();
     let wrapped = match st.kms() {
-        Some(kms) => kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap the environment key: {}", e)))?,
+        Some(kms) => kms.wrap(&key, &format!("env:{}", eid)).await.map_err(|e| bad(&format!("KMS could not wrap the environment key: {}", e)))?,
         None => oc::encrypt_symmetric(&st.master(), &key),
     };
     st.db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,created_at) VALUES(?,?,?,?,?)", &[json!(eid), json!(app_id), json!(name), json!(wrapped), json!(now())]).await.map_err(|e| bad(&e))?; Ok(eid) }
@@ -1673,6 +1676,10 @@ pub(crate) async fn meta_get(st: &S, k: &str) -> String { st.db.one("SELECT v FR
 // One pass over pre-existing secrets. New writes compute their fingerprint
 // inline, so this only needs to run once per database.
 pub async fn backfill_value_fingerprints(st: &S) {
+    let _key_guard = st.key_gate.read().await;
+    backfill_value_fingerprints_inner(st).await;
+}
+async fn backfill_value_fingerprints_inner(st: &S) {
     if st.db.one("SELECT v FROM meta WHERE k='migration:value_fp'", &[]).await.ok().flatten().is_some() { return; }
     let rows = match st.db.query("SELECT id,env_id,version,value_enc,secret_type,e2e FROM secrets WHERE value_fp='' AND deleted=0", &[]).await { Ok(rows) => rows, Err(_) => return };
     let mut keys: HashMap<String, [u8; 32]> = HashMap::new();
@@ -1715,25 +1722,6 @@ fn egress_allowed(u: &str) -> bool {
     true }
 // Outbound OIDC/SAML metadata may only use TLS, except for a loopback IdP used in
 // development or tests. Link-local metadata addresses are always refused.
-#[cfg(not(target_arch = "wasm32"))]
-fn ca_params(cn: &str, is_ca: bool) -> rcgen::CertificateParams {
-    let mut p = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
-    p.not_before = rcgen::date_time_ymd(2020, 1, 1);
-    p.not_after = rcgen::date_time_ymd(2050, 1, 1);
-    p.distinguished_name.push(rcgen::DnType::CommonName, cn);
-    if is_ca { p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained); p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign]; }
-    else { p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature]; p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth, rcgen::ExtendedKeyUsagePurpose::ClientAuth]; }
-    p }
-#[cfg(not(target_arch = "wasm32"))]
-fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair), (StatusCode, Json<Value>)> {
-    if db::s(ca,"kind") == "ssh" { return Err(bad("this is an SSH certificate authority; sign with POST /api/ssh/cas/{id}/sign")); }
-    let pem = oc::decrypt_symmetric(&st.master(), &db::s(ca,"key_enc")).map_err(|e| bad(&e))?;
-    let kp = rcgen::KeyPair::from_pem(&String::from_utf8_lossy(&pem)).map_err(|e| bad(&e.to_string()))?;
-    let mut params = ca_params(&db::s(ca,"name"), true);
-    if let Some(serial) = hex_decode(&db::s(ca,"serial")) { params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial)); }
-    let cert = params.self_signed(&kp).map_err(|e| bad(&e.to_string()))?;
-    Ok((cert, kp)) }
-
 fn issuer_url_ok(issuer: &str) -> bool {
     let u = issuer.trim().to_ascii_lowercase();
     if !url_ok(&u) { return false; }
@@ -1834,7 +1822,6 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
 
 // ---------- SAML 2.0 service provider ----------
-#[cfg(not(target_arch = "wasm32"))]
 struct SamlReplayCache { st: S }
 #[cfg(not(target_arch = "wasm32"))]
 impl ReplayCache for SamlReplayCache {
@@ -1860,23 +1847,20 @@ impl ReplayCache for SamlReplayCache {
             Ok(_) => Ok(()),
             Err(_) => Err(SamlError::ReplayDetected { key: cache_key }),
         } } }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
+impl ReplayCache for SamlReplayCache {
+    fn check_and_store(&mut self, key: ReplayKey, expires_at: SystemTime) -> Result<(), SamlError> {
+        let cache_key = key.cache_key();
+        let expires = expires_at.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_else(|_| now() + 600);
+        self.st.db.exec_sync("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(&cache_key), json!(expires)])
+            .map(|_| ()).map_err(|_| SamlError::ReplayDetected { key: cache_key })
+    }
+}
 async fn saml_config_row(st: &S, org: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(org)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "SAML is not configured for this organisation")) }
-#[cfg(not(target_arch = "wasm32"))]
 fn saml_sp_entity(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/metadata", base.trim_end_matches('/'), org) }
-#[cfg(not(target_arch = "wasm32"))]
 fn saml_acs_url(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/acs", base.trim_end_matches('/'), org) }
-#[cfg(not(target_arch = "wasm32"))]
-fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> {
-    use rsa::pkcs8::EncodePrivateKey;
-    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
-    let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| e.to_string())?.to_string();
-    let kp = rcgen::KeyPair::from_pem(&pem).map_err(|e| e.to_string())?;
-    let cert = ca_params(cn, false).self_signed(&kp).map_err(|e| e.to_string())?;
-    Ok((pem, cert.pem())) }
-#[cfg(not(target_arch = "wasm32"))]
 fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsigned: bool) -> Result<IdpDescriptor, String> {
     let entity = EntityId::try_new(idp_entity).map_err(|e| e.to_string())?;
     if !trusted_cert.trim().is_empty() {
@@ -1885,7 +1869,6 @@ fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsign
     } else if allow_unsigned {
         IdpDescriptor::from_metadata_xml_for(entity, xml, MetadataTrustPolicy::UnsignedForCompatibility).map_err(|e| e.to_string())
     } else { Err("SAML metadata must be signed by metadata_trusted_cert, or set allow_unsigned_metadata".into()) } }
-#[cfg(not(target_arch = "wasm32"))]
 fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, String> {
     let key_pem = oc::decrypt_symmetric(&st.master(), &db::s(cfg,"sp_key_enc")).map_err(|e| e.to_string())?;
     let creds = Credentials {
@@ -1897,7 +1880,6 @@ fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, 
         .credentials(creds)
         .validation(SpValidationPolicy::strict())
         .build().map_err(|e| e.to_string()) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     let cfg = saml_config_row(&st, &oid).await?; let base = issuer(&st, &h);
@@ -1912,7 +1894,6 @@ async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         "auto_provision": db::n(&cfg,"auto_provision") == 1,
         "allowed_domains": db::s(&cfg,"allowed_domains"),
     }))) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     let idp_entity_id = body.get("idp_entity_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -1936,7 +1917,7 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let (key_enc, cert_pem) = match existing {
         Some(ref row) => (db::s(row,"sp_key_enc"), db::s(row,"sp_cert_pem")),
         None => {
-            let (key_pem, cert_pem) = saml_signing_keypair(&format!("openwarp-saml-{}", oid)).map_err(|e| bad(&e))?;
+            let (key_pem, cert_pem) = crate::pki::saml_signing_keypair(&format!("openwarp-saml-{}", oid)).map_err(|e| bad(&e))?;
             (oc::encrypt_symmetric(&st.master(), key_pem.as_bytes()), cert_pem)
         }
     };
@@ -1949,14 +1930,12 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     }
     st.audit(&oid, "", "", &uid, "saml.configure", &idp_entity_id).await;
     Ok(j(json!({"ok": true, "sp_metadata_url": saml_sp_entity(&issuer(&st,&h), &oid)}))) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let sp = match saml_sp_config(&st, &issuer(&st,&h), &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
     let mut resp = sp.metadata_xml().to_string().into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/samlmetadata+xml"));
     resp }
-#[cfg(not(target_arch = "wasm32"))]
 async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let base = issuer(&st, &h);
@@ -1975,7 +1954,6 @@ async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) 
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]).await;
     if let Err(e) = st.db.exec("INSERT INTO saml_pending(state,org_id,snapshot,created_at) VALUES(?,?,?,?)", &[json!(&state), json!(&oid), json!(&snapshot), json!(now())]).await { return bad(&e).into_response(); }
     axum::response::Redirect::temporary(&url).into_response() }
-#[cfg(not(target_arch = "wasm32"))]
 async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
     if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).await.map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
@@ -2005,7 +1983,6 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     claim_instance_owner(st, &uid).await;
     st.audit(org, "", "", &uid, "auth.saml_provision", &format!("{} {}", email, name_id)).await;
     Ok(uid) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
     let pending_row = match st.db.one("SELECT * FROM saml_pending WHERE org_id=? AND state=?", &[json!(&oid), json!(form.get("RelayState").cloned().unwrap_or_default())]).await { Ok(Some(r)) => r, _ => return bad("SAML request is missing, expired, or already used").into_response() };
     if db::n(&pending_row,"created_at") + 600 < now() { return bad("SAML request expired").into_response(); }
@@ -2025,7 +2002,7 @@ async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, ax
     if let Some(e) = snapshot["expires"].as_str() { if let Ok(v) = SamlInstant::try_new(e) { snap.expires_at = Some(v); } }
     let pending = match Pending::<AuthnRequest>::from_snapshot(snap) { Ok(p) => p, Err(e) => return bad(&e.to_string()).into_response() };
     let mut cache = SamlReplayCache { st: st.clone() };
-    let ctx = SamlValidationContext::new(SystemTime::now(), ReplayPolicy::RequireCache(&mut cache));
+    let ctx = SamlValidationContext::new(crate::clock::system_time(), ReplayPolicy::RequireCache(&mut cache));
     let fields: Vec<FormField> = form.iter().map(|(k,v)| FormField::new(k.clone(), v.clone())).collect();
     let session = match sp.finish_sso(&idp, &pending, BrowserInput::<SsoResponse>::post(fields), ctx) { Ok(s) => s, Err(e) => return bad(&format!("SAML validation failed: {}", e)).into_response() };
     let name_id = session.name_id().value().to_string(); let email = name_id.to_lowercase();
@@ -2296,7 +2273,6 @@ async fn send_template(to: &str, kind: &str, vars: &[(&str, &str)]) {
 // Security codes need the delivery outcome, so they use the fallible variant.
 // Outside production a suppressed message still counts as delivered: the code
 // is written to the operator log, which is how the local walkthrough works.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn send_email_result(to: &str, subject: &str, text: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let cfg = mailer::MailConfig::from_env();
     if !cfg.enabled() {
@@ -2869,7 +2845,7 @@ async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
         // env_key unwraps both legacy and KMS rows, so this also migrates a
         // deployment that enabled KMS after its data was created.
         if let Ok(key) = st.env_key(&eid).await {
-            let wrapped = kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
+            let wrapped = kms.wrap(&key, &format!("env:{}", eid)).await.map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
             stmts.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(&eid)]));
             rewrapped += 1;
         }
@@ -2908,94 +2884,103 @@ async fn encrypt_metadata(State(st): State<S>, h: HeaderMap) -> Res {
     }
     st.audit("", "", "", &uid, "instance.encrypt_metadata", &format!("{} secrets", updated)).await;
     Ok(j(json!({"updated": updated}))) }
-#[cfg(not(target_arch = "wasm32"))]
+// Complete inventory shared by rotation and first-boot master identity validation.
+async fn master_updates(db: &Db, old: &[u8; 32], new: &[u8; 32]) -> Result<Vec<(String, Vec<Value>)>, String> {
+    let mut updates = Vec::new();
+    for (table, id_col, col, predicate) in [
+        ("envs", "id", "env_key_wrapped", "env_key_wrapped<>''"),
+        ("meta", "k", "v", "k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%'"),
+        ("pki_cas", "id", "key_enc", "key_enc<>''"),
+        ("log_streams", "id", "secret", "secret<>''"),
+        ("saml_configs", "org_id", "sp_key_enc", "sp_key_enc<>''"),
+        ("rotation_hooks", "org_id", "secret_enc", "secret_enc<>''"),
+        ("ldap_configs", "org_id", "bind_password_enc", "bind_password_enc<>''"),
+        ("users", "id", "auth_key_enc", "auth_key_enc<>''"),
+    ] {
+        let rows = db.query(&format!("SELECT {},{} FROM {} WHERE {}", id_col, col, table, predicate), &[]).await?;
+        for row in rows {
+            let id = db::s(&row, id_col); let value = db::s(&row, col);
+            if value.is_empty() || (table == "envs" && value.starts_with("owkms:")) { continue; }
+            let plain = if table == "users" { oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value) } else { oc::decrypt_symmetric(old, &value) }
+                .map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
+            let encrypted = if table == "users" { oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain) } else { oc::encrypt_symmetric(new, &plain) };
+            updates.push((format!("UPDATE {} SET {}=? WHERE {}=?", table, col, id_col), vec![json!(encrypted), json!(id)]));
+        }
+    }
+    Ok(updates)
+}
+
+pub async fn verify_master(db: &Db, key: &[u8; 32]) -> Result<(), String> {
+    if let Some(row) = db.one("SELECT v FROM meta WHERE k='master_key_check'", &[]).await? {
+        let plain = oc::decrypt_symmetric(key, &db::s(&row, "v")).map_err(|_| "configured master key does not match the database; restore the current key".to_string())?;
+        if plain != b"openwarp-master-key-v1" { return Err("invalid persisted master key verifier".into()); }
+    } else {
+        master_updates(db, key, key).await?;
+    }
+    Ok(())
+}
+
+pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], String> {
+    let supplied = crate::envcfg::var("OPENWARP_MASTER_KEY").ok().map(|v| {
+        oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string())?
+            .try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string())
+    }).transpose()?;
+    let wrapped = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?;
+    let local = db.one("SELECT v FROM meta WHERE k='master'", &[]).await?;
+    let existing = if let Some(row) = &wrapped {
+        if let Some(kms) = kms {
+            let raw = kms.unwrap(&db::s(row, "v"), "master").await.map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
+            Some(raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?)
+        } else if supplied.is_some() { supplied } else { return Err("this database's master root is wrapped by a KMS, but OPENWARP_KMS_URL is not configured".into()); }
+    } else if let Some(row) = &local {
+        Some(oc::unb64(&db::s(row, "v")).map_err(|_| "stored master root is not valid base64; refusing to generate a replacement".to_string())?
+            .try_into().map_err(|_| "stored master root is not 32 bytes; refusing to generate a replacement".to_string())?)
+    } else { None };
+    if let (Some(binding), Some(existing)) = (supplied, existing) { if binding != existing { return Err("OPENWARP_MASTER_KEY does not match the stored master root".into()); } }
+    if supplied.is_none() && crate::production() { return Err("OPENWARP_MASTER_KEY is required in production".into()); }
+    let key = supplied.or(existing).unwrap_or_else(oc::random_key);
+    verify_master(db, &key).await?;
+    let mut updates = Vec::new();
+    if let Some(kms) = kms {
+        if wrapped.is_none() {
+            let envelope = kms.wrap(&key, "master").await?;
+            updates.push(("INSERT INTO meta(k,v) VALUES('kms_root',?)".into(), vec![json!(envelope)]));
+            updates.push(("DELETE FROM meta WHERE k='master'".into(), vec![]));
+        }
+    } else if supplied.is_none() && local.is_none() {
+        updates.push(("INSERT INTO meta(k,v) VALUES('master',?)".into(), vec![json!(oc::b64(&key))]));
+    }
+    updates.push(("INSERT INTO meta(k,v) VALUES('master_key_check',?) ON CONFLICT(k) DO NOTHING".into(), vec![json!(oc::encrypt_symmetric(&key, b"openwarp-master-key-v1"))]));
+    db.batch(&updates).await?;
+    verify_master(db, &key).await?;
+    Ok(key)
+}
+
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
-    let new_key = body.get("new_key").and_then(|v| v.as_str()).unwrap_or("");
-    let new: [u8; 32] = oc::unb64(new_key).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    if !st.db.master_rotation_supported() { return Err(err(StatusCode::CONFLICT, "master rotation is unavailable on shared PostgreSQL until distributed key reload is supported")); }
+    let new: [u8; 32] = oc::unb64(body.get("new_key").and_then(|v| v.as_str()).unwrap_or("")).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    let _key_guard = st.key_gate.write().await;
     let old = st.master();
     if old == new { return Err(bad("new_key is the current key")); }
-    // Preflight every encrypted value before touching the database.
-    let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
-    let mut env_updates = Vec::new();
-    for r in &envs {
-        let wrapped = db::s(r, "env_key_wrapped");
-        // KMS-wrapped and client-encrypted environments do not depend on the
-        // local master key, so leave their blobs untouched.
-        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
-        let plain = oc::decrypt_symmetric(&old, &wrapped)
-            .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
-        env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
+    verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
+    let mut updates = master_updates(&st.db, &old, &new).await.map_err(|e| bad(&e))?;
+    let count = updates.len();
+    if st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() {
+        let kms = st.kms().ok_or_else(|| bad("restore the KMS bridge before rotating its root"))?;
+        let wrapped = kms.wrap(&new, "master").await.map_err(|e| bad(&e))?;
+        updates.push(("UPDATE meta SET v=? WHERE k='kms_root'".into(), vec![json!(wrapped)]));
     }
-    let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%'", &[]).await.map_err(|e| bad(&e))?;
-    let mut meta_updates = Vec::new();
-    for r in &metas {
-        let value = db::s(r, "v"); if value.is_empty() { continue; }
-        let plain = oc::decrypt_symmetric(&old, &value)
-            .map_err(|_| bad(&format!("stored secret {} cannot be decrypted with the current master key; refusing rotation", db::s(r, "k"))))?;
-        meta_updates.push((db::s(r, "k"), oc::encrypt_symmetric(&new, &plain)));
-    }
-    let cas = st.db.query("SELECT id,key_enc FROM pki_cas", &[]).await.map_err(|e| bad(&e))?;
-    let mut ca_updates = Vec::new();
-    for r in &cas {
-        let plain = oc::decrypt_symmetric(&old, &db::s(r, "key_enc"))
-            .map_err(|_| bad("a CA private key cannot be decrypted with the current master key; refusing rotation"))?;
-        ca_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
-    }
-    let streams = st.db.query("SELECT id,secret FROM log_streams", &[]).await.map_err(|e| bad(&e))?;
-    let mut stream_updates = Vec::new();
-    for r in &streams {
-        let value = db::s(r, "secret"); if value.is_empty() { continue; }
-        let plain = oc::decrypt_symmetric(&old, &value)
-            .map_err(|_| bad("a log stream secret cannot be decrypted with the current master key; refusing rotation"))?;
-        stream_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
-    }
-    let samls = st.db.query("SELECT org_id,sp_key_enc FROM saml_configs", &[]).await.map_err(|e| bad(&e))?;
-    let mut saml_updates = Vec::new();
-    for r in &samls {
-        let plain = oc::decrypt_symmetric(&old, &db::s(r, "sp_key_enc"))
-            .map_err(|_| bad("a SAML signing key cannot be decrypted with the current master key; refusing rotation"))?;
-        saml_updates.push((db::s(r, "org_id"), oc::encrypt_symmetric(&new, &plain)));
-    }
-    let hooks = st.db.query("SELECT org_id,secret_enc FROM rotation_hooks WHERE secret_enc<>''", &[]).await.map_err(|e| bad(&e))?;
-    let mut hook_updates = Vec::new();
-    for r in &hooks {
-        let plain = oc::decrypt_symmetric(&old, &db::s(r, "secret_enc"))
-            .map_err(|_| bad("a rotation hook secret cannot be decrypted with the current master key; refusing rotation"))?;
-        hook_updates.push((db::s(r, "org_id"), oc::encrypt_symmetric(&new, &plain)));
-    }
-    let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
-
-    // Block new encryptions with the old key while the database is updated.
-    // The write guard lives inside a blocking task so it never crosses an
-    // await point in this handler's future.
-    let counts = (env_updates.len(), meta_updates.len(), ca_updates.len(), stream_updates.len(), saml_updates.len(), hook_updates.len());
-    let st2 = st.clone();
-    let updates = tokio::task::spawn_blocking(move || {
-        let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| bad(&e.to_string()))?;
-        let result = runtime.block_on(async {
-            for (id, wrapped) in &env_updates { st2.db.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?", &[json!(wrapped), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (k, value) in &meta_updates { st2.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(value), json!(k)]).await.map_err(|e| bad(&e))?; }
-            for (id, key_enc) in &ca_updates { st2.db.exec("UPDATE pki_cas SET key_enc=? WHERE id=?", &[json!(key_enc), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (id, secret) in &stream_updates { st2.db.exec("UPDATE log_streams SET secret=? WHERE id=?", &[json!(secret), json!(id)]).await.map_err(|e| bad(&e))?; }
-            for (org, key_enc) in &saml_updates { st2.db.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?", &[json!(key_enc), json!(org)]).await.map_err(|e| bad(&e))?; }
-            for (org, secret) in &hook_updates { st2.db.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?", &[json!(secret), json!(org)]).await.map_err(|e| bad(&e))?; }
-            if generated_master { st2.db.exec("UPDATE meta SET v=? WHERE k='master'", &[json!(oc::b64(&new))]).await.map_err(|e| bad(&e))?; }
-            Ok::<(), (StatusCode, Json<Value>)>(())
-        });
-        if result.is_ok() { *guard = new; }
-        result
-    }).await.map_err(|e| bad(&e.to_string()))?;
-    updates?;
-    // Fingerprints are keyed by the master key and salted by workspace, so the
-    // old ones are invalid. Clear them and rebuild the index off the request.
-    let _ = st.db.exec("UPDATE secrets SET value_fp=''", &[]).await;
-    let _ = st.db.exec("DELETE FROM meta WHERE k='migration:value_fp'", &[]).await;
-    { let st2 = st.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
-    st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={} saml={} hooks={}", counts.0, counts.1, counts.2, counts.3, counts.4, counts.5)).await;
-    Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
+    updates.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))]));
+    updates.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))]));
+    updates.push(("UPDATE secrets SET value_fp=''".into(), vec![]));
+    updates.push(("DELETE FROM meta WHERE k='migration:value_fp'".into(), vec![]));
+    st.db.batch(&updates).await.map_err(|e| bad(&e))?;
+    *st.master.write().unwrap_or_else(|e| e.into_inner()) = new;
+    backfill_value_fingerprints_inner(&st).await;
+    st.audit("", "", "", &uid, "instance.master_rotate", &format!("{} encrypted records", count)).await;
+    Ok(j(json!({"ok":true,"rotated_records":count,"note":"Update OPENWARP_MASTER_KEY before restarting. Stale bindings fail closed. Fingerprints rebuild during maintenance."}))) }
 
 // ---------- SCIM groups + user lifecycle ----------
 async fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
@@ -3393,7 +3378,6 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     st.db.exec("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
         &[json!(cert_id), json!(caid), json!(cn), json!(&issued.certificate_pem), json!(&issued.serial_hex), json!(now()+days*86400), json!(now())]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": cert_id, "certificate": issued.certificate_pem, "private_key": issued.private_key_pem, "ca_certificate": db::s(&ca,"cert_pem")}))) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     // Unauthenticated, so an SSH CA answers as if it did not exist.
@@ -3410,14 +3394,14 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     // table once instead of doing a database lookup per certificate.
     let certs = st.db.query("SELECT serial,revoked FROM pki_certs WHERE ca_id=?", &[json!(&caid)]).await.unwrap_or_default();
     let status: HashMap<String, bool> = certs.iter().map(|r| (db::s(r, "serial").to_lowercase(), db::n(r, "revoked") == 1)).collect();
-    let response = match responder.respond(&request, |cert_id| {
+    let response = match responder.respond_at(&request, |cert_id| {
         let serial = cert_id.serial_hex().to_lowercase();
         match status.get(&serial) {
             Some(true) => keystore_ocsp::CertStatus::Revoked { revocation_time: now(), reason: None },
             Some(false) => keystore_ocsp::CertStatus::Good,
             None => keystore_ocsp::CertStatus::Unknown,
         }
-    }) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
+    }, crate::clock::system_time()) { Ok(r) => r, Err(e) => return bad(&e.to_string()).into_response() };
     let mut resp = response.to_der().into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/ocsp-response"));
     resp }
@@ -3431,29 +3415,16 @@ async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>)
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(db::s(&row,"ca_id"))]).await.map_err(|e| bad(&e))?;
     if let Some(ca)=&ca { if db::s(ca,"kind") == "ssh" { return Err(bad("this is an SSH certificate authority; its certificates are listed at /api/ssh/cas/{id}/certs")); } st.check_admin(&db::s(ca,"org_id"),&uid).await?; }
     st.db.exec("UPDATE pki_certs SET revoked=1 WHERE id=?", &[json!(cid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": cid}))) }
-#[cfg(not(target_arch = "wasm32"))]
 async fn ca_crl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response { let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     if let Err(e) = st.check_admin(&db::s(&ca,"org_id"), &uid).await { return e.into_response(); }
-    let (issuer_cert, issuer_kp) = match load_issuer(&st, &ca) { Ok(x) => x, Err(e) => return e.into_response() };
+    if db::s(&ca,"kind") == "ssh" { return bad("this is an SSH certificate authority; use its revocation endpoints").into_response(); }
+    let key = match oc::decrypt_symmetric(&st.master(), &db::s(&ca,"key_enc")) { Ok(k) => k, Err(e) => return bad(&e).into_response() };
     let rows = match st.db.query("SELECT serial,revoked FROM pki_certs WHERE ca_id=?", &[json!(&caid)]).await { Ok(r) => r, Err(e) => return bad(&e).into_response() };
-    let mut revoked = Vec::new();
-    for r in &rows { if db::n(r,"revoked") == 1 { if let Some(serial) = hex_decode(&db::s(r,"serial")) {
-        revoked.push(rcgen::RevokedCertParams { serial_number: rcgen::SerialNumber::from_slice(&serial), revocation_time: time::OffsetDateTime::now_utc(), reason_code: None, invalidity_date: None }); } } }
-    let params = rcgen::CertificateRevocationListParams {
-        this_update: time::OffsetDateTime::now_utc(),
-        next_update: time::OffsetDateTime::now_utc() + time::Duration::days(7),
-        crl_number: rcgen::SerialNumber::from_slice(&oc::random_key()[..8]),
-        issuing_distribution_point: None,
-        revoked_certs: revoked,
-        key_identifier_method: rcgen::KeyIdMethod::Sha256,
-    };
-    match params.signed_by(&issuer_cert, &issuer_kp) {
-        Ok(crl) => match crl.pem() {
-            Ok(pem) => { let mut resp = pem.into_response(); resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/pkix-crl")); resp }
-            Err(e) => bad(&e.to_string()).into_response(),
-        },
-        Err(e) => bad(&e.to_string()).into_response(),
+    let revoked: Vec<Vec<u8>> = rows.iter().filter(|r| db::n(r,"revoked") == 1).filter_map(|r| hex_decode(&db::s(r,"serial"))).collect();
+    match crate::pki::crl(&db::s(&ca,"cert_pem"), &String::from_utf8_lossy(&key), &revoked, now()) {
+        Ok(pem) => { let mut resp = pem.into_response(); resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/pkix-crl")); resp }
+        Err(e) => bad(&e).into_response(),
     } }
 
 
@@ -3603,22 +3574,7 @@ pub(crate) fn totp_code(secret: &[u8], counter: u64) -> String { use sha1::Sha1;
     let off = (hash[19] & 0x0f) as usize; let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off+1] as u32) << 16) | ((hash[off+2] as u32) << 8) | hash[off+3] as u32; format!("{:06}", code % 1_000_000) }
 async fn otp_ok(st: &S, uid: &str, code: &str) -> bool {
     if meta_get(st, &format!("totp_enabled:{}", uid)).await != "1" { return true; }
-    if code.is_empty() { return false; }
-    if let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) {
-        let counter = (now() / 30) as u64;
-        for c in [counter.wrapping_sub(1), counter, counter + 1] {
-            if totp_code(&secret, c) == code {
-                let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
-                if c <= last { return false; }
-                meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
-                return true;
-            }
-        }
-    }
-    let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await; let hash = oc::hash_token(code);
-    let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    if let Some(pos) = list.iter().position(|x| *x == hash) { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; return true; }
-    false }
+    mfa::totp_ok(st, uid, code).await || mfa::recovery_ok(st, uid, code).await }
 
 pub(crate) async fn meta_set(st: &S, k: &str, v: &str) { if st.db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(k), json!(v)]).await.is_err() { let _ = st.db.exec("UPDATE meta SET v=? WHERE k=?", &[json!(v), json!(k)]).await; } }
 async fn totp_setup(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
@@ -3647,7 +3603,7 @@ async fn mfa_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(body): Js
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed two-factor attempts; try again later")); }
     if !mfa::second_factor_ok(&st, &uid, code).await { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid MFA code")); }
     st.rate_clear(&key).await;
-    mfa::consume_challenge(&st, token).await;
+    if !mfa::consume_challenge(&st, token).await { return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired MFA challenge")); }
     st.audit("", "", "", &uid, "auth.mfa", "").await;
     let session = make_session(&st, &uid).await?; let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&session).parse().unwrap()); Ok((hdr, j(json!({"token": session, "user_id": uid})))) }
 
@@ -3697,6 +3653,8 @@ pub async fn try_leader(st: &S, name: &str, owner: &str, ttl: i64) -> bool {
     if st.db.exec("UPDATE instance_leases SET owner=?,expires_at=? WHERE name=? AND (owner=? OR expires_at<?)", &[json!(owner), json!(expires), json!(name), json!(owner), json!(current)]).await.unwrap_or(0) > 0 { return true; }
     st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?)", &[json!(name), json!(owner), json!(expires)]).await.is_ok() }
 pub async fn process_maintenance(st: &S) {
+    let _key_guard = st.key_gate.read().await;
+    backfill_value_fingerprints_inner(st).await;
     process_rotations(st).await;
     retry_stale_deliveries(st).await;
     reap_expired_leases(st).await;
@@ -3883,7 +3841,7 @@ async fn oauth_decision(State(st): State<S>, h: HeaderMap, PeerAddr(addr): PeerA
             st.rate_fail(&key, 900).await;
             return (StatusCode::UNAUTHORIZED, html_csp(consent_mfa_page(&form, &form_token))).into_response(); }
         st.rate_clear(&key).await;
-        mfa::consume_challenge(&st, &form_token).await;
+        if !mfa::consume_challenge(&st, &form_token).await { return (StatusCode::UNAUTHORIZED, "this two-factor challenge expired; sign in again").into_response(); }
         uid }
     else if let Some(u) = oauth_user(&st, &h).await {
         // A session already passed the sign-in checks, but consent is a
@@ -4029,40 +3987,87 @@ async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(
 // The socket stays on the replica that accepted it. That replica's single poll
 // reads the shared table and fans matching events out, so a write on any
 // replica shows up here within a second. Frames carry audit fields only.
+#[derive(Clone, serde::Serialize, Deserialize)]
+pub(crate) struct LiveAdmission {
+    pub uid: String,
+    pub credential_hash: String,
+    pub cursor: i64,
+    pub peer: String,
+}
+impl AppState {
+    pub(crate) async fn live_identity(&self, admission: &LiveAdmission) -> Result<String, (StatusCode, Json<Value>)> {
+        let uid = self.token_user_by_hash(&admission.credential_hash).await?;
+        if uid != admission.uid { return Err(err(StatusCode::UNAUTHORIZED, "live credential changed")); }
+        if let Some(row) = self.db.one("SELECT scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(admission.credential_hash), json!(now())]).await.map_err(|e| bad(&e))? {
+            if !db::s(&row, "scope").split_whitespace().any(|s| s == "*" || s == "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "OAuth token lacks secrets:read")); }
+        } else if let Some(row) = self.db.one("SELECT scopes FROM tokens WHERE token_hash=?", &[json!(admission.credential_hash)]).await.map_err(|e| bad(&e))? {
+            let scopes = db::s(&row, "scopes");
+            if !scopes.is_empty() && !scopes.split_whitespace().any(|s| s == "*" || s == "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "token lacks secrets:read")); }
+        }
+        Ok(uid)
+    }
+    pub(crate) async fn live_authorize(&self, admission: &LiveAdmission, event: &Value) -> bool {
+        let Ok(uid) = self.live_identity(admission).await else { return false };
+        let org = event.get("org").and_then(Value::as_str).unwrap_or("");
+        if self.require_org(org, &uid).await.is_err() || self.check_perm(org, &uid, "secrets:read").await.is_err() { return false; }
+        let Ok(Some(row)) = self.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(org)]).await else { return false };
+        let list = db::s(&row, "ip_allowlist");
+        if !list.trim().is_empty() && !list.split(',').any(|c| ip_in_cidr(&admission.peer, c)) { return false; }
+        let env = event.get("env").and_then(Value::as_str).unwrap_or("");
+        if self.check_scope_by_hash(&admission.credential_hash, env).await.is_err() { return false; }
+        env.is_empty() || self.require_env(env, &uid).await.is_ok()
+    }
+    pub(crate) async fn live_replay(&self, cursor: i64) -> Result<Vec<Value>, String> {
+        let rows = self.db.query("SELECT id,org_id,app_id,env_id,action,detail,created_at FROM live_events WHERE id>? AND created_at>=? ORDER BY id LIMIT 500", &[json!(cursor), json!(now() - 3600)]).await?;
+        Ok(rows.iter().map(|r| json!({"type":"event","id":db::n(r,"id"),"org":db::s(r,"org_id"),"app":db::s(r,"app_id"),"env":db::s(r,"env_id"),"action":db::s(r,"action"),"detail":db::s(r,"detail"),"ts":db::n(r,"created_at")})).collect())
+    }
+}
+async fn live_admission(st: &S, h: &HeaderMap, q: &HashMap<String,String>, peer: PeerAddr) -> Result<LiveAdmission, (StatusCode, Json<Value>)> {
+    let uid = st.token_user(h).await?;
+    st.check_scope(h, "").await?;
+    let token = bearer_token(h);
+    let token = if token.is_empty() { cookie_val(h, "ow_session") } else { token };
+    let cursor = match q.get("since").and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0) {
+        Some(since) => since,
+        None => st.db.one("SELECT COALESCE(MAX(id),0) AS cursor FROM live_events", &[]).await.map_err(|e| bad(&e))?.map(|r| db::n(&r,"cursor")).unwrap_or(0),
+    };
+    let trust_proxy = !cfg!(target_arch = "wasm32") && crate::envcfg::var("OPENWARP_TRUST_PROXY").map(|v| v == "1").unwrap_or(false);
+    let proxy_ok = crate::envcfg::var("OPENWARP_TRUSTED_PROXIES").unwrap_or_else(|_| "127.0.0.1/32,::1".into())
+        .split(',').any(|cidr| ip_in_cidr(&peer.0.to_string(), cidr));
+    let client_ip = if trust_proxy && proxy_ok {
+        h.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| peer.0.to_string())
+    } else { peer.0.to_string() };
+    let admission = LiveAdmission { uid, credential_hash: oc::hash_token(&token), cursor, peer: client_ip };
+    st.live_identity(&admission).await?;
+    Ok(admission)
+}
+#[cfg(target_arch = "wasm32")]
+async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, peer: PeerAddr) -> Response {
+    if !h.get("upgrade").and_then(|v| v.to_str().ok()).map(|v| v.eq_ignore_ascii_case("websocket")).unwrap_or(false) { return err(StatusCode::BAD_REQUEST, "WebSocket upgrade required").into_response(); }
+    match live_admission(&st, &h, &q, peer).await {
+        Ok(admission) => { let mut response = StatusCode::OK.into_response(); response.extensions_mut().insert(admission); response }
+        Err(e) => e.into_response(),
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
-async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, ws: WebSocketUpgrade) -> Response {
-    let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
-    let mut orgs = st.db.query("SELECT org_id FROM org_members WHERE user_id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "org_id")).collect::<Vec<_>>();
-    if let Ok(rows) = st.db.query("SELECT org_id FROM identities WHERE id=?", &[json!(&uid)]).await {
-        for r in rows { let org = db::s(&r, "org_id"); if !orgs.contains(&org) { orgs.push(org); } } }
-    // Reconnect with the last id the client saw. Capped at an hour and 500 rows:
-    // the table is pruned at an hour, and a wider catch-up belongs to the audit log.
-    let since = q.get("since").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-    // One placeholder per organisation, capped: a caller in more orgs than this
-    // gets the first 32 and relies on the live stream for the rest.
-    let missed = if since > 0 && !orgs.is_empty() {
-        let scope: Vec<&String> = orgs.iter().take(32).collect();
-        let marks = scope.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut params = vec![json!(since), json!(now() - 3600)];
-        params.extend(scope.iter().map(|o| json!(o.as_str())));
-        st.db.query(&format!("SELECT id,org_id,app_id,env_id,action,detail,created_at FROM live_events WHERE id>? AND created_at>=? AND org_id IN ({}) ORDER BY id LIMIT 500", marks), &params).await.unwrap_or_default()
-    } else { Vec::new() };
-    // Subscribing before the upgrade means the poll is already running when the
-    // first frame could be missed, and a slow client is dropped rather than blocking.
+async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, peer: PeerAddr, ws: WebSocketUpgrade) -> Response {
+    // Subscribe before the database snapshot so replay and the stream overlap.
     let rx = st.live.subscribe();
-    ws.on_upgrade(move |socket| live_socket(st, uid, orgs, missed, rx, socket)) }
+    let admission = match live_admission(&st, &h, &q, peer).await { Ok(a) => a, Err(e) => return e.into_response() };
+    ws.on_upgrade(move |socket| live_socket(st, admission, rx, socket)) }
 #[cfg(not(target_arch = "wasm32"))]
-async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
+async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
     if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
-    // Rows already in the table are sent before the live subscription, and the
-    // subscription may repeat the newest of them. The client dedupes on id.
-    let mut sent = 0i64;
-    for r in &missed {
-        let env = db::s(r, "env_id");
-        if !env.is_empty() && st.require_env(&env, &uid).await.is_err() { continue; }
-        sent = db::n(r, "id");
-        let ev = json!({"type":"event","id":sent,"org":db::s(r,"org_id"),"app":db::s(r,"app_id"),"env":env,"action":db::s(r,"action"),"detail":db::s(r,"detail"),"ts":db::n(r,"created_at")});
-        if socket.send(Message::Text(ev.to_string().into())).await.is_err() { return; }
+    let mut sent = admission.cursor;
+    loop {
+        let Ok(missed) = st.live_replay(sent).await else { return };
+        let full = missed.len() == 500;
+        for ev in missed {
+            sent = ev["id"].as_i64().unwrap_or(sent);
+            if !st.live_authorize(&admission, &ev).await { continue; }
+            if socket.send(Message::Text(ev.to_string().into())).await.is_err() { return; }
+        }
+        if !full { break; }
     }
     loop {
         tokio::select! {
@@ -4082,10 +4087,9 @@ async fn live_socket(st: S, uid: String, orgs: Vec<String>, missed: Vec<db::Row>
                 let raw = match ev { Ok(v) => v, Err(_) => break };
                 let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
                 if v.get("id").and_then(|x| x.as_i64()).unwrap_or(0) <= sent { continue; }
-                let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
-                if !orgs.iter().any(|o| o == org) { continue; }
-                let env = v.get("env").and_then(|x| x.as_str()).unwrap_or("");
-                if !env.is_empty() && st.require_env(env, &uid).await.is_err() { continue; }
+                if st.live_identity(&admission).await.is_err() { break; }
+                sent = v.get("id").and_then(Value::as_i64).unwrap_or(sent);
+                if !st.live_authorize(&admission, &v).await { continue; }
                 let mut out = v; out["type"] = json!("event");
                 if socket.send(Message::Text(out.to_string().into())).await.is_err() { return; }
             }
@@ -4195,6 +4199,15 @@ async fn peer_middleware(mut req: axum::extract::Request, next: Next) -> Respons
     next.run(req).await }
 #[cfg(target_arch = "wasm32")]
 async fn peer_middleware(req: axum::extract::Request, next: Next) -> Response { next.run(req).await }
+// Rotation takes the write gate only after body extraction and owner authentication.
+async fn key_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    if req.method() == axum::http::Method::POST && req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()) == Some("/api/instance/rotate-master") {
+        next.run(req).await
+    } else {
+        let _key_guard = st.key_gate.read().await;
+        next.run(req).await
+    }
+}
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
@@ -4295,18 +4308,16 @@ pub fn router(state: S) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(axum::middleware::from_fn(peer_middleware))
         .with_state::<()>(state.clone());
-    #[cfg(not(target_arch = "wasm32"))]
     let app = { let live = Router::new().route("/api/live", get(live_ws))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(metrics_middleware))
+        .layer(axum::middleware::from_fn(peer_middleware))
         .with_state(state.clone());
         live.merge(app) };
-    #[cfg(target_arch = "wasm32")]
-    let app = app.route("/api/live", get(live_unavailable));
 
-    app
+    app.layer(axum::middleware::from_fn_with_state(state, key_middleware))
 }
 
 // ---------- step-up verification ----------
@@ -4655,21 +4666,6 @@ async fn ssh_sign_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<Strin
 
 
 
-// The Workers build has no SAML, PKI signing, OCSP/CRL or WebSocket runtime.
-#[cfg(target_arch = "wasm32")]
-async fn saml_metadata() -> Response { err(StatusCode::NOT_IMPLEMENTED, "SAML requires the native server").into_response() }
-#[cfg(target_arch = "wasm32")]
-async fn saml_start() -> Response { err(StatusCode::NOT_IMPLEMENTED, "SAML requires the native server").into_response() }
-#[cfg(target_arch = "wasm32")]
-async fn saml_acs() -> Response { err(StatusCode::NOT_IMPLEMENTED, "SAML requires the native server").into_response() }
-#[cfg(target_arch = "wasm32")]
-async fn get_saml_config(State(_): State<S>, _: HeaderMap, _: Path<String>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "SAML requires the native server")) }
-#[cfg(target_arch = "wasm32")]
-async fn put_saml_config(State(_): State<S>, _: HeaderMap, _: Path<String>, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "SAML requires the native server")) }
-#[cfg(target_arch = "wasm32")]
-async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
-#[cfg(target_arch = "wasm32")]
-async fn live_unavailable() -> Response { err(StatusCode::NOT_IMPLEMENTED, "the live event stream requires the native server; poll the audit endpoint instead").into_response() }
 
 pub enum Job {
     Log { url: String, secret: String, payload: String, signed_at: i64, delivery_id: String },
@@ -4698,7 +4694,3 @@ pub async fn deliver_job(db: &Db, job: Job) {
             let _ = crate::http::Client::new().post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({}))).send().await; }
     }
 }
-#[cfg(target_arch = "wasm32")]
-async fn rotate_master(State(_): State<S>, _: HeaderMap, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
-#[cfg(target_arch = "wasm32")]
-async fn ca_crl() -> Response { err(StatusCode::NOT_IMPLEMENTED, "CRL generation requires the native server").into_response() }

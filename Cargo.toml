@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
 members = ["crates/crypto", "crates/server", "crates/cli", "crates/eso"]
-exclude = ["vendor/lber"]
+exclude = ["vendor/lber", "vendor/risaml", "vendor/webauthn-rs-core", "vendor/keystore-ocsp"]
 
 # Local fork of lber 0.4.2 that caps BER nesting depth. See
 # vendor/lber/README.openwarp.md for the single change and its license.
 [patch.crates-io]
 lber = { path = "vendor/lber" }
+risaml = { path = "vendor/risaml" }
+webauthn-rs-core = { path = "vendor/webauthn-rs-core" }
+keystore-ocsp = { path = "vendor/keystore-ocsp" }
 
 [workspace.package]
 edition = "2021"
