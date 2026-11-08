@@ -9,7 +9,10 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 | Path | What |
 |---|---|
 | `crates/server/src/main.rs` | Axum routes, identity and authorisation, secret operations, background work. ~2.3k lines, deliberately dense |
-| `crates/server/src/db.rs` | SQLite/PostgreSQL/MySQL adapter, schema, numbered migrations |
+| `crates/server/src/db.rs` | SQLite/PostgreSQL/MariaDB adapter, statement execution, MySQL DDL rewriting |
+| `crates/server/src/migrate.rs` | Migration runner: ledger, checksums, locking, squash baseline and repair |
+| `crates/server/src/bin/migrate.rs` | `openwarp-migrate` operator CLI |
+| `crates/server/migrations/` | Immutable numbered SQL migrations; `0001_baseline.sql` is the consolidated schema |
 | `crates/server/src/ui.rs` | The entire browser console: HTML, CSS and JS in Rust string constants |
 | `crates/server/src/e2e.js` | Browser-side end-to-end cryptography, served at `/e2e.js` |
 | `crates/server/src/integrations.rs` | Provider sync (Instabox, Boat, Daytona, Trigger, …) |
@@ -40,6 +43,7 @@ cargo test -p openwarp-crypto
 cargo test -p openwarp-server --test security -- --test-threads=2
 cargo test -p openwarp-server --test authorization -- --test-threads=2
 cargo test -p openwarp-server --test accounts -- --test-threads=2
+cargo test -p openwarp-server --test migrations -- --test-threads=1
 ```
 
 Run the stack with `DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo run -p openwarp-server`; the CLI is `cargo run -p openwarp-cli -- --help` (binary name `openwarp`). The local walkthrough needs no Redis or PostgreSQL.
@@ -49,7 +53,8 @@ Run the stack with `DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo 
 - **The console is not a frontend build.** Change `ui.rs` (or `e2e.js`), rebuild and restart the server; a stale `target/debug` binary will not show the edit. `node --test` checks source, not rendering, so any UI change also needs a real browser check for layout, keyboard interaction and console errors.
 - **Do not run `cargo fmt`.** CI does not check rustfmt and the tree is not rustfmt-clean; formatting rewrites nearly every file. Match the local style, including one-line functions and compact markup.
 - **Authentication is not authorisation.** `check_scope`, `role_perms`, `require_org` and `require_env` (`main.rs:171-223`) each narrow a request. OAuth scopes, token environment scope, custom roles, team grants, environment policy and IP allowlists all apply on top of the caller's identity.
-- **SQL must run on every backend.** `db.rs` translates `?` placeholders for PostgreSQL and rewrites the canonical DDL for MySQL/MariaDB (keyed or indexed `TEXT` becomes `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX IF NOT EXISTS` loses the guard, tables use a binary collation). Avoid SQLite-only syntax and MySQL reserved words (`key`) as bare identifiers. Schema changes append to `MIGRATIONS` under a new version number; never edit a migration that has shipped.
+- **SQL must run on every backend.** `db.rs` translates `?` placeholders for PostgreSQL and rewrites the canonical DDL for MySQL/MariaDB (keyed or indexed `TEXT` becomes `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX IF NOT EXISTS` loses the guard, tables use a binary collation). Avoid SQLite-only syntax and MySQL reserved words (`key`) as bare identifiers.
+- **Migrations are immutable and checked.** Add `crates/server/migrations/NNNN_name.sql` and the matching entry in `migrate.rs`; never edit a file that has shipped, because its SHA-256 is in `schema_migrations` and boot refuses on drift. Versions must be contiguous. A fresh database applies the consolidated baseline and records old versions as squashed; older databases replay frozen files tolerantly. Test with `cargo test -p openwarp-server --test migrations` and, when the containers are available, `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL`. `openwarp-migrate status|verify|repair` inspects or reconciles a database without starting the server.
 - **E2E environments keep the key on the client.** The server stores ciphertext and per-user wrapped keys. Do not add a server-side plaintext path, and do not describe the compatibility creation path (which generates the key server-side) as server-blind.
 - **Egress guards are deliberate.** `url_ok` / `egress_allowed` reject private and loopback targets for OIDC, webhooks and integrations. `OPENWARP_ALLOW_PRIVATE_EGRESS=1` is an operator override, not a way to make a test pass; dynamic database leases additionally require `OPENWARP_ALLOWED_DB_HOSTS`.
 - **Provider sync is not transactional with local writes.** A local deploy can succeed while a remote write fails. Report per-integration results instead of assuming both landed, and keep provider-specific mirror-deletion behaviour intact.
@@ -58,7 +63,8 @@ Run the stack with `DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 cargo 
 
 ## Tests and evidence
 
-- `security.rs` locks tenant isolation, scopes, sessions and protocol boundaries; `authorization.rs` covers roles, grants, environment policy and approvals; `accounts.rs` covers signup, invitations, providers and recovery; `ui.test.cjs` checks console source.
+- `security.rs` locks tenant isolation, scopes, sessions and protocol boundaries; `authorization.rs` covers roles, grants, environment policy and approvals; `accounts.rs` covers signup, invitations, providers and recovery; `migrations.rs` covers ledger checks, a real v9 upgrade, and live PostgreSQL and MariaDB; `ui.test.cjs` checks console source.
+- `scripts/d1-migrate-smoke.sh` runs the migration driver against a local workerd D1 database. It builds a test-only Worker feature, so never enable `d1-smoke` in a deployed bundle.
 - The HTTP suites start real server processes against private databases. Never point them at data you care about, and never commit `*.db` files, recovery kits, tokens or exported secrets.
 - Reproduce a bug with a failing test first. Tenant, token and environment boundaries need failure cases as well as success cases.
 - Never weaken an assertion, skip a check or hardcode a value to manufacture green.

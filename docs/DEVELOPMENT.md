@@ -50,6 +50,7 @@ cargo test -p openwarp-crypto
 cargo test -p openwarp-server --test security -- --test-threads=2
 cargo test -p openwarp-server --test authorization -- --test-threads=2
 cargo test -p openwarp-server --test accounts -- --test-threads=2
+cargo test -p openwarp-server --test migrations -- --test-threads=1
 node --test crates/server/tests/ui.test.cjs
 ```
 
@@ -59,6 +60,7 @@ node --test crates/server/tests/ui.test.cjs
 | `security.rs` | Tenant isolation, scopes, authentication, and protocol boundaries |
 | `authorization.rs` | Roles, administrative gates, environment policy, and related regressions |
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
+| `migrations.rs` | Runner failure modes, legacy catch-up, and live PostgreSQL/MariaDB applies |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
 The PostgreSQL recovery regression target is opt-in because it changes login roles in an external database. Use a disposable PostgreSQL database and a test administrator, never deployment credentials:
@@ -73,6 +75,12 @@ OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
 `rotation_regressions` is excluded from default workspace runs and fails if explicitly enabled without its database URL. `static_rotation_live` reports that live checks were not run when the URL is absent. A green default workspace run does not establish live PostgreSQL recovery coverage. Both live targets create uniquely named test roles and remove those roles after their cases.
 
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
+
+## Schema changes
+
+Schema changes are append-only. Add a numbered file under `crates/server/migrations/` and the matching entry in `crates/server/src/migrate.rs`; never edit a migration that a released binary has applied, because the runner stores a checksum and refuses to boot when it no longer matches. The [schema migrations](MIGRATIONS.md) guide covers the ledger, the consolidated baseline, the MySQL DDL rules, and the repair commands.
+
+`openwarp-migrate status`, `plan`, and `verify` inspect a database without changing it. `repair` modifies the migration ledger; follow the [repair guide](MIGRATIONS.md#operator-cli) before using it. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines. Run `WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh` to exercise the D1 driver against local workerd.
 
 ### Device certificate checks
 
@@ -91,10 +99,12 @@ that variable, the live database checks do not run. TPM interoperability uses
 swtpm evidence, not a physical TPM; its public fixtures and generation recipe are
 in `crates/server/tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
 
-Device schema migrations append after canonical main's existing migrations.
-The protocol discriminator `pki_cas.kind` remains `x509` or `ssh`; X.509 hierarchy
-uses `ca_kind`. Additive convergence also covers the earlier device branch's
-migration ledger without rewriting published statements.
+Device schema migrations ship as engine versions 24 through 28 under
+`crates/server/migrations/`; the [schema migrations](MIGRATIONS.md) guide covers
+the adoption paths. The protocol discriminator `pki_cas.kind` remains `x509` or
+`ssh`; X.509 hierarchy uses `ca_kind`. Version 28 converges every shipped
+lineage, including the earlier device branch's migration ledger, without
+rewriting published statements.
 
 ## Container validation
 
