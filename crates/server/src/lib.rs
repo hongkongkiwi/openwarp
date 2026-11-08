@@ -4,6 +4,7 @@
 pub mod app;
 pub mod clock;
 pub mod db;
+pub mod edition;
 pub mod envcfg;
 pub mod http;
 pub mod inference_leases;

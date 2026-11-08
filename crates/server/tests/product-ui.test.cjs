@@ -144,6 +144,7 @@ async function consoleUI(opts = {}) {
   const role = opts.role || 'admin', uid = opts.uid || 'reviewer-a';
   const routes = {
     '/api/auth/providers': {}, '/api/me': { id: uid, email: 'fixture@test.invalid' },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/orgs': [{ id: 'org-a', name: 'Workspace A', role }, { id: 'org-b', name: 'Workspace B', role }],
   };
   for (const org of ['org-a', 'org-b']) {

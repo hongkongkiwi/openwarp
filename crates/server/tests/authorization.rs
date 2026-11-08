@@ -85,6 +85,7 @@ impl Server {
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &base)
             .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
+            .env("OPENWARP_LICENSE", "development")
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")

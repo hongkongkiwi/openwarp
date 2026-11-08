@@ -36,7 +36,7 @@
 | Static PostgreSQL role rotation | n/a | rotate an existing remote login and store its password in an SSE secret; encrypted pending candidate supports retries after uncertain outcomes; see [integrations](INTEGRATIONS.md#static-postgresql-password-rotation) |
 | Transit encryption | n/a | workspace payload encryption, version rotation and rewrap with distinct transit permissions; no key export; see [API](API.md#transit) |
 | CLI template agent | n/a | literal secret placeholders, bounded in-memory cache and atomic output; no disk cache or offline fallback; see [CLI](CLI.md) |
-| Licence checks / seat limits | n/a | **none, by design** |
+| Licence checks / seat limits | n/a | two plans: self-hosted needs no key and keeps every core feature; an offline ES256 enterprise licence unlocks workspace SAML/OIDC, LDAP, SCIM and audit streaming. No seat counts; see [editions](EDITIONS.md) |
 
 ## Integrations (`POST /api/envs/:id/integrations`, auto-sync on deploy, manual `POST /api/integrations/:id/sync`)
 

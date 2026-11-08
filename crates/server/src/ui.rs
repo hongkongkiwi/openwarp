@@ -120,7 +120,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="toasts"></div>
 <script src="/i18n.js" integrity="sha384-xcFG++hus38AuPdw7fy9ggOPnV3E3T56utMawtR9JkpoOBlpIRv9rbRampxtl1qE"></script>
 <script>
-let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0;
+let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0, EDITION=null;
 let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
@@ -143,6 +143,8 @@ function clearSecretState(){SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_K
   closeModal();$('modal').innerHTML='';$('palette').style.display='none';$('paletteresults').innerHTML='';$('deploybar').classList.remove('show')}
 function sessionEnded(){AUTH_READY=false;EMERGENCY_REQUEST++;clearInterval(EMERGENCY_POLL);T='';clearSecretState();applyEmergency(false,false);PROJECT_DIRECT=false;EMERGENCY_OWNER=false;APP=null;ENV=null;APPS=[];ENVS=[];MY_PUBKEY='';MY_UID='';
   $('view').innerHTML='';$('shell').style.display='none';$('auth').style.display='grid';$('pw').value='';toastUI('Your session ended. Sign in again.', true)}
+function isEnterprise(){return !!(EDITION&&EDITION.enterprise)}
+function enterpriseLock(title,body){return `<div class="card"><h3>${esc(title)} <span class="chip">Enterprise</span></h3><p class="mut">${esc(body)}</p><p class="small mut">Set <span class="mono">OPENWARP_LICENSE</span> to a license issued for this installation, then restart the server to enable it.</p></div>`}
 function emergencyCard(project=false){let locked=project?PROJECT_EMERGENCY:EMERGENCY,direct=project?PROJECT_DIRECT:EMERGENCY,scope=project?'project':'workspace';return `<div class="card" style="border-color:var(--bad)"><h3>${locked?'Emergency lockdown active':(project?'Project lockdown':'Emergency lockdown')}</h3>
   <p>${locked?'The web console is read-only. Secrets are hidden, syncs are paused, and all automation reads and writes for this scope are rejected.':`Halt this ${scope}, sign out non-owner members, and block secret access, changes and automation requests.`}</p>
   ${project&&EMERGENCY?'<p>The workspace lockdown also applies. Only restoring the workspace can lift that restriction.</p>':''}
@@ -284,6 +286,7 @@ async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+  EDITION=await api('GET','/api/instance/edition').catch(()=>null);
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
   $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
   $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
@@ -857,7 +860,8 @@ async function mkLockbox(){try{let d=await api('POST','/api/lockbox',{text:$('lb
 
 let AUDIT_ROWS=[], AUDIT_HAS_MORE=false, AUDIT_ACTORS={};
 async function renderAudit(){owText($('pagetitle'),'Audit log');owDataText($('crumb'),'');AUDIT_ROWS=[];AUDIT_ACTORS={};
-  $('view').innerHTML=`<div class="card"><h3 data-i18n="Log streams">Log streams</h3><p data-i18n="Audit events are also forwarded to streams with HMAC-signed retries.">Audit events are also forwarded to streams with HMAC-signed retries.</p><div class="row"><input id="stream-url" placeholder="https://hooks.example.com/openwarp" style="min-width:300px"><button onclick="mkStream()" data-i18n="Add stream">Add stream</button><button onclick="loadDeliveries()" data-i18n="Delivery history">Delivery history</button></div><pre class="val" id="delivs"></pre></div>
+  let streamCard=isEnterprise()?`<div class="card"><h3 data-i18n="Log streams">Log streams</h3><p data-i18n="Audit events are also forwarded to streams with HMAC-signed retries.">Audit events are also forwarded to streams with HMAC-signed retries.</p><div class="row"><input id="stream-url" placeholder="https://hooks.example.com/openwarp" style="min-width:300px"><button onclick="mkStream()" data-i18n="Add stream">Add stream</button><button onclick="loadDeliveries()" data-i18n="Delivery history">Delivery history</button></div><pre class="val" id="delivs"></pre></div>`:`<div class="card"><h3>Log streams <span class="chip">Enterprise</span></h3><p class="mut">Forward audit events to a SIEM with HMAC-signed retries. Audit logging and chain verification remain available without an enterprise license.</p></div>`;
+  $('view').innerHTML=`${streamCard}
   <div class="tabs"><button class="tabbtn ${LOG_TAB==='audit'?'on':''}" onclick="setLogTab('audit')" data-i18n="Audit">Audit</button><button class="tabbtn ${LOG_TAB==='sync'?'on':''}" onclick="setLogTab('sync')" data-i18n="Sync activity">Sync activity</button><button class="tabbtn ${LOG_TAB==='delivery'?'on':''}" onclick="setLogTab('delivery')" data-i18n="Delivery attempts">Delivery attempts</button></div>
   <div class="row" style="margin-bottom:12px"><input id="auditfilter" placeholder="Filter by action, actor or detail…" data-i18n-placeholder="Filter by action, actor or detail…" style="min-width:280px" oninput="drawLog()"><span class="mut small" id="auditcount"></span></div><div id="auditrows"><div class="empty"><div class="big" data-i18n="Loading…">Loading…</div></div></div>`;
   await auditLoad(0)}
@@ -883,9 +887,10 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
-  let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
+  let saml=isEnterprise()?await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null):null;
   let orgs=await api('GET','/api/orgs').catch(()=>[]);let myOrg=orgs.find(o=>o.id===ORG)||{};
-  let samlCard=`<div class="card"><h3 data-i18n="SAML SSO">SAML SSO</h3><p><span data-i18n="Service provider metadata:">Service provider metadata:</span> <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
+  let ent=isEnterprise();let dis=ent?'':' disabled';
+  let samlCard=!ent?enterpriseLock('SAML SSO','SAML single sign-on for this workspace is part of OpenWarp Enterprise.'):`<div class="card"><h3 data-i18n="SAML SSO">SAML SSO</h3><p><span data-i18n="Service provider metadata:">Service provider metadata:</span> <span class="mono">${esc(saml?.sp_metadata_url||'')}</span></p>
     <div class="field"><label for="set-saml-entity" data-i18n="IdP entity ID">IdP entity ID</label><input id="set-saml-entity" value="${esc(saml?.idp_entity_id||'')}" placeholder="https://idp.example/metadata"></div>
     <div class="field"><label for="set-saml-url" data-i18n="IdP metadata URL">IdP metadata URL</label><input id="set-saml-url" placeholder="https://idp.example/metadata.xml" style="width:100%"></div>
     <div class="field"><label for="set-saml-xml" data-i18n="or paste metadata XML">or paste metadata XML</label><textarea id="set-saml-xml" rows="4">${esc(saml?.metadata_xml||'')}</textarea></div>
@@ -894,8 +899,8 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <div class="field"><label for="set-saml-domains" data-i18n="Allowed email domains">Allowed email domains</label><input id="set-saml-domains" value="${esc(saml?.allowed_domains||'')}" placeholder="example.com" style="width:100%"></div>
     <div class="row"><button class="primary" onclick="saveSaml()" data-i18n="Save SAML">Save SAML</button></div><pre class="val" id="saml-out"></pre></div>`;
   let prov=await api('GET','/api/auth/providers').catch(()=>null);
-  let ldap=prov?.ldap?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
-  let ldapCard=prov?.ldap?`<div class="card"><h3 data-i18n="LDAP directory">LDAP directory</h3><p data-i18n="Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry&#39;s own password is bound. Native builds only.">Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
+  let ldap=prov?.ldap&&isEnterprise()?await api('GET',`/api/orgs/${ORG}/ldap`).catch(()=>null):null;
+  let ldapCard=!prov?.ldap?'':(!ent?enterpriseLock('LDAP directory','Directory sign-in and SCIM provisioning are part of OpenWarp Enterprise.'):`<div class="card"><h3 data-i18n="LDAP directory">LDAP directory</h3><p data-i18n="Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry&#39;s own password is bound. Native builds only.">Users sign in with directory credentials over TLS; a service account searches for the entry, then the entry's own password is bound. Native builds only.</p>
   <div class="field"><label for="ld-url" data-i18n="Directory URL (ldaps:// only)">Directory URL (ldaps:// only)</label><input id="ld-url" value="${esc(ldap?.url||'')}" placeholder="ldaps://dc01.example.com:636" style="width:100%"></div>
   <div class="row"><input id="ld-bind-dn" value="${esc(ldap?.bind_dn||'')}" placeholder="service bind DN" data-i18n-placeholder="service bind DN" style="min-width:280px"><input id="ld-bind-pw" type="password" placeholder="${ldap?.bind_password_set?'stored; leave blank to keep':'service account password'}" data-i18n-placeholder="${ldap?.bind_password_set?'stored; leave blank to keep':'service account password'}"></div>
   <div class="field"><label for="ld-base-dn" data-i18n="Base DN">Base DN</label><input id="ld-base-dn" value="${esc(ldap?.base_dn||'')}" placeholder="OU=People,DC=example,DC=com" style="width:100%"></div>
@@ -905,7 +910,7 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <div class="row"><input id="ld-default-role" value="${esc(ldap?.default_role||'developer')}" placeholder="default role"><input id="ld-domains" value="${esc(ldap?.allowed_domains||'')}" placeholder="allowed email domains" style="min-width:260px"></div>
   <div class="field"><label for="ld-ca" data-i18n="Internal CA certificate (PEM, optional)">Internal CA certificate (PEM, optional)</label><textarea id="ld-ca" rows="3">${esc(ldap?.ca_cert_pem||'')}</textarea></div>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="ld-auto" ${ldap?.auto_provision?'checked':''}> <span data-i18n="Auto-provision first-time users in allowed domains">Auto-provision first-time users in allowed domains</span></label>
-  <div class="row"><button class="primary" onclick="saveLdap()" data-i18n="Save LDAP">Save LDAP</button><button class="danger" onclick="removeLdap()" data-i18n="Remove">Remove</button></div></div>`:'';
+  <div class="row"><button class="primary" onclick="saveLdap()" data-i18n="Save LDAP">Save LDAP</button><button class="danger" onclick="removeLdap()" data-i18n="Remove">Remove</button></div></div>`);
   let instanceCard=inst&&inst.instance_owner?`<div class="card"><h3 data-i18n="Instance">Instance</h3><p data-i18n="Control who can create an account on this server.">Control who can create an account on this server.</p>
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> <span data-i18n="Allow self signup">Allow self signup</span></label>
     <p class="small mut"><span data-i18n="When off, new users join only by invitation.">When off, new users join only by invitation.</span> ${inst.signups_env_locked?owHTML('Locked by OPENWARP_SIGNUPS.'):''}</p>
@@ -920,15 +925,17 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <option value="dark"${tp==='dark'?' selected':''} data-i18n="Dark">Dark</option></select>
     <label class="small mut" for="set-lang" data-i18n="Language">Language</label><select id="set-lang" class="langsel" data-langsel onchange="owSetLang(this.value)"></select></div></div>`;
   if(!AUTH_READY)return;if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
-  $('view').innerHTML=`${EMERGENCY_OWNER?emergencyCard():''}${instanceCard}${appearanceCard}
+  let planCard=`<div class="card"><h3>Plan</h3><p><span class="chip">${ent?'Enterprise':'Self-hosted'}</span> ${ent?(EDITION.customer?`Licensed to ${esc(EDITION.customer)}${EDITION.expires_at?` until ${new Date(EDITION.expires_at*1000).toLocaleDateString()}`:''}`:'Enterprise license active.'):'All core features are enabled without a license. SAML, workspace OIDC, directory sync and audit streaming need an enterprise license.'}</p>${EDITION?.warning?`<p class="small" style="color:var(--bad)">${esc(EDITION.warning)}</p>`:''}</div>`;
+  $('view').innerHTML=`${EMERGENCY_OWNER?emergencyCard():''}${instanceCard}${appearanceCard}${planCard}
   <div class="card"><h3 data-i18n="Organisation security">Organisation security</h3><p data-i18n="IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.">IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip" data-i18n="IP allowlist (CIDR, comma separated, empty = allow all)">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> <span data-i18n="Warn when a secret value is reused elsewhere in this workspace">Warn when a secret value is reused elsewhere in this workspace</span></label>
   <p class="small mut" style="margin:0 0 10px" data-i18n="Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.">Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.</p>
-  <div class="field"><label for="set-oidc-iss" data-i18n="OIDC issuer">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"></div>
-  <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id" data-i18n-placeholder="OIDC client id"><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}" data-i18n-placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" data-i18n-placeholder="redirect URI" style="min-width:260px"></div>
-  <div class="field"><label for="set-oidc-domains" data-i18n="SSO email domains (comma separated; empty = any account at the issuer may join)">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"></div>
-  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> <span data-i18n="Allow first-time SSO users to join as developers">Allow first-time SSO users to join as developers</span></label>
+  ${ent?'':'<p class="small mut" style="margin:0 0 10px">Workspace OIDC single sign-on requires an enterprise license. Existing configuration is shown read-only.</p>'}
+  <div class="field"><label for="set-oidc-iss" data-i18n="OIDC issuer">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"${dis}></div>
+  <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id" data-i18n-placeholder="OIDC client id"${dis}><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}" data-i18n-placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"${dis}><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" data-i18n-placeholder="redirect URI" style="min-width:260px"${dis}></div>
+  <div class="field"><label for="set-oidc-domains" data-i18n="SSO email domains (comma separated; empty = any account at the issuer may join)">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"${dis}></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}${dis}> <span data-i18n="Allow first-time SSO users to join as developers">Allow first-time SSO users to join as developers</span></label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()" data-i18n="Save settings">Save settings</button></div></div>
   ${samlCard}
   ${ldapCard}
@@ -941,11 +948,12 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <div class="card" id="sessions-card"><h3 data-i18n="Sessions">Sessions</h3><p class="mut">Browser sessions signed in with your account. Revoking one ends that browser immediately.</p><div class="row"><button onclick="loadSessions()" data-i18n="Show sessions">Show sessions</button><button onclick="loadTokensSettings()" data-i18n="My tokens">My tokens</button><button class="danger" onclick="endAllSessions()" data-i18n="End all sessions">End all sessions</button></div><div id="session-list"></div><pre class="val" id="sess-out"></pre></div>
   ${myOrg.role==='owner'?`<div class="card"><h3 data-i18n="Delete workspace">Delete workspace</h3><p><span data-i18n="Type">Type</span> <span class="mono">${esc(myOrg.name||'')}</span> <span data-i18n="to confirm. Every app, environment, secret, token and identity in this workspace is removed.">to confirm. Every app, environment, secret, token and identity in this workspace is removed.</span></p><div class="row"><label for="del-org-name" data-i18n="Workspace name">Workspace name</label><input id="del-org-name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')" data-i18n="Delete workspace">Delete workspace</button></div></div>`:''}
   <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;loadSshCAs()}
-async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
-  if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
-  if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
-  if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
-  if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
+async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked};
+  if(isEnterprise()){b.oidc_auto_provision=$('set-oidc-auto').checked;b.oidc_allowed_domains=$('set-oidc-domains').value;
+    if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
+    if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
+    if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
+    if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;}
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toastUI('Settings saved', false)}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toastUI('Signups '+(d.signups_open?'enabled':'disabled'), false);renderSettings()}catch(e){toast(e.message,true)}}
 async function saveSaml(){try{let b={idp_entity_id:$('set-saml-entity').value,metadata_url:$('set-saml-url').value,metadata_xml:$('set-saml-xml').value,allow_unsigned_metadata:$('set-saml-unsigned').checked,auto_provision:$('set-saml-auto').checked,allowed_domains:$('set-saml-domains').value};let d=await api('PUT',`/api/orgs/${ORG}/saml`,b);$('saml-out').textContent='SP metadata: '+d.sp_metadata_url;toastUI('SAML saved', false)}catch(e){toast(e.message,true)}}

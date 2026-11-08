@@ -1,4 +1,4 @@
-use crate::{db, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
+use crate::{db, edition, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
 #[path = "transit_compat.rs"] mod transit_compat;
 #[path = "workloads.rs"] mod workloads;
 #[path = "path_policy.rs"] mod path_policy;
@@ -73,11 +73,12 @@ pub struct AppState {
     transit_lifecycle: transit::Lifecycle,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
+    license: edition::LicenseState,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), license: edition::LicenseState::from_env(), live })
 }
 /// The root KMS is installed once at boot by the native entrypoint. The
 /// Workers build has no blocking HTTP client, so its slot stays empty.
@@ -197,8 +198,12 @@ fn def_path() -> String { "/".into() }
 #[derive(Deserialize, Default)] struct ReuseReq { #[serde(default)] secrets: Vec<SecretIn>, #[serde(default)] exclude: Vec<String> }
 
 impl AppState {
+    pub(crate) fn edition(&self) -> &edition::LicenseState { &self.license }
+    pub(crate) fn require_enterprise(&self, feature: edition::Feature) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.license.allows(feature) { Ok(()) } else { Err(edition::locked(feature)) } }
     pub(crate) async fn audit(&self, org: &str, app: &str, env: &str, actor: &str, action: &str, detail: &str) {
         // log streams (T10): persist delivery then send with retries in a thread
+        if self.license.allows(edition::Feature::AuditStreaming) {
         if let Ok(streams) = self.db.query("SELECT id,url,secret FROM log_streams WHERE org_id=?", &[json!(org)]).await { for srow in &streams {
             let did = id(); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}).to_string();
             let _ = self.db.exec("INSERT INTO log_deliveries(id,stream_id,event,payload,status,created_at) VALUES(?,?,?,?,'pending',?)", &[json!(did), json!(db::s(srow,"id")), json!(action), json!(payload), json!(now())]).await;
@@ -208,6 +213,7 @@ impl AppState {
             self.dispatch_log(db::s(srow,"url"), secret, payload, now(), did);
         } }
         if let Ok(Some(wh)) = self.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("audit_webhook:{}", org))]).await { let url = db::s(&wh, "v"); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}); self.dispatch_webhook(url, payload.to_string()); }
+        }
         let created_at = now();
         let (seq, prev_hash, hash) = self.audit_link(org, app, env, actor, action, detail, created_at).await;
         let _ = self.db.exec("INSERT INTO audit(id,org_id,app_id,env_id,actor,action,detail,created_at,seq,prev_hash,hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(org), json!(app), json!(env), json!(actor), json!(action), json!(detail), json!(created_at), json!(seq), json!(&prev_hash), json!(&hash)]).await;
@@ -1938,6 +1944,11 @@ async fn get_org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<Str
     }))) }
 async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid,&uid).await?;
+    let wants_oidc = ["oidc_issuer","oidc_client_id","oidc_client_secret","oidc_redirect_uri","oidc_allowed_domains"].iter()
+        .any(|k| body.get(*k).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false))
+        || body.get("oidc_auto_provision").and_then(|v| v.as_bool()) == Some(true);
+    if wants_oidc { st.require_enterprise(edition::Feature::OrgOidc)?; }
+    if body.get("audit_webhook").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) { st.require_enterprise(edition::Feature::AuditStreaming)?; }
     if let Some(v)=body.get("ip_allowlist").and_then(|x|x.as_str()) {
         if !valid_cidr_list(v) { return Err(bad("ip_allowlist must be comma-separated IP addresses or CIDR ranges")); }
         st.db.exec("UPDATE orgs SET ip_allowlist=? WHERE id=?", &[json!(v), json!(oid)]).await.map_err(|e| bad(&e))?; }
@@ -2010,6 +2021,7 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let rotation_hook_error = fire_rotation_hook(&st, &org, &eid, key_name, &new_val).await;
     Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id"),"sync_errors":sync_errors,"rotation_hook_error":rotation_hook_error}))) }
 async fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     if oauth_access(st, h).await.is_some() { return Err(err(StatusCode::FORBIDDEN, "OAuth access tokens cannot call SCIM; use a session or a service token")); }
     let uid = st.token_user(h).await?;
     let oid = q.get("org_id").cloned().unwrap_or_default();
@@ -2330,6 +2342,7 @@ async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
 async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::OrgOidc)?;
     // Per-workspace SSO is configured by that workspace's admins, so it is not
     // governed by the instance-wide sign-in method switch.
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)).await; let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)).await; let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid)).await;
@@ -2460,7 +2473,7 @@ fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, 
         .build().map_err(|e| e.to_string()) }
 #[cfg(not(target_arch = "wasm32"))]
 async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid, &uid).await?;
+    st.check_admin(&oid, &uid).await?; st.require_enterprise(edition::Feature::OrgSso)?;
     let base = issuer(&st, &h);
     let Some(cfg) = st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))? else {
         return Ok(j(json!({
@@ -2487,7 +2500,7 @@ async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     }))) }
 #[cfg(not(target_arch = "wasm32"))]
 async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid, &uid).await?;
+    st.check_admin(&oid, &uid).await?; st.require_enterprise(edition::Feature::OrgSso)?;
     let idp_entity_id = body.get("idp_entity_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if idp_entity_id.is_empty() { return Err(bad("idp_entity_id is required")); }
     let mut xml = body.get("metadata_xml").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2531,6 +2544,7 @@ async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     resp }
 #[cfg(not(target_arch = "wasm32"))]
 async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
+    if let Err(e) = st.require_enterprise(edition::Feature::OrgSso) { return e.into_response(); }
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let base = issuer(&st, &h);
     let sp = match saml_sp_config(&st, &base, &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
@@ -2664,7 +2678,7 @@ fn ldap_field(body: &Value, row: Option<&Row>, key: &str) -> String {
         .or_else(|| row.map(|r| db::s(r, key))).unwrap_or_default() }
 #[cfg(feature = "ldap")]
 async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
-    let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?; st.require_enterprise(edition::Feature::DirectorySync)?;
     let existing = ldap_row(&st, &oid).await?;
     let url = ldap_field(&body, existing.as_ref(), "url");
     if !ldap::url_ok(&url) { return Err(bad("LDAP URL must be ldaps:// (TLS is required); ldap:// and STARTTLS are not accepted")); }
@@ -2749,6 +2763,7 @@ async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<S
 #[derive(Deserialize)] struct LdapLoginReq { org_id: String, username: String, password: String }
 #[cfg(feature = "ldap")]
 async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<LdapLoginReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     let org = r.org_id.trim().to_string();
     let username = r.username.trim().to_string();
     // Two budgets: one per account and one per address, so spraying many names
@@ -3463,6 +3478,13 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     out["workos"] = json!(social_enabled("workos"));
     out["oidc"] = json!(social_enabled("oidc"));
     Ok(j(out)) }
+async fn edition_info(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
+    let mut status = st.edition().status();
+    // The customer and expiry are commercial details; other members only need
+    // to know which plan is active.
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) {
+        if let Some(map) = status.as_object_mut() { map.remove("customer"); map.remove("expires_at"); } }
+    Ok(j(status)) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -4539,7 +4561,7 @@ async fn mfa_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(body): Js
 
 // ---------- log streams (T10) ----------
 async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid,&uid).await?;
+    st.check_admin(&oid,&uid).await?; st.require_enterprise(edition::Feature::AuditStreaming)?;
     let url = body.get("url").and_then(|v|v.as_str()).unwrap_or("");
     if !url_ok(url) || !egress_allowed(url) { return Err(bad("log stream url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let secret = body.get("secret").and_then(|v|v.as_str()).unwrap_or("");
@@ -5224,7 +5246,7 @@ pub fn router(state: S) -> Router {
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/edition", get(edition_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
         .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))

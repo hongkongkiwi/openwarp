@@ -135,6 +135,10 @@ The console clears cached secret values and drafts when it detects a halt. Open 
 
 Lockdown cannot erase values already copied by a client, secrets already sent to a provider, or a runner payload already downloaded. Previously created Lockbox shares have no workspace association and remain usable. Rotate exposed credentials and revoke external access separately when responding to an incident.
 
+## Plan and enterprise features
+
+Settings shows the current plan. A self-hosted installation has every core feature and needs no key. The SAML, workspace OIDC, LDAP and log-stream cards show an Enterprise label and stay unavailable until an enterprise license is installed by the instance operator; the rest of the console is unchanged. See [editions and licensing](EDITIONS.md).
+
 ## Administrative settings
 
 Workspace settings include IP allowlists and OIDC configuration. Test policy changes with a second authorised session before ending your working session. Only trust forwarded client IPs when the instance operator has configured the actual reverse proxies.

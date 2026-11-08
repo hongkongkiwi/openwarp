@@ -190,6 +190,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
     '/api/instance': { instance_owner: false },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
@@ -981,4 +982,34 @@ test('the logs screen separates audit, sync activity and delivery attempts', asy
   assert.match(deliveries, /failed/);
   assert.match(deliveries, /3/);
   assert.equal(ui.el('auditcount').textContent, '1 attempts shown');
+});
+
+test('the self-hosted plan shows its plan card and locks enterprise settings', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Self-hosted/, 'the plan card names the self-hosted plan');
+  assert.match(view.textContent, /All core features are enabled without a license/);
+  assert.match(view.textContent, /SAML SSO/, 'the locked SAML card is still discoverable');
+  assert.match(view.textContent, /Enterprise/, 'the locked cards carry the enterprise label');
+  assert.equal(ui.el('set-oidc-iss').disabled, true, 'workspace OIDC fields are read-only without a license');
+  assert.equal(ui.button(view, /^Save SAML$/), undefined, 'no SAML save action is offered while locked');
+});
+
+test('an enterprise edition unlocks the settings forms', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  ui.run("EDITION={tier:'enterprise',enterprise:true,customer:'Acme Ltd',expires_at:null,development:false,warning:null}");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Licensed to Acme Ltd/);
+  assert.equal(ui.el('set-oidc-iss').disabled, false, 'OIDC fields are editable with a license');
+  assert.ok(ui.button(view, /^Save SAML$/), 'the SAML form is available with a license');
 });
