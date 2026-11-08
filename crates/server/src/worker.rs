@@ -51,6 +51,7 @@ impl DurableObject for OpenWarp {
             if let Some(v) = value { cfg.insert((*key).to_string(), v); }
         }
         envcfg::init(cfg);
+        crate::app::validate_region_env().expect("region configuration");
         let master: [u8; 32] = envcfg::var("OPENWARP_MASTER_KEY")
             .map_err(|_| "OPENWARP_MASTER_KEY binding is required on Workers".to_string())
             .and_then(|v| oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string()))

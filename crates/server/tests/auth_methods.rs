@@ -54,6 +54,22 @@ fn free_port() -> u16 {
 impl Server {
     async fn start() -> Server { Server::start_env(&[]).await }
     async fn start_env(extra: &[(&str, String)]) -> Server {
+        let server = Server::spawn_env(extra).await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut server = server;
+        while Instant::now() < deadline {
+            if server.child_exited().is_some() { panic!("server exited during startup; see {}", server.log.display()); }
+            if let Ok(r) = server.client.get(server.url("/health")).send().await {
+                if r.status().is_success() { return server; }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("server did not become healthy at {}", server.base);
+    }
+    // For a configuration that must refuse to start: no health wait, so the
+    // caller can observe the exit instead of a startup timeout.
+    async fn start_env_unchecked(extra: &[(&str, String)]) -> Server { Server::spawn_env(extra).await }
+    async fn spawn_env(extra: &[(&str, String)]) -> Server {
         let _start = START_LOCK.lock().await;
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-authmethods-{}-{}", std::process::id(), seq));
@@ -72,6 +88,8 @@ impl Server {
             .env_remove("OPENWARP_ENV")
             .env_remove("OPENWARP_SIGNUPS")
             .env_remove("OPENWARP_AUTH_PROVIDERS")
+            .env_remove("OPENWARP_REGION")
+            .env_remove("OPENWARP_REGIONS")
             .env_remove("OPENWARP_EMAIL_WEBHOOK")
             .env_remove("OPENWARP_EMAIL_TOKEN")
             .env_remove("OPENWARP_RP_ID")
@@ -85,15 +103,18 @@ impl Server {
         for (k, v) in extra { cmd.env(k, v); }
         let child = cmd.spawn().expect("spawn openwarp-server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(30)).build().unwrap();
-        let server = Server { child, base, dir, log, client };
+        Server { child, base, dir, log, client }
+    }
+    fn child_exited(&mut self) -> Option<std::process::ExitStatus> { self.child.try_wait().ok().flatten() }
+    // Borrowed, not consumed: dropping the Server removes its directory, so a
+    // caller that still needs the startup log must keep the server alive.
+    async fn wait_for_exit(&mut self) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if let Ok(r) = server.client.get(server.url("/health")).send().await {
-                if r.status().is_success() { return server; }
-            }
+            if let Some(status) = self.child_exited() { return Some(status); }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("server did not become healthy at {}", server.base);
+        None
     }
     fn url(&self, path: &str) -> String { format!("{}{}", self.base, path) }
     fn verification_link(&self) -> String {
@@ -129,6 +150,7 @@ impl Server {
         Resp { status, text, body, headers }
     }
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
+    async fn get_as(&self, path: &str, token: &str) -> Resp { self.call(Method::GET, path, Some(token), None).await }
 }
 
 async fn register(s: &Server, email: &str) -> Resp {
@@ -525,4 +547,42 @@ async fn a_passkey_can_be_registered_and_used_as_a_second_factor() {
     });
     let r = s.call(Method::POST, "/api/auth/mfa/passkey/finish", None, Some(json!({"mfa_token": challenge_token, "credential": assertion}))).await;
     assert!(matches!(r.status, 400 | 401), "a replayed signature counter must be rejected: {} {}", r.status, r.text);
+}
+
+// The console states the jurisdiction its deployment serves and reports how
+// many members each workspace has, because the picker shows that count. Both
+// come from the server so the client cannot contradict the deployment.
+#[tokio::test]
+async fn provider_discovery_reports_the_jurisdiction_and_workspace_sizes() {
+    let s = Server::start_env(&[
+        ("OPENWARP_REGION", "eu".into()),
+        ("OPENWARP_REGIONS", "global=https://global.example.test,eu=https://eu.example.test".into()),
+    ]).await;
+    let p = s.get("/api/auth/providers").await;
+    assert_eq!(p.status, 200, "{}", p.text);
+    assert_eq!(p.body["region"], json!("eu"), "the login screen must name its jurisdiction: {}", p.text);
+    let regions = p.body["regions"].as_array().expect("region list");
+    assert_eq!(regions.len(), 2, "{}", p.text);
+    assert!(regions.iter().any(|r| r["label"] == json!("eu") && r["origin"] == json!("https://eu.example.test")), "{}", p.text);
+    assert!(regions.iter().any(|r| r["label"] == json!("global")), "{}", p.text);
+
+    let owner = register_verified(&s, "owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap().to_string();
+    let orgs = s.get_as("/api/orgs", &ot).await;
+    assert_eq!(orgs.status, 200, "{}", orgs.text);
+    let first = orgs.body.as_array().and_then(|a| a.first()).expect("one workspace after registration");
+    assert_eq!(first["members"], json!(1), "the picker needs a member count: {}", orgs.text);
+    assert_eq!(first["role"], json!("owner"), "{}", orgs.text);
+}
+
+#[tokio::test]
+async fn a_jurisdiction_list_that_omits_the_deployment_refuses_to_start() {
+    let mut s = Server::start_env_unchecked(&[
+        ("OPENWARP_REGION", "ap".into()),
+        ("OPENWARP_REGIONS", "global=https://global.example.test,eu=https://eu.example.test".into()),
+    ]).await;
+    let status = s.wait_for_exit().await.expect("the server must exit rather than serve a mislabelled jurisdiction");
+    assert!(!status.success(), "startup must fail, not warn");
+    let text = std::fs::read_to_string(&s.log).unwrap_or_default();
+    assert!(text.contains("does not list this deployment's region"), "unexpected startup output: {}", text);
 }

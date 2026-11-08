@@ -184,13 +184,15 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   document.body = document.querySelector('body');
   document.documentElement = document.querySelector('html');
   document.activeElement = document.body;
-  const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
+  // A remembered workspace keeps the existing flows inside the shell. The
+  // picker tests clear it to exercise the choice itself.
+  const calls = [], unexpected = [], confirmations = [], timers = [], store = { 'ow.org.fixture@example.invalid': 'org-a', ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
     '/api/instance': { instance_owner: false },
     '/api/me': { email: 'fixture@example.invalid' },
-    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
+    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin', members: 3 }, { id: 'org-b', name: 'Second org', role: 'admin', members: 1 }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
@@ -302,8 +304,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   // Browser load order: the i18n runtime executes before the inline console script.
   vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
-  await ui.invoke('enterApp()');
-  await ui.invoke("openApp('app-a')");
+  if (!opts.manualBoot) { await ui.invoke('enterApp()'); await ui.invoke("openApp('app-a')"); }
   calls.length = 0;
   return ui;
 }
@@ -421,10 +422,8 @@ for (const boundary of ['navigation', 'app', 'organization']) {
     } else if (boundary === 'app') {
       await ui.invoke("openApp('app-b')");
     } else {
-      ui.el('orgs').value = 'org-b';
-      await ui.invoke('switchOrg()');
-      ui.el('orgs').value = 'org-a';
-      await ui.invoke('switchOrg()');
+      await ui.invoke("switchOrg('org-b')");
+      await ui.invoke("switchOrg('org-a')");
     }
     await ui.invoke("openApp('app-a')");
     assert.ok(ui.row(draft.key), 'the original environment must still expose its staged draft');
@@ -933,4 +932,73 @@ test('language follows the browser, translates the chrome, and the override pers
   assert.equal(ui.el('authtitle').textContent, 'おかえりなさい', 'switching languages re-translates the chrome');
   await ui.run(`owSetLang('en')`);
   assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
+});
+
+test('a member of several workspaces chooses one, and the choice survives the next visit', async () => {
+  const ui = await consoleUI([saved], [], { manualBoot: true, store: { 'ow.org.fixture@example.invalid': '' } });
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'grid', 'a member of two workspaces must be asked which one to open');
+  assert.equal(ui.el('shell').style.display, 'none', 'the shell must not open behind the picker');
+  const rows = ui.el('pickerlist').children.filter(child => typeof child !== 'string');
+  assert.equal(rows.length, 2, 'both workspaces must be offered');
+  assert.match(rows[0].textContent, /First org/);
+  assert.match(rows[0].textContent, /3 members/, 'the picker shows how large a workspace is');
+  assert.match(rows[1].textContent, /1 member\b/, 'a single-member workspace is not pluralised');
+  assert.match(rows[1].textContent, /admin/, 'the picker shows the role held there');
+
+  await ui.invoke("pickOrg('org-b')");
+  assert.equal(ui.el('picker').style.display, 'none', 'picking a workspace closes the picker');
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'the switcher names the chosen workspace');
+
+  // The remembered choice is what a returning browser lands in.
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'none', 'a remembered workspace must not ask again');
+  assert.equal(ui.el('orgname').textContent, 'Second org');
+});
+
+test('the login screen names its jurisdiction and offers another only when one exists', async () => {
+  const local = await consoleUI([saved], [], { manualBoot: true });
+  await local.invoke('loadProviders()');
+  assert.match(local.el('regionline').textContent, /global/, 'a single deployment still states its jurisdiction');
+  assert.doesNotMatch(local.el('regionline').textContent, /Change region/, 'no switch is offered when there is nowhere to go');
+
+  const multi = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'eu', regions: [
+      { label: 'global', origin: 'https://global.example.test' },
+      { label: 'eu', origin: 'https://eu.example.test' },
+    ] },
+  } });
+  await multi.invoke('loadProviders()');
+  assert.match(multi.el('regionline').textContent, /eu/, 'the login screen names the jurisdiction it will authenticate against');
+  assert.match(multi.el('regionline').textContent, /Change region/, 'a second jurisdiction is offered as a hand-off');
+  await multi.invoke('regionPick()');
+  assert.match(multi.el('modal').textContent, /GLOBAL/, 'the picker lists the jurisdictions by name');
+  assert.match(multi.el('modal').textContent, /EU/, 'the picker lists the jurisdictions by name');
+});
+
+test('the workspace menu keeps workspace actions apart from account actions', async () => {
+  const ui = await consoleUI();
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false', 'the menu starts closed');
+  await ui.invoke('toggleOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'true', 'the trigger reports the open state');
+  const menu = ui.el('orgmenu').textContent;
+  assert.match(menu, /First org/);
+  assert.match(menu, /Second org/);
+  assert.match(menu, /fixture@example\.invalid/, 'the account holding the session is named once');
+  assert.match(menu, /Account settings/);
+  assert.match(menu, /Sign out/);
+  assert.ok(menu.indexOf('Second org') < menu.indexOf('Account settings'), 'workspaces come before account actions');
+  const items = ui.el('orgmenu').querySelectorAll('button.orgitem');
+  assert.ok(items.length >= 4, 'the menu exposes its actions as buttons');
+  assert.equal(ui.document.activeElement, items[0], 'opening the menu focuses its first action');
+  await ui.invoke('orgMenuKey({key: "ArrowDown", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[1], 'ArrowDown moves within the menu');
+  await ui.invoke('orgMenuKey({key: "ArrowUp", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[0], 'ArrowUp moves back');
+  await ui.invoke('closeOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false');
+  await ui.invoke("switchOrg('org-b')");
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'switching updates the trigger, not just the state');
+  await ui.invoke('toggleOrgMenu()');
+  assert.match(ui.el('orgmenu').textContent, /✓\s*Second org/, 'the open menu marks the selected workspace');
 });

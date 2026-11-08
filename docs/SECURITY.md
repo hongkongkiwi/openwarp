@@ -88,6 +88,14 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## Jurisdictions and tenant boundaries
+
+A deployment serves one jurisdiction, labelled by `OPENWARP_REGION` (`global` when unset). A jurisdiction is a deployment boundary, not a tenant attribute: it means this database and this master key. No row records a jurisdiction, so a workspace cannot claim one, and the label the console reports is read from the deployment's own configuration rather than from tenant data. Two jurisdictions that share a database are not separated, whatever their labels say.
+
+An account belongs to one jurisdiction, because the server that verifies the credential is the server that holds the data. The same person needing access in two jurisdictions therefore has two accounts. The sign-in card names its jurisdiction and, when the operator lists other origins in `OPENWARP_REGIONS`, links to them. It never switches jurisdiction inside the current server, and an email address alone is not used to discover which jurisdiction an account lives in: that would disclose account existence across a boundary the operator drew for separation.
+
+Inside a jurisdiction, a workspace remains the access boundary described above. Isolation between workspaces is enforced per request by `require_org` and `require_env`, not by the session, which is account-wide. A per-workspace session would add a second workspace value to check without removing any of those checks.
+
 ## Emergency workspace and project lockdown
 
 A workspace owner can halt the workspace or one project (an application). The console uses `PUT /api/orgs/{org_id}/emergency` or `PUT /api/apps/{app_id}/emergency` with `{"locked":true}` to activate and `{"locked":false}` to restore the selected scope. Both require a cookie-backed database account session and the actual workspace `owner` role. Admins, custom administrative roles and owner-created automation credentials cannot restore access. Member console sessions can read status through `GET` on the same routes. Project status reports `locked` (effective state), `direct_locked` and `workspace_locked`.

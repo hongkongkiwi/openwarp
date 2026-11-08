@@ -29,7 +29,18 @@ a{color:var(--acc2)}code,.mono{font-family:var(--mono);font-size:12.5px}
 .seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:3px;margin-bottom:20px}.seg button{flex:1;background:transparent;border:0;color:var(--muted)}.seg button.on{background:var(--panel2);color:var(--text);box-shadow:var(--sh-sm)}
 #shell{display:none;height:100vh;grid-template-columns:248px 1fr;grid-template-rows:100vh}
 aside{background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 12px;gap:4px;overflow:auto}
-aside .orgsel{width:100%;margin:14px 0 10px}
+#picker{min-height:100vh;display:none;place-items:center;background:radial-gradient(900px 500px at 50% -10%,var(--glow),transparent)}
+.picklist{display:flex;flex-direction:column;gap:8px}
+.pickrow{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--text);font-weight:600}
+.pickrow:hover{border-color:var(--line2)}.pickrow .pn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pickrow .pm{color:var(--muted);font-size:12.5px;font-weight:500;white-space:nowrap;flex:none}
+.regionline{margin:14px 0 0;text-align:center}.regionline a{color:var(--muted)}
+.orgbtn{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;color:var(--text);font-weight:600;margin:14px 0 10px}
+.orgbtn .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orgmenu{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px;box-shadow:var(--sh-side);display:flex;flex-direction:column;gap:1px;margin-bottom:10px}
+.orgmenu[hidden]{display:none}
+.orgitem{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:0;border-radius:7px;padding:7px 8px;color:var(--muted);font-size:13px;font-weight:500}
+.orgitem:hover{background:var(--panel2);color:var(--text)}.orgitem .ck{width:14px;flex:none;color:var(--acc)}.orgitem .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orgitem .pm{color:var(--faint);font-size:12px}.orgsep{height:1px;background:var(--line);margin:4px 2px}
 .navbtn{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:0;border-radius:8px;padding:8px 10px;color:var(--muted);font-weight:500}.navbtn:hover{background:var(--panel2);color:var(--text)}.navbtn.on{background:var(--sel);color:var(--text)}.navbtn .ic{width:18px;text-align:center;flex:none}
 .sidefoot{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;color:var(--muted);font-size:12.5px}
 main{overflow:auto;display:flex;flex-direction:column}
@@ -74,23 +85,34 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field" id="mfafield" style="display:none"><label for="mfacode" data-i18n="Authenticator / recovery code">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()" data-i18n="Sign in">Sign in</button>
       <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()" data-i18n="Forgot password?">Forgot password?</button>
-      <button class="ghost" style="width:100%;margin-top:6px" onclick="samlPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
+      <button class="ghost" style="width:100%;margin-top:6px" onclick="workspaceSsoPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
       <div id="social" class="row" style="margin-top:12px;flex-wrap:wrap"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0" data-i18n="Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
+      <p class="small mut regionline" id="regionline"></p>
     </div>
+  </div>
+</div>
+
+<div id="picker">
+  <div class="authcard">
+    <div class="logo"><span class="mark">◆</span>OpenWarp</div>
+    <h1 data-i18n="Choose your workspace">Choose your workspace</h1>
+    <p class="sub" data-i18n="You belong to more than one workspace. Pick the one to open; you can switch at any time.">You belong to more than one workspace. Pick the one to open; you can switch at any time.</p>
+    <div id="pickerlist" class="picklist"></div>
+    <p class="small mut" style="margin:14px 0 0" data-i18n="Missing a workspace? Ask an owner for an invitation.">Missing a workspace? Ask an owner for an invitation.</p>
   </div>
 </div>
 
 <div id="shell">
   <aside>
     <div class="logo"><span class="mark">◆</span>OpenWarp</div>
-    <select id="orgs" class="orgsel" onchange="switchOrg()"></select>
+    <button class="orgbtn" id="orgbtn" aria-haspopup="menu" aria-expanded="false" onclick="toggleOrgMenu(event)"><span class="grow" id="orgname"></span><span aria-hidden="true">▾</span></button>
+    <div class="orgmenu" id="orgmenu" role="menu" aria-label="Workspace menu" hidden onkeydown="orgMenuKey(event)"></div>
     <button class="navbtn" data-nav="apps" onclick="nav('apps')"><span class="ic">▦</span><span data-i18n="Apps">Apps</span></button>
     <button class="navbtn" data-nav="access" onclick="nav('access')"><span class="ic">♟</span><span data-i18n="Members &amp; access">Members &amp; access</span></button>
     <button class="navbtn" data-nav="integrations" onclick="nav('integrations')"><span class="ic">⇄</span><span data-i18n="Integrations">Integrations</span></button>
     <button class="navbtn" data-nav="audit" onclick="nav('audit')"><span class="ic">≡</span><span data-i18n="Audit log">Audit log</span></button>
     <button class="navbtn" data-nav="settings" onclick="nav('settings')"><span class="ic">⚙</span><span data-i18n="Settings">Settings</span></button>
-    <div class="sidefoot"><div id="whoami" class="mono"></div><button class="ghost" style="padding:4px 0" onclick="logout()" data-i18n="Sign out">Sign out</button></div>
   </aside>
   <main>
     <div class="topbar"><button class="iconbtn" id="navtoggle" aria-label="Open navigation" data-i18n-aria-label="Open navigation" onclick="toggleNav()">☰</button><h2 id="pagetitle" data-i18n="Apps">Apps</h2><span class="crumb" id="crumb"></span><div class="grow"></div>
@@ -108,10 +130,10 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div class="modalwrap" id="modalwrap"><div class="modal" id="modal"></div></div>
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" data-i18n-placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
-<script src="/i18n.js" integrity="sha384-SNq7b1pECfLV1fuSsFTAwS2vW7hRnU9JenHEZxeMd14VvhJHc+P8bgdMoNhAmR19"></script>
+<script src="/i18n.js" integrity="sha384-k9ZtQn4527vaalNt46tCLynkB5sL8Xzk3IX65S6qlc4i0d6gF3wFM8Jpi80UmJ5x"></script>
 <script>
 let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0;
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
+let T='', ORG='', ORGS=[], REGIONS=[], APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
@@ -191,6 +213,7 @@ function applyThemeIcons(){let p=themePref();let ic=p==='system'?'◐':p==='ligh
 // ---------- auth ----------
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
+  renderRegion(p);
   let btns=[];
   for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X'],['discord','Discord'],['linkedin','LinkedIn'],['workos','WorkOS']]){
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">${owHTML('Continue with {x}',{x:name})}</button>`)}
@@ -217,7 +240,26 @@ async function acceptInvite(){try{
 function forgotPrompt(){modal(`<h3 data-i18n="Reset your password">Reset your password</h3><p class="mut" data-i18n="Enter your email. If an account exists, a reset link is sent.">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email" data-i18n="Email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()" data-i18n="Send link">Send link</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Reset password')}
-function samlPrompt(){let org=prompt(owT('Workspace ID for SAML sign-in'));if(org)location.href='/api/auth/saml/'+encodeURIComponent(org)+'/start'}
+function workspaceSsoPrompt(){modal(`<h3>Sign in to a workspace</h3><p class="mut">Single sign-on is configured per workspace, and an address alone cannot reveal which workspace you mean.</p>
+  <div class="field"><label for="saml-org">Workspace ID</label><input id="saml-org" placeholder="workspace id" autocomplete="off" onkeydown="if(event.key==='Enter')samlGo('saml')"></div>
+  <p class="small mut">An owner can copy it from Members and access.</p>
+  <div class="row" style="margin-top:12px"><button class="primary" onclick="samlGo('saml')">Continue with SAML</button><button onclick="samlGo('oidc')">Continue with OIDC</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Workspace sign-in')}
+function samlGo(method){let org=$('saml-org').value.trim();if(!org){toast('Enter the workspace ID',true);return}
+  location.href='/api/auth/'+(method==='oidc'?'oidc':'saml')+'/'+encodeURIComponent(org)+'/start'}
+// The jurisdiction is a deployment, so the console can only report the one
+// serving this page and offer a hand-off to another origin. It never switches
+// region server-side, because a region is not a tenant preference.
+function renderRegion(p){
+  let line=$('regionline');if(!line)return;
+  REGIONS=(p&&p.regions)||[];
+  let here=(p&&p.region)||'global';
+  let others=REGIONS.filter(r=>r.label!==here);
+  line.innerHTML='<span id="regtext"></span><span id="regsw"></span>';
+  owText($('regtext'),'Signing in to {x}',{x:here});
+  if(others.length)$('regsw').innerHTML=' · <a href="#" role="button" onclick="regionPick(event);return false" data-i18n="Change region">Change region</a>'}
+function regionPick(e){if(e)e.preventDefault();
+  let rows=REGIONS.map((r,i)=>`<button class="pickrow" onclick="location.href=this.getAttribute('data-origin')" data-origin="${esc(r.origin)}"><span>${esc(String(r.label).toUpperCase())}</span><span class="grow"></span><span class="pm">${esc(r.origin)}</span></button>`).join('');
+  modal(`<h3 data-i18n="Choose a jurisdiction">Choose a jurisdiction</h3><p class="mut" data-i18n="Sign in where your workspace stores its data.">Sign in where your workspace stores its data.</p><div class="picklist">${rows}</div><div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Jurisdiction')}
 function ldapPrompt(){modal(`<h3 data-i18n="Sign in with your directory">Sign in with your directory</h3><p class="mut" data-i18n="Your password goes to this server over the API and is checked by your directory over TLS.">Your password goes to this server over the API and is checked by your directory over TLS.</p>
   <div class="field"><label for="ld-org" data-i18n="Workspace ID">Workspace ID</label><input id="ld-org" placeholder="workspace id" data-i18n-placeholder="workspace id"></div>
   <div class="field"><label for="ld-user" data-i18n="Directory username">Directory username</label><input id="ld-user" autocomplete="username"></div>
@@ -259,15 +301,51 @@ async function doAuth(){try{
 }catch(e){toast(e.message,true)}}
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
 async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
-async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
-  let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
-  let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
-  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
-  $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
+// The last workspace is remembered per account, so a shared browser does not
+// carry one person's choice into the next person's session.
+function orgMemoryKey(){return 'ow.org.'+((ME&&(ME.id||ME.email))||'')}
+function rememberedOrg(){try{return localStorage.getItem(orgMemoryKey())||''}catch(e){return ''}}
+function rememberOrg(id){try{localStorage.setItem(orgMemoryKey(),id)}catch(e){}}
+async function enterApp(){$('auth').style.display='none';
+  let me=await api('GET','/api/me');ME=me;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+  ORGS=await api('GET','/api/orgs');
+  let want=(PENDING_ORG&&ORGS.some(o=>o.id===PENDING_ORG))?PENDING_ORG:rememberedOrg();PENDING_ORG=null;
+  if(want&&!ORGS.some(o=>o.id===want))want='';
+  ORG=want||(ORGS.length===1?(ORGS[0].id||''):'');
+  if(!ORG&&ORGS.length>1){$('shell').style.display='none';$('picker').style.display='grid';showPicker();return}
+  if(ORG)rememberOrg(ORG);
+  $('shell').style.display='grid';
+  await startWorkspace()}
+function memberLabel(o){let n=Number(o.members)||0;return n+' '+(n===1?'member':'members')}
+function showPicker(){$('pickerlist').innerHTML=ORGS.map(o=>`<button class="pickrow" onclick="pickOrg(this.getAttribute('data-id'))" data-id="${esc(o.id)}"><span class="pn">${esc(o.name)}</span><span class="grow"></span><span class="pm">${memberLabel(o)} · ${esc(o.role)}</span></button>`).join('')}
+async function pickOrg(id){ORG=id;rememberOrg(id);$('picker').style.display='none';$('shell').style.display='grid';await startWorkspace()}
+async function startWorkspace(){
+  renderOrgMenu();
+  EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
   await refreshEmergency();clearInterval(EMERGENCY_POLL);EMERGENCY_POLL=setInterval(refreshEmergency,5000);
   await nav(EMERGENCY?'settings':'apps')}
-async function switchOrg(){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
-async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner'}
+function renderOrgMenu(){
+  let cur=ORGS.find(o=>o.id===ORG);
+  if(cur)owDataText($('orgname'),cur.name);else owText($('orgname'),'No workspace');
+  let rows=ORGS.map(o=>`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();switchOrg(this.getAttribute('data-id'))" data-id="${esc(o.id)}"><span class="ck" aria-hidden="true">${o.id===ORG?'✓':''}</span><span class="grow">${esc(o.name)}</span><span class="pm">${esc(o.role)}</span></button>`);
+  let who=esc((ME&&ME.email)||'');
+  $('orgmenu').innerHTML=rows.join('')+'<div class="orgsep"></div>'
+    +`<div class="orgitem" role="none" style="cursor:default"><span class="ck" aria-hidden="true">◆</span><span class="grow small">${who}</span></div>`
+    +`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();nav('settings')"><span class="ck" aria-hidden="true"></span><span class="grow" data-i18n="Account settings">Account settings</span></button>`
+    +`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();logout()"><span class="ck" aria-hidden="true"></span><span class="grow" data-i18n="Sign out">Sign out</span></button>`}
+function orgMenuOpen(){return $('orgbtn').getAttribute('aria-expanded')==='true'}
+function orgMenuItems(){return Array.from($('orgmenu').querySelectorAll('button.orgitem'))}
+function toggleOrgMenu(e){if(e&&e.stopPropagation)e.stopPropagation();let open=!orgMenuOpen();$('orgmenu').hidden=!open;$('orgbtn').setAttribute('aria-expanded',open?'true':'false');
+  if(open){let first=orgMenuItems()[0];if(first)first.focus()}}
+function closeOrgMenu(){let m=$('orgmenu');if(m)m.hidden=true;let b=$('orgbtn');if(b)b.setAttribute('aria-expanded','false')}
+function orgMenuKey(e){if(!orgMenuOpen())return;let items=orgMenuItems();if(!items.length)return;
+  let i=items.indexOf(document.activeElement);
+  if(e.key==='ArrowDown'){e.preventDefault();items[(i+1)%items.length].focus()}
+  else if(e.key==='ArrowUp'){e.preventDefault();items[(i-1+items.length)%items.length].focus()}
+  else if(e.key==='Home'){e.preventDefault();items[0].focus()}
+  else if(e.key==='End'){e.preventDefault();items[items.length-1].focus()}}
+async function switchOrg(id){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=id||ORG;APP=null;ENV=null;EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';PROJECT_DIRECT=false;rememberOrg(ORG);renderOrgMenu();applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
+async function refreshOrgs(){ORGS=await api('GET','/api/orgs');renderOrgMenu();EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner'}
 
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
@@ -940,6 +1018,8 @@ async function paletteSearch(){let q=$('paletteinput').value;if(q.length<2){$('p
   try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${jsq(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
 function paletteGo(key){$('palette').style.display='none';if(APP&&ENV){nav('apps');renderEnv().then(()=>{let f=$('sfilter');if(f){f.value=key;drawSecrets()}})}}
 $('palette').addEventListener('click',e=>{if(e.target.id==='palette')$('palette').style.display='none'});
+document.addEventListener('click',e=>{if(!orgMenuOpen())return;let t=e.target;if(t.closest&&(t.closest('#orgmenu')||t.closest('#orgbtn')))return;closeOrgMenu()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeOrgMenu()});
 
 loadProviders();
 applyThemeIcons();
@@ -965,7 +1045,7 @@ function boot(){
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
-$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
+$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none';$('picker').style.display='none'})
 </script>
 <script src="/libsodium.js" integrity="sha384-3KUAqev6nUaNHDSTa/UjyEycVN8iMfq/UtzKf3ZDTuGSb+P3y9kMu/WCVqnLAxUB"></script>
 <script src="/libsodium-wrappers.js" integrity="sha384-uj62oy76l27Bkf3eEP5knMYc094z6HzwAR7Rn8ZZcBBsg5nMibZXSvjRqgZMFg/L"></script>

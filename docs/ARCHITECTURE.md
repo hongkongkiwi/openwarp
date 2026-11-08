@@ -36,7 +36,7 @@ Authentication establishes the caller. OAuth scope checks, token environment sco
 ## Data model
 
 ```text
-Instance
+Instance (one jurisdiction)
   Organisation (workspace)
     Members, teams, roles, settings, audit history
     Application
@@ -48,6 +48,8 @@ Instance
 ```
 
 Accounts can participate in multiple workspaces. Workspace membership and instance ownership are distinct. A standard secret is identified by its environment, path, and normalised key, not its key alone.
+
+A jurisdiction is a deployment: the instance, its database and its master key. Tenant rows carry no jurisdiction, so data cannot be created under a label that disagrees with where it is stored, and separating two jurisdictions means separating their databases.
 
 ## Database adapter
 
