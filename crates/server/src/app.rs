@@ -2284,6 +2284,7 @@ pub(crate) fn issuer_url_ok(issuer: &str) -> bool {
     host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]" }
 // A bracketed IPv6 literal contains colons, so it has to be read as a unit
 // before the port is stripped.
+#[cfg(test)]
 fn url_host(u: &str) -> &str {
     let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).unwrap_or(u);
     let rest = rest.split('/').next().unwrap_or("");
