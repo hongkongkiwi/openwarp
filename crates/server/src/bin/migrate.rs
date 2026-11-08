@@ -16,6 +16,7 @@ commands:
   verify                 fail when checksums, history or completion are wrong
   apply [--to N]         apply pending versions (the server also does this on boot)
   repair --version N (--set-applied | --remove | --accept-checksum)
+  recover-lock --expected-owner OWNER --quiesced
 
 The database URL defaults to DATABASE_URL. A missing scheme is a SQLite path.
 Exit codes: 0 success or clean, 1 problems found, 2 invocation or connection error.";
@@ -27,6 +28,7 @@ struct Args {
     version: Option<i64>,
     repair: Option<&'static str>,
     dry_run: bool,
+    expected_owner: Option<String>,
 }
 
 #[tokio::main]
@@ -49,6 +51,8 @@ fn parse() -> Result<Option<Args>, String> {
     let mut version = None;
     let mut repair = None;
     let mut dry_run = false;
+    let mut expected_owner = None;
+    let mut quiesced = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -60,6 +64,8 @@ fn parse() -> Result<Option<Args>, String> {
             "--remove" => repair = Some("remove"),
             "--accept-checksum" => repair = Some("accept-checksum"),
             "--dry-run" => dry_run = true,
+            "--expected-owner" => expected_owner = Some(arguments.next().ok_or("--expected-owner needs a value")?),
+            "--quiesced" => quiesced = true,
             other if other.starts_with('-') => return Err(format!("unknown option {}", other)),
             other => {
                 if !command.is_empty() { return Err(format!("unexpected argument {}", other)); }
@@ -68,7 +74,7 @@ fn parse() -> Result<Option<Args>, String> {
         }
     }
     if command.is_empty() { return Ok(None); }
-    if !matches!(command.as_str(), "status" | "plan" | "verify" | "apply" | "repair") {
+    if !matches!(command.as_str(), "status" | "plan" | "verify" | "apply" | "repair" | "recover-lock") {
         return Err(format!("unknown command {}", command));
     }
     if url.trim().is_empty() { return Err("set DATABASE_URL or pass --database-url".to_string()); }
@@ -81,7 +87,11 @@ fn parse() -> Result<Option<Args>, String> {
         if version.is_none() { return Err("repair needs --version N".to_string()); }
         if repair.is_none() { return Err("repair needs --set-applied, --remove or --accept-checksum".to_string()); }
     }
-    Ok(Some(Args { url, command, to, version, repair, dry_run }))
+    if command == "recover-lock" && (!quiesced || expected_owner.as_deref().is_none_or(str::is_empty)) {
+        return Err("recover-lock requires --expected-owner OWNER and --quiesced after stopping all runners".to_string());
+    }
+    if command != "recover-lock" && (expected_owner.is_some() || quiesced) { return Err("recovery options require recover-lock".to_string()); }
+    Ok(Some(Args { url, command, to, version, repair, dry_run, expected_owner }))
 }
 
 async fn run(args: Args) -> Result<i32, String> {
@@ -93,7 +103,7 @@ async fn run(args: Args) -> Result<i32, String> {
     } else {
         match args.command.as_str() {
             "status" | "plan" | "verify" => Db::connect_read_only(&args.url).await?,
-            "repair" => Db::connect_existing(&args.url).await?,
+            "repair" | "recover-lock" => Db::connect_existing(&args.url).await?,
             _ => Db::connect(&args.url).await?,
         }
     };
@@ -144,6 +154,11 @@ async fn run(args: Args) -> Result<i32, String> {
                 for version in &report.applied { println!("applied {:04}", version); }
                 println!("now at version {}", db.version().await?);
             }
+            Ok(0)
+        }
+        "recover-lock" => {
+            migrate::recover_lock(&db, args.expected_owner.as_deref().expect("validated")).await?;
+            println!("matching migration lock removed; inspect incomplete history before applying");
             Ok(0)
         }
         "repair" => {

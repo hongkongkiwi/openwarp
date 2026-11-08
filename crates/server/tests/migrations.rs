@@ -200,20 +200,29 @@ async fn sqlite_upgrades_a_real_v9_schema() {
 }
 
 #[tokio::test]
-async fn sqlite_lock_blocks_a_second_runner_and_expires() {
+async fn sqlite_persistent_owner_requires_explicit_recovery_even_when_old() {
     let (path, _scratch) = scratch_path();
     let db = sqlite(&path).await;
-    fresh(&db).await;
-
+    // Model an older/custom runner's persistent claim before native protocol initialization.
+    db.exec_raw("CREATE TABLE schema_migration_lock(id BIGINT PRIMARY KEY,owner TEXT NOT NULL,acquired_at BIGINT NOT NULL)").await.unwrap();
     let now = openwarp_server::clock::now();
     db.exec("INSERT INTO schema_migration_lock(id,owner,acquired_at) VALUES(1,'other',?)", &[json!(now)]).await.unwrap();
     let error = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap_err();
-    assert!(error.contains("another instance"), "{}", error);
+    assert!(error.contains("migration lock") && error.contains("other"), "{}", error);
 
     db.exec("UPDATE schema_migration_lock SET acquired_at=? WHERE id=1", &[json!(now - 3600)]).await.unwrap();
+    let before = db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap();
+    let error = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap_err();
+    assert!(error.contains("migration lock") && error.contains("other"), "{}", error);
+    assert_eq!(db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap(), before, "age does not prove abandonment");
+    assert!(migrate::recover_lock(&db, "wrong-owner").await.is_err());
+    assert_eq!(db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap(), before, "recovery must match the exact owner");
+    // This fixture has no active runner or remotely submitted SQL.
+    migrate::recover_lock(&db, "other").await.unwrap();
     migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
-    let lock = db.one("SELECT owner FROM schema_migration_lock WHERE id=1", &[]).await.unwrap();
-    assert!(lock.is_none(), "a completed run releases its lock");
+    let lock = db.one("SELECT owner FROM schema_migration_lock WHERE id=1", &[]).await.unwrap().unwrap();
+    assert_eq!(openwarp_server::db::s(&lock, "owner"), "native-session-v1", "native initialization retains its permanent protocol marker");
+    assert!(migrate::status(&db, MIGRATIONS).await.unwrap().problems.is_empty());
 }
 
 #[tokio::test]

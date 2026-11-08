@@ -13,7 +13,7 @@
 //!
 //! Backends implement [`Target`]; [`Db`] covers SQLite, PostgreSQL, MariaDB and
 //! the Durable Object SQLite handle, and [`worker::D1Database`] covers D1. The
-//! runner itself never branches on the backend.
+//! public runner dispatches ownership through the target before executing SQL.
 
 use crate::db::{n, s, Db, Row};
 use sha2::{Digest, Sha256};
@@ -60,10 +60,6 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 20, name: "main18_reconciliation", sql: include_str!("../migrations/0020_main18_reconciliation.sql"), tolerant: true },
 ];
 
-/// How long a migration lock survives its owner. Long enough for a cold
-/// baseline on a slow database, short enough to recover from a killed process.
-const LOCK_STALE_SECS: i64 = 15 * 60;
-
 /// SQL profile used when splitting migration statements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqlDialect { Legacy, Sqlite, Postgres, Mysql }
@@ -72,6 +68,8 @@ pub enum SqlDialect { Legacy, Sqlite, Postgres, Mysql }
 /// not parameterised, and a literal `?` in SQL text must never be rewritten.
 #[allow(async_fn_in_trait)] // awaited inline; these futures are never spawned
 pub trait Target {
+    async fn apply(&self, migrations: &[Migration], options: Options) -> Result<Report, String> where Self: Sized { apply_generic(self, migrations, options).await }
+    async fn repair(&self, migrations: &[Migration], action: Repair) -> Result<String, String> where Self: Sized { repair_generic(self, migrations, action).await }
     async fn exec(&self, sql: &str) -> Result<(), String>;
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String>;
     /// Apply statements as one unit where the backend can. MySQL commits DDL
@@ -90,6 +88,8 @@ pub trait Target {
 }
 
 impl Target for Db {
+    async fn apply(&self, migrations: &[Migration], options: Options) -> Result<Report, String> { self.migration_apply(migrations, options).await }
+    async fn repair(&self, migrations: &[Migration], action: Repair) -> Result<String, String> { self.migration_repair(migrations, action).await }
     async fn exec(&self, sql: &str) -> Result<(), String> { Db::exec_raw(self, sql).await }
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { Db::query(self, sql, &[]).await }
     async fn script(&self, statements: &[String]) -> Result<(), String> { Db::exec_script(self, statements).await }
@@ -252,14 +252,59 @@ pub async fn run<T: Target>(target: &T) -> Result<(), String> {
 /// Apply pending migrations. Verifies the whole ledger first and holds the
 /// cross-process lock for the duration, including the ledger write.
 pub async fn apply<T: Target>(target: &T, migrations: &[Migration], options: Options) -> Result<Report, String> {
+    target.apply(migrations, options).await
+}
+
+async fn apply_generic<T: Target>(target: &T, migrations: &[Migration], options: Options) -> Result<Report, String> {
     validate(migrations)?;
     let mut report = Report::default();
-    ensure_ledger(target).await?;
+    ensure_lock_table(target).await?;
     let lock = Lock::acquire(target).await?;
-    let result = apply_locked(target, migrations, options, &mut report).await;
-    lock.release().await;
+    let result = async {
+        ensure_ledger(target).await?;
+        apply_locked(target, migrations, options, &mut report).await
+    }.await;
+    // A transport error can leave submitted SQL running. Only verified success
+    // proves that a generic target's owner may release its persistent claim.
+    if result.is_ok() { lock.release().await; }
     result?;
     Ok(report)
+}
+
+pub(crate) async fn apply_owned<T: Target>(target: &T, migrations: &[Migration], options: Options) -> Result<Report, String> {
+    validate(migrations)?;
+    ensure_native_protocol(target).await?;
+    ensure_ledger(target).await?;
+    let mut report = Report::default();
+    apply_locked(target, migrations, options, &mut report).await?;
+    Ok(report)
+}
+
+const NATIVE_PROTOCOL: &str = "native-session-v1";
+
+// The shared primary key arbitrates native protocol initialization against
+// generic claims. This marker is permanent, not a recoverable run owner.
+async fn ensure_native_protocol<T: Target>(target: &T) -> Result<(), String> {
+    ensure_lock_table(target).await?;
+    let inserted = target.exec(&format!(
+        "INSERT INTO schema_migration_lock(id,owner,acquired_at) VALUES(1,'{}',0)", NATIVE_PROTOCOL,
+    )).await;
+    if inserted.is_ok() { return Ok(()); }
+    let row = target.query("SELECT owner FROM schema_migration_lock WHERE id=1").await?.into_iter().next();
+    if row.as_ref().is_some_and(|row| s(row, "owner") == NATIVE_PROTOCOL) { return Ok(()); }
+    reject_persistent_owner(target).await?;
+    Err("could not initialize native migration ownership protocol; retry".to_string())
+}
+
+async fn reject_persistent_owner<T: Target>(target: &T) -> Result<(), String> {
+    if let Some(row) = target.query("SELECT owner FROM schema_migration_lock WHERE id=1").await?.first() {
+        let owner = s(row, "owner");
+        if owner == NATIVE_PROTOCOL {
+            return Err("database uses native-session-v1 migration ownership; this permanent protocol marker is not an active lock. Use Db apply/repair or an explicitly forwarding target".to_string());
+        }
+        return Err(format!("migration lock held by {:?}; confirm all previous runners are stopped before owner-qualified recovery", owner));
+    }
+    Ok(())
 }
 
 async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: Options, report: &mut Report) -> Result<(), String> {
@@ -322,12 +367,19 @@ async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: 
 async fn apply_one<T: Target>(target: &T, migration: &Migration) -> Result<(), String> {
     let checksum = checksum(migration.sql);
     let started = now_ms();
-    target.exec(&format!(
+    let insert = format!(
         "INSERT INTO schema_migrations(version,applied_at,name,checksum,success,execution_ms) VALUES({},{},'{}','{}',0,0)",
         migration.version, crate::clock::now(), sql_literal(migration.name), checksum,
-    )).await?;
-
+    );
     let statements = split_sql_with_dialect(migration.sql, target.sql_dialect());
+    if !migration.tolerant && target.atomic_ddl() {
+        let mut atomic = vec![insert];
+        atomic.extend(statements);
+        atomic.push(format!("UPDATE schema_migrations SET success=1 WHERE version={}", migration.version));
+        target.script(&atomic).await.map_err(|error| format!("migration {} ({}) failed; transaction outcome must be verified before retry: {}", migration.version, migration.name, error))?;
+        return verify_completion(target, migration, &checksum).await;
+    }
+    target.exec(&insert).await?;
     let outcome = if migration.tolerant {
         exec_tolerant(target, &statements, migration.version <= SQUASHED_THROUGH).await
     } else {
@@ -341,28 +393,14 @@ async fn apply_one<T: Target>(target: &T, migration: &Migration) -> Result<(), S
                 "UPDATE schema_migrations SET success=1, execution_ms={} WHERE version={}",
                 elapsed, migration.version,
             )).await?;
-            // A runner whose lock went stale can be overtaken while a long
-            // migration finishes. Re-read the row so a row another runner
-            // removed or rewrote cannot be reported as our success.
+            // Completion must identify the exact row this operation inserted.
             verify_completion(target, migration, &checksum).await
         }
-        Err(error) => {
-            if migration.tolerant || !target.atomic_ddl() {
-                // The statement loop commits as it goes, and MySQL commits DDL
-                // implicitly, so some objects may exist. Leave the success=0 row
-                // as the marker that a human must reconcile.
-                Err(format!(
-                    "migration {} ({}) failed part-way: {}. The database is marked incomplete; after checking the schema run \
-                     `openwarp-migrate repair --version {} --set-applied`, or `--remove` to retry from scratch",
-                    migration.version, migration.name, error, migration.version,
-                ))
-            } else {
-                // The transaction rolled the whole migration back; forget the
-                // marker so the next boot can simply try again.
-                let _ = target.exec(&format!("DELETE FROM schema_migrations WHERE version={} AND success=0", migration.version)).await;
-                Err(format!("migration {} ({}) failed and was rolled back: {}", migration.version, migration.name, error))
-            }
-        }
+        Err(error) => Err(format!(
+            "migration {} ({}) failed part-way: {}. The database is marked incomplete; after checking the schema run \
+             `openwarp-migrate repair --version {} --set-applied`, or `--remove` to retry from scratch",
+            migration.version, migration.name, error, migration.version,
+        )),
     }
 }
 
@@ -504,18 +542,39 @@ pub async fn status<T: Target>(target: &T, migrations: &[Migration]) -> Result<S
 }
 
 pub async fn repair<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
+    target.repair(migrations, action).await
+}
+
+async fn repair_generic<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
     validate(migrations)?;
     // A repair must never manufacture a ledger in a database that has none.
     if target.query("SELECT version FROM schema_migrations LIMIT 1").await.is_err() {
         return Err("no schema_migrations ledger in this database; run status or apply first".to_string());
     }
-    ensure_ledger(target).await?;
-    // A repair rewrites history, so it takes the same lock as a migration run
-    // and always releases it, including when the repair itself is refused.
+    ensure_lock_table(target).await?;
     let lock = Lock::acquire(target).await?;
-    let result = repair_locked(target, migrations, action).await;
-    lock.release().await;
+    let result = async {
+        ensure_ledger(target).await?;
+        repair_locked(target, migrations, action).await
+    }.await;
+    if result.is_ok() { lock.release().await; }
     result
+}
+
+pub(crate) async fn repair_owned<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
+    validate(migrations)?;
+    target.query("SELECT version FROM schema_migrations LIMIT 1").await.map_err(|_| "no schema_migrations ledger in this database; run status or apply first".to_string())?;
+    ensure_native_protocol(target).await?;
+    ensure_ledger(target).await?;
+    repair_locked(target, migrations, action).await
+}
+
+/// Only call after quiescing every migration runner, including remote requests.
+pub async fn recover_lock<T: Target>(target: &T, expected_owner: &str) -> Result<(), String> {
+    if expected_owner.is_empty() { return Err("expected lock owner is required".to_string()); }
+    if expected_owner == NATIVE_PROTOCOL { return Err("native-session-v1 is a permanent protocol marker, not an abandoned owner; it cannot be removed by recovery".to_string()); }
+    target.exec(&format!("DELETE FROM schema_migration_lock WHERE id=1 AND owner='{}'", sql_literal(expected_owner))).await?;
+    reject_persistent_owner(target).await
 }
 
 async fn repair_locked<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
@@ -825,21 +884,12 @@ impl<'a, T: Target> Lock<'a, T> {
                 if attempt == 0 { continue; }
                 return Err("could not acquire the migration lock; retry".to_string());
             };
-            let current = s(&holder, "owner");
-            let acquired_at = n(&holder, "acquired_at");
-            if now - acquired_at > LOCK_STALE_SECS {
-                // Compare-and-swap: only one contender wins a stale takeover.
-                let _ = target.exec(&format!(
-                    "UPDATE schema_migration_lock SET owner='{}', acquired_at={} WHERE id=1 AND owner='{}'",
-                    owner, now, sql_literal(&current),
-                )).await;
+            if s(&holder, "owner") == NATIVE_PROTOCOL {
+                return Err("database uses native-session-v1 migration ownership; this permanent protocol marker is not an active lock. Use Db apply/repair or an explicitly forwarding target".to_string());
             }
-            let held = target.query("SELECT owner FROM schema_migration_lock WHERE id=1").await?
-                .into_iter().next().map(|row| s(&row, "owner")).unwrap_or_default();
-            if held == owner { return Ok(Self { target, owner }); }
             return Err(format!(
-                "another instance is applying migrations (lock held since {}); retry after it finishes or {} seconds after a crash",
-                acquired_at, LOCK_STALE_SECS,
+                "another instance is applying migrations (owner {:?}, held since {}); ownership never expires. Quiesce all runners before owner-qualified recovery",
+                s(&holder, "owner"), n(&holder, "acquired_at"),
             ));
         }
         Err("could not acquire the migration lock; retry".to_string())
@@ -865,8 +915,11 @@ async fn ensure_ledger<T: Target>(target: &T) -> Result<(), String> {
     ] {
         exec_idempotent(target, column).await?;
     }
-    exec_idempotent(target, "CREATE TABLE IF NOT EXISTS schema_migration_lock(id BIGINT PRIMARY KEY,owner TEXT NOT NULL,acquired_at BIGINT NOT NULL)").await?;
     Ok(())
+}
+
+async fn ensure_lock_table<T: Target>(target: &T) -> Result<(), String> {
+    exec_idempotent(target, "CREATE TABLE IF NOT EXISTS schema_migration_lock(id BIGINT PRIMARY KEY,owner TEXT NOT NULL,acquired_at BIGINT NOT NULL)").await
 }
 
 /// Create or alter an object that another booting instance may be creating at

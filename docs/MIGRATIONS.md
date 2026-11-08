@@ -89,23 +89,50 @@ Two sentinel values are meaningful:
   because the consolidated baseline is not the file that original database
   applied.
 
-When a migration finishes, the runner writes `success = 1` and then re-reads the
-row, requiring the version, name and checksum it inserted. A row another runner
-removed or rewrote during a stale-lock takeover fails the run instead of being
-reported as applied by this process.
+Completion requires re-reading the version, name, checksum and success marker.
+Strict PostgreSQL migrations commit their initial marker, DDL and completion
+marker in one transaction. An unknown commit result is an error, not proof of
+rollback, and the next owner must inspect the persisted ledger.
 
-`schema_migration_lock` is a single row that serialises runners. A run takes it
-before reading the ledger and deletes it when finished. A row older than 15
-minutes is treated as abandoned and can be taken over. Long migrations are
-unaffected: the timestamp is checked only when another runner cannot acquire the
-lock. `repair` takes the same lock and always releases it, so it cannot rewrite
-history while another runner is applying migrations.
+Native SQLite holds one `BEGIN IMMEDIATE` transaction on the same connection for
+the entire apply or repair. Failure or process death rolls back the run, including
+the ledger. PostgreSQL holds a session advisory lock on a client detached from its
+pool before acquiring ownership. MySQL uses an unpooled connection and `GET_LOCK`.
+All migration and ledger queries use that owning session. Dropping or cancelling
+the operation discards the session instead of returning a locked connection to a
+pool. Backend ownership ends only when the database ends the session or transaction,
+not when a wall-clock deadline expires. MySQL and tolerant PostgreSQL failures can
+still leave incomplete DDL; recovering ownership does not repair arbitrary data.
 
-Several replicas can boot at once against one database. Ledger creation is
-idempotent and tolerates the PostgreSQL catalogue race; the loser of the lock
-exits with `another instance is applying migrations` rather than waiting. Let the
-winning instance finish and restart the other one. The migration tests include
-two simultaneous PostgreSQL runners and assert a clean final ledger.
+Durable Object migration operations run synchronously inside `transactionSync`;
+an exception rolls back the whole operation. This does not depend on assuming
+that asynchronous Durable Object events cannot interleave.
+
+D1 and custom `Target` implementations have no proven session ownership protocol.
+They use a persistent `schema_migration_lock` row that never expires. Only a
+verified successful run releases its own row. An error or cancellation keeps it,
+because submitted SQL may still be executing remotely. Its timestamp is diagnostic,
+never permission for takeover. Both apply and repair obey the same ownership
+protocol. Native backends also refuse an existing persistent row from an older or
+custom runner until an operator resolves it.
+
+Native operations reserve `schema_migration_lock` row 1 with owner
+`native-session-v1` and timestamp 0. This permanent protocol marker is not an
+active owner and does not mean that a migration is running. The native backend
+lock remains the authority for each operation. Initialization competes atomically
+with generic claims for the same primary key, before ledger creation or upgrades.
+Generic apply and repair refuse a native-marked database, so a custom wrapper
+cannot bypass a native session lock. A wrapper needing native access must
+explicitly forward its `Target::apply` and `Target::repair` methods to the wrapped
+`Db` operations. Read-only status, plan and verify remain available through either
+path. Recovery cannot remove the native protocol marker.
+
+Several replicas can boot at once against one database. Native ownership is
+acquired before ledger creation or inspection. PostgreSQL and MySQL contenders
+refuse an occupied session lock; SQLite waits up to its configured busy timeout
+for the writer transaction. Let the winning instance finish before retrying.
+The migration tests include two simultaneous PostgreSQL runners and assert a
+clean final ledger when a live PostgreSQL test URL is configured.
 
 ## What boot refuses
 
@@ -121,9 +148,10 @@ the reason in the error, when:
 - application tables exist but the ledger has no rows, so the consolidated
   baseline cannot be recorded as squashed.
 
-A failed strict migration on SQLite or PostgreSQL is rolled back and its ledger
-row is removed, so the next boot can simply try again. MySQL commits DDL
-implicitly, so a failure there leaves `success = 0` and needs a decision.
+SQLite rolls back the whole failed run. A strict PostgreSQL transaction includes
+its ledger marker, so a confirmed rollback leaves nothing to retry manually.
+A lost commit response must be checked against persisted history. MySQL commits
+DDL implicitly, so a failure there leaves `success = 0` and needs a decision.
 
 ## Operator CLI
 
@@ -165,6 +193,25 @@ command. Use `--accept-checksum` only after reviewing why a frozen file
 changed; it rewrites the stored hash, not the database. It refuses rows that
 predate checksums and rows covered by the consolidated baseline, because
 `checksum = ''` and `checksum = 'squashed'` are history markers, not drift.
+
+### Recovering uncertain ownership
+
+Stop all server instances, migration commands and workers that can submit SQL.
+For a remote backend, confirm that previously submitted operations have finished
+or been cancelled at the database; stopping the caller alone is not proof.
+Inspect `SELECT owner, acquired_at FROM schema_migration_lock WHERE id=1` and
+record the exact owner. Only after confirmed quiescence, native CLI users can run:
+
+```bash
+openwarp-migrate recover-lock --expected-owner 'mig_EXACT_RECORDED_OWNER' --quiesced
+```
+
+The deletion matches the expected owner, never every row. On D1, use the owning
+Worker's `migrate::recover_lock(&d1, expected_owner)` after the same checks, or an
+owner-qualified SQL deletion through the database operator tools. A different
+owner must remain untouched. Then inspect `status`, reconcile partial DDL and use
+an explicit repair if needed before restarting. Do not automate this fallback
+based on age or heartbeat absence.
 
 ## Adding a migration
 

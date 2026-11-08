@@ -1,7 +1,7 @@
 //! Offline migration review regressions against private SQLite databases.
 
 use openwarp_server::db::{n, s, Db, Row};
-use openwarp_server::migrate::{self, Options, Repair, MIGRATIONS};
+use openwarp_server::migrate::{self, Options, Repair, Target, MIGRATIONS};
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -65,9 +65,13 @@ async fn unledgered_partial_users_is_not_falsely_squashed() {
                 .into_iter().filter(|name| !names.iter().any(|present| present == name)).collect();
             assert!(missing.is_empty(), "apply reported success ({:?}) on an incomplete users schema; missing columns: {:?}", report, missing);
         }
-        Err(_) => {
-            let rows = db.query("SELECT version FROM schema_migrations WHERE success=1 OR checksum='squashed'", &[]).await.unwrap();
-            assert!(rows.is_empty(), "refusing a partial unledgered schema must not certify skipped migrations");
+        Err(error) => {
+            assert!(error.contains("application tables but no schema_migrations ledger"), "unexpected refusal: {}", error);
+            let status = migrate::status(&db, MIGRATIONS).await.unwrap();
+            assert!(!status.ledger_present, "native SQLite must roll back newly created migration metadata on refusal");
+            assert_eq!(status.current, 0, "refusal must not certify skipped migrations");
+            assert_eq!(status.pending().len(), MIGRATIONS.len());
+            assert!(db.query("SELECT owner FROM schema_migration_lock", &[]).await.is_err(), "native rollback must not leave a persistent claim");
         }
     }
 }
@@ -121,9 +125,21 @@ fn cli_status_invalid_remote_url_does_not_leak_credentials() {
     assert!(![username, password].iter().any(|secret| stdout.contains(secret) || stderr.contains(secret)), "URL parse error leaked database credential canaries");
 }
 
+struct GenericFixture(Db);
+
+impl Target for GenericFixture {
+    async fn exec(&self, sql: &str) -> Result<(), String> { self.0.exec_raw(sql).await }
+    async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { self.0.query(sql, &[]).await }
+    async fn script(&self, statements: &[String]) -> Result<(), String> { self.0.exec_script(statements).await }
+    fn atomic_ddl(&self) -> bool { self.0.script_is_atomic() }
+    async fn has_application_schema(&self) -> Result<bool, String> { self.0.has_application_schema().await }
+}
+
 async fn assert_repair_respects_lock(action: Repair) {
     let scratch = Scratch::new();
-    let db = fresh(&scratch).await;
+    let fixture = GenericFixture(Db::connect(&scratch.url()).await.unwrap());
+    migrate::apply(&fixture, MIGRATIONS, Options::default()).await.expect("initialize generic owner fixture");
+    let db = fixture.0;
     let latest = MIGRATIONS.last().unwrap().version;
     db.exec("UPDATE schema_migrations SET success=0,checksum='review-drift' WHERE version=?", &[json!(latest)]).await.unwrap();
     let now = openwarp_server::clock::now();

@@ -34,23 +34,38 @@ struct CompletionTarget {
     intercepted: Cell<bool>,
 }
 
+impl CompletionTarget {
+    fn completion_fault(&self, sql: &str) -> Option<&'static str> {
+        let normalized: String = sql.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+        let assignments = normalized.trim_end_matches(';').strip_prefix("updateschema_migrationsset")?
+            .strip_suffix("whereversion=18")?;
+        if !assignments.split(',').any(|assignment| assignment == "success=1") { return None; }
+        self.intercepted.set(true);
+        match self.fault {
+            Fault::None => None,
+            Fault::Remove => Some("DELETE FROM schema_migrations WHERE version=18"),
+            Fault::Name => Some("UPDATE schema_migrations SET name='other_runner' WHERE version=18"),
+            Fault::Checksum => Some("UPDATE schema_migrations SET checksum='other_checksum' WHERE version=18"),
+        }
+    }
+}
+
 impl Target for CompletionTarget {
     async fn exec(&self, sql: &str) -> Result<(), String> {
         // Model an operator rewriting history after SQL succeeds but before completion is recorded.
-        if sql.starts_with("UPDATE schema_migrations SET success=1,") && sql.ends_with("WHERE version=18") {
-            self.intercepted.set(true);
-            match self.fault {
-                Fault::None => {},
-                Fault::Remove => self.db.exec_raw("DELETE FROM schema_migrations WHERE version=18").await?,
-                Fault::Name => self.db.exec_raw("UPDATE schema_migrations SET name='other_runner' WHERE version=18").await?,
-                Fault::Checksum => self.db.exec_raw("UPDATE schema_migrations SET checksum='other_checksum' WHERE version=18").await?,
-            }
-        }
+        if let Some(fault) = self.completion_fault(sql) { self.db.exec_raw(fault).await?; }
         self.db.exec_raw(sql).await
     }
 
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { self.db.query(sql, &[]).await }
-    async fn script(&self, statements: &[String]) -> Result<(), String> { self.db.exec_script(statements).await }
+    async fn script(&self, statements: &[String]) -> Result<(), String> {
+        let mut injected = Vec::new();
+        for statement in statements {
+            if let Some(fault) = self.completion_fault(statement) { injected.push(fault.to_string()); }
+            injected.push(statement.clone());
+        }
+        self.db.exec_script(&injected).await
+    }
     fn atomic_ddl(&self) -> bool { self.db.script_is_atomic() }
     async fn has_application_schema(&self) -> Result<bool, String> { self.db.has_application_schema().await }
 }
@@ -68,10 +83,10 @@ async fn exercise(fault: Fault, tolerant: bool) {
     let scratch = Scratch::new();
     let db = Db::connect(&scratch.url()).await.expect("connect private database");
     let migrations = migrations(tolerant);
-    // Seed the squashed history so the two test migrations execute normally.
-    migrate::apply(&db, &migrations[..SQUASHED_THROUGH as usize], Options::default()).await.expect("initialize fixture");
-    db.exec_raw("CREATE TABLE migration_effects(version INTEGER PRIMARY KEY)").await.unwrap();
     let target = CompletionTarget { db, fault, intercepted: Cell::new(false) };
+    // Initialize through the same generic ownership protocol as the fault-injecting run.
+    migrate::apply(&target, &migrations[..SQUASHED_THROUGH as usize], Options::default()).await.expect("initialize fixture");
+    target.db.exec_raw("CREATE TABLE migration_effects(version INTEGER PRIMARY KEY)").await.unwrap();
 
     let outcome = migrate::apply(&target, &migrations, Options::default()).await;
     assert!(target.intercepted.get(), "completion fault must reach version 18, fault={:?}, tolerant={}", fault, tolerant);

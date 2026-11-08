@@ -5,6 +5,9 @@ use mysql_async::prelude::Queryable;
 
 pub type Row = HashMap<String, Value>;
 
+#[path = "migration_session.rs"]
+mod migration_session;
+
 /// Storage backend. Native builds use SQLite or a PostgreSQL pool; the Workers
 /// build uses the synchronous SQLite handle of a Durable Object, which is
 /// wrapped in async methods so call sites stay identical on both targets.

@@ -98,7 +98,19 @@ async fn interrupted_squash_resumes(version: i64) {
     drop(target);
 
     let db = Db::connect_existing(&scratch.url()).await.expect("reopen interrupted database without fault injection");
-    let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("restart must finish recording the baseline squash");
+    let lock_before = db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap();
+    assert_eq!(lock_before.len(), 1, "a generic target cannot infer SQL completion from an error");
+    let owner = s(&lock_before[0], "owner");
+    assert!(!owner.is_empty());
+    let error = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect_err("native restart must respect an uncertain generic owner");
+    assert!(error.contains("migration lock"), "{}", error);
+    assert_eq!(ledger(&db).await, prefix, "blocked restart must not rewrite the squash prefix");
+    assert!(migrate::recover_lock(&db, "wrong-owner").await.is_err());
+    assert_eq!(db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap(), lock_before, "wrong-owner recovery must leave the claim intact");
+    // The synchronous fault target has returned and was dropped; no fixture SQL remains in flight.
+    migrate::recover_lock(&db, &owner).await.expect("recover only the stopped fixture's exact owner");
+    assert!(db.query("SELECT * FROM schema_migration_lock", &[]).await.unwrap().is_empty());
+    let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("restart must finish recording the baseline squash after explicit recovery");
     assert_eq!(db.query("SELECT * FROM users ORDER BY id", &[]).await.unwrap(), users_before, "restart must preserve initialized users");
     assert_eq!(db.query("SELECT k,v FROM meta WHERE k='squash-fixture'", &[]).await.unwrap(), meta_before, "restart must preserve initialized metadata");
     let rows = ledger(&db).await;
