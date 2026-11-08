@@ -96,11 +96,11 @@ async fn assert_emergency_schema(db: &Db, expected: i64) {
     }
 }
 
-async fn assert_final20(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 20, "the conflicting main18 history needs an appended reconciliation");
+async fn assert_final22(db: &Db) {
+    assert_eq!(db.version().await.unwrap(), 22, "the conflicting main18 history needs an appended reconciliation");
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 20);
-    assert_eq!(status.latest, 20);
+    assert_eq!(status.current, 22);
+    assert_eq!(status.latest, 22);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
@@ -137,7 +137,7 @@ async fn main18_without_sentinel_backfills_existing_environment_members() {
     assert_eq!(restricted(&db, "main18-member-env").await, 1, "legacy version 18 denotes emergency locks, so it must not suppress the missing allowlist backfill");
     assert!(db.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap().is_some());
     db.exec("UPDATE envs SET restricted=0 WHERE id='main18-member-env'", &[]).await.unwrap();
-    assert_final20(&db).await;
+    assert_final22(&db).await;
     assert_eq!(restricted(&db, "main18-member-env").await, 0, "a later intentional unlock must survive another boot");
 }
 
@@ -146,7 +146,7 @@ async fn main18_with_sentinel_preserves_intentionally_unrestricted_environment()
     let db = upgrade_legacy_main18(true).await;
     assert_eq!(restricted(&db, "main18-member-env").await, 0, "membership must not override an intentional unrestricted setting after the sentinel");
     let before = common_data(&db).await;
-    assert_final20(&db).await;
+    assert_final22(&db).await;
     assert_eq!(common_data(&db).await, before);
     assert_emergency_schema(&db, 1).await;
 }
@@ -158,7 +158,7 @@ async fn fresh_engine_database_contains_shipped_main18_emergency_fields() {
     assert_emergency_schema(&db, 0).await;
     db.exec("UPDATE orgs SET emergency_locked=1", &[]).await.unwrap();
     db.exec("UPDATE apps SET emergency_locked=1", &[]).await.unwrap();
-    assert_final20(&db).await;
+    assert_final22(&db).await;
     assert_emergency_schema(&db, 1).await;
 }
 
@@ -179,8 +179,8 @@ async fn upgrade_engine_history(version: usize) {
         assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=? ORDER BY version", &[serde_json::json!(version)]).await.unwrap(), ledger, "engine{} ledger rows and checksums are immutable", version);
         assert_eq!(restricted(&db, "main18-member-env").await, 0, "the existing engine sentinel preserves later unrestricted environments");
         assert_emergency_schema(&db, 0).await;
-        assert_eq!(report.applied, ((version as i64 + 1)..=20).collect::<Vec<_>>());
-        assert_final20(&db).await;
+        assert_eq!(report.applied, ((version as i64 + 1)..=22).collect::<Vec<_>>());
+        assert_final22(&db).await;
         assert_eq!(common_data(&db).await, before);
 }
 

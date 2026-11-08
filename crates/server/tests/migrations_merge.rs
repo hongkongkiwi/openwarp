@@ -78,8 +78,8 @@ async fn assert_main17_defaults(db: &Db) {
     assert_eq!(n(&wrap, "used"), 0);
 }
 
-async fn assert_final20(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 20, "the merge appends migrations 19 and 20 without renumbering either history");
+async fn assert_final22(db: &Db) {
+    assert_eq!(db.version().await.unwrap(), 22, "the merge appends reconciliation without renumbering either history");
     for table in ["orgs", "apps"] {
         let rows = db.query(&format!("SELECT emergency_locked FROM {}", table), &[]).await.unwrap();
         assert!(!rows.is_empty(), "{} must contain the seeded row", table);
@@ -88,8 +88,8 @@ async fn assert_final20(db: &Db) {
         }
     }
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 20);
-    assert_eq!(status.latest, 20);
+    assert_eq!(status.current, 22);
+    assert_eq!(status.latest, 22);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
@@ -102,7 +102,7 @@ async fn fresh_database_contains_shipped_main17_schema() {
     assert_main17_schema(&db).await;
     seed_common_rows(&db).await;
     assert_main17_defaults(&db).await;
-    assert_final20(&db).await;
+    assert_final22(&db).await;
 }
 
 async fn main_data(db: &Db) -> Vec<Vec<Row>> {
@@ -142,9 +142,9 @@ async fn shipped_main17_legacy_ledger_upgrade_preserves_data() {
     assert!(!report.squashed, "a main17 database must not be replaced by the branch baseline");
     assert_eq!(main_data(&db).await, before, "all shipped main17 data must survive reconciliation");
     assert_main17_schema(&db).await;
-    assert_eq!(report.applied, vec![18, 19, 20]);
+    assert_eq!(report.applied, vec![18, 19, 20, 21, 22]);
     assert_eq!(db.query("SELECT version,applied_at FROM schema_migrations WHERE version<=17 ORDER BY version", &[]).await.unwrap(), ledger);
-    assert_final20(&db).await;
+    assert_final22(&db).await;
     assert_eq!(main_data(&db).await, before, "the second boot must also preserve ciphertext, chain state and used flags");
 }
 
@@ -164,12 +164,12 @@ async fn branch18_upgrade_appends19_without_rewriting_checksums() {
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade a checksum-bearing branch18 ledger without repair");
     assert_main17_schema(&db).await;
-    assert_eq!(report.applied, vec![19, 20]);
+    assert_eq!(report.applied, vec![19, 20, 21, 22]);
     assert!(!report.squashed);
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=18 ORDER BY version", &[]).await.unwrap(), ledger, "the pre-merge engine ledger must remain unchanged");
     assert_eq!(db.one("SELECT id,app_id,name,env_key_wrapped,created_at FROM envs WHERE id='merge-env'", &[]).await.unwrap(), env_before);
     assert_eq!(db.one("SELECT id,env_id,name,value_enc,expires_at,created_at FROM leases WHERE id='merge-lease'", &[]).await.unwrap(), lease_before);
     assert_eq!(db.one("SELECT id,org_id,env_id,actor,action,detail,created_at FROM audit WHERE id='merge-audit'", &[]).await.unwrap(), audit_before);
     assert_main17_defaults(&db).await;
-    assert_final20(&db).await;
+    assert_final22(&db).await;
 }

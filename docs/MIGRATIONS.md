@@ -63,9 +63,23 @@ plus unique names, on every apply.
   Existing lockdown values and intentional changes made after the sentinel are
   retained.
 
-New migrations start at version 21. SQL files 1 through 19 remain unchanged.
-Legacy main version 17 and 18 ledger rows have no checksum and remain unverified;
-versions 19 and 20 record the reconciliations.
+- Version 21 adds `change_requests` and `change_request_envs`, matching the main
+  branch's shipped version 19.
+- Version 22 reconciles all objects from the main branch's shipped versions 17
+  through 21. It repeats the engine's version 19 and 20 reconciliation SQL and
+  adds change requests, workload trusts, workload replay protection,
+  `tokens.trust_id`, and transit keys and versions. Repeating these guarded
+  statements is necessary because a legacy main version 21 row occupies the
+  engine's version 21 without proving that its SQL ran. Existing ciphertext,
+  revocation state, key versions and lockdown values are retained. The
+  environment backfill still respects its existing sentinel.
+
+New migrations start at version 23. SQL files 1 through 20 remain unchanged.
+Legacy main version 17 through 21 ledger rows have no checksum and remain
+unverified. A legacy main version 21 database applies only version 22; an engine
+version 20 database applies versions 21 and 22. The runner records checksums only
+for the new reconciliation files it actually executes, without relabelling
+occupied legacy versions.
 
 ## The ledger
 
@@ -215,7 +229,7 @@ based on age or heartbeat absence.
 
 ## Adding a migration
 
-1. Add `crates/server/migrations/0021_your_change.sql`.
+1. Add `crates/server/migrations/0023_your_change.sql`.
 2. Add the matching entry to `MIGRATIONS` in `crates/server/src/migrate.rs` with
    the next version, a short name, and `tolerant: false`.
 3. Write canonical SQL:

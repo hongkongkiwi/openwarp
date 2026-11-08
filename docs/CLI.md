@@ -110,6 +110,47 @@ openwarp run -- sh -c 'printf "%s\n" "$EXAMPLE_GREETING"'
 
 The CLI sets fetched values in the child's environment and propagates its exit status. The `--` separates OpenWarp arguments from the child command. Shell operators require an explicit shell, as in the second example. Do not run untrusted programs with production secrets.
 
+## Encrypted files
+
+File commands run offline and do not load saved credentials or contact an instance. They encrypt an entire file in an OpenWarp JSON envelope, not the SOPS file format. File names and sizes remain visible; JSON keys inside the input do not.
+
+```bash
+openwarp file keygen --out identity.json
+openwarp file encrypt settings.json --recipient PUBLIC_KEY --out settings.ow.json
+openwarp file decrypt settings.ow.json --identity identity.json --out settings.local.json
+openwarp file rekey settings.ow.json --identity identity.json --recipient NEW_PUBLIC_KEY --out settings.rekeyed.json
+```
+
+The identity file contains `public_key` and `private_key`. Keep it outside version control and back it up separately from encrypted files. Encryption accepts up to 16 MiB and 1-32 distinct X25519 recipients; repeat `--recipient` for additional recipients. Any listed recipient can decrypt. The envelope authenticates the payload and recipient metadata.
+
+Every output must be a new path. Existing files and symlinks are refused; Unix output permissions are 0600. Decrypt and rekey authenticate the source before creating output. Rekey replaces the recipients and preserves the encrypted payload. It does not revoke an old copy: anyone who saved the previous envelope or data key can still decrypt that copy.
+
+## Secret references
+
+Use a reference to select a secret by environment ID, path and key. A root reference is `ow://ENV_ID/KEY`; a nested reference is `ow://ENV_ID/team/db/KEY` for the path `/team/db/`. Percent-encode spaces and other special characters in individual path segments. References never select a different server; the host and token come from normal CLI configuration.
+
+A UTF-8 template can contain `{{ow://ENV_ID/KEY}}` placeholders:
+
+```bash
+openwarp inject --input app.template --out app.local.conf
+```
+
+Without `--out`, `inject` writes plaintext to standard output. All references resolve before any output is written. Returned values are inserted literally and are not expanded as further references. Output files follow the new-only and Unix 0600 rules above. Templates are literal substitution, not JSON, shell or YAML escaping; quote values for the destination format yourself.
+
+For process injection, put explicit environment-variable bindings in a JSON file:
+
+```json
+{"DATABASE_URL":"ow://ENV_ID/services/db/DATABASE_URL"}
+```
+
+```bash
+openwarp run --env ENV_ID --refs-file bindings.json -- ./your-app
+```
+
+With `--refs-file`, OpenWarp injects only the listed bindings rather than exporting the whole environment. All bindings must resolve before the child starts. Command arguments remain literal. The child still inherits the calling process's ordinary environment; this is not a sandbox. OpenWarp removes inherited `OPENWARP_TOKEN` and `OPENWARP_PRIVKEY` in this mode, unless an explicit binding supplies that name. Without `--refs-file`, `run` retains its whole-environment export behavior.
+
+References use current server authorization and resolve afresh on each CLI invocation. Sealed or unreadable targets fail. For an E2E or delegated environment, pass `--identity identity.json` containing the public/private key pair that holds a wrapped environment-key grant. Decryption happens in the CLI. An unrelated offline file identity does not grant access to an environment. These commands do not provide biometric authorization.
+
 ## End-to-end environments
 
 E2E operations use separate endpoints and perform encryption/decryption locally. Do not substitute ordinary `set`, `get`, or `run` for these commands.

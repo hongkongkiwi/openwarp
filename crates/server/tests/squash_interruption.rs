@@ -69,9 +69,9 @@ fn assert_history(rows: &[Row], through: i64) {
 
 async fn assert_complete_and_stable(db: &Db) {
     let before = ledger(db).await;
-    assert_history(&before, 20);
+    assert_history(&before, 22);
     let status = migrate::status(db, MIGRATIONS).await.expect("inspect completed history");
-    assert_eq!(status.current, 20);
+    assert_eq!(status.current, 22);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.expect("completed squash remains restartable");
@@ -115,8 +115,8 @@ async fn interrupted_squash_resumes(version: i64) {
     assert_eq!(db.query("SELECT k,v FROM meta WHERE k='squash-fixture'", &[]).await.unwrap(), meta_before, "restart must preserve initialized metadata");
     let rows = ledger(&db).await;
     assert_eq!(&rows[..prefix.len()], prefix.as_slice(), "restart must retain already completed ledger entries");
-    assert_history(&rows, 20);
-    assert_eq!(report.applied, vec![18, 19, 20], "restart must run only migrations beyond the consolidated baseline");
+    assert_history(&rows, 22);
+    assert_eq!(report.applied, vec![18, 19, 20, 21, 22], "restart must run only migrations beyond the consolidated baseline");
     assert_complete_and_stable(&db).await;
 }
 
@@ -136,6 +136,6 @@ async fn fresh_squash_completes_and_restart_is_noop() {
     let db = Db::connect(&scratch.url()).await.expect("connect private database");
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("uninterrupted fresh apply");
     assert!(report.squashed);
-    assert_eq!(report.applied, vec![1, 18, 19, 20]);
+    assert_eq!(report.applied, vec![1, 18, 19, 20, 21, 22]);
     assert_complete_and_stable(&db).await;
 }
