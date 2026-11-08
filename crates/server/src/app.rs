@@ -59,9 +59,10 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 }
 
 pub struct AppState {
-    pub(crate) db: Db,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    db_url: String,
+    // Shared with the delivery thread so it writes status through the same
+    // handle. Reopening by URL would acquire the migration lock again and
+    // could not reach an in-memory database.
+    pub(crate) db: Arc<Db>,
     instance_id: String,
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
@@ -75,8 +76,8 @@ pub struct AppState {
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
-pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
+    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// The root KMS is installed once at boot by the native entrypoint. The
 /// Workers build has no blocking HTTP client, so its slot stays empty.
@@ -242,7 +243,8 @@ impl AppState {
     fn dispatch_log(&self, url: String, secret: String, payload: String, signed_at: i64, did: String) {
         if DELIVERY_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) >= MAX_DELIVERY_THREADS {
             DELIVERY_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst); return; }
-        let db_url = self.db_url.clone();
+        let db = self.db.clone();
+        let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5)).build();
             let mut status = "failed"; let mut attempts = 0;
@@ -250,11 +252,7 @@ impl AppState {
                 for i in 0..3 { attempts = i + 1; let mut req = client.post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({})));
                     if !secret.is_empty() { let sig = hmac_hex(secret.as_bytes(), format!("{}.{}", signed_at, payload).as_bytes()); req = req.header("X-OpenWarp-Timestamp", signed_at.to_string()).header("X-OpenWarp-Signature", format!("t={},v1={}", signed_at, sig)); }
                     if let Ok(r) = req.send() { if r.status().is_success() { status = "delivered"; break; } } std::thread::sleep(std::time::Duration::from_millis(200)); } }
-            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                if let Ok(db2) = runtime.block_on(Db::open(&db_url)) {
-                    let _ = runtime.block_on(db2.exec("UPDATE log_deliveries SET status=?,attempts=? WHERE id=?", &[json!(status), json!(attempts), json!(&did)]));
-                }
-            }
+            let _ = runtime.block_on(db.exec("UPDATE log_deliveries SET status=?,attempts=? WHERE id=?", &[json!(status), json!(attempts), json!(&did)]));
             DELIVERY_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst); });
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -3480,7 +3478,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let new_key = body.get("new_key").and_then(|v| v.as_str()).unwrap_or("");
     let new: [u8; 32] = oc::unb64(new_key).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
     if st.kms().is_some() || st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT,"master rotation is unavailable while KMS auto-unseal is configured")); }
-    if !matches!(&st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
+    if !matches!(&*st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
     let _lifecycle = st.transit_lifecycle.write().await;
     let old = st.master();

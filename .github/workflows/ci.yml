@@ -104,6 +104,8 @@ jobs:
         run: |
           npm install --no-save wrangler@4.151.1
           WRANGLER=node_modules/.bin/wrangler scripts/worker-smoke.sh
+      - name: D1 migration driver
+        run: WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -127,6 +129,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8080/health
           docker exec openwarp-ci openwarp --help >/dev/null
+          docker exec openwarp-ci openwarp-migrate status >/dev/null
           docker stop openwarp-ci
 
   sdks-and-provider:

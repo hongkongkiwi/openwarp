@@ -1,5 +1,6 @@
 [package]
 name = "openwarp-server"
+default-run = "openwarp-server"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -12,6 +13,10 @@ crate-type = ["rlib", "cdylib"]
 [[bin]]
 name = "openwarp-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "openwarp-migrate"
+path = "src/bin/migrate.rs"
 
 [dependencies]
 openwarp-crypto = { path = "../crypto" }
@@ -58,7 +63,7 @@ native-tls = { version = "0.2", optional = true }
 webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = { version = "0.8", features = ["tokio-postgres"] }
+worker = { version = "0.8", features = ["tokio-postgres", "d1"] }
 js-sys = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-util = "0.3"
@@ -72,6 +77,9 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
+# Test-only Worker route that runs the migration manifest against a D1 binding.
+# The production Worker build does not enable it.
+d1-smoke = []
 live-db-tests = []
 
 [[test]]

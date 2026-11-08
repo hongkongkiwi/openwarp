@@ -5,6 +5,9 @@ use mysql_async::prelude::Queryable;
 
 pub type Row = HashMap<String, Value>;
 
+#[path = "migration_session.rs"]
+mod migration_session;
+
 /// Storage backend. Native builds use SQLite or a PostgreSQL pool; the Workers
 /// build uses the synchronous SQLite handle of a Durable Object, which is
 /// wrapped in async methods so call sites stay identical on both targets.
@@ -31,6 +34,12 @@ unsafe impl Sync for Db {}
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, PartialEq)]
 pub enum Backend { Sqlite, Postgres, Mysql }
+
+/// How an operator command opens SQLite. PostgreSQL and MySQL ignore it because
+/// opening a connection does not create a database.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq)]
+enum OpenMode { Create, Existing, ReadOnly }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn pg_sql(sql: &str) -> String {
@@ -66,6 +75,25 @@ impl Db {
     pub fn backend(&self) -> Backend { match self { Db::Sqlite(_) => Backend::Sqlite, Db::Postgres(_) => Backend::Postgres, Db::Mysql(_) => Backend::Mysql } }
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(url: &str) -> Result<Self, String> {
+        let db = Db::connect(url).await?;
+        db.migrate().await?;
+        Ok(db)
+    }
+    /// Open without migrating. The operator CLI uses this to apply or repair.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn connect(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::Create).await }
+    /// Open an existing database without creating it. A mistyped SQLite path
+    /// fails instead of leaving an empty file behind.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn connect_existing(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::Existing).await }
+    /// Open for inspection. SQLite rejects writes on this connection, so status
+    /// and verify cannot change a ledger or create a database by accident.
+    /// PostgreSQL and MySQL are not enforced read-only; those commands only
+    /// issue SELECTs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn connect_read_only(url: &str) -> Result<Self, String> { Db::open_mode(url, OpenMode::ReadOnly).await }
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn open_mode(url: &str, mode: OpenMode) -> Result<Self, String> {
         // A scheme is case-insensitive in a URL; the drivers are not, so the
         // normalized form is what gets parsed.
         let (scheme, rest) = match url.split_once("://") { Some((s, r)) => (s.to_ascii_lowercase(), r), None => (String::new(), "") };
@@ -75,7 +103,7 @@ impl Db {
             let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
             let size = std::env::var("OPENWARP_PG_POOL_SIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 64);
             let pool = deadpool_postgres::Pool::builder(manager).max_size(size).build().map_err(|e| format!("postgres pool: {}", e))?;
-            let db = Db::Postgres(pool); db.migrate().await?; Ok(db)
+            Ok(Db::Postgres(pool))
         } else if scheme == "mysql" || scheme == "mariadb" {
             let url = format!("mysql://{}", rest);
             let opts = mysql_async::Opts::from_url(&url).map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
@@ -85,12 +113,24 @@ impl Db {
             // count from UPDATE (leader election, rotation claims), and MySQL
             // otherwise reports changed rows only.
             let opts = mysql_async::OptsBuilder::from_opts(opts).client_found_rows(true).pool_opts(mysql_async::PoolOpts::default().with_constraints(constraints));
-            let db = Db::Mysql(mysql_async::Pool::new(opts)); db.migrate().await?; Ok(db)
+            Ok(Db::Mysql(mysql_async::Pool::new(opts)))
         } else {
             let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or(url);
-            let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
-            let db = Db::Sqlite(std::sync::Mutex::new(conn)); db.migrate().await?; Ok(db)
+            let flags = if mode == OpenMode::Create {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            } else {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            };
+            let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
+            // A second instance booting at the same time waits for the writer
+            // instead of failing the migration with SQLITE_BUSY.
+            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            if mode == OpenMode::ReadOnly {
+                conn.execute_batch("PRAGMA query_only=ON;").map_err(|e| e.to_string())?;
+            } else {
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+            }
+            Ok(Db::Sqlite(std::sync::Mutex::new(conn)))
         }
     }
     /// Wrap the Durable Object SQLite handle used by the Workers deployment.
@@ -138,14 +178,88 @@ impl Db {
             }
         }
     }
+    /// Execute one statement without placeholder translation. Migrations use
+    /// this so a literal `?` in SQL text is never rewritten as `$1`.
+    pub async fn exec_raw(&self, sql: &str) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => { let conn = c.lock().unwrap(); conn.execute_batch(sql).map_err(|e| e.to_string()) }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let client = pool.get().await.map_err(|e| e.to_string())?;
+                client.batch_execute(sql).await.map_err(pg_err)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(s, _) => { s.exec(sql, do_binds(&[])).map_err(|e| e.to_string())?; Ok(()) }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+                client.query_drop(mysql_sql(sql)).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+    /// Apply a migration in one transaction where the backend supports it.
+    /// MySQL commits DDL implicitly, so `script_is_atomic` is false there.
+    pub async fn exec_script(&self, statements: &[String]) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let conn = c.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                for statement in statements {
+                    if let Err(e) = conn.execute_batch(statement) { let _ = conn.execute_batch("ROLLBACK"); return Err(e.to_string()); }
+                }
+                if let Err(error) = conn.execute_batch("COMMIT") { let _ = conn.execute_batch("ROLLBACK"); return Err(error.to_string()); }
+                Ok(())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                for statement in statements { tx.batch_execute(statement).await.map_err(pg_err)?; }
+                tx.commit().await.map_err(pg_err)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(s, _) => {
+                // The object serialises events and the handle is synchronous, so
+                // a sequential script cannot interleave with another request.
+                for statement in statements { s.exec(statement, do_binds(&[])).map_err(|e| e.to_string())?; }
+                Ok(())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+                client.query_drop("START TRANSACTION").await.map_err(|e| e.to_string())?;
+                for statement in statements {
+                    if let Err(e) = client.query_drop(mysql_sql(statement)).await {
+                        let _ = client.query_drop("ROLLBACK").await;
+                        return Err(e.to_string());
+                    }
+                }
+                client.query_drop("COMMIT").await.map_err(|e| e.to_string())
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn script_is_atomic(&self) -> bool { matches!(self.backend(), Backend::Sqlite | Backend::Postgres) }
+    #[cfg(target_arch = "wasm32")]
+    pub fn script_is_atomic(&self) -> bool { false }
     pub async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        self.query_inner(sql, params, true).await
+    }
+    pub(crate) async fn query_raw(&self, sql: &str) -> Result<Vec<Row>, String> {
+        self.query_inner(sql, &[], false).await
+    }
+    async fn query_inner(&self, sql: &str, params: &[Value], translate: bool) -> Result<Vec<Row>, String> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = translate;
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
             #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
                 let client = pool.get().await.map_err(|e| e.to_string())?;
-                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                let sql2 = if translate { pg_sql(sql) } else { sql.to_string() }; let pg = PgParams::new(params); let refs = pg.refs();
                 let rows = client.query(sql2.as_str(), &refs[..]).await.map_err(pg_err)?;
                 let mut out = Vec::new();
                 for r in &rows {
@@ -462,138 +576,44 @@ impl Db {
         self.batch_expected(&statements, &expected, lock_secrets).await
             .map_err(|e| if e.contains("version conflict") { "checked transaction conflict".into() } else { e })
     }
-    pub async fn version(&self) -> Result<i64, String> {
-        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
-    async fn migrate(&self) -> Result<(), String> {
-        for stmt in SCHEMA { self.exec(stmt, &[]).await?; }
-        for alter in [
-            "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
-            "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
-            "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1",
-            "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'",
-            "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0",
-            "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''",
-            "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''",
-            "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
-            "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
-            "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
-            "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
-        ] { let _ = self.exec(alter, &[]).await; }
-        for idx in INDEXES { let _ = self.exec(idx, &[]).await; }
-        // Record the baseline once, then apply numbered additive migrations.
-        if self.one("SELECT version FROM schema_migrations WHERE version=1", &[]).await?.is_none() {
-            let _ = self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(crate::clock::now())]).await;
-        }
-        for (version, statements) in MIGRATIONS {
-            if self.one("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)]).await?.is_some() { continue; }
-            for stmt in *statements {
-                if let Err(e) = self.exec(stmt, &[]).await {
-                    let message = e.to_ascii_lowercase();
-                    let duplicate = message.contains("duplicate column") || message.contains("already exists") || message.contains("duplicate key name");
-                    if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
-                }
-            }
-            self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())]).await?;
-        }
-        // Migration 22 seeds the lifecycle barrier row. A resumed run may have
-        // inserted it before the ledger entry landed, so this insert is idempotent.
-        if self.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await?.is_none() {
-            self.insert_if_absent("rotation_lifecycle", "").await?;
-        }
-        // One-time backfill: environments that already had an allowlist keep it.
-        if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
-            let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
-            let _ = self.exec("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(crate::clock::now())]).await;
-        }
-        Ok(())
+    /// True when the database holds tables outside the migration ledger and
+    /// its lock. A pre-engine database has application tables but no ledger,
+    /// so the migration runner must refuse to squash its baseline. System,
+    /// extension bookkeeping and D1 internal tables are not application schema.
+    pub async fn has_application_schema(&self) -> Result<bool, String> {
+        // SQLite, the Durable Object handle and D1 all answer from sqlite_master.
+        #[cfg(target_arch = "wasm32")]
+        let sql = "SELECT name FROM sqlite_master WHERE type='table' \
+                   AND substr(name,1,7)<>'sqlite_' AND substr(name,1,4)<>'_cf_' AND substr(name,1,3)<>'d1_' \
+                   AND name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1";        #[cfg(not(target_arch = "wasm32"))]
+        let sql = match self {
+            Db::Sqlite(_) => "SELECT name FROM sqlite_master WHERE type='table' \
+                              AND substr(name,1,7)<>'sqlite_' \
+                              AND name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+            Db::Postgres(_) => "SELECT table_name AS name FROM information_schema.tables \
+                                WHERE table_schema=current_schema() \
+                                AND table_type='BASE TABLE' \
+                                AND table_name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+            Db::Mysql(_) => "SELECT table_name AS name FROM information_schema.tables \
+                             WHERE table_schema=DATABASE() AND table_type='BASE TABLE' \
+                             AND table_name NOT IN ('schema_migrations','schema_migration_lock') LIMIT 1",
+        };
+        Ok(!self.query(sql, &[]).await?.is_empty())
     }
+    pub async fn version(&self) -> Result<i64, String> {
+        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations WHERE success=1", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
+    async fn migrate(&self) -> Result<(), String> { crate::migrate::run(self).await }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl Db {
     /// Constructor for the Durable Object. Migrations run synchronously because
-    /// the object constructor cannot await, and the SQL handle never yields.
+    /// the object constructor cannot await, and every storage call in that path
+    /// resolves without yielding.
     pub fn from_do_sql_now(storage: worker::Storage) -> Result<Self, String> {
         let db = Db::DoSqlite(std::rc::Rc::new(storage.sql()), std::rc::Rc::new(storage));
-        db.migrate_now()?;
+        crate::migrate::wait(db.migrate())?;
         Ok(db)
-    }
-    fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
-        match self {
-            Db::DoSqlite(s, _) => { let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
-        }
-    }
-    fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
-        match self {
-            Db::DoSqlite(s, _) => {
-                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
-                let cols = cursor.column_names();
-                let mut out = Vec::new();
-                for row in cursor.raw() {
-                    let values = row.map_err(|e| e.to_string())?;
-                    let mut m = Row::new();
-                    for (i, v) in values.into_iter().enumerate() { if let Some(name) = cols.get(i) { m.insert(name.clone(), do_value(v)); } }
-                    out.push(m);
-                }
-                Ok(out)
-            }
-        }
-    }
-    fn one_now(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query_now(sql, params)?.into_iter().next()) }
-    fn insert_if_absent_now(&self, k: &str, v: &str) -> Result<bool, String> {
-        match self {
-            Db::DoSqlite(s, _) => {
-                s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
-                let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
-                Ok(changes["n"].as_u64() == Some(1))
-            }
-        }
-    }
-    fn migrate_now(&self) -> Result<(), String> {
-        for stmt in SCHEMA { self.exec_now(stmt, &[])?; }
-        for alter in [
-            "ALTER TABLE envs ADD COLUMN mode TEXT DEFAULT 'sse'",
-            "ALTER TABLE envs ADD COLUMN restricted BIGINT DEFAULT 0",
-            "ALTER TABLE envs ADD COLUMN require_approval BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN e2e BIGINT DEFAULT 0",
-            "ALTER TABLE secrets ADD COLUMN deleted_at BIGINT DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN active BIGINT DEFAULT 1",
-            "ALTER TABLE tokens ADD COLUMN kind TEXT DEFAULT 'human'",
-            "ALTER TABLE tokens ADD COLUMN expires_at BIGINT DEFAULT 0",
-            "ALTER TABLE leases ADD COLUMN username TEXT DEFAULT ''",
-            "ALTER TABLE leases ADD COLUMN config_enc TEXT DEFAULT ''",
-            "ALTER TABLE oidc_states ADD COLUMN nonce TEXT DEFAULT ''",
-            "ALTER TABLE pki_cas ADD COLUMN serial TEXT DEFAULT ''",
-            "ALTER TABLE rotation_schedules ADD COLUMN path TEXT DEFAULT '/'",
-            "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN email_verified BIGINT DEFAULT 1",
-        ] { let _ = self.exec_now(alter, &[]); }
-        for idx in INDEXES { let _ = self.exec_now(idx, &[]); }
-        if self.one_now("SELECT version FROM schema_migrations WHERE version=1", &[])?.is_none() {
-            let _ = self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", &[serde_json::json!(crate::clock::now())]);
-        }
-        for (version, statements) in MIGRATIONS {
-            if self.one_now("SELECT version FROM schema_migrations WHERE version=?", &[serde_json::json!(version)])?.is_some() { continue; }
-            for stmt in *statements {
-                if let Err(e) = self.exec_now(stmt, &[]) {
-                    let duplicate = e.contains("duplicate column") || e.contains("already exists");
-                    if !duplicate { return Err(format!("migration {} failed: {}", version, e)); }
-                }
-            }
-            self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())])?;
-        }
-        if self.one_now("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[])?.is_none() {
-            self.insert_if_absent_now("rotation_lifecycle", "")?;
-        }
-        if self.one_now("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
-            let _ = self.exec_now("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
-            let _ = self.exec_now("INSERT INTO meta(k,v) VALUES('migration:env_restricted',?)", &[serde_json::json!(crate::clock::now())]);
-        }
-        Ok(())
     }
 }
 
@@ -701,11 +721,16 @@ fn mysql_index_target(sql: &str) -> Option<(String, Vec<String>)> {
     Some((table.trim().to_string(), cols.trim_end_matches(')').split(',').map(|c| c.trim().to_string()).filter(|c| c != "*").collect())) }
 #[cfg(not(target_arch = "wasm32"))]
 fn mysql_indexed_columns() -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    let mut statements: Vec<&str> = INDEXES.to_vec();
-    for (_, list) in MIGRATIONS { statements.extend(list.iter().copied()); }
-    for sql in statements { if let Some((table, cols)) = mysql_index_target(sql) { out.entry(table).or_default().extend(cols); } }
-    out }
+    // Indexed TEXT columns become VARCHAR on MySQL, so the rewriter needs the
+    // column list from every CREATE INDEX and PRIMARY KEY in the manifest.
+    static CACHE: std::sync::OnceLock<HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for sql in crate::migrate::all_statements() {
+            if let Some((table, cols)) = mysql_index_target(&sql) { out.entry(table).or_default().extend(cols); }
+        }
+        out
+    }).clone() }
 #[cfg(not(target_arch = "wasm32"))]
 fn mysql_column_def(seg: &str, keyed: &[String]) -> String {
     let t = seg.trim();
@@ -767,342 +792,6 @@ pub fn s(row: &Row, k: &str) -> String { row.get(k).and_then(|v| v.as_str()).unw
 pub fn n(row: &Row, k: &str) -> i64 { row.get(k).and_then(|v| v.as_i64()).unwrap_or(0) }
 pub fn obj(row: &Row) -> Value { let mut m = Map::new(); for (k, v) in row { m.insert(k.clone(), v.clone()); } Value::Object(m) }
 
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL,pubkey TEXT NOT NULL,wrapped_privkey TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS oidc_subjects(issuer TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(issuer,subject))",
-    "CREATE TABLE IF NOT EXISTS orgs(id TEXT PRIMARY KEY,name TEXT NOT NULL,ip_allowlist TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS org_members(org_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,PRIMARY KEY(org_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS teams(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS team_members(team_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(team_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS apps(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,readme TEXT DEFAULT '',sse BIGINT DEFAULT 1,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS app_members(app_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,PRIMARY KEY(app_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS envs(id TEXT PRIMARY KEY,app_id TEXT NOT NULL,name TEXT NOT NULL,env_key_wrapped TEXT NOT NULL,restricted BIGINT DEFAULT 0,require_approval BIGINT DEFAULT 0,max_versions BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS env_members(env_id TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT DEFAULT '/',key_enc TEXT NOT NULL,key_hash TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',tags TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',version BIGINT DEFAULT 1,deleted BIGINT DEFAULT 0,deleted_at BIGINT DEFAULT 0,updated_at BIGINT NOT NULL,updated_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS secret_versions(id TEXT PRIMARY KEY,secret_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,value_enc TEXT NOT NULL,comment_enc TEXT DEFAULT '',secret_type TEXT DEFAULT 'secret',path TEXT DEFAULT '/',tags TEXT DEFAULT '',created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS overrides(secret_id TEXT NOT NULL,user_id TEXT NOT NULL,value_enc TEXT NOT NULL,PRIMARY KEY(secret_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',actor TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL,seq BIGINT DEFAULT 0,prev_hash TEXT DEFAULT '',hash TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS audit_heads(org_id TEXT PRIMARY KEY,seq BIGINT NOT NULL,hash TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,org_id TEXT DEFAULT '',app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,token_hash TEXT NOT NULL,role TEXT DEFAULT 'developer',expires_at BIGINT DEFAULT 0,scopes TEXT DEFAULT '',last_used_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL,created_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS integrations(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,config_enc TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS lockbox(id TEXT PRIMARY KEY,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,max_views BIGINT DEFAULT 1,views BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS wrap_tokens(token_hash TEXT PRIMARY KEY,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-    "CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,name TEXT NOT NULL,value_enc TEXT NOT NULL,expires_at BIGINT NOT NULL,revoked BIGINT DEFAULT 0,attempted_at BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS env_keys(env_id TEXT NOT NULL,user_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(env_id,user_id))",
-    "CREATE TABLE IF NOT EXISTS oidc_states(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,nonce TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS identities(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,role TEXT DEFAULT 'developer',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS identity_credentials(id TEXT PRIMARY KEY,identity_id TEXT NOT NULL,client_id TEXT UNIQUE NOT NULL,secret_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,author TEXT NOT NULL,status TEXT DEFAULT 'pending',payload_enc TEXT NOT NULL,created_at BIGINT NOT NULL,decided_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS access_requests(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,user_id TEXT NOT NULL,reason TEXT DEFAULT '',status TEXT DEFAULT 'pending',created_at BIGINT NOT NULL,decided_by TEXT DEFAULT '')",
-    "CREATE TABLE IF NOT EXISTS pki_cas(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,cert_pem TEXT NOT NULL,key_enc TEXT NOT NULL,serial TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS integration_sync_state(integration_id TEXT NOT NULL,remote_name TEXT NOT NULL,value_hash TEXT NOT NULL,PRIMARY KEY(integration_id,remote_name))",
-    "CREATE TABLE IF NOT EXISTS oauth_clients(client_id TEXT PRIMARY KEY,client_secret_hash TEXT DEFAULT '',name TEXT DEFAULT '',redirect_uris TEXT DEFAULT '[]',scopes TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS oauth_codes(code_hash TEXT PRIMARY KEY,client_id TEXT NOT NULL,user_id TEXT NOT NULL,redirect_uri TEXT NOT NULL,code_challenge TEXT NOT NULL,scope TEXT DEFAULT '',resource TEXT DEFAULT '',expires_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS oauth_tokens(token_hash TEXT PRIMARY KEY,client_id TEXT NOT NULL,user_id TEXT NOT NULL,scope TEXT DEFAULT '',resource TEXT DEFAULT '',kind TEXT DEFAULT 'access',pair_id TEXT DEFAULT '',expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS roles(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,permissions TEXT DEFAULT '[]')",
-    "CREATE TABLE IF NOT EXISTS log_streams(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,secret TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS log_deliveries(id TEXT PRIMARY KEY,stream_id TEXT NOT NULL,event TEXT NOT NULL,payload TEXT DEFAULT '',status TEXT DEFAULT 'pending',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS rotation_schedules(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,key_name TEXT NOT NULL,path TEXT DEFAULT '/',interval_secs BIGINT NOT NULL,next_run BIGINT NOT NULL,enabled BIGINT DEFAULT 1,config_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS mfa_challenges(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS pki_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,cn TEXT NOT NULL,cert_pem TEXT NOT NULL,serial TEXT NOT NULL,revoked BIGINT DEFAULT 0,expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,window_start BIGINT NOT NULL,count BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS social_states(state TEXT PRIMARY KEY,provider TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS social_subjects(provider TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(provider,subject))",
-    "CREATE TABLE IF NOT EXISTS invites(token_hash TEXT PRIMARY KEY,email TEXT NOT NULL,org_id TEXT NOT NULL,role TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,accepted BIGINT DEFAULT 0)",
-    "CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,kind TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-    "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
-    "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS saml_configs(org_id TEXT PRIMARY KEY,idp_entity_id TEXT NOT NULL,idp_metadata_xml TEXT NOT NULL,sp_key_enc TEXT NOT NULL,sp_cert_pem TEXT NOT NULL,allow_unsigned_metadata BIGINT DEFAULT 0,metadata_trusted_cert TEXT DEFAULT '',auto_provision BIGINT DEFAULT 0,allowed_domains TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS saml_pending(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,snapshot TEXT NOT NULL,created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS saml_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS saml_subjects(org_id TEXT NOT NULL,idp_entity_id TEXT NOT NULL,name_id TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(org_id,idp_entity_id,name_id))",
-    "CREATE TABLE IF NOT EXISTS rotation_hooks(org_id TEXT PRIMARY KEY,url TEXT NOT NULL,secret_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-];
-
-// Additive migrations applied after the baseline schema. A statement may fail
-// because a fresh database already created the column or table; those errors
-// are recognised and ignored, anything else aborts the boot.
-const MIGRATIONS: &[(i64, &[&str])] = &[
-    (2, &[
-        "ALTER TABLE tokens ADD COLUMN scopes TEXT DEFAULT ''",
-        "ALTER TABLE tokens ADD COLUMN last_used_at BIGINT DEFAULT 0",
-    ]),
-    (3, &[
-        "CREATE TABLE IF NOT EXISTS team_env_grants(team_id TEXT NOT NULL,env_id TEXT NOT NULL,PRIMARY KEY(team_id,env_id))",
-    ]),
-    (4, &[
-        "CREATE TABLE IF NOT EXISTS instance_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL)",
-    ]),
-    (5, &[
-        "CREATE TABLE IF NOT EXISTS saml_configs(org_id TEXT PRIMARY KEY,idp_entity_id TEXT NOT NULL,idp_metadata_xml TEXT NOT NULL,sp_key_enc TEXT NOT NULL,sp_cert_pem TEXT NOT NULL,allow_unsigned_metadata BIGINT DEFAULT 0,metadata_trusted_cert TEXT DEFAULT '',auto_provision BIGINT DEFAULT 0,allowed_domains TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS saml_pending(state TEXT PRIMARY KEY,org_id TEXT NOT NULL,snapshot TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS saml_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS saml_subjects(org_id TEXT NOT NULL,idp_entity_id TEXT NOT NULL,name_id TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(org_id,idp_entity_id,name_id))",
-    ]),
-    (6, &[
-        "CREATE TABLE IF NOT EXISTS rotation_hooks(org_id TEXT PRIMARY KEY,url TEXT NOT NULL,secret_enc TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    ]),
-    (7, &[
-        "ALTER TABLE social_states ADD COLUMN nonce TEXT DEFAULT ''",
-        "ALTER TABLE social_states ADD COLUMN code_verifier TEXT DEFAULT ''",
-    ]),
-    (8, &[
-        "CREATE TABLE IF NOT EXISTS live_events(id BIGINT PRIMARY KEY,org_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',action TEXT NOT NULL,detail TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-    ]),
-    (9, &[
-        "ALTER TABLE social_states ADD COLUMN link_user TEXT DEFAULT ''",
-        "ALTER TABLE oidc_states ADD COLUMN link_user TEXT DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS identity_bindings(issuer TEXT NOT NULL,subject TEXT NOT NULL,user_id TEXT NOT NULL,provider TEXT DEFAULT '',created_at BIGINT NOT NULL,PRIMARY KEY(issuer,subject))",
-        "CREATE TABLE IF NOT EXISTS logout_replay(jti TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-    ]),
-    (10, &[
-        "CREATE TABLE IF NOT EXISTS ldap_configs(org_id TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '',bind_dn TEXT NOT NULL DEFAULT '',bind_password_enc TEXT NOT NULL DEFAULT '',base_dn TEXT NOT NULL DEFAULT '',user_filter TEXT NOT NULL DEFAULT '(uid={username})',email_attr TEXT NOT NULL DEFAULT 'mail',name_attr TEXT NOT NULL DEFAULT 'displayName',group_attr TEXT NOT NULL DEFAULT 'memberOf',group_roles TEXT NOT NULL DEFAULT '',default_role TEXT NOT NULL DEFAULT 'developer',auto_provision BIGINT NOT NULL DEFAULT 0,allowed_domains TEXT NOT NULL DEFAULT '',ca_cert_pem TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS ldap_subjects(org_id TEXT NOT NULL,dn TEXT NOT NULL,user_id TEXT NOT NULL,created_at BIGINT NOT NULL,role TEXT NOT NULL DEFAULT '',PRIMARY KEY(org_id,dn))",
-    ]),
-    (11, &[
-        "ALTER TABLE rotation_schedules ADD COLUMN config_enc TEXT DEFAULT ''",
-    ]),
-    (12, &[
-        "ALTER TABLE orgs ADD COLUMN reuse_check BIGINT DEFAULT 1",
-        "ALTER TABLE apps ADD COLUMN reuse_check BIGINT DEFAULT 1",
-        "ALTER TABLE secrets ADD COLUMN value_fp TEXT DEFAULT ''",
-        "CREATE INDEX IF NOT EXISTS idx_secrets_fp ON secrets(value_fp)",
-    ]),
-    (13, &[
-        "ALTER TABLE secret_versions ADD COLUMN path TEXT DEFAULT '/'",
-        "ALTER TABLE secret_versions ADD COLUMN tags TEXT DEFAULT ''",
-    ]),
-    // SSH certificate authorities reuse pki_cas so the sealed CA key and the
-    // master-key rotation that re-wraps it stay in one place.
-    (14, &[
-        "ALTER TABLE pki_cas ADD COLUMN kind TEXT DEFAULT 'x509'",
-        "ALTER TABLE pki_cas ADD COLUMN allow_forwarding BIGINT DEFAULT 0",
-        "CREATE TABLE IF NOT EXISTS ssh_principal_grants(ca_id TEXT NOT NULL,role TEXT NOT NULL,principals TEXT NOT NULL,max_ttl BIGINT DEFAULT 900,PRIMARY KEY(ca_id,role))",
-        "CREATE TABLE IF NOT EXISTS ssh_certs(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,key_id TEXT NOT NULL,principal TEXT NOT NULL,public_key TEXT NOT NULL,cert TEXT NOT NULL,serial BIGINT NOT NULL,actor TEXT NOT NULL,revoked BIGINT DEFAULT 0,valid_after BIGINT NOT NULL,valid_before BIGINT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_ssh_certs_ca ON ssh_certs(ca_id,created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_ssh_grants_ca ON ssh_principal_grants(ca_id)",
-    ]),
-    // Host certificates are issued only for a hostname and key an admin
-    // registered, so the registry is the authorisation for host issuance.
-    (15, &[
-        "ALTER TABLE ssh_certs ADD COLUMN cert_type TEXT DEFAULT 'user'",
-        "CREATE TABLE IF NOT EXISTS ssh_hosts(id TEXT PRIMARY KEY,ca_id TEXT NOT NULL,hostname TEXT NOT NULL,public_key TEXT NOT NULL,fingerprint TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_hosts_key ON ssh_hosts(ca_id,hostname,fingerprint)",
-        "CREATE TABLE IF NOT EXISTS step_up_challenges(challenge_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,need_totp BIGINT DEFAULT 0,need_email BIGINT DEFAULT 0,email_code_hash TEXT DEFAULT '',attempts BIGINT DEFAULT 0,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS step_up_grants(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,risk TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-    ]),
-    // Delegated environments, client-derived auth and second factors.
-    (16, &[
-        "ALTER TABLE envs ADD COLUMN runner_id TEXT DEFAULT ''",
-        "ALTER TABLE secrets ADD COLUMN path_enc TEXT DEFAULT ''",
-        "ALTER TABLE secrets ADD COLUMN tags_enc TEXT DEFAULT ''",
-        "ALTER TABLE secrets ADD COLUMN key_index TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN auth_version BIGINT DEFAULT 1",
-        "ALTER TABLE users ADD COLUMN kdf_salt TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN kdf_iterations BIGINT DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN kdf_algo TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN auth_key_enc TEXT DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT DEFAULT '',credential_id TEXT NOT NULL,credential_json TEXT NOT NULL,sign_count BIGINT DEFAULT 0,created_at BIGINT NOT NULL,last_used_at BIGINT DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS passkey_registrations(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS mfa_passkey_states(mfa_token TEXT PRIMARY KEY,user_id TEXT NOT NULL,state_json TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS email_codes(user_id TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,attempts BIGINT DEFAULT 0,PRIMARY KEY(user_id,purpose))",
-        "CREATE TABLE IF NOT EXISTS runners(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,pubkey TEXT NOT NULL,token_hash TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS runner_env_keys(runner_id TEXT NOT NULL,env_id TEXT NOT NULL,wrapped_key TEXT NOT NULL,PRIMARY KEY(runner_id,env_id))",
-        "CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,integration_id TEXT NOT NULL,runner_id TEXT NOT NULL,kind TEXT DEFAULT 'sync',status TEXT DEFAULT 'pending',detail TEXT DEFAULT '',created_at BIGINT NOT NULL,claimed_at BIGINT DEFAULT 0,claim_id TEXT DEFAULT '')",
-        "CREATE TABLE IF NOT EXISTS auth_challenges(id_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,challenge TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_secrets_key_index ON secrets(env_id,key_index)",
-        "CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_passkeys_credential ON passkeys(credential_id)",
-        "CREATE INDEX IF NOT EXISTS idx_runners_token ON runners(token_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_pending ON sync_jobs(status,created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_integration ON sync_jobs(integration_id,status)",
-        "CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(user_id)",
-    ]),
-    (17, &[
-        "ALTER TABLE envs ADD COLUMN max_versions BIGINT DEFAULT 0",
-        "ALTER TABLE leases ADD COLUMN attempted_at BIGINT DEFAULT 0",
-        "ALTER TABLE audit ADD COLUMN seq BIGINT DEFAULT 0",
-        "ALTER TABLE audit ADD COLUMN prev_hash TEXT DEFAULT ''",
-        "ALTER TABLE audit ADD COLUMN hash TEXT DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS audit_heads(org_id TEXT PRIMARY KEY,seq BIGINT NOT NULL,hash TEXT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS wrap_tokens(token_hash TEXT PRIMARY KEY,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
-        "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
-    ]),
-    // Main shipped 18 for emergency lockdown; product migrations follow it so a
-    // database that already applied main's 18 still receives them.
-    (18, &[
-        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
-    ]),
-    (19, &[
-        "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
-    ]),
-    (20, &[
-        "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS workload_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-        "ALTER TABLE tokens ADD COLUMN trust_id TEXT DEFAULT ''",
-    ]),
-    (21, &[
-        "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
-        "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
-    ]),
-    (22, &[
-        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
-        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
-        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
-        "CREATE TABLE compat_transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX idx_compat_transit_keys_name ON compat_transit_keys(org_id,name)",
-        "CREATE TABLE compat_transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
-        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
-        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
-        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
-        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
-    ]),
-    (23, &[
-        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
-        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
-        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
-        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
-    ]),
-    (24, &[
-        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
-        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
-        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
-        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
-        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
-        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
-        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
-        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
-        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN ca_kind TEXT DEFAULT 'root'",
-        "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
-        "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
-    ]),
-    (25, &[
-        "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
-        "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
-        "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
-        "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
-    ]),
-    // Device-lineage databases recorded 17-21 before canonical product shipped,
-    // so the canonical product tables they skipped must be replayed here.
-    (26, &[
-        "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
-        "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS workload_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-        "ALTER TABLE tokens ADD COLUMN trust_id TEXT DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
-        "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
-        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
-        "ALTER TABLE envs ADD COLUMN max_versions BIGINT DEFAULT 0",
-        "ALTER TABLE leases ADD COLUMN attempted_at BIGINT DEFAULT 0",
-        "ALTER TABLE audit ADD COLUMN seq BIGINT DEFAULT 0",
-        "ALTER TABLE audit ADD COLUMN prev_hash TEXT DEFAULT ''",
-        "ALTER TABLE audit ADD COLUMN hash TEXT DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS audit_heads(org_id TEXT PRIMARY KEY,seq BIGINT NOT NULL,hash TEXT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS wrap_tokens(token_hash TEXT PRIMARY KEY,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
-        "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
-        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
-        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
-        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
-        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
-        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
-        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
-        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
-        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
-        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
-        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
-        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
-        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
-        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN ca_kind TEXT DEFAULT 'root'",
-        "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
-        "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
-        "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
-        "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
-        "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
-        "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
-        "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
-        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
-        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
-        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
-        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
-        "CREATE TABLE compat_transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
-        "CREATE UNIQUE INDEX idx_compat_transit_keys_name ON compat_transit_keys(org_id,name)",
-        "CREATE TABLE compat_transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
-        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
-        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
-        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
-        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
-    ]),
-    // Device lookups and expiry scans never had an index on the columns they filter.
-    (27, &[
-        "CREATE INDEX IF NOT EXISTS idx_pki_certs_device ON pki_certs(device_id)",
-        "CREATE INDEX IF NOT EXISTS idx_pki_certs_expiry ON pki_certs(expires_at)",
-    ]),
-];
-
-const INDEXES: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_secrets_env ON secrets(env_id)",
-    "CREATE INDEX IF NOT EXISTS idx_secret_versions_secret ON secret_versions(secret_id)",
-    "CREATE INDEX IF NOT EXISTS idx_audit_org ON audit(org_id,created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
-    "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user ON oauth_tokens(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_env_members_user ON env_members(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_leases_env ON leases(env_id)",
-    "CREATE INDEX IF NOT EXISTS idx_sync_state_integration ON integration_sync_state(integration_id)",
-    "CREATE INDEX IF NOT EXISTS idx_team_env_grants_env ON team_env_grants(env_id)",
-    "CREATE INDEX IF NOT EXISTS idx_instance_leases_expiry ON instance_leases(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_rotations_due ON rotation_schedules(enabled,next_run)",
-    "CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)",
-    "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_live_events_id ON live_events(id)",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*; use serde_json::json;
@@ -1116,67 +805,13 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 27, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 28, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 27, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 28, "each migration must be recorded exactly once");
+        let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
+        assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }
-    fn seeded(seed: impl FnOnce(&rusqlite::Connection)) -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        for sql in SCHEMA { conn.execute_batch(sql).unwrap(); }
-        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(1,0)", []).unwrap();
-        seed(&conn);
-        Db::Sqlite(std::sync::Mutex::new(conn))
-    }
-    fn recorded(conn: &rusqlite::Connection, version: i64) {
-        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,0)", [version]).unwrap(); }
-    fn applied(conn: &rusqlite::Connection, version: i64) {
-        for sql in MIGRATIONS.iter().find(|(v, _)| *v == version).unwrap().1 {
-            if let Err(e)=conn.execute_batch(sql) { assert!(e.to_string().contains("duplicate column"),"{}: {}",sql,e); }
-        }
-        recorded(conn, version); }
-    // Canonical main stops at 21; device migrations append after it.
-    #[tokio::test] async fn main_21_upgrades_to_device_schema() {
-        let db = seeded(|conn| {
-            for version in 2..=21 { applied(conn, version); }
-            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
-        });
-        db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 27);
-        assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
-        db.query("SELECT id FROM change_requests", &[]).await.unwrap();
-        db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
-        db.query("SELECT id FROM transit_keys", &[]).await.unwrap();
-        db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();
-        db.query("SELECT payload_enc FROM wrap_tokens", &[]).await.unwrap();
-        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();
-        db.query("SELECT emergency_locked FROM orgs", &[]).await.unwrap();
-    }
-    // A device-lineage database recorded 17-20 before canonical product shipped,
-    // so those ledger rows cover device tables rather than the product tables.
-    #[tokio::test] async fn feature_20_upgrades_to_canonical_product() {
-        let db = seeded(|conn| {
-            for version in 2..=16 { applied(conn, version); }
-            applied(conn, 18);
-            // The legacy lineage's 19-20 held the device schema now numbered 23-24.
-            for version in [23, 24] {
-                for sql in MIGRATIONS.iter().find(|(v, _)| *v == version).unwrap().1 { conn.execute_batch(sql).unwrap(); }
-            }
-            recorded(conn, 17); recorded(conn, 19); recorded(conn, 20);
-            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
-            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind,ca_kind,parent_id) VALUES('child','org','child','cert','sealed',1,'x509','intermediate','root')", []).unwrap();
-        });
-        db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 27);
-        assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
-        assert_eq!(s(&db.one("SELECT ca_kind FROM pki_cas WHERE id='child'", &[]).await.unwrap().unwrap(), "ca_kind"), "intermediate");
-        // The canonical product the ledger skipped must be replayed by 26.
-        db.query("SELECT id FROM change_requests", &[]).await.unwrap();
-        db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
-        db.query("SELECT id FROM transit_keys", &[]).await.unwrap();
-        db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();
-        db.query("SELECT payload_enc FROM wrap_tokens", &[]).await.unwrap();
-        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();    }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {
         let users = mysql_sql("CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL)");
