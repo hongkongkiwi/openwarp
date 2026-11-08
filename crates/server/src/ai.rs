@@ -14,7 +14,7 @@ const MAX_RESPONSE: usize = 65536;
 #[serde(default, deny_unknown_fields)]
 struct Settings { enabled: bool, endpoint: String, model: String, allow_metadata: bool, allow_actions: bool, allow_local_search: bool, monitoring_enabled: bool, request_limit: i64, token_limit: i64, max_output_tokens: i64 }
 impl Default for Settings { fn default() -> Self { Self { enabled:false, endpoint:String::new(), model:String::new(), allow_metadata:false, allow_actions:false, allow_local_search:false, monitoring_enabled:false, request_limit:100, token_limit:100000, max_output_tokens:1024 } } }
-fn key_aad(org: &str) -> Vec<u8> { format!("ow-ai-key:v1|{}", org).into_bytes() }
+pub(crate) fn key_aad(org: &str) -> Vec<u8> { format!("ow-ai-key:v1|{}", org).into_bytes() }
 fn dialect<'a>(db:&db::Db, standard:&'a str, mysql:&'a str) -> &'a str {
     #[cfg(not(target_arch="wasm32"))] if db.backend()==db::Backend::Mysql { return mysql; }
     let _=(db,mysql); standard
@@ -296,6 +296,14 @@ pub(crate) async fn rewrap(st:&S,old:&[u8;32],new:&[u8;32]) -> Result<Vec<(Strin
 #[cfg(all(test,not(target_arch="wasm32")))]
 mod tests {
     use super::*;
+    #[tokio::test] async fn master_inventory_proves_ai_provider_credentials() {
+        let db=db::Db::open_memory().await.unwrap();
+        let root=[7u8;32]; let other=[8u8;32];
+        db.exec("INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES('o','{}',?,1)",&[json!(oc::encrypt_symmetric_aad(&root,&key_aad("o"),b"provider-key"))]).await.unwrap();
+        crate::app::verify_master(&db,&root).await.expect("the wrapped credential must verify under its own root");
+        let err=crate::app::verify_master(&db,&other).await.expect_err("a different root must refuse the AI inventory");
+        assert!(err.contains("ai_settings.key_enc"),"{}",err);
+    }
     #[tokio::test] async fn certificate_explanations_preserve_evidence_scope() {
         use std::sync::{Arc,Mutex};
         async fn complete(State(captured):State<Arc<Mutex<Vec<Value>>>>,Json(body):Json<Value>) -> Json<Value> {
@@ -360,7 +368,7 @@ mod tests {
         conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on MySQL");
-        assert_eq!(db.version().await.unwrap(),29);
+        assert_eq!(db.version().await.unwrap(),30);
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
         let outcome=tokio::spawn(assert_database_ai(st)).await;
@@ -377,7 +385,7 @@ mod tests {
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let outcome=tokio::spawn(async move {
             let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
-            assert_eq!(db.version().await.unwrap(),29);
+            assert_eq!(db.version().await.unwrap(),30);
             let (live,_)=tokio::sync::broadcast::channel(4);
             let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
             assert_database_ai(st).await;

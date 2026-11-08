@@ -171,10 +171,10 @@ async fn assert_meta_contract(db: &Db, before: &[(String, String)]) {
 }
 
 async fn assert_final28_and_second_boot(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 29);
+    assert_eq!(db.version().await.unwrap(), 30);
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 29);
-    assert_eq!(status.latest, 29);
+    assert_eq!(status.current, 30);
+    assert_eq!(status.latest, 30);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let before = snapshot(db).await;
@@ -214,7 +214,7 @@ async fn engine23_upgrade_preserves_checksums_and_product_data() {
     let before = snapshot(&db).await;
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("append device migrations without checksum repair");
-    assert_eq!(report.applied, vec![24, 25, 26, 27, 28, 29]);
+    assert_eq!(report.applied, vec![24, 25, 26, 27, 28, 29, 30]);
     assert!(!report.squashed);
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=23 ORDER BY version", &[]).await.unwrap(), ledger);
@@ -236,7 +236,7 @@ async fn historical_device20_restores_skipped_product_schema_and_keeps_ca_kinds(
     let before = snapshot_except(&db, &["meta"]).await;
     let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade the historical device20 lineage without ledger repair");
-    assert_eq!(report.applied, (21..=29).collect::<Vec<_>>());
+    assert_eq!(report.applied, (21..=30).collect::<Vec<_>>());
     assert!(!report.squashed);
     assert_preserved(&db, &before).await;
     assert_meta_contract(&db, &meta_before).await;
@@ -264,14 +264,14 @@ async fn historical_device20_restores_skipped_product_schema_and_keeps_ca_kinds(
         "INSERT INTO meta(k,v) VALUES('device20:marker','preserve-me')",
     ] { guarded.exec(sql, &[]).await.unwrap(); }
     migrate::apply(&guarded, MIGRATIONS, Options::default()).await.expect("converge a device20 lineage carrying preexisting bootstrap meta");
-    assert_eq!(guarded.version().await.unwrap(), 29);
+    assert_eq!(guarded.version().await.unwrap(), 30);
     assert_eq!(n(&guarded.one("SELECT COUNT(*) AS n FROM meta", &[]).await.unwrap().unwrap(), "n"), 3);
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap().unwrap(), "v"), "device20-sentinel");
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='device20:marker'", &[]).await.unwrap().unwrap(), "v"), "preserve-me");
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().unwrap(), "v"), "");
 }
 
-// Main27 ends with versions 1..27 occupied, so only 28 and 29 run: the guarded
+// Main27 ends with versions 1..27 occupied, so only 28 through 30 run: the guarded
 // env_restricted backfill that closed old main's migrations (d39138e db.rs
 // trailing bootstrap) must ride with 28 or member envs keep org-wide access.
 #[tokio::test]
@@ -280,7 +280,7 @@ async fn occupied_main27_convergence_bootstraps_env_restricted() {
     db.exec("DELETE FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap();
     seed_occupied_member_env(&db).await;
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("converge an occupied main27 lineage");
-    assert_eq!(report.applied, vec![28, 29]);
+    assert_eq!(report.applied, vec![28, 29, 30]);
     assert_eq!(n(&db.one("SELECT restricted FROM envs WHERE id='occupied-env'", &[]).await.unwrap().unwrap(), "restricted"), 1, "member envs must gain the restricted boundary");
     assert_eq!(s(&db.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap().unwrap(), "v"), "0");
     // An existing marker suppresses the backfill: no flip, no overwrite.
@@ -309,7 +309,7 @@ async fn canonical_legacy23_through_27_preserve_data_and_unverified_history() {
         let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
         let report = migrate::apply(&db, MIGRATIONS, Options::default()).await
             .unwrap_or_else(|error| panic!("upgrade canonical main{} without ledger repair: {}", version, error));
-        assert_eq!(report.applied, ((version + 1)..=29).collect::<Vec<_>>(), "occupied main{} versions must not be replayed as engine SQL", version);
+        assert_eq!(report.applied, ((version + 1)..=30).collect::<Vec<_>>(), "occupied main{} versions must not be replayed as engine SQL", version);
         assert!(!report.squashed);
         assert_preserved(&db, &before).await;
         assert_eq!(db.query(&format!("SELECT version,applied_at FROM schema_migrations WHERE version<={} ORDER BY version", version), &[]).await.unwrap(), ledger);
@@ -319,7 +319,7 @@ async fn canonical_legacy23_through_27_preserve_data_and_unverified_history() {
             assert_eq!(s(&row, "checksum"), "", "main{} history must not be falsely certified", legacy);
             assert!(status.entries.iter().any(|entry| entry.version == legacy && entry.state == State::Legacy));
         }
-        for applied in (version + 1)..=29 {
+        for applied in (version + 1)..=30 {
             let row = db.one(&format!("SELECT checksum,success FROM schema_migrations WHERE version={}", applied), &[]).await.unwrap().unwrap();
             assert_eq!(s(&row, "checksum"), migrate::checksum(MIGRATIONS[(applied - 1) as usize].sql));
             assert_eq!(n(&row, "success"), 1);

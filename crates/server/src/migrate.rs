@@ -66,7 +66,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 26, name: "main25_reconciliation", sql: include_str!("../migrations/0026_main25_reconciliation.sql"), tolerant: true },
     Migration { version: 27, name: "main27_reconciliation", sql: include_str!("../migrations/0027_main27_reconciliation.sql"), tolerant: true },
     Migration { version: 28, name: "lineage_convergence", sql: include_str!("../migrations/0028_lineage_convergence.sql"), tolerant: true },
-    Migration { version: 29, name: "ai_assistant", sql: include_str!("../migrations/0029_ai_assistant.sql"), tolerant: false },
+    // Tolerant because a database that already ran PR7's former inline
+    // migration 18 carries these columns and meta rows.
+    Migration { version: 29, name: "workspace_policy", sql: include_str!("../migrations/0029_workspace_policy.sql"), tolerant: true },
+    Migration { version: 30, name: "ai_assistant", sql: include_str!("../migrations/0030_ai_assistant.sql"), tolerant: false },
 ];
 
 /// SQL profile used when splitting migration statements.

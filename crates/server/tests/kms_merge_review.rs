@@ -160,7 +160,7 @@ async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
         let reopened = Db::open(&url).await;
         assert!(reopened.is_ok(), "migration 22 resume failed: {:?}", reopened.err());
         let reopened = reopened.unwrap();
-        assert_eq!(reopened.version().await.unwrap(), 29, "the ledger must record the current version");
+        assert_eq!(reopened.version().await.unwrap(), 30, "the ledger must record the current version");
         let rows = reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap();
         assert_eq!(rows.len(), 1, "the lifecycle row must remain a single row");
     }
@@ -379,7 +379,7 @@ async fn migration22_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absen
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on MySQL: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 29);
+    assert_eq!(reopened.version().await.unwrap(), 30);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1
@@ -407,7 +407,7 @@ async fn migration22_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_ab
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on Postgres: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 29);
+    assert_eq!(reopened.version().await.unwrap(), 30);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1

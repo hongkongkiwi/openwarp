@@ -103,13 +103,24 @@ plus unique names, on every apply.
   trusts, transit, the audit chain, wrap tokens, emergency lockdown, and the
   main 22 objects), the complete device schema, and the lifecycle meta guard. A
   database that already carries an object keeps it and its data.
+- Version 29 restores the workspace-policy schema PR7's former inline migration
+  18 carried before the engine merge: the invitation management id and inviter
+  columns on `invites`, the `idx_invites_id` unique index, and the guarded
+  `workspace_policy_lock` and `workspace_creation_open` meta rows. It is
+  tolerant: a database that already ran the inline original keeps its columns.
+- Version 30 adds the assistant schema after the lineage convergence: `ai_settings`
+  (BYOK endpoint and model policy plus the wrapped provider credential),
+  `ai_plans`, `ai_finding_states`, `ai_finding_history`, `ai_usage` and
+  `ai_activity`, the `folders` tree, and `integration_drafts`. Every create is
+  guarded so a database that already carries the tables keeps them and their data.
 
-New migrations start at version 29. SQL files 1 through 23 remain unchanged.
+New migrations start at version 31. SQL files 1 through 29 remain unchanged.
 Legacy main version 17 through 27 ledger rows have no checksum and remain
-unverified. A legacy main version 22 database applies versions 23 through 28; a
-legacy main version 23 database applies versions 24 through 28; each later main
-version applies the remaining tail, so a main version 27 database executes only
-version 28. An engine version 20 database applies versions 21 through 28. The
+unverified. A legacy main version 22 database applies versions 23 through 30; a
+legacy main version 23 database applies versions 24 through 30; each later main
+version applies the remaining tail, so a main version 27 database executes
+versions 28 through 30. An engine version 20 database applies versions 21 through
+30. The
 runner records checksums only for the new reconciliation files it actually
 executes, without relabelling occupied legacy versions.
 
@@ -266,7 +277,7 @@ based on age or heartbeat absence.
 
 ## Adding a migration
 
-1. Add `crates/server/migrations/0029_your_change.sql`.
+1. Add `crates/server/migrations/0031_your_change.sql`.
 2. Add the matching entry to `MIGRATIONS` in `crates/server/src/migrate.rs` with
    the next version, a short name, and `tolerant: false`.
 3. Write canonical SQL:

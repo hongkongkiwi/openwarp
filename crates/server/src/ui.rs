@@ -60,7 +60,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 .mut{color:var(--muted)}.small{font-size:12.5px}.val{font-family:var(--mono);font-size:12.5px;word-break:break-all}
 #navtoggle{display:none}
 .langsel{padding:6px 8px;font-size:12.5px;color:var(--muted);max-width:150px}.langsel option{color:var(--text);background:var(--panel)}.authprefs{position:absolute;top:18px;right:18px;display:flex;gap:6px;align-items:center}
-@media(max-width:820px){#shell{grid-template-columns:1fr}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:var(--sh-side)}aside.open{display:flex}.content{padding:16px 14px 100px}.members-table,.members-table tbody{display:block;width:100%}.members-table thead{display:none}.members-table tr{display:flex;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.members-table td{display:block;border:0;padding:6px 0;min-width:0}.members-table td:first-child{width:100%;overflow-wrap:anywhere}.members-table td:last-child{display:flex;flex-wrap:wrap;gap:8px;width:100%}.members-table select{max-width:100%}}
+@media(max-width:820px){#shell{grid-template-columns:minmax(0,1fr)}.topbar{padding:12px 14px;gap:8px;flex-wrap:wrap}.searchbox{min-width:0;flex:1}.topbar h2{min-width:0;overflow-wrap:anywhere}#topaction{flex-shrink:0}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:var(--sh-side)}aside.open{display:flex}.content{padding:16px 14px 100px}.members-table,.members-table tbody{display:block;width:100%}.members-table thead{display:none}.members-table tr{display:flex;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.members-table td{display:block;border:0;padding:6px 0;min-width:0}.members-table td:first-child{width:100%;overflow-wrap:anywhere}.members-table td:last-child{display:flex;flex-wrap:wrap;gap:8px;width:100%}.members-table select{max-width:100%}}
 </style></head>
 <body>
 <div id="auth">
@@ -86,6 +86,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
   <aside>
     <div class="logo"><span class="mark">◆</span>OpenWarp</div>
     <select id="orgs" class="orgsel" onchange="switchOrg()"></select>
+    <div class="row"><button id="new-workspace" onclick="newWorkspace()">New workspace</button><button onclick="joinWorkspace()">Join workspace</button></div>
     <button class="navbtn" data-nav="apps" onclick="nav('apps')"><span class="ic">▦</span><span data-i18n="Apps">Apps</span></button>
     <button class="navbtn" data-nav="access" onclick="nav('access')"><span class="ic">♟</span><span data-i18n="Members &amp; access">Members &amp; access</span></button>
     <button class="navbtn" data-nav="integrations" onclick="nav('integrations')"><span class="ic">⇄</span><span data-i18n="Integrations">Integrations</span></button>
@@ -113,6 +114,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="toasts"></div>
 <script src="/i18n.js" integrity="sha384-SNq7b1pECfLV1fuSsFTAwS2vW7hRnU9JenHEZxeMd14VvhJHc+P8bgdMoNhAmR19"></script>
 <script>
+let CREATION_OPEN=true, INVITE='', INVITE_META=null;
 let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0;
 let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
@@ -121,11 +123,11 @@ function draftList(){return Object.values(drafts())}
 function e2eDrafts(){return (ENV&&E2E_DRAFTS[ENV.id])||{}}
 function e2eDraftList(){return Object.values(e2eDrafts())}
 const $=id=>document.getElementById(id);
-const H=()=>({'Content-Type':'application/json'});
+const H=(u)=>(T&&!(EMERGENCY||PROJECT_EMERGENCY)&&!/\/emergency$/.test(u||''))?{'Authorization':'Bearer '+T,'Content-Type':'application/json'}:{'Content-Type':'application/json'};
 function emergencyAllowed(m,u){if(u===`/api/orgs/${ORG}/emergency`||u===`/api/apps/${APP?.id}/emergency`||u==='/api/auth/logout')return true;
   return m==='GET'&&!/\/(secrets|export|e2e|leases|search)(\/|\?|$)/.test(u)}
 async function api(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
-  let active=AUTH_READY,org=ORG;let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+  let active=AUTH_READY,org=ORG;let r=await fetch(u,{method:m,headers:H(u),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   if(active&&(!AUTH_READY||org!==ORG))throw new Error('Session or workspace changed');
   if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
   if(r.status===401&&AUTH_READY)sessionEnded();
@@ -149,7 +151,7 @@ async function refreshEmergency(){let org=ORG,app=APP?.id,request=++EMERGENCY_RE
 function confirmEmergency(locked,project=false){let org=ORG,app=APP?.id,scope=project?'project':'workspace';modal(`<h3>${locked?`Activate ${scope} lockdown?`:`Restore ${scope} access?`}</h3><p>${locked?'Non-owner members will be signed out. The console will be read-only, secrets hidden and automation reads and writes rejected for this scope.':`The direct ${scope} lockdown will be lifted. Other lockdowns still apply. Revoked sessions stay revoked.`}</p><div class="row"><button class="${locked?'danger':'primary'}" id="emergency-confirm">${locked?'Activate lockdown':'Restore access'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Confirm emergency lockdown');
   $('emergency-confirm').onclick=async()=>{if(ORG!==org||(project&&APP?.id!==app)){closeModal();return}try{EMERGENCY_REQUEST++;await api('PUT',project?`/api/apps/${app}/emergency`:`/api/orgs/${org}/emergency`,{locked});await refreshEmergency();closeModal();if(project){$('view').innerHTML=emergencyCard(true)}else await nav('settings')}catch(e){toast(e.message,true)}}}
 // Keep the error body for deletion's ownership and credential warnings.
-async function apiRaw(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+async function apiRaw(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');let r=await fetch(u,{method:m,headers:H(u),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   return {ok:r.ok,status:r.status,body:d}}
 function toast(msg,err,key,args){let el=document.createElement('div');el.className='toast'+(err?' err':'');if(key)owText(el,key,args);else el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -199,6 +201,8 @@ async function loadProviders(){try{
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">${owHTML('Continue with {x}',{x:name})}</button>`)}
   if(p.oidc)btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start'">${owHTML('Continue with {x}',{x:p.oidc_name||'SSO'})}</button>`);
   if(p.ldap)btns.push(`<button style="flex:1 1 45%" onclick="ldapPrompt()" data-i18n="Sign in with directory (LDAP)">Sign in with directory (LDAP)</button>`);
+  // The invitation screen replaces the form that hosts these nodes.
+  if(!$('social'))return;
   $('social').innerHTML=btns.join('');
   if(p.signups!=='open'){
     $('segreg').style.display='none';
@@ -206,16 +210,30 @@ async function loadProviders(){try{
     owText($('signupnote'),'Signups are closed. Ask an administrator for an invitation.');
   }
 }catch(e){}}
-function showInvite(token){
-  $('auth').style.display='grid';$('shell').style.display='none';
-  owText($('authtitle'),'Accept invitation');
-  $('authform').innerHTML=`<p class="mut" data-i18n="Choose a password for your new account.">Choose a password for your new account.</p>
-    <div class="field"><label for="inv-pw" data-i18n="Password">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters" data-i18n-placeholder="at least 8 characters"></div>
-    <button class="primary" style="width:100%;padding:11px" onclick="acceptInvite()" data-i18n="Create account">Create account</button>`;
-  $('authform').dataset.invite=token;}
+function joinWorkspace(){let value=prompt('Paste an invitation link or token');if(!value)return;let token=value.trim();try{if(token.includes('#invite='))token=decodeURIComponent(token.split('#invite=')[1].split('&')[0])}catch(e){toast('Invalid invitation link',true);return}showInvite(token)}
+const AUTH_FORM=$('authform').innerHTML;
+function inviteSignIn(){INVITE='';$('authform').innerHTML=AUTH_FORM;authMode('login');loadProviders();history.replaceState(null,'',location.pathname)}
+async function showInvite(token){
+  INVITE=token;sessionStorage.setItem('ow_pending_invite',token);
+  $('auth').style.display='grid';$('shell').style.display='none';owText($('authtitle'),'Accept invitation');
+  $('authform').innerHTML='<p class="mut">Loading invitation...</p>';
+  try{let d=await api('GET','/api/auth/invite?token='+encodeURIComponent(token));INVITE_META=d;
+    let me=await api('GET','/api/me').catch(()=>null);let matching=me&&me.email.toLowerCase()===d.email.toLowerCase();
+    $('authform').innerHTML=`<p>Join <strong>${esc(d.org_name)}</strong> as ${esc(d.role)} with ${esc(d.email)}.</p><p class="small mut">Expires ${esc(new Date(d.expires_at*1000).toLocaleString())}. Joining requires your consent.</p>
+      ${me&&!matching?`<p>You are signed in as ${esc(me.email)}. Sign out before accepting this invitation.</p><button onclick="logout()" data-i18n="Sign out">Sign out</button>`:matching?'<button class="primary" onclick="acceptInvite()">Join workspace</button>':d.existing_account?`<p>Sign in to the invited account, then return to this invitation.</p><button onclick="inviteSignIn()" data-i18n="Sign in">Sign in</button>`:`<div class="field"><label for="inv-pw" data-i18n="Password">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters" data-i18n-placeholder="at least 8 characters"></div><button class="primary" onclick="acceptInvite()">Create account and join</button><p class="small mut">Or sign in with a configured provider, then return here to join.</p><button onclick="inviteSignIn()">Sign in with a provider</button>`}
+      <button class="ghost" onclick="dismissInvite()">Not now</button>`;
+  }catch(e){$('authform').innerHTML=`<p>${esc(e.message)}</p><button onclick="dismissInvite()">Back to sign in</button>`}}
+function dismissInvite(){INVITE='';sessionStorage.removeItem('ow_pending_invite');history.replaceState(null,'',location.pathname);location.reload()}
 async function acceptInvite(){try{
-  let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
-  T='';history.replaceState(null,'',location.pathname);enterApp();
+  let d;
+  if(INVITE_META.existing_account){d=await api('POST','/api/auth/accept-invite',{token:INVITE})}
+  else {let password=$('inv-pw').value;if(password.length<8)throw new Error('Password must be at least 8 characters');
+    let salt=AuthV2.randomSalt(),iterations=600000,keys=await AuthV2.deriveKeys(password,salt,iterations),kp=await OW.generateKeypair();
+    d=await api('POST','/api/auth/accept-invite-v2',{token:INVITE,salt,iterations,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:await AuthV2.wrapPrivate(keys.wrap,kp.secret)});
+    E2E_KIT=AuthV2.b64enc(kp.secret);
+  }
+  INVITE='';sessionStorage.removeItem('ow_pending_invite');PENDING_ORG=d.org_id||INVITE_META.org_id;history.replaceState(null,'',location.pathname);if(!INVITE_META.existing_account)T='';await enterApp();
+  if(E2E_KIT)modal(`<h3>Save your recovery kit</h3><p>Keep this private key offline to recover end-to-end access.</p><textarea aria-label="Recovery kit" rows="3" readonly>${esc(E2E_KIT)}</textarea><button onclick="closeModal()">I saved it</button>`,'Save recovery kit');
 }catch(e){toast(e.message,true)}}
 function forgotPrompt(){modal(`<h3 data-i18n="Reset your password">Reset your password</h3><p class="mut" data-i18n="Enter your email. If an account exists, a reset link is sent.">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email" data-i18n="Email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
@@ -256,17 +274,24 @@ async function doAuth(){try{
       return}
     T='';
     modal(`<h3 data-i18n="Save your recovery kit">Save your recovery kit</h3><p class="mut" data-i18n="This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" data-i18n-aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toastUI('Recovery kit copied', false)" data-i18n="Copy kit">Copy kit</button><button class="primary" onclick="closeModal();enterApp()" data-i18n="I saved it, continue">I saved it, continue</button></div>`,'Save your recovery kit');return}
-  let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
+  let email=$('email').value.trim(),password=$('pw').value,kdf=await AuthV2.kdf(email),d;
+  if(kdf.version===2){let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations),challenge=await AuthV2.challenge(email);
+    d=await api('POST','/api/auth/login-v2',{email,challenge_id:challenge.challenge_id,proof:await AuthV2.proof(keys.auth,challenge.challenge,challenge.challenge_id)});
+  }else d=await api('POST','/api/auth/login',{email,password});
   if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';owText($('authbtn'),'Verify code');$('authbtn').onclick=doMfa;toastUI('Enter your authenticator or recovery code', false);return}
   T='';enterApp();
 }catch(e){toast(e.message,true)}}
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
-async function logout(){aiReset();closeModal();try{await api('POST','/api/auth/logout',{})}catch(e){} T='';clearPkiState();location.reload()}
-async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
+async function logout(){aiReset();try{await api('POST','/api/auth/logout',{})}catch(e){} T='';clearPkiState();location.reload()}
+async function enterApp(){
+  let pending=sessionStorage.getItem('ow_pending_invite');
+  if(pending&&!INVITE){await showInvite(pending);return}
+  $('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+  let policy=await api('GET','/api/auth/providers');CREATION_OPEN=policy.workspace_creation_open!==false;$('new-workspace').style.display=CREATION_OPEN?'':'none';
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
   $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
-  $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
+  $('orgs').value=ORG;APP=null;ENV=null;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
   await refreshEmergency();clearInterval(EMERGENCY_POLL);EMERGENCY_POLL=setInterval(refreshEmergency,5000);
   await nav(EMERGENCY?'settings':'apps')}
 async function switchOrg(){aiReset();if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;clearPkiState();APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
@@ -275,15 +300,22 @@ async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').inn
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
 async function nav(v){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
-  $('topaction').style.display=(v==='apps'&&!EMERGENCY)?'':'none';
+  $('topaction').style.display=(v==='apps'&&ORG&&!EMERGENCY)?'':'none';
   if(v!=='assistant')AI_PLAN=null;
+  if(!ORG&&v!=='settings'){renderEmptyWorkspace();return}
   updateDeployBar();
   if((EMERGENCY||PROJECT_EMERGENCY)&&['access','integrations','assistant','insights'].includes(v)){$('pagetitle').textContent='Read-only inspection';$('crumb').textContent='';$('view').innerHTML=emergencyCard(!EMERGENCY);return}
   await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,assistant:renderAssistant,insights:renderInsights,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
   updateDeployBar()}
 
+function renderEmptyWorkspace(){$('topaction').style.display='none';owText($('pagetitle'),'Workspaces');owDataText($('crumb'),'');$('view').innerHTML=`<div class="empty"><h3>No workspace yet</h3><p>${CREATION_OPEN?'Create a workspace or accept an invitation.':'Workspace creation is disabled. Ask an administrator for an invitation.'}</p><div class="row">${CREATION_OPEN?'<button class="primary" onclick="newWorkspace()">Create workspace</button>':''}<button onclick="joinWorkspace()">Join workspace</button><button onclick="nav('settings')">Account and instance settings</button></div></div>`}
+function newWorkspace(){if(!CREATION_OPEN){toast('Workspace creation is disabled',true);return}modal(`<h3>New workspace</h3><div class="field"><label for="nw-name">Workspace name</label><input id="nw-name"></div><button class="primary" onclick="createWorkspace()">Create workspace</button><button onclick="closeModal()">Cancel</button>`,'New workspace')}
+async function createWorkspace(){try{let d=await api('POST','/api/orgs',{name:$('nw-name').value.trim()});PENDING_ORG=d.id;closeModal();await enterApp()}catch(e){toast(e.message,true)}}
+async function renameWorkspace(){let name=prompt('Workspace name');if(name===null)return;try{await api('PATCH',`/api/orgs/${ORG}`,{name});await refreshOrgs();renderSettings()}catch(e){toast(e.message,true)}}
+async function leaveWorkspace(){if(!confirm('Leave this workspace? An invitation is required to return.'))return;try{await api('POST',`/api/orgs/${ORG}/leave`,{});await enterApp()}catch(e){toast(e.message,true)}}
+
 // ---------- apps ----------
-async function renderApps(){$('topaction').style.display=EMERGENCY?'none':'';owText($('pagetitle'),'Apps');owDataText($('crumb'),'');
+async function renderApps(){if(!ORG){renderEmptyWorkspace();return}$('topaction').style.display=EMERGENCY?'none':'';owText($('pagetitle'),'Apps');owDataText($('crumb'),'');
   $('view').innerHTML='<div class="empty"><div class="big" data-i18n="Loading…">Loading…</div></div>';
   APPS=ORG?await api('GET',`/api/orgs/${ORG}/apps`):[];
   if(!APPS.length){$('view').innerHTML=`<div class="empty"><div class="big">▦</div><span data-i18n="No apps yet">No apps yet</span><p data-i18n="Create an app to start managing secrets for a project.">Create an app to start managing secrets for a project.</p><button class="primary" onclick="newApp()" data-i18n="Create your first app">Create your first app</button></div>`;return}
@@ -686,6 +718,7 @@ async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export
 function needAppEnv(){if(!APP){toastUI('Open an app first', true);nav('apps');return false} return true}
 async function renderAccess(){if(!ORG)return;let org=ORG,view=VIEW,accessSerial=++PRODUCT_RENDER;owText($('pagetitle'),'Members & access');owDataText($('crumb'),'');
   let teams=await api('GET',`/api/orgs/${org}/teams`).catch(()=>[]);let roles=await api('GET',`/api/orgs/${org}/roles`).catch(()=>[]);
+  let pending=await api('GET',`/api/orgs/${org}/invites`).catch(()=>[]);
   let members=await api('GET',`/api/orgs/${org}/members`).catch(()=>[]);let myRole=members.find(m=>m.id===ME?.id)?.role||'';
   let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
   let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
@@ -695,7 +728,8 @@ async function renderAccess(){if(!ORG)return;let org=ORG,view=VIEW,accessSerial=
   <table class="members-table"><thead><tr><th data-i18n="Member">Member</th><th data-i18n="Role">Role</th><th></th></tr></thead><tbody>
   ${members.map(m=>`<tr><td>${esc(m.email)}${m.id===ME?.id?' <span class="chip" data-i18n="you">you</span>':''}</td><td><select aria-label="Role for ${esc(m.email)}" onchange="setMemberRole('${jsq(m.id)}',this.value)">${roles.map(r=>`<option value="${esc(r.name)}"${r.name===m.role?' selected':''}>${esc(r.name)}</option>`).join('')}</select></td><td>${m.role!=='owner'&&myRole==='owner'?`<button onclick="transferOwner('${jsq(m.id)}','${jsq(m.email)}')" data-i18n="Make owner">Make owner</button> `:''}${m.id!==ME?.id?`<button class="danger" onclick="removeMember('${jsq(m.id)}','${jsq(m.email)}')" data-i18n="Remove">Remove</button>`:''}</td></tr>`).join('')||'<tr><td colspan="3" class="mut" data-i18n="No members">No members</td></tr>'}
   </tbody></table></div>
-  <div class="card"><h3 data-i18n="Invite member">Invite member</h3><p data-i18n="Existing accounts are added immediately. New addresses get a single-use link, valid for seven days, to set a password or sign in with a configured provider.">Existing accounts are added immediately. New addresses get a single-use link, valid for seven days, to set a password or sign in with a configured provider.</p><div class="row"><label class="small mut" for="inv-email" data-i18n="Email">Email</label><input id="inv-email" type="email" placeholder="teammate@company.com" style="min-width:240px"><label class="small mut" for="inv-role" data-i18n="Role">Role</label><select id="inv-role">${roles.map(r=>`<option value="${esc(r.name)}"${r.name==='developer'?' selected':''}>${esc(r.name)}</option>`).join('')}</select><button class="primary" onclick="invite()" data-i18n="Invite">Invite</button></div></div>
+  <div class="card"><h3 data-i18n="Invite member">Invite member</h3><p>Every invitee receives a single-use link valid for seven days. Existing accounts must sign in and explicitly join. Share the link securely; issuing it does not add membership.</p><div class="row"><label class="small mut" for="inv-email" data-i18n="Email">Email</label><input id="inv-email" type="email" placeholder="teammate@company.com" style="min-width:240px"><label class="small mut" for="inv-role" data-i18n="Role">Role</label><select id="inv-role">${roles.map(r=>`<option value="${esc(r.name)}"${r.name==='developer'?' selected':''}>${esc(r.name)}</option>`).join('')}</select><button class="primary" onclick="invite()" data-i18n="Invite">Invite</button></div></div>
+  <div class="card"><h3>Pending invitations</h3>${pending.map(i=>`<div class="row"><span>${esc(i.email)} (${esc(i.role)}), expires ${esc(new Date(i.expires_at*1000).toLocaleString())}</span><button onclick="resendInvite('${jsq(i.id)}')">Resend link</button><button class="danger" onclick="revokeInvite('${jsq(i.id)}')">Revoke</button></div>`).join('')||'<p class="mut">No pending invitations</p>'}</div>
   <div class="card"><h3 data-i18n="Custom roles">Custom roles</h3><p><span data-i18n="Comma-separated permissions, for example">Comma-separated permissions, for example</span> <span class="mono">secrets:read</span> <span data-i18n="or">or</span> <span class="mono">*</span>.</p><div class="row"><input id="role-name" placeholder="deployer"><input id="role-perms" placeholder="secrets:read,secrets:write" style="min-width:260px"><button onclick="mkRole()" data-i18n="Create role">Create role</button></div><div>${roles.map(r=>`<span class="chip">${esc(r.name)}: ${esc((r.permissions||[]).join(', '))}${r.managed?' '+owHTML('(managed)'):''}</span>`).join('')}</div></div>
   <div class="card"><h3 data-i18n="Teams">Teams</h3><div class="row"><input id="team-name" placeholder="platform-team"><button onclick="mkTeam()" data-i18n="Create team">Create team</button></div><div>${teams.map(t=>`<span class="chip">${esc(t.name)}</span>`).join('')||'<span class="mut" data-i18n="No teams yet">No teams yet</span>'}</div></div>
   <div class="card"><h3><span data-i18n="Secret change proposals">Secret change proposals</span> ${ENV?('· '+esc(ENV.name)):''}</h3><p data-i18n="Proposals stage secret changes for admin approval instead of deploying directly.">Proposals stage secret changes for admin approval instead of deploying directly.</p>
@@ -749,6 +783,8 @@ async function invite(){try{let d=await api('POST',`/api/orgs/${ORG}/members`,{e
     modal(`<h3 data-i18n="Invitation created">Invitation created</h3><p class="mut">${owHTML('Send this single-use link to {x}. It expires in 7 days.',{x:$('inv-email').value})}</p><textarea rows="3" readonly>${esc(link)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toastUI('Invite link copied', false)" data-i18n="Copy link">Copy link</button><button class="primary" onclick="closeModal()" data-i18n="Done">Done</button></div>`);}
   else toastUI('Member added', false);
   $('inv-email').value='';renderAccess()}catch(e){toast(e.message,true)}}
+async function resendInvite(id){try{let d=await api('POST',`/api/orgs/${ORG}/invites/${id}/resend`,{});let link=location.origin+'/#invite='+encodeURIComponent(d.invite_token);modal(`<h3>Replacement invitation</h3><p>The previous link no longer works. Share this new link securely.</p><textarea aria-label="Invitation link" rows="3" readonly>${esc(link)}</textarea><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toastUI('Link copied', false)">Copy link</button><button onclick="closeModal()">Done</button>`,'Replacement invitation');renderAccess()}catch(e){toast(e.message,true)}}
+async function revokeInvite(id){if(!confirm('Revoke this invitation?'))return;try{await api('DELETE',`/api/orgs/${ORG}/invites/${id}`);renderAccess()}catch(e){toast(e.message,true)}}
 async function setMemberRole(uid,role){try{await api('PATCH',`/api/orgs/${ORG}/members/${uid}`,{role});toastUI('Role updated', false);renderAccess()}catch(e){toast(e.message,true);renderAccess()}}
 async function removeMember(uid,email){if(!confirm(`Remove ${email} from this workspace?`))return;try{await api('DELETE',`/api/orgs/${ORG}/members/${uid}`);toastUI('Member removed', false);renderAccess()}catch(e){toast(e.message,true)}}
 async function transferOwner(uid,email){if(!confirm(`Make ${email} the owner? You become an admin and lose owner controls.`))return;try{await api('POST',`/api/orgs/${ORG}/transfer`,{user_id:uid});toastUI('Ownership transferred', false);await refreshOrgs();renderAccess()}catch(e){toast(e.message,true)}}
@@ -824,6 +860,9 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> <span data-i18n="Allow self signup">Allow self signup</span></label>
     <p class="small mut"><span data-i18n="When off, new users join only by invitation.">When off, new users join only by invitation.</span> ${inst.signups_env_locked?owHTML('Locked by OPENWARP_SIGNUPS.'):''}</p>
     <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''} data-i18n="Save signup policy">Save signup policy</button>
+    <label class="row" style="gap:8px;margin-top:16px"><input type="checkbox" id="set-workspace-creation" ${inst.workspace_creation_open?'checked':''} ${inst.workspace_creation_env_locked?'disabled':''}> Allow workspace creation</label>
+    <p class="small mut">Separate from account signup. When off, new accounts have no personal workspace; invitations still work. ${inst.workspace_creation_env_locked?'Locked by OPENWARP_WORKSPACE_CREATION.':''}</p>
+    <button onclick="saveWorkspacePolicy()" ${inst.workspace_creation_env_locked?'disabled':''}>Save workspace policy</button>
     <div class="row" style="margin-top:12px"><label for="set-instance-owner" data-i18n="New instance owner email">New instance owner email</label><input id="set-instance-owner" type="email" style="min-width:260px"><button onclick="transferInstance()" data-i18n="Transfer instance">Transfer instance</button></div>
     <p class="small mut" style="margin-top:6px" data-i18n="The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
   let tp=themePref();
@@ -835,7 +874,8 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <label class="small mut" for="set-lang" data-i18n="Language">Language</label><select id="set-lang" class="langsel" data-langsel onchange="owSetLang(this.value)"></select></div></div>`;
   if(!AUTH_READY)return;if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
   $('view').innerHTML=`${EMERGENCY_OWNER?emergencyCard():''}${instanceCard}${appearanceCard}
-  <div class="card"><h3 data-i18n="Organisation security">Organisation security</h3><p data-i18n="IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.">IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
+  ${ORG?`<div class="card"><h3>Workspace</h3><p>${esc(myOrg.name||'')}</p><div class="row"><button onclick="renameWorkspace()">Rename workspace</button><button onclick="leaveWorkspace()">Leave workspace</button><button onclick="joinWorkspace()">Join another workspace</button></div></div>`:''}
+  ${ORG?`<div class="card"><h3 data-i18n="Organisation security">Organisation security</h3><p data-i18n="IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.">IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip" data-i18n="IP allowlist (CIDR, comma separated, empty = allow all)">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> <span data-i18n="Warn when a secret value is reused elsewhere in this workspace">Warn when a secret value is reused elsewhere in this workspace</span></label>
   <p class="small mut" style="margin:0 0 10px" data-i18n="Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.">Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.</p>
@@ -845,12 +885,12 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}> <span data-i18n="Allow first-time SSO users to join as developers">Allow first-time SSO users to join as developers</span></label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()" data-i18n="Save settings">Save settings</button></div></div>
   ${samlCard}
-  ${ldapCard}
+  ${ldapCard}`:''}
   <div class="card"><h3 data-i18n="Authenticator app (TOTP)">Authenticator app (TOTP)</h3><p data-i18n="Add a second factor to your login.">Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()" data-i18n="Set up TOTP">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator" data-i18n-placeholder="code from authenticator"><button onclick="totpVerify()" data-i18n="Verify and enable">Verify and enable</button></div></div>
   <div class="card"><h3 data-i18n="End-to-end environments">End-to-end environments</h3><p data-i18n="Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.">Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" data-i18n-placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID" data-i18n-placeholder="E2E env ID"><button class="primary" onclick="loadE2E()" data-i18n="Decrypt">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  <div class="card"><h3 data-i18n="Device certificates">Device certificates</h3><p data-i18n="Client certificates for devices and services, issued from your own CA after a CSR.">Client certificates for devices and services, issued from your own CA after a CSR.</p><p data-i18n="CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.">CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.</p><div id="pki-body" class="small mut" data-i18n="Loading…">Loading…</div></div>
-  <div class="card"><h3 data-i18n="SSH certificates">SSH certificates</h3><div class="row"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><pre class="val" id="ssh-ca-out"></pre><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>
+  ${ORG?`<div class="card"><h3 data-i18n="Device certificates">Device certificates</h3><p data-i18n="Client certificates for devices and services, issued from your own CA after a CSR.">Client certificates for devices and services, issued from your own CA after a CSR.</p><p data-i18n="CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.">CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.</p><div id="pki-body" class="small mut" data-i18n="Loading…">Loading…</div></div>
+  <div class="card"><h3 data-i18n="SSH certificates">SSH certificates</h3><div class="row"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><pre class="val" id="ssh-ca-out"></pre><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>`:''}
   <div class="card"><h3 data-i18n="Session">Session</h3><div class="row"><button onclick="loadTokensSettings()" data-i18n="My tokens">My tokens</button><button class="danger" onclick="logout()" data-i18n="Sign out everywhere (this device)">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>
   ${myOrg.role==='owner'?`<div class="card"><h3 data-i18n="Delete workspace">Delete workspace</h3><p><span data-i18n="Type">Type</span> <span class="mono">${esc(myOrg.name||'')}</span> <span data-i18n="to confirm. Every app, environment, secret, token and identity in this workspace is removed.">to confirm. Every app, environment, secret, token and identity in this workspace is removed.</span></p><div class="row"><label for="del-org-name" data-i18n="Workspace name">Workspace name</label><input id="del-org-name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')" data-i18n="Delete workspace">Delete workspace</button></div></div>`:''}
   <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;loadSshCAs();renderPki()}
@@ -861,6 +901,7 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_ch
   if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toastUI('Settings saved', false)}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toastUI('Signups '+(d.signups_open?'enabled':'disabled'), false);renderSettings()}catch(e){toast(e.message,true)}}
+async function saveWorkspacePolicy(){try{let d=await api('PUT','/api/instance/workspaces',{open:$('set-workspace-creation').checked});CREATION_OPEN=d.workspace_creation_open;$('new-workspace').style.display=CREATION_OPEN?'':'none';toastUI('Workspace policy saved', false);renderSettings()}catch(e){toast(e.message,true)}}
 async function saveSaml(){try{let b={idp_entity_id:$('set-saml-entity').value,metadata_url:$('set-saml-url').value,metadata_xml:$('set-saml-xml').value,allow_unsigned_metadata:$('set-saml-unsigned').checked,auto_provision:$('set-saml-auto').checked,allowed_domains:$('set-saml-domains').value};let d=await api('PUT',`/api/orgs/${ORG}/saml`,b);$('saml-out').textContent='SP metadata: '+d.sp_metadata_url;toastUI('SAML saved', false)}catch(e){toast(e.message,true)}}
 async function saveLdap(){try{
   let b={url:$('ld-url').value,bind_dn:$('ld-bind-dn').value,base_dn:$('ld-base-dn').value,user_filter:$('ld-filter').value,email_attr:$('ld-email-attr').value,name_attr:$('ld-name-attr').value,group_attr:$('ld-group-attr').value,group_roles:$('ld-roles').value,default_role:$('ld-default-role').value,allowed_domains:$('ld-domains').value,ca_cert_pem:$('ld-ca').value,auto_provision:$('ld-auto').checked};
@@ -1147,7 +1188,7 @@ function boot(){
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
-$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
+if(!INVITE&&!MFA&&!location.hash.startsWith('#reset=')&&!location.hash.startsWith('#mfa=')){$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})}
 </script>
 <script src="/libsodium.js" integrity="sha384-3KUAqev6nUaNHDSTa/UjyEycVN8iMfq/UtzKf3ZDTuGSb+P3y9kMu/WCVqnLAxUB"></script>
 <script src="/libsodium-wrappers.js" integrity="sha384-uj62oy76l27Bkf3eEP5knMYc094z6HzwAR7Rn8ZZcBBsg5nMibZXSvjRqgZMFg/L"></script>

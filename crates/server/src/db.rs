@@ -615,6 +615,20 @@ impl Db {
         crate::migrate::wait(db.migrate())?;
         Ok(db)
     }
+    /// Workers entrypoint variant of from_do_sql_now; both apply the numbered
+    /// migrations synchronously through the shared engine.
+    pub fn from_do_storage_now(storage: worker::Storage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage.sql()), std::rc::Rc::new(storage));
+        crate::migrate::wait(db.migrate())?;
+        Ok(db)
+    }
+    /// Synchronous exec for callers that cannot hold a future across a borrow,
+    /// such as the risaml replay cache. Mirrors the async DoSqlite exec arm.
+    pub(crate) fn exec_sync(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+        let Db::DoSqlite(s, _) = self;
+        let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
+        Ok(cursor.rows_written() as u64)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -805,10 +819,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 29, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 30, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 29, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 30, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }

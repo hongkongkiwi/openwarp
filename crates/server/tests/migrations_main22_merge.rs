@@ -157,10 +157,10 @@ async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
 }
 
 async fn assert_final28_and_second_boot(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 29);
+    assert_eq!(db.version().await.unwrap(), 30);
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 29);
-    assert_eq!(status.latest, 29);
+    assert_eq!(status.current, 30);
+    assert_eq!(status.latest, 30);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let before = snapshot(db).await;
@@ -202,7 +202,7 @@ async fn engine22_upgrade_adds_main22_schema_without_rewriting_history_or_data()
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade engine22 without checksum repair");
     assert!(!report.squashed);
-    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29], "a pre-merge engine database applies the appended reconciliation suffix");
+    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29, 30], "a pre-merge engine database applies the appended reconciliation suffix");
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=22 ORDER BY version", &[]).await.unwrap(), ledger);
     assert_main22_schema(&db).await;
@@ -219,7 +219,7 @@ async fn shipped_main22_legacy_upgrade_preserves_product_data_and_unverified_his
     let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("recognise real main22 history without newer-schema rejection or checksum repair");
     assert!(!report.squashed);
-    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29], "occupied legacy versions must not be replayed as engine SQL");
+    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29, 30], "occupied legacy versions must not be replayed as engine SQL");
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT version,applied_at FROM schema_migrations WHERE version<=22 ORDER BY version", &[]).await.unwrap(), ledger);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();

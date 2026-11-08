@@ -1,7 +1,8 @@
 //! Second factors for an account: TOTP, WebAuthn passkeys and emailed codes.
 //! Every factor is optional, but at least one enabled factor makes the second
 //! step mandatory on every sign-in path, including social and OIDC.
-use crate::app::{b64url, bad, err, hmac_hex, id, j, make_session, meta_get, meta_set, now, send_email_result, session_cookie, totp_code, PeerAddr, Res, S};
+use crate::app::{bad, err, hmac_hex, j, meta_get, meta_set, now, send_email_result, totp_code, PeerAddr, Res, S};
+use crate::app::{b64url, id, make_session, session_cookie};
 use crate::db;
 use crate::mailer;
 use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, Json};
@@ -72,28 +73,32 @@ pub async fn confirm_totp(st: &S, uid: &str, code: &str) -> bool {
     false
 }
 
-async fn totp_ok(st: &S, uid: &str, code: &str) -> bool {
+pub(crate) async fn totp_ok(st: &S, uid: &str, code: &str) -> bool {
     if !totp_enabled(st, uid).await || code.is_empty() { return false; }
     let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) else { return false };
     let counter = (now() / 30) as u64;
     for c in [counter.wrapping_sub(1), counter, counter + 1] {
         if ct_eq(&totp_code(&secret, c), code) {
-            let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
+            let key = format!("totp_last:{}", uid);
+            let stored = meta_get(st, &key).await;
+            let last = stored.parse::<u64>().unwrap_or(0);
             if c <= last { return false; }
-            meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
-            return true;
+            return st.db.exec("UPDATE meta SET v=? WHERE k=? AND v=?", &[json!(c.to_string()), json!(key), json!(stored)]).await == Ok(1);
         }
     }
     false
 }
-async fn recovery_ok(st: &S, uid: &str, code: &str) -> bool {
+pub(crate) async fn recovery_ok(st: &S, uid: &str, code: &str) -> bool {
     if code.is_empty() { return false; }
     let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await;
     if stored.is_empty() { return false; }
     let hash = oc::hash_token(code);
     let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
     match list.iter().position(|x| ct_eq(x, &hash)) {
-        Some(pos) => { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; true }
+        Some(pos) => {
+            list.remove(pos);
+            st.db.exec("UPDATE meta SET v=? WHERE k=? AND v=?", &[json!(list.join(",")), json!(format!("totp_recovery:{}", uid)), json!(stored)]).await == Ok(1)
+        }
         None => false,
     }
 }
@@ -118,22 +123,16 @@ async fn store_email_code(st: &S, uid: &str, purpose: &str, code: &str) {
 }
 async fn email_code_ok(st: &S, uid: &str, code: &str, purpose: &str) -> bool {
     if code.is_empty() { return false; }
-    let row = match st.db.one("SELECT code_hash,expires_at,attempts FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await {
+    let row = match st.db.one("SELECT code_hash,created_at,expires_at,attempts FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await {
         Ok(Some(r)) => r, _ => return false };
-    let attempts = db::n(&row, "attempts");
-    if db::n(&row, "expires_at") < now() || attempts >= MAX_CODE_ATTEMPTS {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-        return false;
-    }
+    let current = now();
+    if db::n(&row, "expires_at") < current || db::n(&row, "attempts") >= MAX_CODE_ATTEMPTS { return false; }
+    let params = [json!(uid), json!(purpose), json!(db::s(&row, "code_hash")), json!(db::n(&row, "created_at")), json!(db::n(&row, "expires_at")), json!(current), json!(MAX_CODE_ATTEMPTS)];
     if ct_eq(&db::s(&row, "code_hash"), &code_hash(st, code)) {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-        return true;
+        return st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=? AND code_hash=? AND created_at=? AND expires_at=? AND expires_at>=? AND attempts<?", &params).await == Ok(1);
     }
-    if attempts + 1 >= MAX_CODE_ATTEMPTS {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-    } else {
-        let _ = st.db.exec("UPDATE email_codes SET attempts=attempts+1 WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-    }
+    // Increment atomically without deleting a concurrently issued replacement.
+    let _ = st.db.exec("UPDATE email_codes SET attempts=attempts+1 WHERE user_id=? AND purpose=? AND code_hash=? AND created_at=? AND expires_at=? AND expires_at>=? AND attempts<?", &params).await;
     false
 }
 async fn send_code(st: &S, uid: &str, purpose: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -178,8 +177,8 @@ pub async fn challenge_user(st: &S, token: &str) -> Option<String> {
     if db::n(&row, "created_at") + CHALLENGE_TTL < now() { return None; }
     Some(db::s(&row, "user_id"))
 }
-pub async fn consume_challenge(st: &S, token: &str) {
-    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(oc::hash_token(token))]).await;
+pub async fn consume_challenge(st: &S, token: &str) -> bool {
+    st.db.exec("DELETE FROM mfa_challenges WHERE token=? AND created_at>=?", &[json!(oc::hash_token(token)), json!(now() - CHALLENGE_TTL)]).await == Ok(1)
 }
 
 async fn password_known(st: &S, uid: &str) -> bool { meta_get(st, &format!("password_known:{}", uid)).await == "1" }
@@ -213,7 +212,7 @@ fn loopback_host(host: &str) -> bool {
 fn public_origin(st: &S, h: &HeaderMap) -> Option<String> {
     // WebAuthn's origin and RP ID decide whether a credential may sign in, so
     // production pins them. Only a loopback Host is trusted for local dev.
-    let raw = std::env::var("OPENWARP_RP_ORIGIN").ok().filter(|v| !v.trim().is_empty())
+    let raw = crate::envcfg::var("OPENWARP_RP_ORIGIN").ok().filter(|v| !v.trim().is_empty())
         .or_else(|| Some(st.pub_url.clone()).filter(|v| !v.is_empty()))
         .or_else(|| h.get("host").and_then(|v| v.to_str().ok()).filter(|host| loopback_host(host)).map(|host| format!("http://{}", host)))?;
     let url = Url::parse(raw.trim()).ok()?;
@@ -224,7 +223,7 @@ fn public_origin(st: &S, h: &HeaderMap) -> Option<String> {
 fn webauthn(st: &S, h: &HeaderMap) -> Result<Webauthn, (StatusCode, Json<Value>)> {
     let origin = public_origin(st, h).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "passkeys need OPENWARP_PUBLIC_URL or a Host header"))?;
     let url = Url::parse(&origin).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the public origin is not a valid URL"))?;
-    let rp_id = std::env::var("OPENWARP_RP_ID").ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty())
+    let rp_id = crate::envcfg::var("OPENWARP_RP_ID").ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty())
         .or_else(|| url.host_str().map(str::to_string)).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the public origin has no host"))?;
     WebauthnBuilder::new(&rp_id, &url)
         .and_then(|b| b.rp_name("OpenWarp").build())
@@ -407,7 +406,8 @@ pub async fn passkey_login_finish(State(st): State<S>, PeerAddr(addr): PeerAddr,
     let key = oc::hash_token(&r.mfa_token);
     let row = st.db.one("SELECT user_id,state_json,created_at FROM mfa_passkey_states WHERE mfa_token=?", &[json!(&key)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again"))?;
-    let _ = st.db.exec("DELETE FROM mfa_passkey_states WHERE mfa_token=?", &[json!(&key)]).await;
+    let consumed = st.db.exec("DELETE FROM mfa_passkey_states WHERE mfa_token=? AND state_json=? AND created_at=?", &[json!(&key), json!(db::s(&row, "state_json")), json!(db::n(&row, "created_at"))]).await.map_err(|e| bad(&e))?;
+    if consumed != 1 { return Err(err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again")); }
     if db::s(&row, "user_id") != uid || db::n(&row, "created_at") + CHALLENGE_TTL < now() {
         return Err(err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again")); }
     let state: PasskeyAuthentication = serde_json::from_str(&db::s(&row, "state_json")).map_err(|_| bad("passkey sign-in failed"))?;
@@ -433,15 +433,16 @@ pub async fn passkey_login_finish(State(st): State<S>, PeerAddr(addr): PeerAddr,
         let updated = serde_json::to_string(&passkey).map_err(|e| bad(&e.to_string()))?;
         // The session may only follow a durable counter update; otherwise the
         // next assertion could replay the same counter.
-        st.db.exec("UPDATE passkeys SET credential_json=?,sign_count=?,last_used_at=? WHERE id=?",
-            &[json!(updated), json!(i64::from(result.counter())), json!(now()), json!(db::s(row, "id"))])
+        let changed = st.db.exec("UPDATE passkeys SET credential_json=?,sign_count=?,last_used_at=? WHERE id=? AND sign_count=? AND credential_json=?",
+            &[json!(updated), json!(i64::from(result.counter())), json!(now()), json!(db::s(row, "id")), json!(stored), json!(db::s(row, "credential_json"))])
             .await.map_err(|e| bad(&format!("passkey state could not be saved: {}", e)))?;
+        if changed != 1 { return Err(err(StatusCode::UNAUTHORIZED, "passkey state changed; start again")); }
         matched = true;
         break;
     }
     if !matched { st.rate_fail(&rl, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "passkey does not belong to this account")); }
     st.rate_clear(&rl).await;
-    consume_challenge(&st, &r.mfa_token).await;
+    if !consume_challenge(&st, &r.mfa_token).await { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired or invalid")); }
     st.audit("", "", "", &uid, "auth.mfa_passkey", "").await;
     let session = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new();

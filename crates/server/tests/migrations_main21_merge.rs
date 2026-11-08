@@ -132,10 +132,10 @@ async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
 }
 
 async fn assert_final22_and_second_boot(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 29);
+    assert_eq!(db.version().await.unwrap(), 30);
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 29);
-    assert_eq!(status.latest, 29);
+    assert_eq!(status.current, 30);
+    assert_eq!(status.latest, 30);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let before = snapshot(db).await;
@@ -181,7 +181,7 @@ async fn engine20_upgrade_adds_main21_schema_without_rewriting_history_or_data()
     let token = db.one("SELECT trust_id FROM tokens WHERE id='main21-token'", &[]).await.unwrap().expect("old token survives");
     assert_eq!(token.get("trust_id"), Some(&serde_json::json!("")), "old tokens receive a real empty-string trust default, not NULL");
     assert_main21_schema(&db).await;
-    assert_eq!(report.applied, vec![21, 22, 23, 24, 25, 26, 27, 28, 29]);
+    assert_eq!(report.applied, vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
     seed_product(&db).await;
     assert_final22_and_second_boot(&db).await;
 }
@@ -195,7 +195,7 @@ async fn shipped_main21_legacy_upgrade_preserves_product_data_and_unverified_his
     let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("recognise real main21 history without newer-schema rejection or checksum repair");
     assert!(!report.squashed);
-    assert_eq!(report.applied, vec![22, 23, 24, 25, 26, 27, 28, 29], "occupied legacy versions must not be replayed as engine SQL");
+    assert_eq!(report.applied, vec![22, 23, 24, 25, 26, 27, 28, 29, 30], "occupied legacy versions must not be replayed as engine SQL");
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT version,applied_at FROM schema_migrations WHERE version<=21 ORDER BY version", &[]).await.unwrap(), ledger);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();

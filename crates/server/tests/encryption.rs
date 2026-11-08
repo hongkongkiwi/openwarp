@@ -380,6 +380,8 @@ async fn rekey_can_remove_a_grantee_atomically() {
     let member_id = member["user_id"].as_str().unwrap().to_string();
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&ot), Some(json!({"email": "member-remove@test.invalid", "role": "developer"}))).await;
     assert_eq!(r.status, 200, "add member failed: {} {}", r.status, r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(&mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept member invitation failed: {}", accepted.text);
     let member_pub = s.call(Method::GET, "/api/users/lookup?email=member-remove@test.invalid", Some(&ot), None).await.body["pubkey"].as_str().unwrap().to_string();
     let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&ot), Some(json!({"name": "app"}))).await;
     let app = r.body["id"].as_str().unwrap().to_string();

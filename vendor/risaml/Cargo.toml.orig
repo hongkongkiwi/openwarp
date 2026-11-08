@@ -1,0 +1,95 @@
+# risaml is Rhein Industries' maintained fork of saml-rs by Sebastian Sala
+# (https://github.com/salasebas/opensaml-rs), starting from saml-rs 0.5.0;
+# see README.md and LICENSE.
+[package]
+name = "risaml"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Sebastian Sala (original saml-rs author)", "Rhein Industries"]
+license = "MIT"
+repository = "https://github.com/Rhein-Industries/risaml"
+homepage = "https://github.com/Rhein-Industries/risaml"
+documentation = "https://docs.rs/risaml"
+readme = "README.md"
+description = "Maintained fork of saml-rs: pure-Rust SAML 2.0 Service Provider and Identity Provider support, with XML security from ribergshamra."
+keywords = ["saml", "sso", "xml", "authentication"]
+categories = ["authentication", "web-programming"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/docs/migrations/**",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/clippy.toml",
+    "/rustfmt.toml",
+]
+
+[workspace]
+resolver = "2"
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["crypto-ribergshamra"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "risaml"
+path = "src/lib.rs"
+
+[features]
+default = ["crypto-ribergshamra"]
+# RustCrypto provider plus ribergshamra's historical optional capabilities
+# (legacy algorithms, post-quantum signatures and PKCS#11).
+crypto-ribergshamra = [
+    "crypto-rustcrypto",
+    "crypto-legacy-algorithms",
+    "crypto-post-quantum",
+    "crypto-pkcs11",
+]
+# Compatibility alias for `crypto-ribergshamra`, kept so that feature
+# selections written for the bergshamra-based releases keep working.
+crypto-bergshamra = ["crypto-ribergshamra"]
+crypto-rustcrypto = ["dep:ribergshamra", "ribergshamra/rustcrypto"]
+crypto-aws-lc = ["dep:ribergshamra", "ribergshamra/aws-lc"]
+crypto-fips = ["dep:ribergshamra", "ribergshamra/fips"]
+crypto-legacy-algorithms = ["ribergshamra?/legacy-algorithms"]
+# Separate, off-by-default acceptance of the unresolved RustCrypto RSA
+# private-decryption timing risk. This does not select a crypto provider.
+crypto-legacy-rsa-decryption = ["ribergshamra?/legacy-rsa-decryption"]
+crypto-post-quantum = ["ribergshamra?/post-quantum"]
+crypto-pkcs11 = ["ribergshamra?/pkcs11"]
+
+[dependencies]
+base64 = "0.23"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+quick-xml = "0.41"
+thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
+url = "2"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+# ribergshamra is Rhein Industries' maintained fork of bergshamra (XML-DSig,
+# XML-Enc, C14N), built on riptering and ritsp-ltv.
+ribergshamra = { version = "0.11.0", optional = true, default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
+
+[lints.clippy]
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+empty_docs = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
