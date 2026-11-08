@@ -11,6 +11,8 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | `DATABASE_URL` | `sqlite://openwarp.db` | SQLite file, PostgreSQL connection URL, or MySQL/MariaDB URL (`mysql://`, `mariadb://`) |
 | `ADDR` | `0.0.0.0:8080` | Listen IP and port; use loopback for private local development |
 | `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key or a configured KMS bridge and activates production-specific checks |
+| `OPENWARP_LICENSE` | Unset | Enterprise license token. `none` forces self-hosted; `development` is accepted only by debug builds outside production |
+| `OPENWARP_LICENSE_FILE` | Unset | Path to a file containing the license token; read once at startup |
 | `OPENWARP_MASTER_KEY` | Generated/stored in development without KMS | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
 | `OPENWARP_KMS_URL` | Unset | Native server HTTP(S) bridge for root/key wrapping; permits production auto-unseal without a plaintext master-key variable. `http://` is accepted, so use HTTPS, loopback or a protected private network |
 | `OPENWARP_KMS_TOKEN` | Unset | Optional bearer credential for the configured KMS bridge |

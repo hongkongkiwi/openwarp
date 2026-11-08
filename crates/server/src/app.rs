@@ -1,9 +1,16 @@
-use crate::{tpm_attestation, db, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
+#[cfg(feature = "pki")] use crate::tpm_attestation;
+use crate::{db, edition, inference_leases, integrations, kms, mailer, mfa, ssh_keys, ui};
+#[cfg(feature = "ssh-ca")]
+use crate::ssh_ca;
 #[path = "transit_compat.rs"] mod transit_compat;
 #[path = "workloads.rs"] mod workloads;
 #[path = "path_policy.rs"] mod path_policy;
-#[path = "static_rotation.rs"] mod static_rotation;#[path = "workload.rs"] mod workload;
+#[path = "static_rotation.rs"] mod static_rotation;
+#[cfg(feature = "workload-identity")]
+#[path = "workload.rs"] mod workload;
+#[cfg(feature = "transit")]
 #[path = "transit.rs"] mod transit;
+#[cfg(feature = "change-requests")]
 #[path = "change_requests.rs"] mod change_requests;
 #[cfg(feature = "ldap")] use crate::ldap;
 use axum::body::Bytes;
@@ -13,6 +20,7 @@ use axum::{extract::{WebSocketUpgrade, ws::{Message, WebSocket}}};
 use db::{Db, Row};
 #[path = "workspaces.rs"] mod workspaces;
 use openwarp_crypto as oc;
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 use risaml::{
     AcsEndpoint, AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, FormField,
     IdpDescriptor, MetadataTrustPolicy, Pending, PendingSnapshot, PrivateKeyPem, RelayStateParam,
@@ -22,6 +30,7 @@ use risaml::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}};
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
@@ -69,15 +78,26 @@ pub struct AppState {
     transit_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(not(target_arch="wasm32"))]
     lifecycle: Arc<tokio::sync::RwLock<()>>,
-    transit_lifecycle: transit::Lifecycle,
+    // Master-rotation fence shared with the transit key store. The type lives
+    // here so the field survives a build without the transit feature.
+    #[cfg_attr(all(target_arch = "wasm32", not(feature = "transit")), allow(dead_code))]
+    transit_lifecycle: TransitLifecycle,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     key_gate: tokio::sync::RwLock<()>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
+    license: edition::LicenseState,
     live: LiveSender,
 }
+#[cfg(not(target_arch = "wasm32"))]
+type TransitLifecycle = tokio::sync::RwLock<()>;
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct TransitLifecycle;
+#[cfg(target_arch = "wasm32")]
+impl TransitLifecycle { #[allow(dead_code)] pub async fn read(&self) {} }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: TransitLifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), license: edition::LicenseState::from_env(), live })
 }
 /// Install the validated bridge before serving requests on either runtime.
 pub fn install_kms(st: &S, kms: Option<kms::Kms>) { assert!(st.kms.set(kms).is_ok(), "KMS already initialized"); }
@@ -121,6 +141,7 @@ fn value_fingerprint(master: &[u8; 32], org: &str, value: &str) -> String {
     data.push(0);
     data.extend_from_slice(value.as_bytes());
     hmac_hex(&key, &data) }
+#[cfg(any(feature = "pki", feature = "saml"))]
 fn hex_encode(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}",b)).collect() }
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) { return None; }
@@ -199,8 +220,12 @@ fn def_path() -> String { "/".into() }
 #[derive(Deserialize, Default)] struct ReuseReq { #[serde(default)] secrets: Vec<SecretIn>, #[serde(default)] exclude: Vec<String> }
 
 impl AppState {
+    pub(crate) fn edition(&self) -> &edition::LicenseState { &self.license }
+    pub(crate) fn require_enterprise(&self, feature: edition::Feature) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.license.allows(feature) { Ok(()) } else { Err(edition::locked(feature)) } }
     pub(crate) async fn audit(&self, org: &str, app: &str, env: &str, actor: &str, action: &str, detail: &str) {
         // log streams (T10): persist delivery then send with retries in a thread
+        if self.license.allows(edition::Feature::AuditStreaming) {
         if let Ok(streams) = self.db.query("SELECT id,url,secret FROM log_streams WHERE org_id=?", &[json!(org)]).await { for srow in &streams {
             let did = id(); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}).to_string();
             let _ = self.db.exec("INSERT INTO log_deliveries(id,stream_id,event,payload,status,created_at) VALUES(?,?,?,?,'pending',?)", &[json!(did), json!(db::s(srow,"id")), json!(action), json!(payload), json!(now())]).await;
@@ -210,6 +235,7 @@ impl AppState {
             self.dispatch_log(db::s(srow,"url"), secret, payload, now(), did);
         } }
         if let Ok(Some(wh)) = self.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("audit_webhook:{}", org))]).await { let url = db::s(&wh, "v"); let payload = json!({"org":org,"app":app,"env":env,"actor":actor,"action":action,"detail":detail,"ts":now()}); self.dispatch_webhook(url, payload.to_string()); }
+        }
         let created_at = now();
         let (seq, prev_hash, hash) = self.audit_link(org, app, env, actor, action, detail, created_at).await;
         let _ = self.db.exec("INSERT INTO audit(id,org_id,app_id,env_id,actor,action,detail,created_at,seq,prev_hash,hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)", &[json!(id()), json!(org), json!(app), json!(env), json!(actor), json!(action), json!(detail), json!(created_at), json!(seq), json!(&prev_hash), json!(&hash)]).await;
@@ -337,7 +363,13 @@ impl AppState {
             return Ok(uid); }
         // service / personal access tokens
         if let Some(row) = self.db.one("SELECT * FROM tokens WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))? {
+            // A workload token is only usable while its trust record is live. A
+            // build without the feature cannot mint them, so any row left over
+            // from another build is rejected rather than trusted.
+            #[cfg(feature = "workload-identity")]
             if db::s(&row, "kind") == "workload" && (db::n(&row, "expires_at") <= now() || !workload::live(self, &row).await) { return Err(err(StatusCode::UNAUTHORIZED, "invalid workload proof")); }
+            #[cfg(not(feature = "workload-identity"))]
+            if db::s(&row, "kind") == "workload" { return Err(err(StatusCode::UNAUTHORIZED, "workload identity is not enabled in this build")); }
             let expires = db::n(&row, "expires_at");
             if expires > 0 && expires <= now() { return Err(err(StatusCode::UNAUTHORIZED, "token expired")); }
             if db::s(&row, "kind") == "machine" && db::n(&row, "created_at") + 3600 < now() { return Err(err(StatusCode::UNAUTHORIZED, "machine token expired (1h TTL); login again via Universal Auth")); }
@@ -437,6 +469,36 @@ impl AppState {
         // machine identities belong to an org directly
         if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { self.require_running(org).await?; return Ok(db::s(&idn, "role")); }
         Err(err(StatusCode::FORBIDDEN, "not an organisation member")) }
+    /// Enterprise surfaces a workspace may use: both a compiled feature and a
+    /// grant are required, and the grant row is the only mutable half.
+    async fn feature_grants(&self, org: &str) -> Vec<String> {
+        self.db.one("SELECT features FROM feature_grants WHERE org_id=?", &[json!(org)]).await.ok().flatten()
+            .map(|r| db::s(&r, "features").split_whitespace().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+    // Called only from the gated handlers, so a core-only build sees no caller.
+    #[allow(dead_code)]
+    async fn feature_granted(&self, org: &str, name: &str) -> bool {
+        crate::features::compiled(name) && self.feature_grants(org).await.iter().any(|f| f == name)
+    }
+    #[allow(dead_code)]
+    async fn require_feature(&self, org: &str, name: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        if !crate::features::compiled(name) { return Err(err(StatusCode::NOT_FOUND, &format!("{} is not available in this build", name))); }
+        if self.feature_granted(org, name).await { return Ok(()); }
+        Err(err(StatusCode::FORBIDDEN, &format!("{} is not enabled for this workspace", name)))
+    }
+    /// Replacement semantics: the caller sends the full set it wants.
+    async fn set_feature_grants(&self, org: &str, names: &[String], actor: &str) -> Result<(), (StatusCode, Json<Value>)> {
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        if refs.iter().any(|n| !crate::features::known(n)) { return Err(bad("unknown feature name")); }
+        if refs.iter().any(|n| !crate::features::compiled(n)) { return Err(bad("this build does not include one of the requested features")); }
+        let joined = crate::features::normalize(refs).join(" ");
+        let sql = "INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(org_id) DO UPDATE SET features=excluded.features,updated_by=excluded.updated_by,updated_at=excluded.updated_at";
+        #[cfg(not(target_arch = "wasm32"))]
+        let sql = if self.db.backend() == db::Backend::Mysql { "INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE features=VALUES(features),updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)" } else { sql };
+        self.db.exec(sql, &[json!(org), json!(&joined), json!(actor), json!(now())]).await.map_err(|e| bad(&e))?;
+        Ok(())
+    }
     async fn env_org_app(&self, env_id: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
         let row = self.db.one("SELECT a.org_id AS org_id, e.app_id AS app_id FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         Ok((db::s(&row, "org_id"), db::s(&row, "app_id")))
@@ -547,7 +609,7 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     let mut out = json!({"user_id":uid,"public_key":kp.public,"recovery_kit":kp.secret_b64(),"verification_required":true});
     if let Some(oid) = oid { out["org_id"] = json!(oid); } Ok((HeaderMap::new(),j(out)))
 }
-pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
+pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(id,token_hash,user_id,created_at) VALUES(?,?,?,?)", &[json!(id()), json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; use a configured provider")); }
     let key = format!("login:{}:{}", addr, r.email.trim().to_lowercase());
@@ -755,6 +817,34 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: Head
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     // A caller can always learn the environment its own credential is confined to.
     let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await?); Ok(j(out)) }
+// Browser sessions are listable by a stable id. Older rows predate the id column,
+// so one is assigned on first listing instead of exposing token hashes.
+async fn list_sessions(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
+    let current = oc::hash_token(&bearer_token_or_cookie(&h));
+    let rows = st.db.query("SELECT id,token_hash,created_at FROM sessions WHERE user_id=? ORDER BY created_at DESC", &[json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let mut out = Vec::new();
+    for r in rows { let mut sid = db::s(&r, "id");
+        if sid.is_empty() { sid = id(); let _ = st.db.exec("UPDATE sessions SET id=? WHERE token_hash=?", &[json!(&sid), json!(&db::s(&r, "token_hash"))]).await; }
+        out.push(json!({"id": sid, "created_at": db::n(&r, "created_at"), "current": db::s(&r, "token_hash") == current})); }
+    Ok(j(json!(out))) }
+fn bearer_token_or_cookie(h: &HeaderMap) -> String { let t = bearer_token(h); if t.is_empty() { cookie_val(h, "ow_session") } else { t } }
+async fn revoke_session(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let current = oc::hash_token(&bearer_token_or_cookie(&h));
+    let row = st.db.one("SELECT token_hash FROM sessions WHERE id=? AND user_id=?", &[json!(&sid), json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "session not found"))?;
+    st.db.exec("DELETE FROM sessions WHERE id=? AND user_id=?", &[json!(&sid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let was_current = db::s(&row, "token_hash") == current;
+    st.audit("", "", "", &uid, "auth.session_revoked", &sid).await;
+    Ok(j(json!({"revoked": sid, "current": was_current}))) }
+async fn revoke_all_sessions(State(st): State<S>, h: HeaderMap) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let uid = st.token_user(&h).await?;
+    let token = bearer_token_or_cookie(&h);
+    if st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=?", &[json!(oc::hash_token(&token)), json!(&uid)]).await.map_err(|e| bad(&e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "sign in to the console to end browser sessions; API keys and OAuth tokens cannot do this")); }
+    let n = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "auth.sessions_revoked", &format!("{n} session(s)")).await;
+    let mut headers=HeaderMap::new();
+    headers.insert(axum::http::header::SET_COOKIE, session_cookie("").replace("Max-Age=604800", "Max-Age=0").parse().unwrap());
+    Ok((headers, j(json!({"ok": true, "revoked": n})))) }
 // Ownership grants and account deletion serialize on the same user rows.
 async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize]) -> Result<(), (StatusCode, Json<Value>)> {
     let mut users = users.to_vec(); users.sort_unstable(); users.dedup();
@@ -764,6 +854,7 @@ async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<V
     batch.extend_from_slice(statements);
     st.db.batch_checked(&batch, &checked).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "account or ownership changed; refresh and try again") } else { bad(&e) })
 }
+#[cfg(any(feature = "scim", feature = "saml", feature = "ldap"))]
 async fn add_provisioned_member(st: &S, org: &str, uid: &str, role: &str) -> Result<(), (StatusCode, Json<Value>)> {
     user_guarded_batch(st, &[uid], &[
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(uid)]),
@@ -1135,12 +1226,19 @@ async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): P
     let deleted = st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)", &[json!(oid), json!(target), json!(oid)]).await.map_err(|e| bad(&e))?;
     if deleted == 0 { return Err(bad("cannot remove the last owner")); }
     st.audit(&oid, "", "", &uid, "member.remove", &target).await; Ok(j(json!({"ok": true}))) }
-async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
+async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
     let org = db::s(&app, "org_id"); st.check_admin(&org, &uid).await?;
-    if r.name.trim().is_empty() { return Err(bad("name required")); }
-    st.db.exec("UPDATE apps SET name=? WHERE id=?", &[json!(r.name.trim()), json!(aid)]).await.map_err(|e| bad(&e))?;
-    st.audit(&org, &aid, "", &uid, "app.rename", &r.name).await; Ok(j(json!({"ok": true}))) }
+    let name = body.get("name").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+    let readme = body.get("readme").and_then(|v| v.as_str());
+    if name.is_empty() && readme.is_none() { return Err(bad("name or readme required")); }
+    if !name.is_empty() {
+        st.db.exec("UPDATE apps SET name=? WHERE id=?", &[json!(name), json!(aid)]).await.map_err(|e| bad(&e))?;
+        st.audit(&org, &aid, "", &uid, "app.rename", name).await; }
+    if let Some(readme) = readme {
+        st.db.exec("UPDATE apps SET readme=? WHERE id=?", &[json!(readme), json!(aid)]).await.map_err(|e| bad(&e))?;
+        st.audit(&org, &aid, "", &uid, "app.readme", &format!("{} bytes", readme.len())).await; }
+    Ok(j(json!({"ok": true}))) }
 async fn get_app_settings(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT org_id,reuse_check FROM apps WHERE id=?", &[json!(&aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
     st.require_org(&db::s(&row,"org_id"), &uid).await?;
@@ -1746,6 +1844,12 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
         crate::ai::activity(&st,(&org,"",&eid),&uid,&h,if result.is_ok() { "integration.test" } else { "integration.test_failed" },&iid,1).await;
         let msg = result.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
+async fn integration_history(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "integration not found"))?;
+    let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let prefix = format!("{}%", iid);
+    let rows = st.db.query("SELECT action,detail,created_at,actor FROM audit WHERE org_id=? AND action IN ('integration.sync','integration.sync_failed') AND detail LIKE ? ORDER BY created_at DESC LIMIT 50", &[json!(&org), json!(&prefix)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -1780,7 +1884,15 @@ async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<S
     }
     errors
 }
-async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true).await }
+async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let out = sync_one_inner(st, iid, uid, true, true).await;
+    if let Err((_, Json(v))) = &out {
+        if let Ok(Some(row)) = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await {
+            let eid = db::s(&row, "env_id");
+            if let Ok((org, app)) = st.env_org_app(&eid).await {
+                let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("integration sync failed");
+                st.audit(&org, &app, &eid, uid, "integration.sync_failed", &format!("{}: {}", iid, msg)).await; } } }
+    out }
 async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: bool) -> Result<String, (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id");
@@ -1855,9 +1967,9 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
             for n in &managed { let base = integrations::local_name(&config, n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
                 st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await.map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?; }
         }
-        st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; return Ok(msg); }
+        st.audit(&org, &app, &eid, uid, "integration.sync", &format!("{}: {}", iid, msg)).await; return Ok(msg); }
     let msg = integrations::sync_with_tags(&kind, &config, &pairs, &tags_by_name).await.map_err(|e| bad(&e))?;
-    st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; Ok(msg)
+    st.audit(&org, &app, &eid, uid, "integration.sync", &format!("{}: {}", iid, msg)).await; Ok(msg)
 }
 
 async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
@@ -1934,6 +2046,11 @@ async fn get_org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<Str
     }))) }
 async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid,&uid).await?;
+    let wants_oidc = ["oidc_issuer","oidc_client_id","oidc_client_secret","oidc_redirect_uri","oidc_allowed_domains"].iter()
+        .any(|k| body.get(*k).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false))
+        || body.get("oidc_auto_provision").and_then(|v| v.as_bool()) == Some(true);
+    if wants_oidc { st.require_enterprise(edition::Feature::OrgOidc)?; }
+    if body.get("audit_webhook").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) { st.require_enterprise(edition::Feature::AuditStreaming)?; }
     if let Some(v)=body.get("ip_allowlist").and_then(|x|x.as_str()) {
         if !valid_cidr_list(v) { return Err(bad("ip_allowlist must be comma-separated IP addresses or CIDR ranges")); }
         st.db.exec("UPDATE orgs SET ip_allowlist=? WHERE id=?", &[json!(v), json!(oid)]).await.map_err(|e| bad(&e))?; }
@@ -2005,7 +2122,9 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
     let rotation_hook_error = fire_rotation_hook(&st, &org, &eid, key_name, &new_val).await;
     Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id"),"sync_errors":sync_errors,"rotation_hook_error":rotation_hook_error}))) }
+#[cfg(feature = "scim")]
 async fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     if oauth_access(st, h).await.is_some() { return Err(err(StatusCode::FORBIDDEN, "OAuth access tokens cannot call SCIM; use a session or a service token")); }
     let uid = st.token_user(h).await?;
     let oid = q.get("org_id").cloned().unwrap_or_default();
@@ -2013,14 +2132,19 @@ async fn scim_org(st: &S, h: &HeaderMap, q: &HashMap<String, String>) -> Result<
     st.require_running(&oid).await?;
     let role = st.require_org(&oid, &uid).await?;
     if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN, "SCIM requires admin of this organisation")); }
+    st.require_feature(&oid, "scim").await?;
     Ok(oid) }
+#[cfg(feature = "scim")]
 async fn scim_member(st: &S, org: &str, user: &str) -> bool { st.db.one("SELECT user_id FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(user)]).await.ok().flatten().is_some() }
+#[cfg(feature = "scim")]
 fn scim_page(q: &HashMap<String, String>) -> (usize, usize) {
     let start = q.get("startIndex").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
     let count = q.get("count").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
     (start, count) }
+#[cfg(feature = "scim")]
 fn scim_eq_filter(q: &HashMap<String, String>) -> Option<String> {
     q.get("filter").and_then(|f| f.split(" eq ").nth(1)).map(|s| s.trim().trim_matches('"').to_string()) }
+#[cfg(feature = "scim")]
 async fn scim_service_config() -> impl IntoResponse { Json(json!({
     "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
     "patch": {"supported": true}, "bulk": {"supported": false, "maxOperations": 0, "maxPayloadSize": 0},
@@ -2028,10 +2152,12 @@ async fn scim_service_config() -> impl IntoResponse { Json(json!({
     "sort": {"supported": false}, "etag": {"supported": false},
     "authenticationSchemes": [{"type": "bearer", "name": "Bearer", "primary": true}]
 })) }
+#[cfg(feature = "scim")]
 async fn scim_resource_types() -> impl IntoResponse { Json(json!([
     {"id": "User", "name": "User", "endpoint": "/Users", "schema": "urn:ietf:params:scim:schemas:core:2.0:User"},
     {"id": "Group", "name": "Group", "endpoint": "/Groups", "schema": "urn:ietf:params:scim:schemas:core:2.0:Group"}
 ])) }
+#[cfg(feature = "scim")]
 async fn scim_schemas() -> impl IntoResponse { Json(json!([
     {"id": "urn:ietf:params:scim:schemas:core:2.0:User", "name": "User",
      "attributes": [{"name": "userName", "type": "string", "required": true, "uniqueness": "server"},
@@ -2040,6 +2166,7 @@ async fn scim_schemas() -> impl IntoResponse { Json(json!([
      "attributes": [{"name": "displayName", "type": "string", "required": true},
                     {"name": "members", "type": "complex", "multiValued": true}]}
 ])) }
+#[cfg(feature = "scim")]
 async fn scim_create_user(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res {
     let org = scim_org(&st, &h, &q).await?;
     let email = body.get("userName").and_then(|v| v.as_str()).unwrap_or(""); if email.is_empty() { return Err(bad("userName required")); }
@@ -2047,6 +2174,7 @@ async fn scim_create_user(State(st): State<S>, h: HeaderMap, Query(q): Query<Has
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(nid), json!(email.to_lowercase()), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|_| bad("user exists"))?;
     st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(org), json!(nid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id":nid,"userName":email,"active":true,"temp_password":pw}))) }
+#[cfg(feature = "scim")]
 async fn scim_list_users(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res {
     let org = scim_org(&st, &h, &q).await?;
     let (start, count) = scim_page(&q); let filter = scim_eq_filter(&q);
@@ -2319,6 +2447,7 @@ async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
 async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::OrgOidc)?;
     // Per-workspace SSO is configured by that workspace's admins, so it is not
     // governed by the instance-wide sign-in method switch.
     let issuer = meta_get(&st, &format!("oidc_issuer:{}", oid)).await; let client_id = meta_get(&st, &format!("oidc_client_id:{}", oid)).await; let redirect_uri = meta_get(&st, &format!("oidc_redirect_uri:{}", oid)).await;
@@ -2385,8 +2514,9 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     Ok((hdr, axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))).into_response()) }
 
 // ---------- SAML 2.0 service provider ----------
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 struct SamlReplayCache { st: S }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 impl ReplayCache for SamlReplayCache {
     fn check_and_store(&mut self, key: ReplayKey, expires_at: SystemTime) -> Result<(), SamlError> {
         let cache_key = key.cache_key();
@@ -2410,20 +2540,23 @@ impl ReplayCache for SamlReplayCache {
             Ok(_) => Ok(()),
             Err(_) => Err(SamlError::ReplayDetected { key: cache_key }),
         } } }
-#[cfg(target_arch = "wasm32")]
-impl ReplayCache for SamlReplayCache {
-    fn check_and_store(&mut self, key: ReplayKey, expires_at: SystemTime) -> Result<(), SamlError> {
-        let cache_key = key.cache_key();
-        let expires = expires_at.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_else(|_| now() + 600);
-        self.st.db.exec_sync("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(&cache_key), json!(expires)])
-            .map(|_| ()).map_err(|_| SamlError::ReplayDetected { key: cache_key })
-    }
-}
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_config_row(st: &S, org: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(org)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "SAML is not configured for this organisation")) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 fn saml_sp_entity(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/metadata", base.trim_end_matches('/'), org) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 fn saml_acs_url(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/acs", base.trim_end_matches('/'), org) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
+    let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| e.to_string())?.to_string();
+    let kp = rcgen::KeyPair::from_pem(&pem).map_err(|e| e.to_string())?;
+    let cert = ca_params(cn, false).self_signed(&kp).map_err(|e| e.to_string())?;
+    Ok((pem, cert.pem())) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsigned: bool) -> Result<IdpDescriptor, String> {
     let entity = EntityId::try_new(idp_entity).map_err(|e| e.to_string())?;
     if !trusted_cert.trim().is_empty() {
@@ -2432,6 +2565,7 @@ fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsign
     } else if allow_unsigned {
         IdpDescriptor::from_metadata_xml_for(entity, xml, MetadataTrustPolicy::UnsignedForCompatibility).map_err(|e| e.to_string())
     } else { Err("SAML metadata must be signed by metadata_trusted_cert, or set allow_unsigned_metadata".into()) } }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, String> {
     let key_pem = oc::decrypt_symmetric(&st.master(), &db::s(cfg,"sp_key_enc")).map_err(|e| e.to_string())?;
     let creds = Credentials {
@@ -2443,9 +2577,22 @@ fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, 
         .credentials(creds)
         .validation(SpValidationPolicy::strict())
         .build().map_err(|e| e.to_string()) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid, &uid).await?;
-    let cfg = saml_config_row(&st, &oid).await?; let base = issuer(&st, &h);
+    st.check_admin(&oid, &uid).await?; st.require_enterprise(edition::Feature::OrgSso)?; st.require_feature(&oid, "saml").await?;
+    let base = issuer(&st, &h);
+    let Some(cfg) = st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))? else {
+        return Ok(j(json!({
+            "configured": false,
+            "idp_entity_id": "",
+            "metadata_xml": "",
+            "sp_metadata_url": saml_sp_entity(&base, &oid),
+            "acs_url": saml_acs_url(&base, &oid),
+            "allow_unsigned_metadata": false,
+            "metadata_trusted_cert_set": false,
+            "auto_provision": false,
+            "allowed_domains": "",
+        }))); };
     Ok(j(json!({
         "configured": true,
         "idp_entity_id": db::s(&cfg,"idp_entity_id"),
@@ -2457,8 +2604,11 @@ async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         "auto_provision": db::n(&cfg,"auto_provision") == 1,
         "allowed_domains": db::s(&cfg,"allowed_domains"),
     }))) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
+    st.require_feature(&oid, "saml").await?;
+    st.require_enterprise(edition::Feature::OrgSso)?;
     let idp_entity_id = body.get("idp_entity_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if idp_entity_id.is_empty() { return Err(bad("idp_entity_id is required")); }
     let mut xml = body.get("metadata_xml").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2480,7 +2630,7 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let (key_enc, cert_pem) = match existing {
         Some(ref row) => (db::s(row,"sp_key_enc"), db::s(row,"sp_cert_pem")),
         None => {
-            let (key_pem, cert_pem) = crate::pki::saml_signing_keypair(&format!("openwarp-saml-{}", oid)).map_err(|e| bad(&e))?;
+            let (key_pem, cert_pem) = saml_signing_keypair(&format!("openwarp-saml-{}", oid)).map_err(|e| bad(&e))?;
             (oc::encrypt_symmetric(&st.master(), key_pem.as_bytes()), cert_pem)
         }
     };
@@ -2493,13 +2643,21 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     }
     st.audit(&oid, "", "", &uid, "saml.configure", &idp_entity_id).await;
     Ok(j(json!({"ok": true, "sp_metadata_url": saml_sp_entity(&issuer(&st,&h), &oid)}))) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
+    if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let sp = match saml_sp_config(&st, &issuer(&st,&h), &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
     let mut resp = sp.metadata_xml().to_string().into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/samlmetadata+xml"));
     resp }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
+    if let Err(e) = st.require_enterprise(edition::Feature::OrgSso) { return e.into_response(); }
+    // This endpoint is reached by a browser navigation, so a workspace without
+    // the grant gets the sign-in screen back with a readable reason rather
+    // than a JSON error body.
+    if !st.feature_granted(&oid, "saml").await { return axum::response::Redirect::temporary("/#error=saml_not_enabled").into_response(); }
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let base = issuer(&st, &h);
     let sp = match saml_sp_config(&st, &base, &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
@@ -2517,6 +2675,7 @@ async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) 
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]).await;
     if let Err(e) = st.db.exec("INSERT INTO saml_pending(state,org_id,snapshot,created_at) VALUES(?,?,?,?)", &[json!(&state), json!(&oid), json!(&snapshot), json!(now())]).await { return bad(&e).into_response(); }
     axum::response::Redirect::temporary(&url).into_response() }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
     if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).await.map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
@@ -2554,7 +2713,9 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     claim_instance_owner(st, &uid).await;
     st.audit(org, "", "", &uid, "auth.saml_provision", &format!("{} {}", email, name_id)).await;
     Ok(uid) }
+#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
+    if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
     let pending_row = match st.db.one("SELECT * FROM saml_pending WHERE org_id=? AND state=?", &[json!(&oid), json!(form.get("RelayState").cloned().unwrap_or_default())]).await { Ok(Some(r)) => r, _ => return bad("SAML request is missing, expired, or already used").into_response() };
     if db::n(&pending_row,"created_at") + 600 < now() { return bad("SAML request expired").into_response(); }
     let snapshot: Value = match serde_json::from_str(&db::s(&pending_row,"snapshot")) { Ok(v) => v, Err(_) => return bad("SAML pending request is corrupt").into_response() };
@@ -2618,6 +2779,8 @@ fn ldap_config_from_row(st: &S, row: &Row) -> Result<ldap::DirectoryConfig, (Sta
 #[cfg(feature = "ldap")]
 async fn get_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    st.require_feature(&oid, "ldap").await?;
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     let Some(row) = ldap_row(&st, &oid).await? else { return Ok(j(json!({"configured": false}))) };
     Ok(j(json!({
         "configured": !db::s(&row, "url").is_empty(),
@@ -2638,6 +2801,8 @@ fn ldap_field(body: &Value, row: Option<&Row>, key: &str) -> String {
 #[cfg(feature = "ldap")]
 async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    st.require_feature(&oid, "ldap").await?;
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     let existing = ldap_row(&st, &oid).await?;
     let url = ldap_field(&body, existing.as_ref(), "url");
     if !ldap::url_ok(&url) { return Err(bad("LDAP URL must be ldaps:// (TLS is required); ldap:// and STARTTLS are not accepted")); }
@@ -2714,6 +2879,7 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
 #[cfg(feature = "ldap")]
 async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
+    st.require_feature(&oid, "ldap").await?;
     st.db.exec("DELETE FROM ldap_configs WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
     let _ = st.db.exec("DELETE FROM ldap_subjects WHERE org_id=?", &[json!(&oid)]).await;
     st.audit(&oid, "", "", &uid, "ldap.delete", "").await;
@@ -2722,7 +2888,9 @@ async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<S
 #[derive(Deserialize)] struct LdapLoginReq { org_id: String, username: String, password: String }
 #[cfg(feature = "ldap")]
 async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<LdapLoginReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    st.require_enterprise(edition::Feature::DirectorySync)?;
     let org = r.org_id.trim().to_string();
+    if !st.feature_granted(&org, "ldap").await { return Err(err(StatusCode::FORBIDDEN, "Directory sign-in is not enabled for this workspace")); }
     let username = r.username.trim().to_string();
     // Two budgets: one per account and one per address, so spraying many names
     // from one host is limited even when each name is tried only once.
@@ -3357,6 +3525,10 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
 async fn auth_providers(State(st): State<S>) -> Res {
     let mut out = auth_settings(&st).await;
     out["ldap"] = json!(cfg!(feature = "ldap"));
+    // Whether the binary can do SAML at all. The sign-in button stays visible
+    // when this is true, even for a workspace without the grant, so the click
+    // can explain itself.
+    out["saml"] = json!(cfg!(feature = "saml"));
     out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
     out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
     out["region"] = json!(region());
@@ -3490,7 +3662,47 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     out["linkedin"] = json!(social_enabled("linkedin"));
     out["workos"] = json!(social_enabled("workos"));
     out["oidc"] = json!(social_enabled("oidc"));
+    out["features"] = json!(crate::features::compiled_names());
     Ok(j(out)) }
+async fn edition_info(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
+    let mut status = st.edition().status();
+    // The customer and expiry are commercial details; other members only need
+    // to know which plan is active.
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) {
+        if let Some(map) = status.as_object_mut() { map.remove("customer"); map.remove("expires_at"); } }
+    Ok(j(status)) }
+/// Instance-owner view: which build features exist and which workspace holds
+/// a grant. The console renders its feature matrix from this.
+async fn list_feature_grants(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can inspect feature grants")); }
+    let rows = st.db.query("SELECT o.id AS org_id, o.name AS name, COALESCE(g.features,'') AS features FROM orgs o LEFT JOIN feature_grants g ON g.org_id=o.id ORDER BY o.name", &[]).await.map_err(|e| bad(&e))?;
+    let mut grants = Vec::new();
+    for r in &rows {
+        let raw = db::s(r, "features");
+        let names: Vec<&str> = raw.split_whitespace().collect();
+        grants.push(json!({"org_id": db::s(r, "org_id"), "name": db::s(r, "name"), "features": crate::features::normalize(names)}));
+    }
+    Ok(j(json!({"compiled": crate::features::compiled_names(), "grants": grants}))) }
+async fn put_feature_grants(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change feature grants")); }
+    let org = body.get("org").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if org.is_empty() { return Err(bad("org is required")); }
+    st.db.one("SELECT id FROM orgs WHERE id=?", &[json!(&org)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "workspace not found"))?;
+    let list = body.get("features").and_then(|v| v.as_array()).ok_or_else(|| bad("features must be an array"))?;
+    let mut names = Vec::new();
+    for v in list { names.push(v.as_str().ok_or_else(|| bad("features must contain strings"))?.to_string()); }
+    st.set_feature_grants(&org, &names, &uid).await?;
+    let saved = st.feature_grants(&org).await;
+    st.audit(&org, "", "", &uid, "instance.features", &saved.join(" ")).await;
+    Ok(j(json!({"org_id": org, "features": saved}))) }
+/// Workspace view for the console: what this workspace may use, so settings
+/// cards for ungranted surfaces stay hidden.
+async fn org_features(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
+    let uid = st.token_user(&h).await?;
+    st.require_org(&oid, &uid).await?;
+    Ok(j(json!({"compiled": crate::features::compiled_names(), "granted": st.feature_grants(&oid).await}))) }
 async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
@@ -3768,6 +3980,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let _ai_guard = st.ai_credentials.lock().await;
     let old = st.master();
     let ai_updates = crate::ai::rewrap(&st, &old, &new).await?;
+    #[cfg(feature = "transit")]
     let transit_root = transit::root(&st, &old).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
@@ -3828,7 +4041,10 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     for r in ldap { let plain=oc::decrypt_symmetric(&old,&db::s(&r,"bind_password_enc")).map_err(|_| bad("LDAP password unavailable; refusing root rotation"))?; ldap_updates.push((db::s(&r,"org_id"),oc::encrypt_symmetric(&new,&plain))); }
     let transit_updates = transit_compat::rewrap_master(&st, &old, &new).await?;
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
+    #[cfg(feature = "transit")]
     let mut statements = transit::rotation(&st, &old, &new, &transit_root).await?;
+    #[cfg(not(feature = "transit"))]
+    let mut statements: Vec<(String, Vec<Value>, Option<u64>)> = Vec::new();
     for (sql, params) in ai_updates { statements.push((sql, params, Some(1))); }
     for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped),json!(id)], Some(1))); }
     for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value),json!(k)], Some(1))); }
@@ -3868,17 +4084,21 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 
 // ---------- SCIM groups + user lifecycle ----------
+#[cfg(feature = "scim")]
 async fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
     let members = st.db.query("SELECT user_id FROM team_members WHERE team_id=?", &[json!(tid)]).await.unwrap_or_default();
     json!({"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"], "id": tid, "displayName": db::s(row,"name"), "members": members.iter().map(|m| json!({"value": db::s(m,"user_id"), "$ref": format!("/scim/v2/Users/{}", db::s(m,"user_id"))})).collect::<Vec<_>>()}) }
+#[cfg(feature = "scim")]
 async fn scim_replace_members(st: &S, org: &str, tid: &str, body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
     st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?;
     for m in body.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default() { if let Some(uid) = m.get("value").and_then(|v| v.as_str()) { if scim_member(st, org, uid).await { let _ = st.db.exec("INSERT INTO team_members(team_id,user_id) VALUES(?,?)", &[json!(tid), json!(uid)]).await; } } } Ok(()) }
+#[cfg(feature = "scim")]
 async fn scim_create_group(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res {
     let org = scim_org(&st, &h, &q).await?;
     let name = body.get("displayName").and_then(|v| v.as_str()).unwrap_or(""); if name.is_empty() { return Err(bad("displayName required")); }
     let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(org), json!(name)]).await.map_err(|e| bad(&e))?;
     scim_replace_members(&st, &org, &tid, &body).await?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.unwrap(); Ok(j(scim_group_json(&st,&row).await)) }
+#[cfg(feature = "scim")]
 async fn scim_list_groups(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let rows = st.db.query("SELECT * FROM teams WHERE org_id=? ORDER BY name", &[json!(org)]).await.map_err(|e| bad(&e))?;
     let (start, count) = scim_page(&q); let filter = scim_eq_filter(&q);
@@ -3888,15 +4108,18 @@ async fn scim_list_groups(State(st): State<S>, h: HeaderMap, Query(q): Query<Has
     let total = all.len(); let page: Vec<Value> = all.into_iter().skip(start - 1).take(count).collect();
     let page_len = page.len();
     Ok(j(json!({"schemas":["urn:ietf:params:scim:api:messages:2.0:ListResponse"], "Resources": page, "totalResults": total, "startIndex": start, "itemsPerPage": page_len}))) }
+#[cfg(feature = "scim")]
 async fn scim_get_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&row,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
     Ok(j(scim_group_json(&st,&row).await)) }
+#[cfg(feature = "scim")]
 async fn scim_put_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
     if let Some(name) = body.get("displayName").and_then(|v| v.as_str()) { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(name), json!(tid)]).await.map_err(|e| bad(&e))?; }
     scim_replace_members(&st, &org, &tid, &body).await?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await)) }
+#[cfg(feature = "scim")]
 async fn scim_patch_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
@@ -3905,10 +4128,12 @@ async fn scim_patch_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<Str
         if path == "displayName" { if let Some(n) = val.as_str() { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(n), json!(tid)]).await.map_err(|e| bad(&e))?; } }
         else if path.starts_with("members") { scim_replace_members(&st, &org, &tid, &json!({"members": val})).await?; } }
     let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await)) }
+#[cfg(feature = "scim")]
 async fn scim_delete_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
     st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; st.db.exec("DELETE FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"deleted": tid}))) }
+#[cfg(feature = "scim")]
 async fn scim_put_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?; let caller = st.token_user(&h).await?; let uid = tid;
     if !scim_member(&st, &org, &uid).await { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
     if let Some(email) = body.get("userName").and_then(|v| v.as_str()) {
@@ -3919,14 +4144,17 @@ async fn scim_put_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String
             st.db.exec("UPDATE users SET email=? WHERE id=?", &[json!(email.to_lowercase()), json!(uid)]).await.map_err(|e| bad(&e))?; } }
     if let Some(active) = body.get("active").and_then(|v| v.as_bool()) { if !active { scim_deactivate(&st, &org, &uid, &caller).await?; } }
     Ok(j(json!({"id": uid, "active": body.get("active").and_then(|v| v.as_bool()).unwrap_or(true)}))) }
+#[cfg(feature = "scim")]
 async fn scim_patch_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?; let caller = st.token_user(&h).await?; let uid = tid;
     if !scim_member(&st, &org, &uid).await { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
     for op in body.get("Operations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         if op.get("path").and_then(|v| v.as_str()) == Some("active") { if let Some(a) = op.get("value").and_then(|v| v.as_bool()) { if !a { scim_deactivate(&st, &org, &uid, &caller).await?; } } } }
     Ok(j(json!({"id": uid}))) }
+#[cfg(feature = "scim")]
 async fn scim_delete_user(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?; let caller = st.token_user(&h).await?;
     if !scim_member(&st, &org, &tid).await { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
     scim_deactivate(&st, &org, &tid, &caller).await?; Ok(j(json!({"id": tid, "active": false}))) }
+#[cfg(feature = "scim")]
 async fn scim_deactivate(st: &S, org: &str, uid: &str, caller: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let target_role = st.org_role(org, uid).await.unwrap_or_default();
     if target_role == "owner" { let caller_role = st.org_role(org, caller).await.unwrap_or_default(); if caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can remove an owner")); } }
@@ -4344,6 +4572,7 @@ async fn lookup_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>
         "revoked": revoked, "renewable": !revoked && expires_at > now()}))) }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "pki")]
 fn ca_params(cn: &str, is_ca: bool) -> rcgen::CertificateParams {
     let mut p = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
     p.not_before = rcgen::date_time_ymd(2020, 1, 1);
@@ -4354,11 +4583,15 @@ fn ca_params(cn: &str, is_ca: bool) -> rcgen::CertificateParams {
     p }
 // Device certificates keep the private key on the device: enrollment takes a
 // CSR, so the server never returns or stores the device key.
+#[cfg(feature = "pki")]
 const DEVICE_SELECT: &str = "SELECT d.*,c.id AS cert_id,c.serial AS cert_serial,c.expires_at AS cert_expires_at,c.revoked AS cert_revoked,c.revoked_at AS cert_revoked_at FROM pki_devices d LEFT JOIN pki_certs c ON c.id=d.active_cert_id";
+#[cfg(feature = "pki")]
 fn valid_device_name(name: &str) -> bool { !name.is_empty() && name.len() <= 64 && !name.starts_with(['.', '-']) && !name.ends_with(['.', '-']) && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')) }
+#[cfg(feature = "pki")]
 fn valid_dns_san(s: &str) -> bool {
     let s = s.trim_end_matches('.');
     !s.is_empty() && s.len() <= 253 && s.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) }
+#[cfg(feature = "pki")]
 fn device_sans(body: &Value) -> Result<Vec<String>, (StatusCode, Json<Value>)> {
     let Some(arr) = body.get("sans") else { return Ok(Vec::new()); };
     let arr = arr.as_array().ok_or_else(|| bad("sans must be an array of DNS names or IP addresses"))?;
@@ -4371,23 +4604,30 @@ fn device_sans(body: &Value) -> Result<Vec<String>, (StatusCode, Json<Value>)> {
             else { return Err(bad(&format!("invalid SAN {:?}: must be a DNS name or IP address", raw))); };
         if !out.iter().any(|x| x.eq_ignore_ascii_case(&value)) { out.push(value); } }
     Ok(out) }
+#[cfg(feature = "pki")]
 fn device_json(r: &Row) -> Value {
     let active = if db::s(r, "cert_id").is_empty() { Value::Null } else {
         json!({"id": db::s(r,"cert_id"), "serial": db::s(r,"cert_serial"), "expires_at": db::n(r,"cert_expires_at"), "revoked": db::n(r,"cert_revoked") == 1, "revoked_at": db::n(r,"cert_revoked_at")}) };
     json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "ca_id": db::s(r,"ca_id"), "app_id": db::s(r,"app_id"), "env_id": db::s(r,"env_id"), "group_id": db::s(r,"group_id"), "name": db::s(r,"name"), "model": db::s(r,"model"), "hardware_serial": db::s(r,"hardware_serial"), "tags": db::s(r,"tags"), "sans": db::s(r,"sans").split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(), "cert_days": db::n(r,"cert_days"), "attested": db::n(r,"attested") == 1, "active_cert_id": db::s(r,"active_cert_id"), "created_at": db::n(r,"created_at"), "updated_at": db::n(r,"updated_at"), "active_cert": active}) }
+#[cfg(feature = "pki")]
 fn group_json(r: &Row) -> Value {
     json!({"id": db::s(r,"id"), "org_id": db::s(r,"org_id"), "ca_id": db::s(r,"ca_id"), "name": db::s(r,"name"), "env_id": db::s(r,"env_id"), "sans": db::s(r,"sans").split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(), "cert_days": db::n(r,"cert_days"), "tags": db::s(r,"tags"), "device_count": db::n(r,"device_count"), "created_at": db::n(r,"created_at"), "updated_at": db::n(r,"updated_at")}) }
+#[cfg(feature = "pki")]
 fn csv_field(v: &str) -> String {
     let formula = v.chars().next().map(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r')).unwrap_or(false);
     let safe = if formula { format!("'{}", v) } else { v.to_string() };
     if safe.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r')) { format!("\"{}\"", safe.replace('"', "\"\"")) } else { safe } }
+#[cfg(feature = "pki")]
 async fn pki_env_access(st: &S, row: &Row, uid: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let env = db::s(row,"env_id"); if !env.is_empty() { st.require_env(&env,uid).await?; } Ok(())
 }
+#[cfg(feature = "pki")]
 async fn load_device_opt(st: &S, did: &str) -> Result<Option<Row>, (StatusCode, Json<Value>)> {
     st.db.one(&format!("{} WHERE d.id=?", DEVICE_SELECT), &[json!(did)]).await.map_err(|e| bad(&e)) }
+#[cfg(feature = "pki")]
 async fn load_device(st: &S, did: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     load_device_opt(st, did).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "device not found")) }
+#[cfg(feature = "pki")]
 async fn resolve_device_scope(st: &S, org: &str, uid: &str, app_id: String, env_id: String) -> Result<(String, String), (StatusCode, Json<Value>)> {
     if !env_id.is_empty() {
         let (eorg, eapp) = st.env_org_app(&env_id).await.map_err(|_| err(StatusCode::NOT_FOUND, "environment not found"))?;
@@ -4400,9 +4640,13 @@ async fn resolve_device_scope(st: &S, org: &str, uid: &str, app_id: String, env_
         if db::s(&row, "org_id") != org { return Err(err(StatusCode::NOT_FOUND, "app not found")); }
         Ok((app_id, env_id))
     } else { Ok((app_id, env_id)) } }
+#[cfg(feature = "pki")]
 fn body_str(body: &Value, key: &str) -> Option<String> { body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()) }
+#[cfg(feature = "pki")]
 fn device_conflict(e: String) -> (StatusCode, Json<Value>) { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a device with this name already exists for the CA") } else { bad(&e) } }
+#[cfg(feature = "pki")]
 fn group_conflict(e: String) -> (StatusCode, Json<Value>) { let l = e.to_lowercase(); if l.contains("unique") || l.contains("duplicate") { err(StatusCode::CONFLICT, "a group with this name already exists for the CA") } else { bad(&e) } }
+#[cfg(feature = "pki")]
 async fn insert_device(st: &S, org: &str, uid: &str, caid: &str, body: &Value, scoped: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     let name = body_str(body, "name").unwrap_or_default();
     if !valid_device_name(&name) { return Err(bad("name must be 1-64 characters of A-Z, a-z, 0-9, dot, underscore, colon or hyphen")); }
@@ -4429,6 +4673,7 @@ async fn insert_device(st: &S, org: &str, uid: &str, caid: &str, body: &Value, s
         st.db.tx_locked("SELECT env_id FROM pki_groups WHERE id=?", &[json!(&group_id)], |r| db::s(r,"env_id").is_empty() || db::s(r,"env_id") == env_id, &[(insert_sql, params)], &[(0, 1)]).await
             .map_err(|e| if e == "lock condition failed" { err(StatusCode::CONFLICT, "group changed or was removed; retry") } else { device_conflict(e) })?; }
     st.db.one(&format!("{} WHERE d.id=?", DEVICE_SELECT), &[json!(&did)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("device not found")) }
+#[cfg(feature = "pki")]
 async fn insert_enrollment(st: &S, did: &str, row: &Row, ttl: i64, revoke_previous: bool, uid: &str) -> Result<(String, i64, String), (StatusCode, Json<Value>)> {
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(db::s(row,"ca_id"))]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "CA not found"))?;
     if ca_revoked(st,&ca).await { return Err(bad("CA is revoked")); }
@@ -4438,8 +4683,9 @@ async fn insert_enrollment(st: &S, did: &str, row: &Row, ttl: i64, revoke_previo
     st.db.exec("INSERT INTO pki_enrollments(id,device_id,token_hash,expires_at,used_at,created_by,created_at,enroll_epoch,revoke_previous,nonce) VALUES(?,?,?,?,0,?,?,?,?,?)",
         &[json!(&eid), json!(did), json!(oc::hash_token(&code)), json!(expires), json!(uid), json!(t), json!(db::n(row,"enroll_epoch")), json!(if revoke_previous {1} else {0}), json!(&nonce)]).await.map_err(|e| bad(&e))?;
     Ok((code, expires, nonce)) }
+#[cfg(feature = "pki")]
 async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid,&uid).await?;
+    st.check_admin(&oid,&uid).await?; st.require_feature(&oid,"pki").await?;
     let name = body_str(&body,"name").unwrap_or_else(|| "OpenWarp CA".to_string());
     let parent_id = body_str(&body,"parent_id").unwrap_or_default();
     let parent = if parent_id.is_empty() { None } else {
@@ -4460,6 +4706,7 @@ async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, J
         st.db.tx_locked("SELECT revoked FROM pki_cas WHERE id=?", &[json!(&parent_id)], |r| db::n(r,"revoked") == 0, &[(insert_sql, params)], &[(0, 1)]).await
             .map_err(|e| if e == "lock condition failed" { bad("parent CA is revoked or missing") } else { bad(&e) })?; }
     Ok(j(json!({"id": cid, "certificate": issued.certificate_pem, "kind": kind, "parent_id": parent_id}))) }
+#[cfg(feature = "pki")]
 async fn ca_chain(st: &S, ca: &Row) -> Vec<String> {
     let mut out = vec![db::s(ca,"cert_pem")]; let mut parent_id = db::s(ca,"parent_id");
     for _ in 0..3 {
@@ -4467,6 +4714,7 @@ async fn ca_chain(st: &S, ca: &Row) -> Vec<String> {
         let Some(p) = st.db.one("SELECT cert_pem,parent_id FROM pki_cas WHERE id=?", &[json!(&parent_id)]).await.ok().flatten() else { break; };
         out.push(db::s(&p,"cert_pem")); parent_id = db::s(&p,"parent_id"); }
     out }
+#[cfg(feature = "pki")]
 async fn ca_revoked(st: &S, ca: &Row) -> bool {
     if !ca_live(ca) { return true; }
     let parent_id = db::s(ca,"parent_id");
@@ -4475,10 +4723,12 @@ async fn ca_revoked(st: &S, ca: &Row) -> bool {
     match st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=? AND org_id=?", &[json!(&parent_id), json!(db::s(ca,"org_id"))]).await {
         Ok(Some(p)) => !ca_live(&p) || db::s(&p,"ca_kind") != "root" || !db::s(&p,"parent_id").is_empty(),
         _ => true } }
+#[cfg(feature = "pki")]
 fn ca_live(ca: &Row) -> bool {
     if db::n(ca,"revoked") != 0 || db::s(ca,"kind") != "x509" { return false; }
     crate::pki::certificate_live(&db::s(ca,"cert_pem")) }
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "pki")]
 fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair), (StatusCode, Json<Value>)> {
     if db::s(ca,"kind") != "x509" { return Err(bad("not an X.509 CA")); }
     let pem = oc::decrypt_symmetric(&st.master(), &db::s(ca,"key_enc")).map_err(|e| bad(&e))?;
@@ -4487,9 +4737,12 @@ fn load_issuer(st: &S, ca: &Row) -> Result<(rcgen::Certificate, rcgen::KeyPair),
     if let Some(serial) = hex_decode(&db::s(ca,"serial")) { params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial)); }
     let cert = params.self_signed(&kp).map_err(|e| bad(&e.to_string()))?;
     Ok((cert, kp)) }
+#[cfg(feature = "pki")]
+#[cfg(feature = "pki")]
 async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     st.check_admin(&db::s(&ca,"org_id"), &uid).await?;
+    st.require_feature(&db::s(&ca,"org_id"), "pki").await?;
     if db::s(&ca,"kind") != "x509" { return Err(bad("CA is not an X.509 CA")); }
     if ca_revoked(&st,&ca).await { return Err(bad("CA is revoked")); }
     if db::n(&ca,"attest_required") == 1 || !db::s(&ca,"hook_url").is_empty() { return Err(err(StatusCode::FORBIDDEN,"CA policy requires CSR issuance")); }
@@ -4532,6 +4785,8 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     if !device_id.is_empty() { st.audit(&db::s(&ca,"org_id"), "", "", &uid, "pki.issue.device", &format!("{} {}", device_id, serial)).await; }
     Ok(j(json!({"id": cert_id, "certificate": issued.certificate_pem, "private_key": issued.private_key_pem, "ca_certificate": db::s(&ca,"cert_pem"), "ca_chain": ca_chain(&st,&ca).await, "device_id": device_id, "expires_at": expires}))) }
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "pki")]
+#[cfg(feature = "pki")]
 async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     let cert_der = match keystore_ocsp::pem::decode("CERTIFICATE", &db::s(&ca,"cert_pem")) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
@@ -4557,6 +4812,8 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     let mut resp = response.to_der().into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/ocsp-response"));
     resp }
+#[cfg(feature = "pki")]
+#[cfg(feature = "pki")]
 async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id,kind FROM pki_cas WHERE id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); let role = st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
@@ -4565,6 +4822,7 @@ async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>)
     // still see that history; anyone narrower sees only certificates whose
     // device (and therefore environment) is still present and accessible.
     let admin = st.role_privileged(&org, &role).await;
+    st.require_feature(&db::s(&ca,"org_id"), "pki").await?;
     let rows = st.db.query("SELECT id,ca_id,cn,serial,revoked,revoked_at,expires_at,created_at,device_id,issued_via FROM pki_certs WHERE ca_id=?", &[json!(caid)]).await.map_err(|e| bad(&e))?;
     let mut visible=Vec::new(); for row in rows { let did=db::s(&row,"device_id"); if !did.is_empty() {
         match load_device_opt(&st,&did).await? {
@@ -4572,6 +4830,8 @@ async fn list_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>)
             None => { if !admin { continue; } } }
     } visible.push(db::obj(&row)); }
     Ok(j(json!(visible))) }
+#[cfg(feature = "pki")]
+#[cfg(feature = "pki")]
 async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT ca_id,device_id FROM pki_certs WHERE id=?", &[json!(cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"cert not found"))?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=? AND kind='x509'", &[json!(db::s(&row,"ca_id"))]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.check_perm(&db::s(&ca,"org_id"),&uid,"pki:write").await?;
@@ -4581,6 +4841,8 @@ async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>)
     if !did.is_empty() { let _ = st.db.exec("UPDATE pki_devices SET active_cert_id='',updated_at=? WHERE id=? AND active_cert_id=?", &[json!(t), json!(&did), json!(cid)]).await; }
     Ok(j(json!({"revoked": cid}))) }
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "pki")]
+#[cfg(feature = "pki")]
 async fn ca_crl(State(st): State<S>, Path(caid): Path<String>) -> Response {
     // A CRL is a signed public artifact; brokers fetch it without a credential.
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
@@ -4614,10 +4876,12 @@ async fn ca_crl(State(st): State<S>, Path(caid): Path<String>) -> Response {
         },
         Err(e) => bad(&e.to_string()).into_response(),
     } }
+#[cfg(feature = "pki")]
 async fn list_cas(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     st.require_org(&oid,&uid).await?; st.check_perm(&oid,&uid,"pki:read").await?;
     let rows = st.db.query("SELECT id,name,cert_pem,serial,created_at,parent_id,ca_kind,revoked,revoked_at,hook_url,attest_issuer,attest_required FROM pki_cas WHERE org_id=? AND kind='x509' ORDER BY created_at", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(|r| json!({"id": db::s(r,"id"), "name": db::s(r,"name"), "certificate": db::s(r,"cert_pem"), "serial": db::s(r,"serial"), "created_at": db::n(r,"created_at"), "parent_id": db::s(r,"parent_id"), "kind": db::s(r,"ca_kind"), "revoked": db::n(r,"revoked") == 1, "revoked_at": db::n(r,"revoked_at"), "hook_set": !db::s(r,"hook_url").is_empty(), "attest_issuer": db::s(r,"attest_issuer"), "attest_required": db::n(r,"attest_required") == 1})).collect::<Vec<_>>()))) }
+#[cfg(feature = "pki")]
 async fn create_device(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
@@ -4625,6 +4889,7 @@ async fn create_device(State(st): State<S>, h: HeaderMap, Path(caid): Path<Strin
     let row = insert_device(&st, &org, &uid, &caid, &body, &scoped).await?;
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.create",&format!("{} ({})", db::s(&row,"name"), db::s(&row,"id"))).await;
     Ok(j(device_json(&row))) }
+#[cfg(feature = "pki")]
 async fn list_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
@@ -4636,10 +4901,12 @@ async fn list_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String
     }.map_err(|e| bad(&e))?;
     let mut visible = Vec::new(); for row in rows { if pki_env_access(&st,&row,&uid).await.is_ok() { visible.push(row); } } let rows = visible;
     Ok(j(json!(rows.iter().map(device_json).collect::<Vec<_>>()))) }
+#[cfg(feature = "pki")]
 async fn get_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
     let certs = st.db.query("SELECT id,cn,serial,revoked,revoked_at,expires_at,created_at,issued_via FROM pki_certs WHERE device_id=? ORDER BY created_at DESC", &[json!(&did)]).await.map_err(|e| bad(&e))?;
     let mut out = device_json(&row); out["certs"] = json!(certs.iter().map(db::obj).collect::<Vec<_>>()); Ok(j(out)) }
+#[cfg(feature = "pki")]
 async fn update_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     let scoped = env_scope_of(&st, &h).await?;
@@ -4666,6 +4933,7 @@ async fn update_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
             .map_err(|e| if e == "lock condition failed" { err(StatusCode::CONFLICT, "group changed or was removed; retry") } else { device_conflict(e) })?; }
     st.audit(&org,&app_id,&env_id,&uid,"pki.device.update",&format!("{} ({})", name, did)).await;
     let fresh = load_device(&st,&did).await?; Ok(j(device_json(&fresh))) }
+#[cfg(feature = "pki")]
 async fn revoke_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     let t = now();
@@ -4678,6 +4946,7 @@ async fn revoke_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
     let n = counts.get(2).copied().unwrap_or(0);
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.revoke",&format!("{} ({})", db::s(&row,"name"), did)).await;
     Ok(j(json!({"revoked": n}))) }
+#[cfg(feature = "pki")]
 async fn delete_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     let t = now();
@@ -4692,6 +4961,7 @@ async fn delete_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
     let revoked = counts.get(2).copied().unwrap_or(0);
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.delete",&format!("{} ({})", db::s(&row,"name"), did)).await;
     Ok(j(json!({"deleted": true, "revoked": revoked}))) }
+#[cfg(feature = "pki")]
 async fn create_enrollment(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     if db::n(&row,"deleting") == 1 { return Err(err(StatusCode::NOT_FOUND, "device not found")); }
@@ -4700,6 +4970,7 @@ async fn create_enrollment(State(st): State<S>, h: HeaderMap, Path(did): Path<St
     let (code, expires, nonce) = insert_enrollment(&st,&did,&row,ttl,revoke_previous,&uid).await?;
     st.audit(&org,&db::s(&row,"app_id"),&db::s(&row,"env_id"),&uid,"pki.device.enrollment",&format!("{} ({}) expires {}", db::s(&row,"name"), did, expires)).await;
     Ok(j(json!({"code": code, "expires_at": expires, "nonce": nonce, "revoke_previous": revoke_previous}))) }
+#[cfg(feature = "pki")]
 async fn renew_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
     if db::n(&row,"deleting") == 1 { return Err(err(StatusCode::NOT_FOUND, "device not found")); }
@@ -4711,18 +4982,23 @@ async fn renew_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>
 // project lockdown flags. FOR UPDATE on these joins serialises issuance with
 // an emergency transition, so a lockdown committed during the enrollment hook
 // cannot be followed by a certificate.
+#[cfg(feature = "pki")]
 const PKI_ISSUER_LOCK: &str = "SELECT c.*,p.revoked AS parent_revoked,p.cert_pem AS parent_cert,p.parent_id AS ancestor_id,p.org_id AS parent_org,p.ca_kind AS parent_kind,o.emergency_locked AS org_locked FROM pki_cas c JOIN pki_cas p ON p.id=CASE WHEN c.parent_id='' THEN c.id ELSE c.parent_id END JOIN orgs o ON o.id=c.org_id WHERE c.id=? AND c.kind='x509' AND p.kind='x509'";
+#[cfg(feature = "pki")]
 fn pki_issuer_lock(app_id: &str) -> String {
     if app_id.is_empty() { return PKI_ISSUER_LOCK.to_string(); }
     PKI_ISSUER_LOCK.replace(",o.emergency_locked AS org_locked FROM", ",o.emergency_locked AS org_locked,a.emergency_locked AS app_locked FROM")
         .replace(" JOIN orgs o ON o.id=c.org_id WHERE", " JOIN orgs o ON o.id=c.org_id JOIN apps a ON a.id=? AND a.org_id=c.org_id WHERE") }
+#[cfg(feature = "pki")]
 fn pki_issuer_params(app_id: &str, caid: &str) -> Vec<Value> {
     if app_id.is_empty() { vec![json!(caid)] } else { vec![json!(app_id), json!(caid)] } }
+#[cfg(feature = "pki")]
 fn issuer_unchanged(r: &Row, ca: &Row) -> bool {
     db::n(r,"org_locked") == 0 && db::n(r,"app_locked") == 0
         && ca_live(r) && db::n(r,"parent_revoked") == 0 && db::s(r,"ancestor_id").is_empty() && db::s(r,"parent_kind") == "root" && db::s(r,"parent_org") == db::s(r,"org_id")
         && crate::pki::certificate_live(&db::s(r,"parent_cert"))
         && ["parent_id","ca_kind","kind","cert_pem","hook_url","hook_secret_enc","attest_mode","attest_issuer","attest_key_pem","attest_alg"].iter().all(|k| db::s(r,k) == db::s(ca,k)) && db::n(r,"attest_required") == db::n(ca,"attest_required") }
+#[cfg(feature = "pki")]
 fn device_attestation(ca: &Row, dev: &Row, nonce: &str, csr: &str, body: &Value) -> Result<String, (StatusCode, Json<Value>)> {
     let required = db::n(ca,"attest_required") == 1;
     if db::s(ca,"attest_mode") == "tpm2" {
@@ -4737,11 +5013,13 @@ fn device_attestation(ca: &Row, dev: &Row, nonce: &str, csr: &str, body: &Value)
     if token.is_empty() { return if required { Err(err(StatusCode::FORBIDDEN,"attestation is required for this CA")) } else { Ok(String::new()) }; }
     if db::s(ca,"attest_key_pem").is_empty() { return Err(bad("attestation is not configured for this CA")); }
     verify_attestation(ca,&db::s(dev,"id"),nonce,csr,token).map(|v| v.to_string()) }
+#[cfg(feature = "pki")]
 async fn get_device_tpm(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; let dev = load_device(&st,&did).await?; pki_env_access(&st,&dev,&uid).await?;
     if !matches!(st.require_org(&db::s(&dev,"org_id"),&uid).await?.as_str(),"owner"|"admin") { return Err(err(StatusCode::FORBIDDEN,"workspace owner or admin required")); }
     st.check_admin(&db::s(&dev,"org_id"),&uid).await?; st.check_perm(&db::s(&dev,"org_id"),&uid,"pki:write").await?;
     Ok(j(json!({"ak_public":db::s(&dev,"tpm_ak_public"),"pcr_digest":db::s(&dev,"tpm_pcr_digest")}))) }
+#[cfg(feature = "pki")]
 async fn put_device_tpm(State(st): State<S>, h: HeaderMap, Path(did): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?; let dev = load_device(&st,&did).await?; pki_env_access(&st,&dev,&uid).await?; let org = db::s(&dev,"org_id");
     if !matches!(st.require_org(&org,&uid).await?.as_str(),"owner"|"admin") { return Err(err(StatusCode::FORBIDDEN,"workspace owner or admin required")); }
@@ -4753,6 +5031,7 @@ async fn put_device_tpm(State(st): State<S>, h: HeaderMap, Path(did): Path<Strin
     st.db.exec("UPDATE pki_devices SET tpm_ak_public=?,tpm_pcr_digest=?,enroll_epoch=enroll_epoch+1,updated_at=? WHERE id=? AND deleting=0", &[json!(pin),json!(policy),json!(now()),json!(&did)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,"","",&uid,"pki.device.tpm",&did).await;
     Ok(j(json!({"ak_public":pin,"pcr_digest":policy}))) }
+#[cfg(feature = "pki")]
 async fn enroll_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let code = body_str(&body,"code").unwrap_or_default(); let csr_pem = body.get("csr").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if code.is_empty() || code.len() > 256 { return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired enrollment code")); }
@@ -4799,10 +5078,12 @@ async fn enroll_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     Ok(j(json!({"device_id": did, "name": db::s(&row,"name"), "serial": serial, "certificate": issued.certificate_pem, "ca_certificate": db::s(&ca,"cert_pem"), "ca_chain": chain, "attested": !attestation_summary.is_empty(), "expires_at": expires}))) }
 
 
+#[cfg(feature = "pki")]
 async fn renewal_leaf(st: &S, dev: &Row) -> Result<Row, (StatusCode, Json<Value>)> {
     if db::n(dev,"deleting") != 0 { return Err(bad("device is unavailable")); }
     let cert = st.db.one("SELECT * FROM pki_certs WHERE id=? AND device_id=? AND ca_id=? AND revoked=0 AND expires_at>?", &[json!(db::s(dev,"active_cert_id")),json!(db::s(dev,"id")),json!(db::s(dev,"ca_id")),json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("active certificate is not live"))?;
     if !crate::pki::certificate_live(&db::s(&cert,"cert_pem")) { return Err(bad("active certificate is not live")); } Ok(cert) }
+#[cfg(feature = "pki")]
 async fn renewal_challenge(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let did = body_str(&body,"device_id").unwrap_or_default();
     let csr = body.get("csr").and_then(Value::as_str).unwrap_or("");
@@ -4831,6 +5112,7 @@ async fn renewal_challenge(State(st): State<S>, Json(body): Json<Value>) -> Res 
     st.db.exec("DELETE FROM pki_renew_challenges WHERE used_at>0 OR expires_at<=?", &[json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO pki_renew_challenges(id,device_id,cert_id,csr,challenge,expires_at,used_at) VALUES(?,?,?,?,?,?,0)", &[json!(&cid),json!(&did),json!(db::s(&cert,"id")),json!(csr),json!(&challenge),json!(expires)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"challenge_id":cid,"challenge":challenge,"expires_at":expires}))) }
+#[cfg(feature = "pki")]
 async fn self_renew_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let cid = body_str(&body,"challenge_id").unwrap_or_default(); let signature = body.get("signature").and_then(Value::as_str).unwrap_or("");
     if cid.len()>128 || signature.len()>8192 { return Err(bad("invalid renewal proof")); }
@@ -4871,6 +5153,7 @@ async fn self_renew_device(State(st): State<S>, Json(body): Json<Value>) -> Res 
     st.db.tx_locked(&renewal_lock,&lock_params,|r| issuer_unchanged(r,&ca),&stmts,&[(0,1),(1,1),(2,1),(3,1)]).await.map_err(|e| err(StatusCode::CONFLICT,&format!("renewal did not commit: {}",e)))?;
     st.audit(&db::s(&dev,"org_id"),&db::s(&dev,"app_id"),&db::s(&dev,"env_id"),&format!("device:{}",did),"pki.renew",&serial).await;
     Ok(j(json!({"device_id":did,"serial":serial,"certificate":issued.certificate_pem,"ca_certificate":db::s(&ca,"cert_pem"),"ca_chain":ca_chain(&st,&ca).await,"attested":!summary.is_empty(),"expires_at":expires}))) }
+#[cfg(feature = "pki")]
 async fn expiring_certs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?;
     st.require_org(&oid,&uid).await?; st.check_perm(&oid,&uid,"pki:read").await?;
     let days = q.get("days").and_then(|s| s.parse::<i64>().ok()).unwrap_or(30).clamp(1, 365);
@@ -4888,6 +5171,7 @@ async fn expiring_certs(State(st): State<S>, h: HeaderMap, Path(oid): Path<Strin
         if expires <= t + 30*86400 { c30 += 1; }
         if expires <= t + days*86400 { items.push(json!({"certificate_id": db::s(r,"cert_id"), "serial": db::s(r,"serial"), "expires_at": expires, "days_left": left, "device_id": db::s(r,"device_id"), "name": db::s(r,"name"), "env_id": db::s(r,"env_id"), "group_id": db::s(r,"group_id"), "attested": db::n(r,"attested") == 1})); } }
     Ok(j(json!({"days": days, "counts": {"7": c7, "14": c14, "30": c30}, "certificates": items}))) }
+#[cfg(feature = "pki")]
 async fn import_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
@@ -4907,6 +5191,7 @@ async fn import_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
             Err(e) => { failed += 1; results.push(json!({"name": item.get("name").cloned().unwrap_or(Value::Null), "error": e.1.0.get("error").cloned().unwrap_or(json!("failed"))})); } } }
     st.audit(&org,"","",&uid,"pki.device.import",&format!("created={} failed={}", created, failed)).await;
     Ok(j(json!({"created": created, "failed": failed, "results": results}))) }
+#[cfg(feature = "pki")]
 async fn bulk_codes(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
@@ -4924,6 +5209,7 @@ async fn bulk_codes(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
             _ => results.push(json!({"id": id, "error": "device not found"})) } }
     st.audit(&org,"","",&uid,"pki.device.codes",&format!("requested={} issued={}", ids.len(), results.iter().filter(|r| r.get("code").is_some()).count())).await;
     Ok(j(json!({"codes": results}))) }
+#[cfg(feature = "pki")]
 async fn export_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response { let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
     let ca = match st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     let org = db::s(&ca,"org_id");
@@ -4943,6 +5229,7 @@ async fn export_devices(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
     let mut resp = csv.into_response(); resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/csv; charset=utf-8"));
     resp.headers_mut().insert(axum::http::header::CONTENT_DISPOSITION, axum::http::HeaderValue::from_static("attachment; filename=\"openwarp-devices.csv\""));
     resp }
+#[cfg(feature = "pki")]
 async fn create_group(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
@@ -4961,6 +5248,7 @@ async fn create_group(State(st): State<S>, h: HeaderMap, Path(caid): Path<String
     st.audit(&org,"",&env_id,&uid,"pki.group.create",&format!("{} ({})", name, gid)).await;
     let row = st.db.one("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("group not found"))?;
     Ok(j(group_json(&row))) }
+#[cfg(feature = "pki")]
 async fn list_groups(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org,&uid,"pki:read").await?;
@@ -4978,6 +5266,7 @@ async fn list_groups(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>
         row.insert("device_count".to_string(),json!(count)); visible.push(row);
     }
     Ok(j(json!(visible.iter().map(group_json).collect::<Vec<_>>()))) }
+#[cfg(feature = "pki")]
 async fn update_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     pki_env_access(&st,&row,&uid).await?;
@@ -4998,6 +5287,7 @@ async fn update_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>
     st.audit(&org,"",&env_id,&uid,"pki.group.update",&format!("{} ({})", name, gid)).await;
     let fresh = st.db.one("SELECT g.*,(SELECT COUNT(*) FROM pki_devices d WHERE d.group_id=g.id) AS device_count FROM pki_groups g WHERE g.id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("group not found"))?;
     Ok(j(group_json(&fresh))) }
+#[cfg(feature = "pki")]
 async fn delete_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     pki_env_access(&st,&row,&uid).await?;
@@ -5014,6 +5304,7 @@ async fn delete_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>
         .map_err(|e| if e == "lock condition failed" || e.contains("affected 0 rows") { err(StatusCode::CONFLICT,"group membership changed; retry") } else { bad(&e) })?;
     st.audit(&org,"",&db::s(&row,"env_id"),&uid,"pki.group.delete",&format!("{} ({})", db::s(&row,"name"), gid)).await;
     Ok(j(json!({"deleted": true, "detached": members.len()}))) }
+#[cfg(feature = "pki")]
 async fn revoke_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM pki_groups WHERE id=?", &[json!(&gid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     pki_env_access(&st,&row,&uid).await?;
@@ -5041,6 +5332,7 @@ async fn revoke_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>
     Ok(j(json!({"devices": members.len(), "revoked": revoked}))) }
 
 
+#[cfg(feature = "pki")]
 async fn revoke_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
@@ -5055,10 +5347,12 @@ async fn revoke_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) 
     ], &[]).await.map_err(|e| if e == "lock condition failed" { err(StatusCode::NOT_FOUND, "CA not found") } else { bad(&e) })?;
     st.audit(&org,"","",&uid,"pki.ca.revoke",&format!("{} ({}) cas={} certs={}", db::s(&ca,"name"), caid, counts.first().copied().unwrap_or(0), counts.get(3).copied().unwrap_or(0))).await;
     Ok(j(json!({"revoked": true, "cas": counts.first().copied().unwrap_or(0), "certificates": counts.get(3).copied().unwrap_or(0)}))) }
+#[cfg(feature = "pki")]
 async fn get_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     st.check_admin(&db::s(&ca,"org_id"),&uid).await?;
     Ok(j(json!({"url": db::s(&ca,"hook_url"), "secret_set": !db::s(&ca,"hook_secret_enc").is_empty()}))) }
+#[cfg(feature = "pki")]
 async fn put_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
@@ -5068,6 +5362,7 @@ async fn put_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>
     st.db.exec("UPDATE pki_cas SET hook_url=?,hook_secret_enc=? WHERE id=?", &[json!(&url), json!(&secret_enc), json!(&caid)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,"","",&uid,"pki.ca.hook",&format!("{} ({})", db::s(&ca,"name"), caid)).await;
     Ok(j(json!({"url": url, "secret_set": !secret_enc.is_empty()}))) }
+#[cfg(feature = "pki")]
 async fn enrollment_hook_ok(st: &S, ca: &Row, dev: &Row, enrollment_id: &str, csr_pem: &str) -> Result<(), (StatusCode, Json<Value>)> {
     let url = db::s(ca,"hook_url"); if url.is_empty() { return Ok(()); }
     if !url_ok(&url) || !egress_allowed(&url) { return Err(err(StatusCode::BAD_GATEWAY, "enrollment policy hook is blocked by the egress policy")); }
@@ -5108,11 +5403,14 @@ async fn enrollment_hook_ok(st: &S, ca: &Row, dev: &Row, enrollment_id: &str, cs
     else { Err(err(StatusCode::FORBIDDEN, "enrollment denied by policy")) }
 }
 #[derive(serde::Deserialize, serde::Serialize)]
+#[cfg(feature = "pki")]
 struct AttestClaims { iss: String, aud: String, sub: String, exp: i64, #[serde(default)] iat: i64, nonce: String, csr_sha256: String, #[serde(default)] hardware_backed: bool, #[serde(default)] key_id: String }
+#[cfg(feature = "pki")]
 fn attest_key(ca: &Row) -> Result<jsonwebtoken::DecodingKey, (StatusCode, Json<Value>)> {
     let pem = db::s(ca,"attest_key_pem"); let alg = db::s(ca,"attest_alg");
     let key = if alg == "RS256" { jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()) } else { jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()) };
     key.map_err(|e| bad(&format!("attestation public key is invalid: {}", e))) }
+#[cfg(feature = "pki")]
 fn verify_attestation(ca: &Row, dev_id: &str, nonce: &str, csr_pem: &str, token: &str) -> Result<Value, (StatusCode, Json<Value>)> {
     let alg = if db::s(ca,"attest_alg") == "RS256" { jsonwebtoken::Algorithm::RS256 } else { jsonwebtoken::Algorithm::ES256 };
     let key = attest_key(ca)?;
@@ -5128,10 +5426,12 @@ fn verify_attestation(ca: &Row, dev_id: &str, nonce: &str, csr_pem: &str, token:
     if claims.csr_sha256.to_lowercase() != digest { return Err(err(StatusCode::FORBIDDEN, "attestation does not bind the submitted CSR")); }
     if !claims.hardware_backed { return Err(err(StatusCode::FORBIDDEN, "attestation does not assert a hardware-backed key")); }
     Ok(json!({"issuer": claims.iss, "subject": claims.sub, "key_id": claims.key_id, "iat": claims.iat, "hardware_backed": true})) }
+#[cfg(feature = "pki")]
 async fn get_ca_attestation(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     st.check_admin(&db::s(&ca,"org_id"),&uid).await?;
     Ok(j(json!({"mode": db::s(&ca,"attest_mode"), "issuer": db::s(&ca,"attest_issuer"), "algorithm": db::s(&ca,"attest_alg"), "required": db::n(&ca,"attest_required") == 1, "key_set": !db::s(&ca,"attest_key_pem").is_empty()}))) }
+#[cfg(feature = "pki")]
 async fn put_ca_attestation(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
@@ -5151,6 +5451,7 @@ async fn put_ca_attestation(State(st): State<S>, h: HeaderMap, Path(caid): Path<
     Ok(j(json!({"mode":mode,"issuer": issuer, "algorithm": alg, "required": required, "key_set": !key.is_empty()}))) }
 
 
+#[cfg(feature = "pki")]
 async fn notify_pki_expiry(st: &S, org: &str) -> Result<(u64,u64), (StatusCode, Json<Value>)> {
     let t = now(); let day = t/86400;
     let rows = st.db.query("SELECT c.expires_at,d.env_id FROM pki_certs c JOIN pki_devices d ON d.id=c.device_id WHERE d.org_id=? AND c.revoked=0 AND c.expires_at<=?", &[json!(org),json!(t+30*86400)]).await.map_err(|e| bad(&e))?;
@@ -5181,12 +5482,14 @@ async fn notify_pki_expiry(st: &S, org: &str) -> Result<(u64,u64), (StatusCode, 
         st.db.exec("UPDATE pki_expiry_deliveries SET status=? WHERE org_id=? AND user_id=? AND day=? AND status=?", &[json!(if delivered {"sent"}else{"failed"}),json!(org),json!(&uid),json!(day),json!(&claim)]).await.map_err(|e| bad(&e))?;
         if delivered { sent+=1; } else { failed+=1; } }
     Ok((sent,failed)) }
+#[cfg(feature = "pki")]
 async fn manual_pki_expiry(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?;
     if !matches!(st.require_org(&oid,&uid).await?.as_str(),"owner"|"admin") { return Err(err(StatusCode::FORBIDDEN,"workspace owner or admin required")); }
     st.check_admin(&oid,&uid).await?; st.check_perm(&oid,&uid,"pki:write").await?; st.check_perm(&oid,&uid,"pki:read").await?;
     let (sent,failed) = notify_pki_expiry(&st,&oid).await?;
     Ok(j(json!({"sent":sent,"failed":failed}))) }
+#[cfg(feature = "pki")]
 pub async fn pki_expiry_alerts(st: &S) {
     let day = now() / 86400;
     let orgs = st.db.query("SELECT id FROM orgs", &[]).await.unwrap_or_default();
@@ -5397,7 +5700,9 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
 // API and MCP audiences are separate; administration needs org:admin, not
 // secret consent. Empty PAT scopes retain their legacy full-access meaning.
 async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    #[cfg(feature = "workload-identity")]
     if let Err(e) = workload::restrict(&st, req.headers(), req.uri().path(), req.method().as_str()).await { return e.into_response(); }
+    #[cfg(feature = "transit")]
     match transit::scope(&st, req.headers(), req.uri().path(), req.method().as_str()).await {
         Ok(true) => {
             let hash = oc::hash_token(&bearer_token(req.headers()));
@@ -5588,7 +5893,7 @@ async fn mfa_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(body): Js
 
 // ---------- log streams (T10) ----------
 async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    st.check_admin(&oid,&uid).await?;
+    st.check_admin(&oid,&uid).await?; st.require_enterprise(edition::Feature::AuditStreaming)?;
     let url = body.get("url").and_then(|v|v.as_str()).unwrap_or("");
     if !url_ok(url) || !egress_allowed(url) { return Err(bad("log stream url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let secret = body.get("secret").and_then(|v|v.as_str()).unwrap_or("");
@@ -5598,7 +5903,7 @@ async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
 async fn list_streams(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let rows = st.db.query("SELECT id,org_id,name,url,created_at FROM log_streams WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn list_deliveries(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
-    let rows = st.db.query("SELECT d.id,d.stream_id,d.event,d.status,d.attempts,d.created_at FROM log_deliveries d JOIN log_streams s ON s.id=d.stream_id WHERE s.org_id=? ORDER BY d.created_at DESC LIMIT 200", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT d.id,d.stream_id,s.name AS stream_name,s.url AS stream_url,d.event,d.status,d.attempts,d.created_at FROM log_deliveries d JOIN log_streams s ON s.id=d.stream_id WHERE s.org_id=? ORDER BY d.created_at DESC LIMIT 200", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 
 // ---------- lease renew + rotation schedules (T09) ----------
 async fn renew_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
@@ -5694,6 +5999,7 @@ async fn reap_expired_leases(st: &S) {
 
 pub async fn process_rotations(st: &S) { #[cfg(not(target_arch="wasm32"))] let _guard=st.lifecycle.read().await; process_rotations_inner(st).await; }
 async fn process_rotations_inner(st: &S) {
+    #[cfg(feature = "pki")]
     if try_leader(st,"pki-expiry",&st.instance_id,3600).await { pki_expiry_alerts(st).await; }    let _ = st.db.exec("DELETE FROM instance_leases WHERE expires_at<?", &[json!(now() - 3600)]).await;
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]).await;
     let _ = st.db.exec("DELETE FROM saml_replay WHERE expires_at<?", &[json!(now() - 3600)]).await;
@@ -6289,10 +6595,11 @@ async fn metrics(State(st): State<S>, h: HeaderMap) -> Response {
 
 
 
-async fn workload_login(State(st): State<S>, h: HeaderMap, peer: PeerAddr, Json(body): Json<Value>) -> Res {
+async fn workload_login(State(st): State<S>, _h: HeaderMap, _peer: PeerAddr, Json(body): Json<Value>) -> Res {
     match (body.get("identity_id"), body.get("trust_id")) {
         (Some(_), None) => workloads::login(State(st), Json(body)).await,
-        (None, Some(_)) => workload::login(State(st), h, peer, Json(body)).await,
+        #[cfg(feature = "workload-identity")]
+        (None, Some(_)) => workload::login(State(st), _h, _peer, Json(body)).await,
         _ => Err(bad("exactly one of identity_id or trust_id is required")),
     }
 }
@@ -6323,51 +6630,69 @@ pub fn router(state: S) -> Router {
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/workspaces", put(workspaces::set_creation)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/edition", get(edition_info)).route("/api/instance/features", get(list_feature_grants).put(put_feature_grants)).route("/api/instance/signups", put(set_signups)).route("/api/instance/workspaces", put(workspaces::set_creation)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
         .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))
-        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
+        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me)).route("/api/me/sessions", get(list_sessions).delete(revoke_all_sessions)).route("/api/me/sessions/{sid}", delete(revoke_session))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org).delete(delete_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/invites", get(workspaces::list)).route("/api/orgs/{oid}/invites/{iid}", delete(workspaces::revoke)).route("/api/orgs/{oid}/invites/{iid}/resend", post(workspaces::resend))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
-        .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
+        .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/features", get(org_features)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
-        .route("/api/orgs/{oid}/identities/{iid}/workload-trust", get(workload::list).post(workload::create))
-        .route("/api/orgs/{oid}/identities/{iid}/workload-trust/{tid}", delete(workload::revoke))
-        .route("/api/orgs/{oid}/change-requests", get(change_requests::list).post(change_requests::create))
-        .route("/api/change-requests/{id}", get(change_requests::detail).put(change_requests::edit))
-        .route("/api/change-requests/{id}/{action}", post(change_requests::action))
-        .route("/api/orgs/{oid}/transit/keys", get(transit::list).post(transit::create))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/rotate", post(transit::rotate))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/{action}", post(transit::operate))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))
         .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/tags", get(list_tags)).route("/api/envs/{eid}/secrets/reuse-check", post(reuse_check)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/meta", get(e2e_meta)).route("/api/envs/{eid}/e2e/rekey", post(e2e_rekey)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets)).route("/api/envs/{eid}/scan", get(scan_env)).route("/api/envs/{eid}/meta", get(env_meta)).route("/api/envs/{eid}/wrap", post(create_wrap)).route("/api/unwrap", get(lookup_wrap).post(consume_wrap))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
         .route("/api/envs/{eid}/dynamic", get(list_leases).post(create_lease_v2)).route("/api/leases/{lid}", get(lookup_lease).delete(revoke_lease)).route("/api/leases/{lid}/renew", post(renew_lease)).route("/api/envs/{eid}/rotations", get(list_rotations).post(create_rotation)).route("/api/rotations/{rid}", delete(delete_rotation)).route("/api/envs/{eid}/rotate", post(rotate_secret)).route("/api/envs/{eid}/restore-point", post(pitr))
-        .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
+        .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/history", get(integration_history)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", get(get_override).post(set_override).delete(delete_override))
         .route("/api/secrets/{sid}/undelete", post(undelete_secret)).route("/api/secrets/{sid}/destroy", post(destroy_secret))
-        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable)).route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate)).route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable)).route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete)).route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send)).route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access)).route("/api/orgs/{oid}/pki/cas", get(list_cas).post(create_ca)).route("/api/orgs/{oid}/pki/expiring", get(expiring_certs)).route("/api/orgs/{oid}/pki/expiry-notify", post(manual_pki_expiry)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/devices", get(list_devices).post(create_device)).route("/api/pki/cas/{caid}/devices/import", post(import_devices)).route("/api/pki/cas/{caid}/devices/codes", post(bulk_codes)).route("/api/pki/cas/{caid}/devices/export", get(export_devices)).route("/api/pki/cas/{caid}/groups", get(list_groups).post(create_group)).route("/api/pki/cas/{caid}/hook", get(get_ca_hook).put(put_ca_hook)).route("/api/pki/cas/{caid}/attestation", get(get_ca_attestation).put(put_ca_attestation)).route("/api/pki/cas/{caid}/revoke", post(revoke_ca)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/devices/{did}", get(get_device).patch(update_device).delete(delete_device)).route("/api/pki/devices/{did}/revoke", post(revoke_device)).route("/api/pki/devices/{did}/renew", post(renew_device)).route("/api/pki/devices/{did}/enrollment", post(create_enrollment)).route("/api/pki/groups/{gid}", axum::routing::patch(update_group).delete(delete_group)).route("/api/pki/groups/{gid}/revoke", post(revoke_group)).route("/api/pki/enroll", post(enroll_device)).route("/api/pki/renew/challenge", post(renewal_challenge)).route("/api/pki/renew", post(self_renew_device)).route("/api/pki/devices/{did}/tpm", get(get_device_tpm).put(put_device_tpm)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert)).route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
-        .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
-        .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas))
-        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));
+        .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable)).route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate)).route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable)).route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete)).route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send)).route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access))
+        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));
     // LDAP needs raw TCP/TLS sockets, so the feature is off in a Workers build
     // and these routes do not exist there.
     #[cfg(feature = "ldap")]
     let app = app
         .route("/api/orgs/{oid}/ldap", get(get_ldap_config).put(put_ldap_config).delete(delete_ldap_config))
         .route("/api/auth/ldap", post(ldap_login));
+    #[cfg(feature = "saml")]
     let app = app
-        .route("/api/auth/step-up/start", post(step_up_start)).route("/api/auth/step-up/verify", post(step_up_verify))
+        .route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config))
+        .route("/api/auth/saml/{oid}/metadata", get(saml_metadata)).route("/api/auth/saml/{oid}/start", get(saml_start)).route("/api/auth/saml/{oid}/acs", post(saml_acs));
+    #[cfg(feature = "scim")]
+    let app = app
+        .route("/scim/v2/Users", get(scim_list_users).post(scim_create_user)).route("/scim/v2/Users/{uid}", put(scim_put_user).patch(scim_patch_user).delete(scim_delete_user))
+        .route("/scim/v2/Groups", get(scim_list_groups).post(scim_create_group)).route("/scim/v2/Groups/{tid}", get(scim_get_group).put(scim_put_group).patch(scim_patch_group).delete(scim_delete_group))
+        .route("/scim/v2/ServiceProviderConfig", get(scim_service_config)).route("/scim/v2/ResourceTypes", get(scim_resource_types)).route("/scim/v2/Schemas", get(scim_schemas));
+    #[cfg(feature = "pki")]
+    let app = app
+        .route("/api/orgs/{oid}/pki/cas", get(list_cas).post(create_ca)).route("/api/orgs/{oid}/pki/expiring", get(expiring_certs)).route("/api/orgs/{oid}/pki/expiry-notify", post(manual_pki_expiry)).route("/api/pki/cas/{caid}/issue", post(issue_cert)).route("/api/pki/cas/{caid}/certs", get(list_certs)).route("/api/pki/cas/{caid}/devices", get(list_devices).post(create_device)).route("/api/pki/cas/{caid}/devices/import", post(import_devices)).route("/api/pki/cas/{caid}/devices/codes", post(bulk_codes)).route("/api/pki/cas/{caid}/devices/export", get(export_devices)).route("/api/pki/cas/{caid}/groups", get(list_groups).post(create_group)).route("/api/pki/cas/{caid}/hook", get(get_ca_hook).put(put_ca_hook)).route("/api/pki/cas/{caid}/attestation", get(get_ca_attestation).put(put_ca_attestation)).route("/api/pki/cas/{caid}/revoke", post(revoke_ca)).route("/api/pki/cas/{caid}/crl", get(ca_crl)).route("/api/pki/cas/{caid}/ocsp", post(ocsp_respond)).route("/api/pki/devices/{did}", get(get_device).patch(update_device).delete(delete_device)).route("/api/pki/devices/{did}/revoke", post(revoke_device)).route("/api/pki/devices/{did}/renew", post(renew_device)).route("/api/pki/devices/{did}/enrollment", post(create_enrollment)).route("/api/pki/groups/{gid}", axum::routing::patch(update_group).delete(delete_group)).route("/api/pki/groups/{gid}/revoke", post(revoke_group)).route("/api/pki/enroll", post(enroll_device)).route("/api/pki/renew/challenge", post(renewal_challenge)).route("/api/pki/renew", post(self_renew_device)).route("/api/pki/devices/{did}/tpm", get(get_device_tpm).put(put_device_tpm)).route("/api/pki/certs/{cid}/revoke", post(revoke_cert));
+    #[cfg(feature = "ssh-ca")]
+    let app = app
         .route("/api/orgs/{oid}/ssh/cas", get(list_ssh_cas).post(create_ssh_ca)).route("/api/ssh/cas/{caid}", get(get_ssh_ca))
         .route("/api/ssh/cas/{caid}/grants", put(put_ssh_grants)).route("/api/ssh/cas/{caid}/sign", post(ssh_sign))
         .route("/api/ssh/cas/{caid}/certs", get(list_ssh_certs)).route("/api/ssh/cas/{caid}/revoked-keys", get(ssh_revoked_keys))
         .route("/api/ssh/cas/{caid}/krl", get(ssh_krl)).route("/api/ssh/cas/{caid}/hosts", get(list_ssh_hosts).post(add_ssh_host))
         .route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host))
         .route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert));
+    #[cfg(feature = "workload-identity")]
+    let app = app
+        .route("/api/orgs/{oid}/identities/{iid}/workload-trust", get(workload::list).post(workload::create))
+        .route("/api/orgs/{oid}/identities/{iid}/workload-trust/{tid}", delete(workload::revoke));
+    #[cfg(feature = "change-requests")]
+    let app = app
+        .route("/api/orgs/{oid}/change-requests", get(change_requests::list).post(change_requests::create))
+        .route("/api/change-requests/{id}", get(change_requests::detail).put(change_requests::edit))
+        .route("/api/change-requests/{id}/{action}", post(change_requests::action));
+    #[cfg(feature = "transit")]
+    let app = app
+        .route("/api/orgs/{oid}/transit/keys", get(transit::list).post(transit::create))
+        .route("/api/orgs/{oid}/transit/keys/{kid}/rotate", post(transit::rotate))
+        .route("/api/orgs/{oid}/transit/keys/{kid}/{action}", post(transit::operate));
+    let app = app
+        .route("/api/auth/step-up/start", post(step_up_start)).route("/api/auth/step-up/verify", post(step_up_verify));
     let app = app
         .merge(crate::ai::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), path_policy::middleware))
@@ -6407,6 +6732,7 @@ enum StepUpRisk { Ok, TwoFactor, VeryRisky }
 impl StepUpRisk {
     fn as_str(self) -> &'static str { match self { StepUpRisk::Ok => "ok", StepUpRisk::TwoFactor => "two_factor", StepUpRisk::VeryRisky => "very_risky" } }
     fn parse(s: &str) -> Self { match s { "very_risky" => StepUpRisk::VeryRisky, "two_factor" => StepUpRisk::TwoFactor, _ => StepUpRisk::Ok } }
+    #[cfg(feature = "ssh-ca")]
     fn rank(self) -> u8 { match self { StepUpRisk::Ok => 0, StepUpRisk::TwoFactor => 1, StepUpRisk::VeryRisky => 2 } } }
 
 fn six_digit_code() -> String { use rand_core::RngCore; let mut b = [0u8; 4]; rand_core::OsRng.fill_bytes(&mut b); format!("{:06}", u32::from_le_bytes(b) % 1_000_000) }
@@ -6419,12 +6745,14 @@ async fn step_up_user(st: &S, h: &HeaderMap) -> Option<String> {
 
 async fn has_totp(st: &S, uid: &str) -> bool { meta_get(st, &format!("totp_enabled:{}", uid)).await == "1" }
 
+#[cfg(feature = "ssh-ca")]
 async fn consume_step_up_grant(st: &S, uid: &str, risk: StepUpRisk, raw: &str) -> bool {
     let hash = oc::hash_token(raw.trim());
     let Ok(Some(row)) = st.db.one("SELECT risk FROM step_up_grants WHERE token_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(uid), json!(now())]).await else { return false };
     if StepUpRisk::parse(&db::s(&row, "risk")).rank() < risk.rank() { return false; }
     st.db.exec("UPDATE step_up_grants SET used=1 WHERE token_hash=? AND used=0", &[json!(&hash)]).await.unwrap_or(0) > 0 }
 
+#[cfg(feature = "ssh-ca")]
 async fn require_step_up(st: &S, h: &HeaderMap, uid: &str, risk: StepUpRisk) -> Result<(), (StatusCode, Json<Value>)> {
     let totp = has_totp(st, uid).await;
     let email = mailer::MailConfig::from_env().enabled();
@@ -6504,15 +6832,21 @@ async fn step_up_verify(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpV
 // sealed key column, and master-key rotation, with X.509 CAs. Everything below
 // only ever sees an SSH CA; the X.509 handlers reject kind='ssh'.
 
+#[cfg(feature = "ssh-ca")]
 fn ssh_grants(raw: &str) -> Vec<String> { serde_json::from_str::<Vec<String>>(raw).unwrap_or_default() }
 
+#[cfg(feature = "ssh-ca")]
 async fn ssh_ca_row(st: &S, caid: &str) -> Result<Row, (StatusCode, Json<Value>)> {
-    st.db.one("SELECT * FROM pki_cas WHERE id=? AND kind='ssh'", &[json!(caid)]).await
-        .map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "SSH CA not found")) }
+    let row = st.db.one("SELECT * FROM pki_cas WHERE id=? AND kind='ssh'", &[json!(caid)]).await
+        .map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "SSH CA not found"))?;
+    st.require_feature(&db::s(&row, "org_id"), "ssh-ca").await?;
+    Ok(row) }
 
+#[cfg(feature = "ssh-ca")]
 async fn create_ssh_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
+    st.require_feature(&oid, "ssh-ca").await?;
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let name = if name.is_empty() { "ssh-ca".to_string() } else { name };
     let forwarding = body.get("allow_forwarding").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -6525,8 +6859,10 @@ async fn create_ssh_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     Ok(j(json!({"id": cid, "name": name, "public_key": public, "fingerprint": ssh_ca::ca_fingerprint(&public).unwrap_or_default(),
         "sshd": ssh_ca::sshd_snippet(&public), "note": "no certificate can be issued until a role grant names the principals it may request"}))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn list_ssh_cas(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
+    st.require_feature(&oid, "ssh-ca").await?;
     let rows = st.db.query("SELECT id,name,cert_pem,allow_forwarding,created_at FROM pki_cas WHERE org_id=? AND kind='ssh' ORDER BY created_at DESC", &[json!(oid)]).await.map_err(|e| bad(&e))?;
     let out: Vec<Value> = rows.iter().map(|r| { let public = db::s(r, "cert_pem");
         json!({"id": db::s(r, "id"), "name": db::s(r, "name"), "public_key": public,
@@ -6534,6 +6870,7 @@ async fn list_ssh_cas(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
             "allow_forwarding": db::n(r, "allow_forwarding") == 1, "created_at": r.get("created_at").cloned().unwrap_or(Value::Null)}) }).collect();
     Ok(j(json!(out))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn get_ssh_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6546,6 +6883,7 @@ async fn get_ssh_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>)
 
 // Replace-all: a role left out of the new list loses its grant, so nobody keeps
 // an old permission by accident.
+#[cfg(feature = "ssh-ca")]
 async fn put_ssh_grants(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6585,6 +6923,7 @@ async fn put_ssh_grants(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
     st.audit(&org, "", "", &uid, "ssh.ca.grants", &format!("{} role(s): {}", granted.len(), granted.join(","))).await;
     Ok(j(json!({"ca_id": caid, "roles": granted}))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6625,6 +6964,7 @@ async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, J
         "principal": principal, "valid_after": signed.valid_after, "valid_before": signed.valid_before,
         "verified": verified, "ca_public_key": db::s(&ca, "cert_pem")}))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn list_ssh_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6632,6 +6972,7 @@ async fn list_ssh_certs(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
     let rows = st.db.query("SELECT id,key_id,principal,serial,actor,revoked,cert_type,valid_after,valid_before,created_at FROM ssh_certs WHERE ca_id=? ORDER BY created_at DESC LIMIT 200", &[json!(&caid)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn revoke_ssh_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT ca_id FROM ssh_certs WHERE id=?", &[json!(&cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "certificate not found"))?;
@@ -6644,6 +6985,7 @@ async fn revoke_ssh_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<Stri
 
 // sshd's RevokedKeys file. There is no KRL writer, so this plus the short
 // certificate lifetime is the whole revocation story.
+#[cfg(feature = "ssh-ca")]
 async fn ssh_revoked_keys(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response {
     let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
     let ca = match ssh_ca_row(&st, &caid).await { Ok(c) => c, Err(e) => return e.into_response() };
@@ -6657,6 +6999,7 @@ async fn ssh_revoked_keys(State(st): State<S>, h: HeaderMap, Path(caid): Path<St
 
 // The same list in OpenSSH's own revocation format. Serial-based, so it stays
 // small and does not need the certificate body.
+#[cfg(feature = "ssh-ca")]
 async fn ssh_krl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Response {
     let uid = match st.token_user(&h).await { Ok(u) => u, Err(e) => return e.into_response() };
     let ca = match ssh_ca_row(&st, &caid).await { Ok(c) => c, Err(e) => return e.into_response() };
@@ -6676,6 +7019,7 @@ async fn ssh_krl(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) ->
 // matches that pair, which lets anyone deploy the certificate without letting
 // anyone invent a host.
 
+#[cfg(feature = "ssh-ca")]
 async fn add_ssh_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6694,6 +7038,7 @@ async fn add_ssh_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String
     st.audit(&org, "", "", &uid, "ssh.host.add", &format!("{} {}", hostname, fingerprint)).await;
     Ok(j(json!({"id": hid, "hostname": hostname, "fingerprint": fingerprint}))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn list_ssh_hosts(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6703,6 +7048,7 @@ async fn list_ssh_hosts(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
 
 // Removing a registration is how a host key is rotated: delete, then register
 // the new key. Outstanding certificates keep working until they expire.
+#[cfg(feature = "ssh-ca")]
 async fn delete_ssh_host(State(st): State<S>, h: HeaderMap, Path((caid, hid)): Path<(String, String)>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6713,6 +7059,7 @@ async fn delete_ssh_host(State(st): State<S>, h: HeaderMap, Path((caid, hid)): P
     st.audit(&org, "", "", &uid, "ssh.host.remove", &hid).await;
     Ok(j(json!({"deleted": hid}))) }
 
+#[cfg(feature = "ssh-ca")]
 async fn ssh_sign_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     let ca = ssh_ca_row(&st, &caid).await?;
@@ -6770,6 +7117,8 @@ pub async fn deliver_job(db: &Db, job: Job) {
             let _ = crate::http::Client::new().post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({}))).send().await; }
     }
 }
+#[cfg(target_arch = "wasm32")]
+async fn rotate_master(State(_): State<S>, _: HeaderMap, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
 #[cfg(test)]
 mod tests {
     use super::*;

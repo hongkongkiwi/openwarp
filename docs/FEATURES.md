@@ -37,7 +37,51 @@
 | Static PostgreSQL role rotation | n/a | rotate an existing remote login and store its password in an SSE secret; encrypted pending candidate supports retries after uncertain outcomes; see [integrations](INTEGRATIONS.md#static-postgresql-password-rotation) |
 | Transit encryption | n/a | workspace payload encryption, version rotation and rewrap with distinct transit permissions; no key export; see [API](API.md#transit) |
 | CLI template agent | n/a | literal secret placeholders, bounded in-memory cache and atomic output; no disk cache or offline fallback; see [CLI](CLI.md) |
-| Licence checks / seat limits | n/a | **none, by design** |
+| Licence checks / seat limits | n/a | two plans: self-hosted needs no key and keeps every core feature; an offline ES256 enterprise licence unlocks workspace SAML/OIDC, LDAP, SCIM and audit streaming. No seat counts; see [editions](EDITIONS.md) |
+
+## Enterprise surfaces: build features and workspace grants
+
+Eight surfaces are opt-in twice, and both gates must pass: the binary must be
+built with the Cargo feature, and the workspace must hold a grant.
+
+| Feature | Surface |
+|---|---|
+| `saml` | SAML 2.0 service provider, per-workspace IdP configuration |
+| `scim` | SCIM 2.0 Users and Groups provisioning under `/scim/v2` |
+| `pki` | X.509 certificate authorities, issuance, CRL and OCSP |
+| `ssh-ca` | SSH user and host certificates, KRL and RevokedKeys |
+| `transit` | Workspace transit keys (`/api/orgs/:id/transit/keys`) |
+| `workload-identity` | Workload trust records and JWT exchange |
+| `change-requests` | Batched multi-environment change requests |
+| `ldap` | Per-workspace LDAPS directory sign-in |
+
+The default build compiles none of them. `cargo build --features enterprise`
+enables all eight, and `enterprise` expands to the individual names, so a
+narrower build such as `--features ssh-ca` is possible. The container image
+builds with `enterprise,redis-cache` unless
+`--build-arg OPENWARP_FEATURES=` overrides it.
+
+Grants are per workspace and only the instance owner changes them:
+
+```
+GET  /api/instance/features        # compiled names plus every workspace's grants
+PUT  /api/instance/features        # {"org": "ORG_ID", "features": ["saml"]}
+GET  /api/orgs/:id/features        # any member: {"compiled": [...], "granted": [...]}
+```
+
+A surface compiled out has no route at all, so requests get 404. A surface that
+is compiled in but not granted answers 403 with a message naming the feature.
+OCSP is the one exception: it stays reachable without a grant, because a client
+checking a certificate must still learn that it was revoked after a workspace
+loses the grant. Elsewhere authentication and workspace membership run before
+the grant check, so an ungranted request never reveals whether an object
+exists; the SAML metadata and start endpoints are unauthenticated by design and
+return no object data.
+The `PUT` body is the full set the workspace should hold, and an empty array
+revokes everything. Grant rows survive a build that omits the feature, so
+rebuilding with it restores the previous choice. The console hides a settings
+card unless both gates pass, and the instance owner gets a feature matrix in
+Settings.
 
 ## Integrations (`POST /api/envs/:id/integrations`, auto-sync on deploy, manual `POST /api/integrations/:id/sync`)
 

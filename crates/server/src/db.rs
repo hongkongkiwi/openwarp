@@ -824,10 +824,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 30, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 32, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 30, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 32, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }

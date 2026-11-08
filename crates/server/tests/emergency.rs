@@ -68,7 +68,7 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_PUBLIC_URL", &base)
-            .env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
+            .env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("OPENWARP_LICENSE", "development").env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_TRUST_PROXY").env_remove("OPENWARP_ALLOWED_DB_HOSTS")
             .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS")

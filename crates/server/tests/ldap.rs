@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -351,6 +352,9 @@ struct Server {
     dir: std::path::PathBuf,
     client: reqwest::Client,
     inbox: Arc<Mutex<Vec<Value>>>,
+    // First account on a fresh server, which is the instance owner and the only
+    // identity allowed to grant a feature to a workspace.
+    owner: Arc<Mutex<Option<String>>>,
 }
 
 impl Drop for Server {
@@ -387,6 +391,7 @@ impl Server {
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
+            .env("OPENWARP_LICENSE", "development")
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -400,7 +405,7 @@ impl Server {
             .expect("spawn openwarp-server");
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15)).build().expect("http client");
-        let server = Server { child, base, dir, client, inbox };
+        let server = Server { child, base, dir, client, inbox, owner: Arc::new(Mutex::new(None)) };
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -410,6 +415,10 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A port probed before the child binds, or a host under load, can leave
+        // no server to talk to. Try again with a fresh database and port instead
+        // of failing a suite that has nothing to do with the cause.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("server did not become healthy at {}", server.base);
     }
 
@@ -429,6 +438,17 @@ impl Server {
     }
 
     async fn register(&self, email: &str, password: &str) -> (String, String) {
+        let (token, org) = self.register_unchecked(email, password).await;
+        // This suite is about LDAP, so every workspace it creates holds the
+        // grant. The first account on a fresh server is the instance owner and
+        // is the only one allowed to grant.
+        let owner = { let mut slot = self.owner.lock().unwrap(); slot.get_or_insert_with(|| token.clone()).clone() };
+        let granted = self.call(reqwest::Method::PUT, "/api/instance/features", Some(&owner), Some(json!({"org": org, "features": ["ldap"]}))).await;
+        assert_eq!(granted.status, 200, "grant ldap to {}: {}", email, granted.text);
+        (token, org)
+    }
+
+    async fn register_unchecked(&self, email: &str, password: &str) -> (String, String) {
         let r = self.call(reqwest::Method::POST, "/api/auth/register", None, Some(json!({"email": email, "password": password}))).await;
         assert_eq!(r.status, 200, "register {} failed: {}", email, r.text);
         let org = r.body["org_id"].as_str().expect("org").to_string();

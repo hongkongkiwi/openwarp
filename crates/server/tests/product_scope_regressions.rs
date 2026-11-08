@@ -1,3 +1,5 @@
+#![cfg(all(feature = "change-requests", feature = "workload-identity", feature = "transit"))]
+
 include!("product_features.rs");
 
 async fn regression_cookie_call(f: &Fixture, method: Method, path: &str, token: &str, body: Option<Value>) -> Reply {

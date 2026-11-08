@@ -142,7 +142,8 @@ function parse(markup, root) {
     for (const [, name, , quoted, bare] of rest.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+)))?/g)) attrs[name] = decode(quoted ?? bare ?? '');
     const el = new Element(tag, root.ownerDocument, attrs);
     stack.at(-1).appendChild(el);
-    if (!/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
+    const selfClosing = /\/\s*>$/.test(token);
+    if (!selfClosing && !/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
   }
 }
 
@@ -191,13 +192,18 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const calls = [], unexpected = [], confirmations = [], timers = [], store = { 'ow.org.fixture@example.invalid': 'org-a', ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
-    '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
     '/api/instance': { instance_owner: false },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin', members: 3 }, { id: 'org-b', name: 'Second org', role: 'admin', members: 1 }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
+    // Fixture workspaces hold every grant; a test that wants an ungranted
+    // surface overrides this entry.
+    '/api/orgs/org-a/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
+    '/api/orgs/org-b/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
     '/api/orgs/org-a/pki/cas': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
@@ -261,6 +267,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
       else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
+      else if (options.method === 'DELETE' && /^\/api\/me\/sessions\/[^/]+$/.test(url)) body = { revoked: url.split('/').pop(), current: false };
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
@@ -678,6 +685,33 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+test('the SAML sign-in button follows the build, not the workspace grant', async () => {
+  // A build that carries SAML keeps the button even when a workspace has not
+  // enabled it; the attempt explains why. A build without it has no route, so
+  // the button would be dead and is hidden.
+  const withSaml = await consoleUI();
+  await withSaml.invoke('loadProviders()');
+  assert.ok(withSaml.document.getElementById('saml-signin'),
+    'the sign-in view always carries the SAML button node');
+  assert.notEqual(withSaml.el('saml-signin').style.display, 'none',
+    'a build with SAML shows the button regardless of workspace grants');
+
+  const withoutSaml = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { google: false, github: false, saml: false, signups: 'open' },
+  } });
+  await withoutSaml.invoke('loadProviders()');
+  assert.equal(withoutSaml.el('saml-signin').style.display, 'none',
+    'a build without SAML hides the button because the route does not exist');
+});
+
+test('a workspace-disabled sign-in method reports a readable reason, not JSON', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  assert.match(source, /saml_not_enabled:'SAML sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the saml_not_enabled code into a sentence');
+  assert.match(source, /ldap_not_enabled:'Directory sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the ldap_not_enabled code into a sentence');
 });
 
 const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };
@@ -1400,6 +1434,81 @@ test('language follows the browser, translates the chrome, and the override pers
   assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
 });
 
+test('settings lists browser sessions and revokes only the chosen one', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/me/sessions': [
+      { id: 'session-current', created_at: 1700000000, current: true },
+      { id: 'session-other', created_at: 1699990000, current: false },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  await ui.invoke('loadSessions()');
+  const rows = ui.el('session-list').querySelectorAll('tbody tr');
+  assert.equal(rows.length, 2, 'one row per browser session');
+  assert.match(rows[0].textContent, /this session/, 'the current session is marked');
+  ui.confirm = true;
+  await ui.click(ui.button(rows[1], /^Revoke$/));
+  assert.deepEqual(ui.writes().map(c => [c.method, c.url]), [['DELETE', '/api/me/sessions/session-other']],
+    'revoking one session targets that id only');
+});
+
+test('the logs screen separates audit, sync activity and delivery attempts', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/audit': [
+      { action: 'secret.read', detail: '1 key', actor: 'fixture-user', created_at: 1700000000 },
+      { action: 'integration.sync_failed', detail: 'int-1: provider rejected the token', actor: 'fixture-user', created_at: 1700000001 },
+      { action: 'rotation.run', detail: 'STRIPE_KEY', actor: 'fixture-user', created_at: 1700000002 },
+    ],
+    '/api/orgs/org-a/log-streams/deliveries': [
+      { id: 'd1', stream_name: 'SIEM', stream_url: 'https://siem.example/ingest', event: 'secret.read', status: 'failed', attempts: 3, created_at: 1700000003 },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderAudit()');
+  assert.match(ui.el('auditrows').textContent, /secret\.read/, 'the audit tab lists workspace events');
+  await ui.invoke("setLogTab('sync')");
+  const sync = ui.el('auditrows').textContent;
+  assert.match(sync, /integration\.sync_failed/);
+  assert.match(sync, /rotation\.run/);
+  assert.doesNotMatch(sync, /secret\.read/, 'sync activity hides unrelated events');
+  await ui.invoke("setLogTab('delivery')");
+  const deliveries = ui.el('auditrows').textContent;
+  assert.match(deliveries, /SIEM/, 'delivery rows name the target stream');
+  assert.match(deliveries, /failed/);
+  assert.match(deliveries, /3/);
+  assert.equal(ui.el('auditcount').textContent, '1 attempts shown');
+});
+
+test('the self-hosted plan shows its plan card and locks enterprise settings', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Self-hosted/, 'the plan card names the self-hosted plan');
+  assert.match(view.textContent, /All core features are enabled without a license/);
+  assert.match(view.textContent, /SAML SSO/, 'the locked SAML card is still discoverable');
+  assert.match(view.textContent, /Enterprise/, 'the locked cards carry the enterprise label');
+  assert.equal(ui.el('set-oidc-iss').disabled, true, 'workspace OIDC fields are read-only without a license');
+  assert.equal(ui.button(view, /^Save SAML$/), undefined, 'no SAML save action is offered while locked');
+});
+
+test('an enterprise edition unlocks the settings forms', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  ui.run("EDITION={tier:'enterprise',enterprise:true,customer:'Acme Ltd',expires_at:null,development:false,warning:null}");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Licensed to Acme Ltd/);
+  assert.equal(ui.el('set-oidc-iss').disabled, false, 'OIDC fields are editable with a license');
+  assert.ok(ui.button(view, /^Save SAML$/), 'the SAML form is available with a license');
+});
 // A stale digest silently blocks the console's translation script in every
 // browser, so each SRI hash must match the file it names.
 test('console script digests match the files they load', () => {

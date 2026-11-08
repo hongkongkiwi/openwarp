@@ -39,6 +39,8 @@ Password reset with a recovery kit re-wraps the same private key under the new p
 
 Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts) and 21 (Transit) remain unchanged. Migration 22 adds external-JWKS workload bindings, path policies, static rotation state and the separate compatibility Transit tables. Migration-engine databases converge on the same objects through version 23, which adds only what a database lacks; shipped main22 ledger rows carry no checksum and stay unverified. Databases from the unpublished feature branch's former migration 19 are not supported upgrades. Reset disposable fixtures; if that schema was used for persistent data, preserve a backup and reconcile it explicitly before starting this version. Do not delete migration ledger rows or reinterpret the old feature Transit tables as the shipped engine's schema.
 
+Migration 31 adds workspace feature grants. Migration 32 adds stable account session IDs.
+
 The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Online root rotation preflights and atomically updates both stores, v2 authentication keys, LDAP passwords and TOTP state, while retaining the main Transit root-generation fence. It is available only on native single-process SQLite without configured or persisted KMS root state.
 
 ## Cryptographic building blocks

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -75,6 +76,10 @@ impl Server {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A port probed before the child binds, or a host under load, can leave
+        // no server to talk to. Try again with a fresh database and port instead
+        // of failing a suite that has nothing to do with the cause.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { drop(_lock); return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
 

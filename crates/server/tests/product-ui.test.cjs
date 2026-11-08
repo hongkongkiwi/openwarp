@@ -112,7 +112,8 @@ function parse(markup, root) {
     const attrs = {};
     for (const [, name, , quoted, bare] of rest.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+)))?/g)) attrs[name] = decode(quoted ?? bare ?? '');
     const el = new Element(tag, root.ownerDocument, attrs); stack.at(-1).appendChild(el);
-    if (!/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
+    const selfClosing = /\/\s*>$/.test(token);
+    if (!selfClosing && !/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
   }
 }
 function visible(el) {
@@ -143,6 +144,7 @@ async function consoleUI(opts = {}) {
   const role = opts.role || 'admin', uid = opts.uid || 'reviewer-a';
   const routes = {
     '/api/auth/providers': {}, '/api/me': { id: uid, email: 'fixture@test.invalid' },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/orgs': [{ id: 'org-a', name: 'Workspace A', role }, { id: 'org-b', name: 'Workspace B', role }],
   };
   for (const org of ['org-a', 'org-b']) {

@@ -26,7 +26,7 @@ OpenWarp groups secrets into workspaces, applications, and environments. Teams c
 | Choose encryption | Server-side encryption for automation, or client-managed end-to-end environments |
 | Automate | REST API, OAuth with PKCE, MCP tools, rotation schedules, and dynamic credentials |
 
-There are no licence checks, paid feature gates, or configured seat and environment tiers. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
+There are no licence checks, paid feature gates, or configured seat and environment tiers. The enterprise surfaces (SAML, SCIM, X.509 PKI, SSH certificates, transit, workload identity, change requests and LDAP) are opt-in twice: a default build compiles them out, and a workspace needs a grant before it can use one. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
 
 > [!IMPORTANT]
 > OpenWarp handles sensitive data. Obtain an independent security and cryptography review before relying on it in production. Server-side encryption trusts the server with plaintext. End-to-end environments require client-managed keys and do not support the same automation paths. Read the [security model](docs/SECURITY.md).

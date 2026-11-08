@@ -70,6 +70,8 @@ pub const MIGRATIONS: &[Migration] = &[
     // migration 18 carries these columns and meta rows.
     Migration { version: 29, name: "workspace_policy", sql: include_str!("../migrations/0029_workspace_policy.sql"), tolerant: true },
     Migration { version: 30, name: "ai_assistant", sql: include_str!("../migrations/0030_ai_assistant.sql"), tolerant: false },
+    Migration { version: 31, name: "feature_grants", sql: include_str!("../migrations/0031_feature_grants.sql"), tolerant: true },
+    Migration { version: 32, name: "session_ids", sql: include_str!("../migrations/0032_session_ids.sql"), tolerant: true },
 ];
 
 /// SQL profile used when splitting migration statements.

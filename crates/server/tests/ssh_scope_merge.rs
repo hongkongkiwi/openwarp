@@ -1,3 +1,5 @@
+#![cfg(feature = "ssh-ca")]
+
 use reqwest::{redirect::Policy, Client, Method};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -113,6 +115,9 @@ fn field(v: &Value, key: &str) -> String { v[key].as_str().expect(key).to_string
 
 async fn scope_contract(oauth: bool) {
     let s = Server::start().await; let owner = s.register().await;
+    // The workspace needs the ssh-ca grant before its routes answer at all.
+    let granted = s.call(Method::PUT, "/api/instance/features", &owner.session, Some(json!({"org": owner.org, "features": ["ssh-ca"]}))).await;
+    assert_eq!(granted.status, 200, "grant ssh-ca: {:?}", granted.body);
     let app = s.call(Method::POST, &format!("/api/orgs/{}/apps", owner.org), &owner.session, Some(json!({"name": "ssh-scopes"}))).await;
     assert_eq!(app.status, 200, "create token app"); let app = field(&app.body, "id");
     let mut tokens = Vec::new();

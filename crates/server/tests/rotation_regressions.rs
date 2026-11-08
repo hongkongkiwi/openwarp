@@ -84,10 +84,10 @@ async fn pending_password_blocks_delete(target: &str) {
     std::env::set_var("OPENWARP_ALLOWED_DB_HOSTS", host);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone(); let target = target.to_string();
+    let f = Fixture::new().await;
     // Clean up the isolated remote role even when the regression assertion fails.
     let outcome = tokio::spawn(async move {
         assert!(worker.authenticates(OLD).await, "old login positive control");
-        let f = Fixture::new().await;
         let (status, body) = f.call("POST", "/api/envs/env/rotations", json!({"key":"DB_PASSWORD","path":"/","interval_secs":3600,"config":{"kind":"postgres-static","connection":url,"username":worker.name}})).await;
         assert_eq!(status,200,"schedule: {}",body);
         let rid = body["id"].as_str().unwrap();

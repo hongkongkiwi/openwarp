@@ -41,7 +41,22 @@ node --test crates/server/tests/ui.test.cjs
 cargo build --workspace
 ```
 
-The [CI workflow](../.github/workflows/ci.yml) runs Clippy, the workspace Rust tests with two test threads, the Node console test, and a separate container build/startup smoke test. `cargo check` and the final workspace build above are useful local checks, not additional claims about CI.
+The default feature set is core only. The enterprise surfaces (SAML, SCIM, PKI,
+SSH certificates, transit, workload identity, change requests, LDAP) are behind
+Cargo features, so anything that compiles or exercises them needs `--features
+enterprise` or `--all-features`:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=2
+```
+
+A feature build still answers 403 until the workspace holds a grant, which is
+why the suites that use one call `PUT /api/instance/features` first. CI runs
+both the core and the all-features pass; changing a gated path without the
+second run leaves it unchecked.
+
+The [CI workflow](../.github/workflows/ci.yml) runs Clippy and the workspace Rust tests twice, once for each feature set, then the Node console test, and a separate container build/startup smoke test. `cargo check` and the final workspace build above are useful local checks, not additional claims about CI.
 
 ### Targeted checks
 
