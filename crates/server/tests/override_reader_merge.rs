@@ -155,6 +155,8 @@ async fn session_reader_can_delete_only_own_override_without_shared_write_permis
     let invited = s.call(Method::POST, &format!("/api/orgs/{}/members", owner.org), &owner.token,
         Some(json!({"email": "reader@test.invalid", "role": "reader"}))).await;
     assert_eq!(invited.status, 200, "add read-only member");
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", &reader.token, Some(json!({"token": field(&invited.body, "invite_token")}))).await;
+    assert_eq!(accepted.status, 200, "accept read-only member invitation");
     let (_, env, sid) = s.secret(&owner).await; let path = format!("/api/secrets/{}/override", sid);
     for (token, value) in [(&owner.token, "owner-personal"), (&reader.token, "reader-personal")] {
         assert_eq!(s.call(Method::POST, &path, token, Some(secret_body(value))).await.status, 200, "set own override");

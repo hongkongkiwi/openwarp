@@ -873,6 +873,8 @@ async fn only_an_owner_can_map_the_owner_or_admin_role() {
     let promoted = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/members", org), Some(&owner),
         Some(json!({"email": "admin@example.com", "role": "admin"}))).await;
     assert_eq!(promoted.status, 200, "promotion failed: {}", promoted.text);
+    let accepted = s.call(reqwest::Method::POST, "/api/auth/accept-invite", Some(&admin_token), Some(json!({"token": promoted.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept admin invitation failed: {}", accepted.text);
 
     let owner_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=owner"})).await;
     assert_eq!(owner_mapping.status, 403, "an admin mapped owner through LDAP: {}", owner_mapping.text);

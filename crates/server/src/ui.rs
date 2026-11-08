@@ -33,7 +33,18 @@ a{color:var(--acc2)}code,.mono{font-family:var(--mono);font-size:12.5px}
 .seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:3px;margin-bottom:20px}.seg button{flex:1;background:transparent;border:0;color:var(--muted)}.seg button.on{background:var(--panel2);color:var(--text);box-shadow:var(--sh-sm)}
 #shell{display:none;height:100vh;grid-template-columns:248px 1fr;grid-template-rows:100vh}
 aside{background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 12px;gap:4px;overflow:auto}
-aside .orgsel{width:100%;margin:14px 0 10px}
+#picker{min-height:100vh;display:none;place-items:center;background:radial-gradient(900px 500px at 50% -10%,var(--glow),transparent)}
+.picklist{display:flex;flex-direction:column;gap:8px}
+.pickrow{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--text);font-weight:600}
+.pickrow:hover{border-color:var(--line2)}.pickrow .pn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pickrow .pm{color:var(--muted);font-size:12.5px;font-weight:500;white-space:nowrap;flex:none}
+.regionline{margin:14px 0 0;text-align:center}.regionline a{color:var(--muted)}
+.orgbtn{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;color:var(--text);font-weight:600;margin:14px 0 10px}
+.orgbtn .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orgmenu{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px;box-shadow:var(--sh-side);display:flex;flex-direction:column;gap:1px;margin-bottom:10px}
+.orgmenu[hidden]{display:none}
+.orgitem{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:0;border-radius:7px;padding:7px 8px;color:var(--muted);font-size:13px;font-weight:500}
+.orgitem:hover{background:var(--panel2);color:var(--text)}.orgitem .ck{width:14px;flex:none;color:var(--acc)}.orgitem .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orgitem .pm{color:var(--faint);font-size:12px}.orgsep{height:1px;background:var(--line);margin:4px 2px}
 .navbtn{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:0;border-radius:8px;padding:8px 10px;color:var(--muted);font-weight:500}.navbtn:hover{background:var(--panel2);color:var(--text)}.navbtn.on{background:var(--sel);color:var(--text)}.navbtn .ic{width:18px;text-align:center;flex:none}
 .sidefoot{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;color:var(--muted);font-size:12.5px}
 main{overflow:auto;display:flex;flex-direction:column}
@@ -41,6 +52,7 @@ main{overflow:auto;display:flex;flex-direction:column}
 .topbar h2{font-size:17px;margin:0;letter-spacing:-.01em}.crumb{color:var(--faint)}.grow{flex:1}
 .searchbox{display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:6px 11px;color:var(--faint);cursor:pointer;min-width:210px}.searchbox:hover{border-color:var(--acc)}kbd{font:11px var(--mono);background:var(--panel2);border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:1px 5px;color:var(--muted)}
 .content{padding:24px 28px 110px;max-width:1220px;width:100%;margin:0 auto}
+.ai-prose{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;font:inherit;line-height:1.65;margin:10px 0;max-width:100%}#ai-plan pre,#ai-answer pre{max-height:560px;overflow:auto}#ai-scope,#ai-task,#ai-compare{max-width:100%}#ai-findings-list summary{cursor:pointer;color:var(--muted);padding:6px 0}[hidden]{display:none!important}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
 .appcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;cursor:pointer;transition:.15s}.appcard:hover{border-color:var(--acc);transform:translateY(-1px)}.appcard h3{margin:0 0 6px;font-size:15px}.appcard .meta{color:var(--muted);font-size:12.5px}
 .chip{display:inline-block;font:11px var(--mono);background:var(--panel2);border:1px solid var(--line2);border-radius:99px;padding:2px 8px;margin:2px 3px 0 0;color:var(--muted)}
@@ -63,6 +75,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 .mut{color:var(--muted)}.small{font-size:12.5px}.val{font-family:var(--mono);font-size:12.5px;word-break:break-all}
 #navtoggle{display:none}
 .langsel{padding:6px 8px;font-size:12.5px;color:var(--muted);max-width:150px}.langsel option{color:var(--text);background:var(--panel)}.authprefs{position:absolute;top:18px;right:18px;display:flex;gap:6px;align-items:center}
+@media(max-width:820px){#shell{grid-template-columns:minmax(0,1fr)}.topbar{padding:12px 14px;gap:8px;flex-wrap:wrap}.searchbox{min-width:0;flex:1}.topbar h2{min-width:0;overflow-wrap:anywhere}#topaction{flex-shrink:0}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:var(--sh-side)}aside.open{display:flex}.content{padding:16px 14px 100px}.members-table,.members-table tbody{display:block;width:100%}.members-table thead{display:none}.members-table tr{display:flex;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.members-table td{display:block;border:0;padding:6px 0;min-width:0}.members-table td:first-child{width:100%;overflow-wrap:anywhere}.members-table td:last-child{display:flex;flex-wrap:wrap;gap:8px;width:100%}.members-table select{max-width:100%}}
 @media(max-width:820px){#shell{grid-template-columns:1fr}#navtoggle{display:inline-block}aside{display:none;position:fixed;top:0;bottom:0;left:0;width:260px;z-index:80;box-shadow:var(--sh-side)}aside.open{display:flex}.content{padding:14px 14px 100px}
   .topbar{flex-wrap:wrap;gap:8px;padding:10px 14px}.topbar h2{font-size:16px;max-width:62vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.crumb{display:none}.langsel{display:none}.searchbox{min-width:0;padding:6px 9px}.searchbox kbd{display:none}.searchbox span:nth-of-type(2){display:none}
   button,input,select,textarea{min-height:44px}.iconbtn{min-width:44px;min-height:44px}.envtabs{gap:8px}.envtab{min-height:40px}
@@ -83,24 +96,38 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field" id="mfafield" style="display:none"><label for="mfacode" data-i18n="Authenticator / recovery code">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()" data-i18n="Sign in">Sign in</button>
       <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()" data-i18n="Forgot password?">Forgot password?</button>
-      <button class="ghost" style="width:100%;margin-top:6px" id="saml-signin" onclick="samlPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
+      <button class="ghost" style="width:100%;margin-top:6px" id="saml-signin" onclick="workspaceSsoPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
       <div id="social" class="row" style="margin-top:12px;flex-wrap:wrap"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0" data-i18n="Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
+      <p class="small mut regionline" id="regionline"></p>
     </div>
   </div>
 </div>
 
 <a class="skip" href="#view" data-i18n="Skip to content">Skip to content</a>
+<div id="picker">
+  <div class="authcard">
+    <div class="logo"><span class="mark">◆</span>OpenWarp</div>
+    <h1 data-i18n="Choose your workspace">Choose your workspace</h1>
+    <p class="sub" data-i18n="You belong to more than one workspace. Pick the one to open; you can switch at any time.">You belong to more than one workspace. Pick the one to open; you can switch at any time.</p>
+    <div id="pickerlist" class="picklist"></div>
+    <p class="small mut" style="margin:14px 0 0" data-i18n="Missing a workspace? Ask an owner for an invitation.">Missing a workspace? Ask an owner for an invitation.</p>
+  </div>
+</div>
+
 <div id="shell">
   <aside>
     <div class="logo"><span class="mark">◆</span>OpenWarp</div>
-    <select id="orgs" class="orgsel" onchange="switchOrg()"></select>
-    <button class="navbtn" data-nav="apps" onclick="nav('apps')"><span class="ic" aria-hidden="true"><svg class="icon" width="18" height="18" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span data-i18n="Apps">Apps</span></button>
-    <button class="navbtn" data-nav="access" onclick="nav('access')"><span class="ic" aria-hidden="true"><svg class="icon" width="18" height="18" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M17 8h4M19 6v4"/></svg></span><span data-i18n="Members &amp; access">Members &amp; access</span></button>
-    <button class="navbtn" data-nav="integrations" onclick="nav('integrations')"><span class="ic" aria-hidden="true"><svg class="icon" width="18" height="18" viewBox="0 0 24 24"><path d="M4 7h11l-3-3M20 17H9l3 3"/></svg></span><span data-i18n="Integrations">Integrations</span></button>
-    <button class="navbtn" data-nav="audit" onclick="nav('audit')"><span class="ic" aria-hidden="true"><svg class="icon" width="18" height="18" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span data-i18n="Audit log">Audit log</span></button>
-    <button class="navbtn" data-nav="settings" onclick="nav('settings')"><span class="ic" aria-hidden="true"><svg class="icon" width="18" height="18" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg></span><span data-i18n="Settings">Settings</span></button>
-    <div class="sidefoot"><div id="whoami" class="mono"></div><button class="ghost" style="padding:4px 0" onclick="logout()" data-i18n="Sign out">Sign out</button></div>
+    <button class="orgbtn" id="orgbtn" aria-haspopup="menu" aria-expanded="false" onclick="toggleOrgMenu(event)"><span class="grow" id="orgname"></span><span aria-hidden="true">▾</span></button>
+    <div class="orgmenu" id="orgmenu" role="menu" aria-label="Workspace menu" hidden onkeydown="orgMenuKey(event)"></div>
+    <div class="row"><button id="new-workspace" onclick="newWorkspace()">New workspace</button><button onclick="joinWorkspace()">Join workspace</button></div>
+    <button class="navbtn" data-nav="apps" onclick="nav('apps')"><span class="ic">▦</span><span data-i18n="Apps">Apps</span></button>
+    <button class="navbtn" data-nav="access" onclick="nav('access')"><span class="ic">♟</span><span data-i18n="Members &amp; access">Members &amp; access</span></button>
+    <button class="navbtn" data-nav="integrations" onclick="nav('integrations')"><span class="ic">⇄</span><span data-i18n="Integrations">Integrations</span></button>
+    <button class="navbtn" data-nav="assistant" onclick="nav('assistant')"><span class="ic">⌕</span><span data-i18n="Assistant">Assistant</span></button>
+    <button class="navbtn" data-nav="insights" onclick="nav('insights')"><span class="ic">◇</span><span data-i18n="Security insights">Security insights</span></button>
+    <button class="navbtn" data-nav="audit" onclick="nav('audit')"><span class="ic">≡</span><span data-i18n="Audit log">Audit log</span></button>
+    <button class="navbtn" data-nav="settings" onclick="nav('settings')"><span class="ic">⚙</span><span data-i18n="Settings">Settings</span></button>
   </aside>
   <main>
     <div class="topbar"><button class="iconbtn" id="navtoggle" aria-label="Open navigation" data-i18n-aria-label="Open navigation" onclick="toggleNav()">☰</button><h2 id="pagetitle" data-i18n="Apps">Apps</h2><span class="crumb" id="crumb"></span><div class="grow"></div>
@@ -118,28 +145,29 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div class="modalwrap" id="modalwrap"><div class="modal" id="modal"></div></div>
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" data-i18n-placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
-<script src="/i18n.js" integrity="sha384-xcFG++hus38AuPdw7fy9ggOPnV3E3T56utMawtR9JkpoOBlpIRv9rbRampxtl1qE"></script>
+<script src="/i18n.js" integrity="sha384-PYvcHtvtzstjiop9qqMOHLCdUlFcI3VJAQN0Nd/9WMFqDmRRngL0Th7R2uByYtD/"></script>
 <script>
+let CREATION_OPEN=true, INVITE='', INVITE_META=null;
 let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0, EDITION=null;
-let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
+let T='', ORG='', ORGS=[], REGIONS=[], APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
 function draftList(){return Object.values(drafts())}
 function e2eDrafts(){return (ENV&&E2E_DRAFTS[ENV.id])||{}}
 function e2eDraftList(){return Object.values(e2eDrafts())}
 const $=id=>document.getElementById(id);
-const H=()=>({'Content-Type':'application/json'});
+const H=(u)=>(T&&!(EMERGENCY||PROJECT_EMERGENCY)&&!/\/emergency$/.test(u||''))?{'Authorization':'Bearer '+T,'Content-Type':'application/json'}:{'Content-Type':'application/json'};
 function emergencyAllowed(m,u){if(u===`/api/orgs/${ORG}/emergency`||u===`/api/apps/${APP?.id}/emergency`||u==='/api/auth/logout')return true;
   return m==='GET'&&!/\/(secrets|export|e2e|leases|search)(\/|\?|$)/.test(u)}
 async function api(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
-  let active=AUTH_READY,org=ORG;let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+  let active=AUTH_READY,org=ORG;let r=await fetch(u,{method:m,headers:H(u),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   if(active&&(!AUTH_READY||org!==ORG))throw new Error('Session or workspace changed');
   if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
   if(r.status===401&&AUTH_READY)sessionEnded();
-  if(AUTH_READY&&(r.status===423||(r.status===403&&String(d.error||'').includes('emergency lockdown')))){clearSecretState();refreshEmergency()}
+  if(AUTH_READY&&(r.status===423||(r.status===403&&String(d.error||'').includes('emergency lockdown')))){clearSecretState();$('view').innerHTML=emergencyCard(true);refreshEmergency()}
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
 function toastUI(key,args,err){if(typeof args==='boolean'){err=args;args=undefined}return toast(owT(key,args),err,key,args)}
-function clearSecretState(){SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOADING={};E2E_LOCKED={};E2E_ERR={};
+function clearSecretState(){aiReset();SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOADING={};E2E_LOCKED={};E2E_ERR={};clearPkiState();
   closeModal();$('modal').innerHTML='';$('palette').style.display='none';$('paletteresults').innerHTML='';$('deploybar').classList.remove('show')}
 function sessionEnded(){AUTH_READY=false;EMERGENCY_REQUEST++;clearInterval(EMERGENCY_POLL);T='';clearSecretState();applyEmergency(false,false);PROJECT_DIRECT=false;EMERGENCY_OWNER=false;APP=null;ENV=null;APPS=[];ENVS=[];MY_PUBKEY='';MY_UID='';
   $('view').innerHTML='';$('shell').style.display='none';$('auth').style.display='grid';$('pw').value='';toastUI('Your session ended. Sign in again.', true)}
@@ -154,11 +182,11 @@ function applyEmergency(locked,project=PROJECT_EMERGENCY){let changed=EMERGENCY!
   banner.innerHTML=halted?`<div class="card" style="border-color:var(--bad)"><strong>Emergency lockdown active: ${locked?'workspace':'project'}</strong><p>The console is read-only. Secrets are hidden and automation requests are rejected.</p></div>`:'';
   if(halted){if(changed)clearSecretState();$('topaction').style.display='none';if(changed)$('view').innerHTML=emergencyCard(!locked)}}
 async function refreshEmergency(){let org=ORG,app=APP?.id,request=++EMERGENCY_REQUEST;if(!org)return;try{let d=await api('GET',`/api/orgs/${org}/emergency`),p=app?await api('GET',`/api/apps/${app}/emergency`):null;
-  if(AUTH_READY&&org===ORG&&app===APP?.id&&request===EMERGENCY_REQUEST){PROJECT_DIRECT=!!p?.direct_locked;applyEmergency(!!d.locked,!!p?.locked)}}catch(e){if(AUTH_READY&&org===ORG&&request===EMERGENCY_REQUEST&&(EMERGENCY||PROJECT_EMERGENCY)){$('view').innerHTML=emergencyCard(!EMERGENCY)}}}
+  if(AUTH_READY&&org===ORG&&app===APP?.id&&request===EMERGENCY_REQUEST){PROJECT_DIRECT=!!p?.direct_locked;applyEmergency(!!d.locked,!!p?.locked);if(!d.locked&&!p?.locked&&['assistant','insights'].includes(VIEW)){let probe=await apiRaw('GET',`/api/orgs/${org}/ai/settings`);if(AUTH_READY&&org===ORG&&request===EMERGENCY_REQUEST&&probe.status===403&&String(probe.body.error||'').includes('emergency lockdown')){clearSecretState();$('view').innerHTML='<div class="card"><h3>Project emergency lockdown active</h3><p>Workspace AI is unavailable while a project is locked.</p></div>'}}}}catch(e){if(AUTH_READY&&org===ORG&&request===EMERGENCY_REQUEST&&(EMERGENCY||PROJECT_EMERGENCY)){$('view').innerHTML=emergencyCard(!EMERGENCY)}}}
 function confirmEmergency(locked,project=false){let org=ORG,app=APP?.id,scope=project?'project':'workspace';modal(`<h3>${locked?`Activate ${scope} lockdown?`:`Restore ${scope} access?`}</h3><p>${locked?'Non-owner members will be signed out. The console will be read-only, secrets hidden and automation reads and writes rejected for this scope.':`The direct ${scope} lockdown will be lifted. Other lockdowns still apply. Revoked sessions stay revoked.`}</p><div class="row"><button class="${locked?'danger':'primary'}" id="emergency-confirm">${locked?'Activate lockdown':'Restore access'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Confirm emergency lockdown');
   $('emergency-confirm').onclick=async()=>{if(ORG!==org||(project&&APP?.id!==app)){closeModal();return}try{EMERGENCY_REQUEST++;await api('PUT',project?`/api/apps/${app}/emergency`:`/api/orgs/${org}/emergency`,{locked});await refreshEmergency();closeModal();if(project){$('view').innerHTML=emergencyCard(true)}else await nav('settings')}catch(e){toast(e.message,true)}}}
 // Keep the error body for deletion's ownership and credential warnings.
-async function apiRaw(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+async function apiRaw(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');let r=await fetch(u,{method:m,headers:H(u),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   return {ok:r.ok,status:r.status,body:d}}
 function toast(msg,err,key,args){let el=document.createElement('div');el.className='toast'+(err?' err':'');if(key)owText(el,key,args);else el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -216,6 +244,7 @@ function applyThemeIcons(){let p=themePref();let ic=icon(p,16);let label=owT('Th
 // ---------- auth ----------
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
+  renderRegion(p);
   // A method the binary lacks has no route at all, so its button is hidden. A
   // method the binary has stays visible even when the workspace has not
   // enabled it: the attempt explains why instead of failing silently.
@@ -225,6 +254,8 @@ async function loadProviders(){try{
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">${owHTML('Continue with {x}',{x:name})}</button>`)}
   if(p.oidc)btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/oidc/start'">${owHTML('Continue with {x}',{x:p.oidc_name||'SSO'})}</button>`);
   if(p.ldap)btns.push(`<button style="flex:1 1 45%" onclick="ldapPrompt()" data-i18n="Sign in with directory (LDAP)">Sign in with directory (LDAP)</button>`);
+  // The invitation screen replaces the form that hosts these nodes.
+  if(!$('social'))return;
   $('social').innerHTML=btns.join('');
   if(p.signups!=='open'){
     $('segreg').style.display='none';
@@ -232,21 +263,54 @@ async function loadProviders(){try{
     owText($('signupnote'),'Signups are closed. Ask an administrator for an invitation.');
   }
 }catch(e){}}
-function showInvite(token){
-  $('auth').style.display='grid';$('shell').style.display='none';
-  owText($('authtitle'),'Accept invitation');
-  $('authform').innerHTML=`<p class="mut" data-i18n="Choose a password for your new account.">Choose a password for your new account.</p>
-    <div class="field"><label for="inv-pw" data-i18n="Password">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters" data-i18n-placeholder="at least 8 characters"></div>
-    <button class="primary" style="width:100%;padding:11px" onclick="acceptInvite()" data-i18n="Create account">Create account</button>`;
-  $('authform').dataset.invite=token;}
+function joinWorkspace(){let value=prompt('Paste an invitation link or token');if(!value)return;let token=value.trim();try{if(token.includes('#invite='))token=decodeURIComponent(token.split('#invite=')[1].split('&')[0])}catch(e){toast('Invalid invitation link',true);return}showInvite(token)}
+const AUTH_FORM=$('authform').innerHTML;
+function inviteSignIn(){INVITE='';$('authform').innerHTML=AUTH_FORM;authMode('login');loadProviders();history.replaceState(null,'',location.pathname)}
+async function showInvite(token){
+  INVITE=token;sessionStorage.setItem('ow_pending_invite',token);
+  $('auth').style.display='grid';$('shell').style.display='none';owText($('authtitle'),'Accept invitation');
+  $('authform').innerHTML='<p class="mut">Loading invitation...</p>';
+  try{let d=await api('GET','/api/auth/invite?token='+encodeURIComponent(token));INVITE_META=d;
+    let me=await api('GET','/api/me').catch(()=>null);let matching=me&&me.email.toLowerCase()===d.email.toLowerCase();
+    $('authform').innerHTML=`<p>Join <strong>${esc(d.org_name)}</strong> as ${esc(d.role)} with ${esc(d.email)}.</p><p class="small mut">Expires ${esc(new Date(d.expires_at*1000).toLocaleString())}. Joining requires your consent.</p>
+      ${me&&!matching?`<p>You are signed in as ${esc(me.email)}. Sign out before accepting this invitation.</p><button onclick="logout()" data-i18n="Sign out">Sign out</button>`:matching?'<button class="primary" onclick="acceptInvite()">Join workspace</button>':d.existing_account?`<p>Sign in to the invited account, then return to this invitation.</p><button onclick="inviteSignIn()" data-i18n="Sign in">Sign in</button>`:`<div class="field"><label for="inv-pw" data-i18n="Password">Password</label><input id="inv-pw" type="password" autocomplete="new-password" placeholder="at least 8 characters" data-i18n-placeholder="at least 8 characters"></div><button class="primary" onclick="acceptInvite()">Create account and join</button><p class="small mut">Or sign in with a configured provider, then return here to join.</p><button onclick="inviteSignIn()">Sign in with a provider</button>`}
+      <button class="ghost" onclick="dismissInvite()">Not now</button>`;
+  }catch(e){$('authform').innerHTML=`<p>${esc(e.message)}</p><button onclick="dismissInvite()">Back to sign in</button>`}}
+function dismissInvite(){INVITE='';sessionStorage.removeItem('ow_pending_invite');history.replaceState(null,'',location.pathname);location.reload()}
 async function acceptInvite(){try{
-  let d=await api('POST','/api/auth/accept-invite',{token:$('authform').dataset.invite,password:$('inv-pw').value});
-  T='';history.replaceState(null,'',location.pathname);enterApp();
+  let d;
+  if(INVITE_META.existing_account){d=await api('POST','/api/auth/accept-invite',{token:INVITE})}
+  else {let password=$('inv-pw').value;if(password.length<8)throw new Error('Password must be at least 8 characters');
+    let salt=AuthV2.randomSalt(),iterations=600000,keys=await AuthV2.deriveKeys(password,salt,iterations),kp=await OW.generateKeypair();
+    d=await api('POST','/api/auth/accept-invite-v2',{token:INVITE,salt,iterations,algo:'pbkdf2-sha256',auth_key:AuthV2.b64enc(keys.auth),public_key:kp.public,wrapped_privkey:await AuthV2.wrapPrivate(keys.wrap,kp.secret)});
+    E2E_KIT=AuthV2.b64enc(kp.secret);
+  }
+  INVITE='';sessionStorage.removeItem('ow_pending_invite');PENDING_ORG=d.org_id||INVITE_META.org_id;history.replaceState(null,'',location.pathname);if(!INVITE_META.existing_account)T='';await enterApp();
+  if(E2E_KIT)modal(`<h3>Save your recovery kit</h3><p>Keep this private key offline to recover end-to-end access.</p><textarea aria-label="Recovery kit" rows="3" readonly>${esc(E2E_KIT)}</textarea><button onclick="closeModal()">I saved it</button>`,'Save recovery kit');
 }catch(e){toast(e.message,true)}}
 function forgotPrompt(){modal(`<h3 data-i18n="Reset your password">Reset your password</h3><p class="mut" data-i18n="Enter your email. If an account exists, a reset link is sent.">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email" data-i18n="Email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()" data-i18n="Send link">Send link</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Reset password')}
-function samlPrompt(){let org=prompt(owT('Workspace ID for SAML sign-in'));if(org)location.href='/api/auth/saml/'+encodeURIComponent(org)+'/start'}
+function workspaceSsoPrompt(){modal(`<h3 data-i18n="Sign in to a workspace">Sign in to a workspace</h3><p class="mut" data-i18n="Single sign-on is configured per workspace, and an address alone cannot reveal which workspace you mean.">Single sign-on is configured per workspace, and an address alone cannot reveal which workspace you mean.</p>
+  <div class="field"><label for="saml-org" data-i18n="Workspace ID">Workspace ID</label><input id="saml-org" placeholder="workspace id" data-i18n-placeholder="workspace id" autocomplete="off" onkeydown="if(event.key==='Enter')samlGo('saml')"></div>
+  <p class="small mut" data-i18n="An owner can copy it from Members and access.">An owner can copy it from Members and access.</p>
+  <div class="row" style="margin-top:12px"><button class="primary" onclick="samlGo('saml')" data-i18n="Continue with SAML">Continue with SAML</button><button onclick="samlGo('oidc')" data-i18n="Continue with OIDC">Continue with OIDC</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Workspace sign-in')}
+function samlGo(method){let org=$('saml-org').value.trim();if(!org){toast('Enter the workspace ID',true);return}
+  location.href='/api/auth/'+(method==='oidc'?'oidc':'saml')+'/'+encodeURIComponent(org)+'/start'}
+// The jurisdiction is a deployment, so the console can only report the one
+// serving this page and offer a hand-off to another origin. It never switches
+// region server-side, because a region is not a tenant preference.
+function renderRegion(p){
+  let line=$('regionline');if(!line)return;
+  REGIONS=(p&&p.regions)||[];
+  let here=(p&&p.region)||'global';
+  let others=REGIONS.filter(r=>r.label!==here);
+  line.innerHTML='<span id="regtext"></span><span id="regsw"></span>';
+  owText($('regtext'),'Signing in to {x}',{x:here});
+  if(others.length)$('regsw').innerHTML=' · <a href="#" role="button" onclick="regionPick(event);return false" data-i18n="Change region">Change region</a>'}
+function regionPick(e){if(e)e.preventDefault();
+  let rows=REGIONS.map((r,i)=>`<button class="pickrow" onclick="location.href=this.getAttribute('data-origin')" data-origin="${esc(r.origin)}"><span>${esc(String(r.label).toUpperCase())}</span><span class="grow"></span><span class="pm">${esc(r.origin)}</span></button>`).join('');
+  modal(`<h3 data-i18n="Choose a jurisdiction">Choose a jurisdiction</h3><p class="mut" data-i18n="Sign in where your workspace stores its data.">Sign in where your workspace stores its data.</p><div class="picklist">${rows}</div><div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Jurisdiction')}
 function ldapPrompt(){modal(`<h3 data-i18n="Sign in with your directory">Sign in with your directory</h3><p class="mut" data-i18n="Your password goes to this server over the API and is checked by your directory over TLS.">Your password goes to this server over the API and is checked by your directory over TLS.</p>
   <div class="field"><label for="ld-org" data-i18n="Workspace ID">Workspace ID</label><input id="ld-org" placeholder="workspace id" data-i18n-placeholder="workspace id"></div>
   <div class="field"><label for="ld-user" data-i18n="Directory username">Directory username</label><input id="ld-user" autocomplete="username"></div>
@@ -256,9 +320,9 @@ async function ldapSignIn(){try{
   let d=await api('POST','/api/auth/ldap',{org_id:$('ld-org').value.trim(),username:$('ld-user').value,password:$('ld-pw').value});
   if(d.mfa_required){MFA=d.mfa_token;
     $('modal').innerHTML=`<h3 data-i18n="Two-factor code">Two-factor code</h3><div class="field"><label for="ld-mfa" data-i18n="Authenticator / recovery code">Authenticator / recovery code</label><input id="ld-mfa" placeholder="123456"></div><div class="row"><button class="primary" onclick="ldapMfa()" data-i18n="Verify">Verify</button></div>`;return}
-  T='';closeModal();enterApp();
+  T='';closeModal();await enterApp();
 }catch(e){toast(e.message,true)}}
-async function ldapMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('ld-mfa').value});T='';closeModal();enterApp()}catch(e){toast(e.message,true)}}
+async function ldapMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('ld-mfa').value});T='';closeModal();await enterApp()}catch(e){toast(e.message,true)}}
 async function sendForgot(){try{await api('POST','/api/auth/forgot',{email:$('fp-email').value});closeModal();toastUI('If that address has an account, a reset link is on its way', false)}catch(e){toast(e.message,true)}}
 function showReset(token){
   $('auth').style.display='grid';$('shell').style.display='none';owText($('authtitle'),'Choose a new password');
@@ -271,7 +335,7 @@ function showReset(token){
 async function resetPassword(){try{
   let d=await api('POST','/api/auth/reset',{token:$('authform').dataset.reset,password:$('rp-pw').value,recovery_kit:$('rp-kit').value,discard_e2e_key:!!$('rp-discard').checked});
   T='';history.replaceState(null,'',location.pathname);
-  toastUI(d.e2e_key_replaced?'Password set; your key was replaced':'Password set', false);enterApp();
+  toastUI(d.e2e_key_replaced?'Password set; your key was replaced':'Password set', false);await enterApp();
 }catch(e){toast(e.message,true)}}
 let MODE='login';
 function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');owText($('authtitle'),m==='login'?'Welcome back':'Create your account');owText($('authbtn'),m==='login'?'Sign in':'Create account')}
@@ -281,36 +345,106 @@ async function doAuth(){try{
       modal(`<h3 data-i18n="Check your email">Check your email</h3><p class="mut">${owHTML('We sent a verification link to {x}. Save your recovery kit now; it is shown once.',{x:$('email').value})}</p><textarea id="kit-text" aria-label="Recovery kit" data-i18n-aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toastUI('Recovery kit copied', false)" data-i18n="Copy kit">Copy kit</button><button class="primary" onclick="closeModal()" data-i18n="I saved it">I saved it</button></div>`,'Check your email');
       return}
     T='';
-    modal(`<h3 data-i18n="Save your recovery kit">Save your recovery kit</h3><p class="mut" data-i18n="This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" data-i18n-aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toastUI('Recovery kit copied', false)" data-i18n="Copy kit">Copy kit</button><button class="primary" onclick="closeModal();enterApp()" data-i18n="I saved it, continue">I saved it, continue</button></div>`,'Save your recovery kit');return}
-  let d=await api('POST','/api/auth/login',{email:$('email').value,password:$('pw').value});
+    modal(`<h3 data-i18n="Save your recovery kit">Save your recovery kit</h3><p class="mut" data-i18n="This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.">This X25519 private key decrypts end-to-end environments and is shown once. Store it in a password manager.</p><textarea id="kit-text" aria-label="Recovery kit" data-i18n-aria-label="Recovery kit" rows="3" readonly>${esc(d.recovery_kit)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText('${esc(d.recovery_kit)}');toastUI('Recovery kit copied', false)" data-i18n="Copy kit">Copy kit</button><button class="primary" onclick="closeModal();enterApp().catch(e=>toast(e.message,true))" data-i18n="I saved it, continue">I saved it, continue</button></div>`,'Save your recovery kit');return}
+  let email=$('email').value.trim(),password=$('pw').value,kdf=await AuthV2.kdf(email),d;
+  if(kdf.version===2){let keys=await AuthV2.deriveKeys(password,kdf.salt,kdf.iterations),challenge=await AuthV2.challenge(email);
+    d=await api('POST','/api/auth/login-v2',{email,challenge_id:challenge.challenge_id,proof:await AuthV2.proof(keys.auth,challenge.challenge,challenge.challenge_id)});
+  }else d=await api('POST','/api/auth/login',{email,password});
   if(d.mfa_required){MFA=d.mfa_token;$('mfafield').style.display='block';owText($('authbtn'),'Verify code');$('authbtn').onclick=doMfa;toastUI('Enter your authenticator or recovery code', false);return}
-  T='';enterApp();
+  T='';await enterApp();
 }catch(e){toast(e.message,true)}}
-async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
-async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
-async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
-  let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';await enterApp()}catch(e){toast(e.message,true)}}
+async function logout(){aiReset();closeModal();try{await api('POST','/api/auth/logout',{})}catch(e){} T='';clearPkiState();location.reload()}
+// The last workspace is remembered per account, so a shared browser does not
+// carry one person's choice into the next person's session.
+function orgMemoryKey(){return 'ow.org.'+((ME&&(ME.id||ME.email))||'')}
+function rememberedOrg(){try{return localStorage.getItem(orgMemoryKey())||''}catch(e){return ''}}
+function rememberOrg(id){try{localStorage.setItem(orgMemoryKey(),id)}catch(e){}}
+// Restore a usable surface if the workspace list cannot be loaded. Leaving the
+// sign-in card hidden turns a failed request into a blank page. A failed
+// bootstrap brings back the ordinary sign-in form (AUTH_FORM), so a consumed
+// invite or reset token cannot be resubmitted; an unconsumed invite preview
+// keeps its own markup. PENDING_ORG survives the failure so a retry still
+// opens the workspace an invitation just added.
+async function enterApp(){
+  let pending=sessionStorage.getItem('ow_pending_invite');
+  if(pending&&!INVITE){await showInvite(pending);return}
+  $('auth').style.display='none';
+  try{await enterAppInner()}
+  catch(e){T='';
+    if(!INVITE){$('authform').innerHTML=AUTH_FORM;delete $('authform').dataset.reset;authMode('login')}
+    $('auth').style.display='grid';$('shell').style.display='none';$('picker').style.display='none';throw e}}
+async function enterAppInner(){
   EDITION=await api('GET','/api/instance/edition').catch(()=>null);
-  let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
-  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
-  $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
+  let me=await api('GET','/api/me');ME=me;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
+  let policy=await api('GET','/api/auth/providers');CREATION_OPEN=policy.workspace_creation_open!==false;$('new-workspace').style.display=CREATION_OPEN?'':'none';
+  ORGS=await api('GET','/api/orgs');
+  let want=(PENDING_ORG&&ORGS.some(o=>o.id===PENDING_ORG))?PENDING_ORG:rememberedOrg();PENDING_ORG=null;
+  if(want&&!ORGS.some(o=>o.id===want))want='';
+  ORG=want||(ORGS.length===1?(ORGS[0].id||''):'');
+  if(!ORG&&ORGS.length>1){$('shell').style.display='none';$('picker').style.display='grid';showPicker();return}
+  if(ORG)rememberOrg(ORG);
+  $('shell').style.display='grid';
+  await startWorkspace()}
+function memberLabel(o){let n=Number(o.members)||0;return n+' '+(n===1?'member':'members')}
+function showPicker(){$('pickerlist').innerHTML=ORGS.map(o=>`<button class="pickrow" onclick="pickOrg(this.getAttribute('data-id'))" data-id="${esc(o.id)}"><span class="pn">${esc(o.name)}</span><span class="grow"></span><span class="pm">${memberLabel(o)} · ${esc(o.role)}</span></button>`).join('')}
+async function pickOrg(id){ORG=id;rememberOrg(id);$('picker').style.display='none';$('shell').style.display='grid';
+  try{await startWorkspace()}
+  catch(e){ORG='';
+    // A 401 during entry has already run sessionEnded and returned the sign-in
+    // card; re-showing the picker would imply a session that no longer exists.
+    if(AUTH_READY){EMERGENCY_OWNER=false;$('shell').style.display='none';$('picker').style.display='grid';showPicker();toast(e.message,true)}
+    else{AUTH_READY=false;EMERGENCY_OWNER=false;$('auth').style.display='grid';$('shell').style.display='none';$('picker').style.display='none'}}}
+async function startWorkspace(){
+  if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];clearPkiState();APP=null;ENV=null;PROJECT_DIRECT=false;applyEmergency(false,false);
+  renderOrgMenu();
+  EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
   await refreshEmergency();clearInterval(EMERGENCY_POLL);EMERGENCY_POLL=setInterval(refreshEmergency,5000);
-  await nav(EMERGENCY?'settings':'apps');await applyHashRoute()}
-async function switchOrg(){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
-async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner'}
+  await nav(EMERGENCY?'settings':'apps')}
+function renderOrgMenu(){
+  let cur=ORGS.find(o=>o.id===ORG);
+  if(cur)owDataText($('orgname'),cur.name);else owText($('orgname'),'No workspace');
+  let rows=ORGS.map(o=>`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();switchOrg(this.getAttribute('data-id'))" data-id="${esc(o.id)}"><span class="ck" aria-hidden="true">${o.id===ORG?'✓':''}</span><span class="grow">${esc(o.name)}</span><span class="pm">${esc(o.role)}</span></button>`);
+  let who=esc((ME&&ME.email)||'');
+  $('orgmenu').innerHTML=rows.join('')+'<div class="orgsep"></div>'
+    +`<div class="orgitem" role="none" style="cursor:default"><span class="ck" aria-hidden="true">◆</span><span class="grow small">${who}</span></div>`
+    +`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();nav('settings')"><span class="ck" aria-hidden="true"></span><span class="grow" data-i18n="Account settings">Account settings</span></button>`
+    +`<button class="orgitem" role="menuitem" onclick="closeOrgMenu();logout()"><span class="ck" aria-hidden="true"></span><span class="grow" data-i18n="Sign out">Sign out</span></button>`}
+function orgMenuOpen(){return $('orgbtn').getAttribute('aria-expanded')==='true'}
+function orgMenuItems(){return Array.from($('orgmenu').querySelectorAll('button.orgitem'))}
+function toggleOrgMenu(e){if(e&&e.stopPropagation)e.stopPropagation();let open=!orgMenuOpen();$('orgmenu').hidden=!open;$('orgbtn').setAttribute('aria-expanded',open?'true':'false');
+  if(open){let first=orgMenuItems()[0];if(first)first.focus()}}
+function closeOrgMenu(){let m=$('orgmenu');if(m)m.hidden=true;let b=$('orgbtn');if(b)b.setAttribute('aria-expanded','false')}
+function orgMenuKey(e){if(!orgMenuOpen())return;let items=orgMenuItems();if(!items.length)return;
+  let i=items.indexOf(document.activeElement);
+  if(e.key==='ArrowDown'){e.preventDefault();items[(i+1)%items.length].focus()}
+  else if(e.key==='ArrowUp'){e.preventDefault();items[(i-1)%items.length].focus()}
+  else if(e.key==='Home'){e.preventDefault();items[0].focus()}
+  else if(e.key==='End'){e.preventDefault();items[items.length-1].focus()}
+  else if(e.key==='Escape'){e.preventDefault();closeOrgMenu();$('orgbtn').focus()}}
+async function switchOrg(id){aiReset();if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=id||ORG;clearPkiState();APP=null;ENV=null;EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';PROJECT_DIRECT=false;rememberOrg(ORG);renderOrgMenu();applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
+async function refreshOrgs(){ORGS=await api('GET','/api/orgs');renderOrgMenu();EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner'}
 
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
 async function nav(v){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
-  $('topaction').style.display=(v==='apps'&&!EMERGENCY)?'':'none';
+  $('topaction').style.display=(v==='apps'&&ORG&&!EMERGENCY)?'':'none';
+  if(v!=='assistant')AI_PLAN=null;
+  if(!ORG&&v!=='settings'){renderEmptyWorkspace();return}
   updateDeployBar();
-  if((EMERGENCY||PROJECT_EMERGENCY)&&['access','integrations'].includes(v)){$('pagetitle').textContent='Read-only inspection';$('crumb').textContent='';$('view').innerHTML=emergencyCard(!EMERGENCY);return}
-  try{await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)()}
+  if((EMERGENCY||PROJECT_EMERGENCY)&&['access','integrations','assistant','insights'].includes(v)){$('pagetitle').textContent='Read-only inspection';$('crumb').textContent='';$('view').innerHTML=emergencyCard(!EMERGENCY);return}
+  try{await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,assistant:renderAssistant,insights:renderInsights,audit:renderAudit,settings:renderSettings}[v]||renderApps)()}
   catch(e){$('view').innerHTML=`<div class="card" style="border-color:var(--bad)"><h3>${esc(owT('This view could not load'))}</h3><p>${esc(e&&e.message||String(e))}</p><div class="row"><button class="primary" onclick="nav(${jsq(v)})">${esc(owT('Try again'))}</button><button class="ghost" onclick="nav('apps')">${esc(owT('Back to apps'))}</button></div></div>`}
   updateDeployBar()}
 
+function renderEmptyWorkspace(){$('topaction').style.display='none';owText($('pagetitle'),'Workspaces');owDataText($('crumb'),'');$('view').innerHTML=`<div class="empty"><h3>No workspace yet</h3><p>${CREATION_OPEN?'Create a workspace or accept an invitation.':'Workspace creation is disabled. Ask an administrator for an invitation.'}</p><div class="row">${CREATION_OPEN?'<button class="primary" onclick="newWorkspace()">Create workspace</button>':''}<button onclick="joinWorkspace()">Join workspace</button><button onclick="nav('settings')">Account and instance settings</button></div></div>`}
+function newWorkspace(){if(!CREATION_OPEN){toast('Workspace creation is disabled',true);return}modal(`<h3>New workspace</h3><div class="field"><label for="nw-name">Workspace name</label><input id="nw-name"></div><button class="primary" onclick="createWorkspace()">Create workspace</button><button onclick="closeModal()">Cancel</button>`,'New workspace')}
+async function createWorkspace(){try{let d=await api('POST','/api/orgs',{name:$('nw-name').value.trim()});PENDING_ORG=d.id;closeModal();await enterApp()}catch(e){toast(e.message,true)}}
+async function renameWorkspace(){let name=prompt('Workspace name');if(name===null)return;try{await api('PATCH',`/api/orgs/${ORG}`,{name});await refreshOrgs();renderSettings()}catch(e){toast(e.message,true)}}
+async function leaveWorkspace(){if(!confirm('Leave this workspace? An invitation is required to return.'))return;try{await api('POST',`/api/orgs/${ORG}/leave`,{});await enterApp()}catch(e){toast(e.message,true)}}
+
 // ---------- apps ----------
-async function renderApps(){$('topaction').style.display=EMERGENCY?'none':'';owText($('pagetitle'),'Apps');owDataText($('crumb'),'');
+async function renderApps(){if(!ORG){renderEmptyWorkspace();return}$('topaction').style.display=EMERGENCY?'none':'';owText($('pagetitle'),'Apps');owDataText($('crumb'),'');
   $('view').innerHTML='<div class="empty"><div class="big" data-i18n="Loading…">Loading…</div></div>';
   APPS=ORG?await api('GET',`/api/orgs/${ORG}/apps`):[];
   if(!APPS.length){$('view').innerHTML=`<div class="empty"><div class="big">▦</div><span data-i18n="No apps yet">No apps yet</span><p data-i18n="Create an app to start managing secrets for a project.">Create an app to start managing secrets for a project.</p><button class="primary" onclick="newApp()" data-i18n="Create your first app">Create your first app</button></div>`;return}
@@ -333,7 +467,10 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';owData
   if(!ENV)ENV=ENVS[0];
   if(isDelegated(ENV)){await renderDelegatedEnv();return}
   if(isE2E(ENV)){await renderE2eEnv();return}
-  let d=await api('GET',`/api/envs/${ENV.id}/secrets`);SECRETS=d.secrets;
+  let eid=ENV.id,org=ORG;let d=await api('GET',`/api/envs/${eid}/secrets`);if(ORG!==org||ENV?.id!==eid||VIEW!=='env')return;SECRETS=d.secrets;
+  // Path policy can deny the folders route; folder chips are optional, so an unavailable fetch degrades to none instead of aborting the secrets view.
+  let folderData;try{folderData=await api('GET',`/api/envs/${eid}/folders`)}catch(e){folderData=[]}
+  if(ORG!==org||ENV?.id!==eid||VIEW!=='env')return;let folders=Array.isArray(folderData)?folderData:(folderData.folders||[]);let folderPaths=[...new Set(folders.map(f=>typeof f==='string'?f:f.path).filter(Boolean))];
   $('view').innerHTML=`
   ${envTabs()}
   <div class="row" style="margin-bottom:12px">
@@ -341,6 +478,7 @@ async function renderEnv(){VIEW='env';$('topaction').style.display='none';owData
     <button onclick="importModal()" data-i18n="Import .env">Import .env</button><button onclick="exportEnv()" data-i18n="Export">Export</button><button onclick="appSettings()" data-i18n="App settings">App settings</button><button onclick="envSettings()" data-i18n="Env settings">Env settings</button><button onclick="cloneModal()" data-i18n="Clone">Clone</button><button onclick="compareModal()" data-i18n="Compare">Compare</button>
     <span class="grow"></span><button class="primary" onclick="addRow()" data-i18n="+ New secret">+ New secret</button>
   </div>
+  ${folderPaths.length?`<div class="row" style="flex-wrap:wrap;margin-bottom:12px"><span class="small mut">Folders:</span>${folderPaths.map(p=>`<button class="small mono" onclick="$('sfilter').value='${jsq(p)}';drawSecrets()">${esc(p)}</button>`).join('')}</div>`:''}
   <div id="stable"></div>
   ${APP?.readme?`<div class="card" style="margin-top:14px"><h3 data-i18n="Readme">Readme</h3><pre class="val" style="white-space:pre-wrap">${esc(APP.readme)}</pre></div>`:''}`;
   drawSecrets();updateDeployBar()}
@@ -740,6 +878,7 @@ async function exportEnv(){try{let d=await api('GET',`/api/envs/${ENV.id}/export
 function needAppEnv(){if(!APP){toastUI('Open an app first', true);nav('apps');return false} return true}
 async function renderAccess(){if(!ORG)return;let org=ORG,view=VIEW,accessSerial=++PRODUCT_RENDER;owText($('pagetitle'),'Members & access');owDataText($('crumb'),'');
   let teams=await api('GET',`/api/orgs/${org}/teams`).catch(()=>[]);let roles=await api('GET',`/api/orgs/${org}/roles`).catch(()=>[]);
+  let pending=await api('GET',`/api/orgs/${org}/invites`).catch(()=>[]);
   let members=await api('GET',`/api/orgs/${org}/members`).catch(()=>[]);let myRole=members.find(m=>m.id===ME?.id)?.role||'';
   let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
   let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
@@ -812,6 +951,8 @@ async function invite(){try{let d=await api('POST',`/api/orgs/${ORG}/members`,{e
     modal(`<h3 data-i18n="Invitation created">Invitation created</h3><p class="mut">${owHTML('Send this single-use link to {x}. It expires in 7 days.',{x:$('inv-email').value})}</p><textarea rows="3" readonly>${esc(link)}</textarea><div class="row" style="margin-top:12px"><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toastUI('Invite link copied', false)" data-i18n="Copy link">Copy link</button><button class="primary" onclick="closeModal()" data-i18n="Done">Done</button></div>`);}
   else toastUI('Member added', false);
   $('inv-email').value='';renderAccess()}catch(e){toast(e.message,true)}}
+async function resendInvite(id){try{let d=await api('POST',`/api/orgs/${ORG}/invites/${id}/resend`,{});let link=location.origin+'/#invite='+encodeURIComponent(d.invite_token);modal(`<h3>Replacement invitation</h3><p>The previous link no longer works. Share this new link securely.</p><textarea aria-label="Invitation link" rows="3" readonly>${esc(link)}</textarea><button onclick="navigator.clipboard.writeText(document.querySelector('#modal textarea').value);toastUI('Copied', false)">Copy link</button><button onclick="closeModal()">Done</button>`,'Replacement invitation');renderAccess()}catch(e){toast(e.message,true)}}
+async function revokeInvite(id){if(!confirm('Revoke this invitation?'))return;try{await api('DELETE',`/api/orgs/${ORG}/invites/${id}`);renderAccess()}catch(e){toast(e.message,true)}}
 async function setMemberRole(uid,role){try{await api('PATCH',`/api/orgs/${ORG}/members/${uid}`,{role});toastUI('Role updated', false);renderAccess()}catch(e){toast(e.message,true);renderAccess()}}
 async function removeMember(uid,email){if(!confirm(`Remove ${email} from this workspace?`))return;try{await api('DELETE',`/api/orgs/${ORG}/members/${uid}`);toastUI('Member removed', false);renderAccess()}catch(e){toast(e.message,true)}}
 async function transferOwner(uid,email){if(!confirm(`Make ${email} the owner? You become an admin and lose owner controls.`))return;try{await api('POST',`/api/orgs/${ORG}/transfer`,{user_id:uid});toastUI('Ownership transferred', false);await refreshOrgs();renderAccess()}catch(e){toast(e.message,true)}}
@@ -922,6 +1063,9 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-signups" ${inst.signups_open?'checked':''} ${inst.signups_env_locked?'disabled':''}> <span data-i18n="Allow self signup">Allow self signup</span></label>
     <p class="small mut"><span data-i18n="When off, new users join only by invitation.">When off, new users join only by invitation.</span> ${inst.signups_env_locked?owHTML('Locked by OPENWARP_SIGNUPS.'):''}</p>
     <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''} data-i18n="Save signup policy">Save signup policy</button>
+    <label class="row" style="gap:8px;margin-top:16px"><input type="checkbox" id="set-workspace-creation" ${inst.workspace_creation_open?'checked':''} ${inst.workspace_creation_env_locked?'disabled':''}> Allow workspace creation</label>
+    <p class="small mut">Separate from account signup. When off, new accounts have no personal workspace; invitations still work. ${inst.workspace_creation_env_locked?'Locked by OPENWARP_WORKSPACE_CREATION.':''}</p>
+    <button onclick="saveWorkspacePolicy()" ${inst.workspace_creation_env_locked?'disabled':''}>Save workspace policy</button>
     <div class="row" style="margin-top:12px"><label for="set-instance-owner" data-i18n="New instance owner email">New instance owner email</label><input id="set-instance-owner" type="email" style="min-width:260px"><button onclick="transferInstance()" data-i18n="Transfer instance">Transfer instance</button></div>
     <p class="small mut" style="margin-top:6px" data-i18n="The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
   let tp=themePref();
@@ -943,7 +1087,8 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   if(!AUTH_READY)return;if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
   let planCard=`<div class="card"><h3>Plan</h3><p><span class="chip">${ent?'Enterprise':'Self-hosted'}</span> ${ent?(EDITION.customer?`Licensed to ${esc(EDITION.customer)}${EDITION.expires_at?` until ${new Date(EDITION.expires_at*1000).toLocaleDateString()}`:''}`:'Enterprise license active.'):'All core features are enabled without a license. SAML, workspace OIDC, directory sync and audit streaming need an enterprise license.'}</p>${EDITION?.warning?`<p class="small" style="color:var(--bad)">${esc(EDITION.warning)}</p>`:''}</div>`;
   $('view').innerHTML=`${EMERGENCY_OWNER?emergencyCard():''}${instanceCard}${featureCard}${appearanceCard}${planCard}
-  <div class="card"><h3 data-i18n="Organisation security">Organisation security</h3><p data-i18n="IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.">IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
+  ${ORG?`<div class="card"><h3>Workspace</h3><p>${esc(myOrg.name||'')}</p><div class="row"><button onclick="renameWorkspace()">Rename workspace</button><button onclick="leaveWorkspace()">Leave workspace</button><button onclick="joinWorkspace()">Join another workspace</button></div></div>`:''}
+  ${ORG?`<div class="card"><h3 data-i18n="Organisation security">Organisation security</h3><p data-i18n="IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.">IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip" data-i18n="IP allowlist (CIDR, comma separated, empty = allow all)">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> <span data-i18n="Warn when a secret value is reused elsewhere in this workspace">Warn when a secret value is reused elsewhere in this workspace</span></label>
   <p class="small mut" style="margin:0 0 10px" data-i18n="Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.">Each app can turn the warning off. The check compares a keyed, non-reversible fingerprint and only reports items you can already open.</p>
@@ -954,17 +1099,17 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}${dis}> <span data-i18n="Allow first-time SSO users to join as developers">Allow first-time SSO users to join as developers</span></label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()" data-i18n="Save settings">Save settings</button></div></div>
   ${samlCard}
-  ${ldapCard}
+  ${ldapCard}`:''}
   <div class="card"><h3 data-i18n="Authenticator app (TOTP)">Authenticator app (TOTP)</h3><p data-i18n="Add a second factor to your login.">Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()" data-i18n="Set up TOTP">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator" data-i18n-placeholder="code from authenticator"><button onclick="totpVerify()" data-i18n="Verify and enable">Verify and enable</button></div></div>
   <div class="card"><h3 data-i18n="End-to-end environments">End-to-end environments</h3><p data-i18n="Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.">Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" data-i18n-placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID" data-i18n-placeholder="E2E env ID"><button class="primary" onclick="loadE2E()" data-i18n="Decrypt">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  ${(on('pki')||on('ssh-ca'))?`<div class="card"><h3 data-i18n="PKI">PKI</h3><p data-i18n="Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.">Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.</p>
-  ${on('pki')?`<div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()" data-i18n="Create CA">Create CA</button></div><pre class="val" id="ca-out"></pre>`:''}
-  ${on('ssh-ca')?`<div class="row" style="margin-top:10px"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div>`:''}</div>`:''}
+  ${ORG?`<div class="card"><h3 data-i18n="Device certificates">Device certificates</h3><p data-i18n="Client certificates for devices and services, issued from your own CA after a CSR.">Client certificates for devices and services, issued from your own CA after a CSR.</p><p data-i18n="CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.">CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.</p><div id="pki-body" class="small mut" data-i18n="Loading…">Loading…</div></div>
+  <div class="card"><h3 data-i18n="SSH certificates">SSH certificates</h3><div class="row"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><pre class="val" id="ssh-ca-out"></pre><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>`:''}
+  <div class="card"><h3 data-i18n="Session">Session</h3><div class="row"><button onclick="loadTokensSettings()" data-i18n="My tokens">My tokens</button><button class="danger" onclick="logout()" data-i18n="Sign out everywhere (this device)">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>
   <div class="card" id="passkeys-card"><h3>Passkeys</h3><p class="mut">Sign in without a password using a platform or security-key passkey. Adding or removing one asks for the current password.</p><div class="row"><button onclick="loadPasskeys()" data-i18n="Show passkeys">Show passkeys</button><button class="primary" onclick="addPasskeyModal()" data-i18n="Add passkey">Add passkey</button></div><div id="passkey-list"></div></div>
   <div class="card" id="sessions-card"><h3 data-i18n="Sessions">Sessions</h3><p class="mut">Browser sessions signed in with your account. Revoking one ends that browser immediately.</p><div class="row"><button onclick="loadSessions()" data-i18n="Show sessions">Show sessions</button><button onclick="loadTokensSettings()" data-i18n="My tokens">My tokens</button><button class="danger" onclick="endAllSessions()" data-i18n="End all sessions">End all sessions</button></div><div id="session-list"></div><pre class="val" id="sess-out"></pre></div>
   ${myOrg.role==='owner'?`<div class="card"><h3 data-i18n="Delete workspace">Delete workspace</h3><p><span data-i18n="Type">Type</span> <span class="mono">${esc(myOrg.name||'')}</span> <span data-i18n="to confirm. Every app, environment, secret, token and identity in this workspace is removed.">to confirm. Every app, environment, secret, token and identity in this workspace is removed.</span></p><div class="row"><label for="del-org-name" data-i18n="Workspace name">Workspace name</label><input id="del-org-name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')" data-i18n="Delete workspace">Delete workspace</button></div></div>`:''}
-  <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;if(on('ssh-ca'))loadSshCAs()}
+  <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;loadSshCAs();renderPki()}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked};
   if(isEnterprise()){b.oidc_auto_provision=$('set-oidc-auto').checked;b.oidc_allowed_domains=$('set-oidc-domains').value;
     if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
@@ -988,9 +1133,114 @@ async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toastUI('TOTP enabled', false)}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
-async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
+let PKI_CAS=[],PKI_CA='',PKI_GROUPS=[],PKI_IMPORT_OUT='',PKI_SELECTED=new Set(),PKI_SELECTION_CA='',PKI_CODE_RESULTS=[],PKI_RENDER=0,PKI_HOOK=null,PKI_ATT=null;
+function clearPkiState(){PKI_RENDER++;PKI_CAS=[];PKI_CA='';PKI_GROUPS=[];PKI_IMPORT_OUT='';PKI_SELECTED=new Set();PKI_SELECTION_CA='';PKI_CODE_RESULTS=[];PKI_HOOK=null;PKI_ATT=null;let el=$('pki-body');if(el)el.innerHTML='Loading…'}
+function switchPkiCA(id){PKI_CA=id;PKI_SELECTED.clear();PKI_CODE_RESULTS=[];PKI_IMPORT_OUT='';PKI_SELECTION_CA='';PKI_HOOK=null;PKI_ATT=null;let el=$('pki-body');if(el)el.innerHTML='Loading…';renderPki()}
+async function renderPki(){let el=$('pki-body');if(!el)return;let org=ORG,render=++PKI_RENDER;let current=()=>ORG===org&&render===PKI_RENDER&&$('pki-body')===el;
+  try{let cas=await api('GET',`/api/orgs/${org}/pki/cas`);if(!current())return;PKI_CAS=cas;
+    if(!PKI_CAS.some(c=>c.id===PKI_CA))PKI_CA=PKI_CAS.length?PKI_CAS[0].id:'';
+    let ca=PKI_CAS.find(c=>c.id===PKI_CA);
+    let caSel=PKI_CAS.length?`<select id="pki-ca" onchange="switchPkiCA(this.value)" style="min-width:220px">${PKI_CAS.map(c=>`<option value="${esc(c.id)}"${c.id===PKI_CA?' selected':''}>${esc(c.name)} (${esc(c.kind||'root')}${c.revoked?' revoked':''})</option>`).join('')}</select>`:'';
+    let roots=PKI_CAS.filter(c=>(c.kind||'root')==='root'&&!c.revoked);
+    let parentSel=roots.length?`<select id="ca-parent" style="min-width:180px">${roots.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}</select><input id="int-name" placeholder="intermediate-ca"><button onclick="mkIntermediate()">Create intermediate</button>`:'';
+    let devices=PKI_CA?await api('GET',`/api/pki/cas/${PKI_CA}/devices`):[];if(!current())return;
+    if(PKI_SELECTION_CA!==PKI_CA){PKI_SELECTED.clear();PKI_CODE_RESULTS=[];PKI_IMPORT_OUT='';PKI_SELECTION_CA=PKI_CA;}
+    PKI_SELECTED=new Set([...PKI_SELECTED].filter(id=>devices.some(d=>d.id===id)));
+    let groups=PKI_CA?await api('GET',`/api/pki/cas/${PKI_CA}/groups`):[];if(!current())return;PKI_GROUPS=groups;
+    let expiring=PKI_CA?await api('GET',`/api/orgs/${org}/pki/expiring?days=30`).catch(()=>null):null;if(!current())return;
+    let expLine=expiring?`<span class="chip">Expiring: ${expiring.counts['7']} in 7d, ${expiring.counts['14']} in 14d, ${expiring.counts['30']} in 30d</span>`:'';
+    let groupOpts=PKI_GROUPS.map(g=>`<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+    let rows=devices.map(d=>`<tr><td><input type="checkbox" class="pki-select" data-device="${esc(d.id)}" aria-label="Select ${esc(d.name)}"${PKI_SELECTED.has(d.id)?' checked':''} onchange="selectPkiDevice(this)"></td><td class="mono">${esc(d.name)}</td><td class="small mut">${esc(d.env_id||'-')}</td><td class="small mut">${esc((PKI_GROUPS.find(g=>g.id===d.group_id)||{}).name||'-')}</td><td class="small">${d.active_cert?esc(d.active_cert.revoked?'revoked':'active')+' '+esc((d.active_cert.serial||'').slice(0,12)):'none'}</td><td class="small mut">${d.active_cert?new Date(d.active_cert.expires_at*1000).toLocaleDateString():'-'}</td><td class="small">${d.attested?'attested':'not attested'}</td><td class="row"><button onclick="mintEnrollment('${esc(d.id)}')">Enroll</button><button onclick="renewDevice('${esc(d.id)}')">Renew</button><button class="danger" onclick="revokeDevice('${esc(d.id)}')">Revoke</button></td></tr>`).join('')||'<tr><td colspan="8" class="mut small">No devices yet.</td></tr>';
+    el.innerHTML=`<div class="row">${caSel}<input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()" data-i18n="Create CA">Create CA</button></div>
+      ${parentSel?`<div class="row" style="margin-top:8px">${parentSel}</div>`:''}
+      ${ca?`<p class="small mut" style="margin:8px 0">${esc(ca.kind||'root')} CA${ca.revoked?' · revoked':''} ${expLine} ${ca.revoked?'':'<button class="danger" onclick="revokeCA()">Revoke CA</button>'}</p>`:''}
+      ${PKI_CA?`<div class="row" style="margin-top:10px"><input id="dev-name" placeholder="device name (CN)"><input id="dev-env" placeholder="environment id (optional)" style="min-width:170px"><select id="dev-group" style="min-width:140px"><option value="">no group</option>${groupOpts}</select><button class="primary" onclick="mkDevice()">Add device</button></div>
+      <div class="row" style="margin-top:8px"><button onclick="selectAllPki()">Select all</button><button onclick="clearPkiSelection()">Clear selection</button><span id="pki-selection-count" role="status">${PKI_SELECTED.size} selected</span><button id="pki-mint-selected" onclick="mintSelectedPki()"${PKI_SELECTED.size?'':' disabled'}>Mint selected codes</button><button id="pki-download-codes" onclick="downloadPkiCodes()"${PKI_CODE_RESULTS.some(r=>r.code)?'':' disabled'}>Download codes CSV</button></div>
+      <pre class="val" id="pki-codes-out" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+      <table class="table"><thead><tr><th>Select</th><th>Device</th><th>Environment</th><th>Group</th><th>Certificate</th><th>Expires</th><th>Key</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      <details style="margin-top:10px"${PKI_IMPORT_OUT?' open':''}><summary class="small mut">Bulk import and export (export headers name,model,hardware_serial,tags,env_id,group_id,sans,cert_days are honoured; SANs separated by semicolons or commas)</summary>
+        <textarea id="pki-import" rows="4" style="width:100%;margin-top:8px" placeholder="sensor-1,model-a,S123,site=a,ENV_ID,gw.local;192.0.2.10,45"></textarea>
+        <div class="row"><button onclick="importDevices()">Import and mint codes</button><button onclick="downloadDevices()">Download CSV</button></div><pre class="val" id="pki-import-out"></pre></details>
+      <details style="margin-top:8px"><summary class="small mut">Groups (defaults for SANs, lifetime, environment and tags)</summary>
+        <div class="row" style="margin-top:8px"><input id="grp-name" placeholder="group name"><input id="grp-env" placeholder="environment id (optional)"><input id="grp-sans" placeholder="gw.local"><input id="grp-days" type="number" value="90" style="width:80px"><button onclick="mkGroup()">Add group</button></div>
+        <div class="row">${PKI_GROUPS.map(g=>`<span class="chip">${esc(g.name)} · ${g.device_count} device(s)</span><button onclick="revokeGroup('${esc(g.id)}')">Revoke</button><button class="danger" onclick="deleteGroup('${esc(g.id)}')">Delete</button>`).join(' ')||'<span class="small mut">No groups yet.</span>'}</div></details>
+      <details style="margin-top:8px"><summary class="small mut">Enrollment policy hook</summary>
+        <div class="row" style="margin-top:8px"><input id="hook-url" placeholder="https://inventory.example/pki/enroll" style="min-width:320px" disabled><input id="hook-secret" type="password" placeholder="HMAC secret (blank keeps)" disabled><button id="hook-save" onclick="saveHook()" disabled>Save hook</button></div>
+        <p class="small mut">Called before every issuance. A deny, an error or a timeout blocks enrollment and leaves the code usable.</p></details>
+      <details style="margin-top:8px"><summary class="small mut">Optional hardware attestation</summary>
+        <p class="small mut">No TPM is required on the server or device. Leave attestation optional for ordinary CSR enrollment and signed renewal. Enable a requirement only for a fleet provisioned for it.</p>
+        <div class="row" style="margin-top:8px"><input id="att-issuer" placeholder="attestation issuer" disabled><input id="att-alg" value="ES256" style="width:90px" disabled><label class="row" style="gap:6px"><input type="checkbox" id="att-required" disabled> required</label><button id="att-save" onclick="saveAttestation()" disabled>Save</button></div>
+        <textarea id="att-key" rows="3" style="width:100%;margin-top:6px" placeholder="attestation service public key (PEM)" disabled></textarea></details>
+      <pre class="val" id="ca-out"></pre>`:''}`;
+    if(PKI_CA&&ca){$('ca-out').textContent='CA certificate (trust this in the broker):\n'+ca.certificate;}
+    if(PKI_IMPORT_OUT&&$('pki-import-out'))$('pki-import-out').textContent=PKI_IMPORT_OUT;
+    if(PKI_CA&&$('pki-codes-out'))$('pki-codes-out').textContent=pkiCodesText();
+    if($('pki-download-codes'))$('pki-download-codes').disabled=!PKI_CODE_RESULTS.some(r=>r.code);
+    PKI_HOOK=null;PKI_ATT=null;
+    if(PKI_CA){let caId=PKI_CA;
+      try{let hook=await api('GET',`/api/pki/cas/${caId}/hook`);if(!current()||PKI_CA!==caId)return;PKI_HOOK={ca:caId,render,url:(hook&&hook.url)||''};
+        if($('hook-url')){$('hook-url').value=PKI_HOOK.url;$('hook-url').disabled=false}
+        if($('hook-secret'))$('hook-secret').disabled=false;
+        if($('hook-save'))$('hook-save').disabled=false;
+      }catch(e){if(current()&&PKI_CA===caId)toast('Enrollment hook settings failed to load: '+(e.message||e),true)}
+      try{let att=await api('GET',`/api/pki/cas/${caId}/attestation`);if(!current()||PKI_CA!==caId)return;
+        PKI_ATT={ca:caId,render,mode:typeof att?.mode==='string'?att.mode:''};
+        if($('att-issuer')){$('att-issuer').value=(att&&att.issuer)||'';$('att-alg').value=(att&&att.algorithm)||'ES256';$('att-required').checked=!!(att&&att.required)}
+        for(let id of ['att-issuer','att-alg','att-required','att-key','att-save']){let f=$(id);if(f)f.disabled=false}
+      }catch(e){if(current()&&PKI_CA===caId)toast('Attestation settings failed to load: '+(e.message||e),true)}
+    }
+  }catch(e){if(current()){el.textContent='PKI unavailable: '+(e.message||e);PKI_HOOK=null;PKI_ATT=null}}}
+async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});PKI_CA=d.id;toast('CA created');renderPki()}catch(e){toast(e.message,true)}}
+async function mkIntermediate(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('int-name').value||'intermediate-ca',parent_id:$('ca-parent').value});PKI_CA=d.id;toast('Intermediate created');renderPki()}catch(e){toast(e.message,true)}}
+async function revokeCA(){if(!confirm('Revoke this CA and every certificate it issued?'))return;try{await api('POST',`/api/pki/cas/${PKI_CA}/revoke`,{});toast('CA revoked');renderPki()}catch(e){toast(e.message,true)}}
+async function mkDevice(){try{let b={name:$('dev-name').value};if($('dev-env').value)b.env_id=$('dev-env').value;if($('dev-group').value)b.group_id=$('dev-group').value;await api('POST',`/api/pki/cas/${PKI_CA}/devices`,b);toast('Device added');renderPki()}catch(e){toast(e.message,true)}}
+function syncPkiSelection(){let count=$('pki-selection-count');if(count)count.textContent=PKI_SELECTED.size+' selected';let mint=$('pki-mint-selected');if(mint)mint.disabled=!PKI_SELECTED.size;document.querySelectorAll('.pki-select').forEach(el=>{el.checked=PKI_SELECTED.has(el.getAttribute('data-device'))})}
+function selectPkiDevice(el){let id=el.getAttribute('data-device');if(el.checked)PKI_SELECTED.add(id);else PKI_SELECTED.delete(id);syncPkiSelection()}
+function selectAllPki(){document.querySelectorAll('.pki-select').forEach(el=>PKI_SELECTED.add(el.getAttribute('data-device')));syncPkiSelection()}
+function clearPkiSelection(){PKI_SELECTED.clear();syncPkiSelection()}
+async function mintSelectedPki(){if(!PKI_SELECTED.size)return;let ca=PKI_CA,org=ORG,render=PKI_RENDER,el=$('pki-body');try{if(PKI_SELECTED.size>500)throw Error('Select at most 500 devices per request');let d=await api('POST',`/api/pki/cas/${ca}/devices/codes`,{device_ids:[...PKI_SELECTED],ttl_seconds:3600});if(PKI_CA!==ca||ORG!==org||PKI_RENDER!==render||$('pki-body')!==el)return;PKI_CODE_RESULTS=d.codes||[];$('pki-codes-out').textContent=pkiCodesText();$('pki-download-codes').disabled=!PKI_CODE_RESULTS.some(r=>r.code)}catch(e){toast(e.message,true)}}
+function pkiCodesText(){return PKI_CODE_RESULTS.map(r=>r.error?(r.name||r.id)+': '+r.error:(r.name||r.id)+': '+r.code+' (nonce '+r.nonce+')').join('\n')}
+function pkiCsvField(value){let s=String(value??'');if(/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
+function downloadPkiCodes(){let rows=PKI_CODE_RESULTS.filter(r=>r.code);if(!rows.length)return;let csv='device_id,name,code,nonce,expires_at\r\n'+rows.map(r=>[r.id,r.name,r.code,r.nonce,r.expires_at].map(pkiCsvField).join(',')).join('\r\n');let url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='openwarp-enrollment-codes.csv';a.click();URL.revokeObjectURL(url)}
+function enrollmentText(d,prefix){return prefix+' (valid until '+new Date(d.expires_at*1000).toLocaleString()+'):\n'+d.code+'\nnonce: '+d.nonce+'\n\nPOST '+location.origin+'/api/pki/enroll from the device with JSON {"code":"<code>","csr":"<PEM CSR>"}.\nNo TPM is required. Supply attestation only when configured by your fleet administrator.\nThe code is single use; only its hash is stored.'}
+async function mintEnrollment(id){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let d=await api('POST',`/api/pki/devices/${id}/enrollment`,{ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;$('ca-out').textContent=enrollmentText(d,'One-time enrollment code')}catch(e){toast(e.message,true)}}
+async function renewDevice(id){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let d=await api('POST',`/api/pki/devices/${id}/renew`,{ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;$('ca-out').textContent=enrollmentText(d,'Renewal code (the previous certificate is revoked on enrollment)')}catch(e){toast(e.message,true)}}
+async function revokeDevice(id){if(!confirm('Revoke the active certificate for this device?'))return;try{let d=await api('POST',`/api/pki/devices/${id}/revoke`,{});toast('Revoked '+d.revoked+' certificate(s)');renderPki()}catch(e){toast(e.message,true)}}
+function parseCsvRows(text){let rows=[],row=[],field='',quoted=false;for(let i=0;i<text.length;i++){let c=text[i];
+  if(quoted){if(c==='"'){if(text[i+1]==='"'){field+='"';i++}else quoted=false}else field+=c}
+  else if(c==='"')quoted=true;
+  else if(c===','){row.push(field);field=''}
+  else if(c==='\n'||c==='\r'){if(c==='\r'&&text[i+1]==='\n')i++;row.push(field);if(row.some(v=>v.trim()))rows.push(row);row=[];field=''}
+  else field+=c}
+  if(quoted)throw Error('Unterminated quoted CSV cell');
+  row.push(field);if(row.some(v=>v.trim()))rows.push(row);return rows}
+const PKI_IMPORT_FIELDS=['name','model','hardware_serial','tags','env_id','group_id','sans','cert_days'];
+function deviceImportRows(text){let rows=parseCsvRows(text);if(!rows.length)return [];
+  let header=rows[0].map(v=>v.trim().toLowerCase()),known=header.filter(k=>PKI_IMPORT_FIELDS.includes(k));
+  let hasHeader=header.includes('name')||known.length>1;
+  if(hasHeader&&!header.includes('name'))throw Error('CSV header must include a name column');
+  let keys=hasHeader?header:['name','model','hardware_serial','tags','env_id','sans','cert_days'];
+  return (hasHeader?rows.slice(1):rows).map((cells,index)=>{let o={};keys.forEach((k,i)=>{if(PKI_IMPORT_FIELDS.includes(k))o[k]=(cells[i]||'').trim()});
+    let out={name:o.name};if(!out.name)throw Error('Row '+(index+1)+' has no device name');
+    for(let k of ['model','hardware_serial','tags','env_id','group_id'])if(o[k])out[k]=o[k];
+    if(o.sans)out.sans=o.sans.split(/[;,]/).map(s=>s.trim()).filter(Boolean);
+    if(o.cert_days){let days=Number(o.cert_days);if(!Number.isFinite(days)||days<=0)throw Error('Row '+(index+1)+' has an invalid cert_days value');out.cert_days=days}
+    return out})}
+async function importDevices(){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let devices=deviceImportRows($('pki-import').value);
+  if($('dev-group')&&$('dev-group').value)devices.forEach(o=>{if(!o.group_id)o.group_id=$('dev-group').value});
+  let d=await api('POST',`/api/pki/cas/${ca}/devices/import`,{devices,mint_codes:true,ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;PKI_IMPORT_OUT='created '+d.created+', failed '+d.failed+'\n'+d.results.map(r=>r.error?(r.name||r.id)+': '+r.error:(r.name||r.id)+': '+(r.code||'ok')).join('\n');await renderPki()}catch(e){toast(e.message,true)}}
+async function downloadDevices(){try{let r=await fetch(`/api/pki/cas/${PKI_CA}/devices/export`,{headers:H()});let t=await r.text();
+  if(!r.ok){let m='';try{m=JSON.parse(t).error||''}catch(e){}throw Error(m||('Could not download devices (HTTP '+r.status+')'))}
+  let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='openwarp-devices.csv';a.click()}catch(e){toast(e.message,true)}}
+async function mkGroup(){try{let b={name:$('grp-name').value,cert_days:Number($('grp-days').value)||90};if($('grp-env').value)b.env_id=$('grp-env').value;if($('grp-sans').value)b.sans=$('grp-sans').value.split(',').map(s=>s.trim()).filter(Boolean);await api('POST',`/api/pki/cas/${PKI_CA}/groups`,b);toast('Group added');renderPki()}catch(e){toast(e.message,true)}}
+async function revokeGroup(id){if(!confirm('Revoke every certificate in this group?'))return;try{let d=await api('POST',`/api/pki/groups/${id}/revoke`,{});toast('Revoked '+d.revoked+' certificate(s)');renderPki()}catch(e){toast(e.message,true)}}
+async function deleteGroup(id){if(!confirm('Delete this group? Devices stay and lose their group defaults.'))return;try{await api('DELETE',`/api/pki/groups/${id}`);toast('Group deleted');renderPki()}catch(e){toast(e.message,true)}}
+async function saveHook(){let ca=PKI_CA;if(!ca||!PKI_HOOK||PKI_HOOK.ca!==ca||PKI_HOOK.render!==PKI_RENDER||!$('hook-url')){toast('Enrollment hook settings are not loaded yet',true);return}
+  try{let b={url:$('hook-url').value};if($('hook-secret').value)b.secret=$('hook-secret').value;await api('PUT',`/api/pki/cas/${ca}/hook`,b);toast('Hook saved');renderPki()}catch(e){toast(e.message,true)}}
+async function saveAttestation(){let ca=PKI_CA;if(!ca||!PKI_ATT||PKI_ATT.ca!==ca||PKI_ATT.render!==PKI_RENDER||!$('att-issuer')){toast('Attestation settings are not loaded yet',true);return}
+  try{let b={issuer:$('att-issuer').value,algorithm:$('att-alg').value||'ES256',required:$('att-required').checked};if(PKI_ATT.mode)b.mode=PKI_ATT.mode;if($('att-key').value)b.public_key_pem=$('att-key').value;await api('PUT',`/api/pki/cas/${ca}/attestation`,b);toast('Attestation saved');renderPki()}catch(e){toast(e.message,true)}}
 async function mkSshCA(){try{let d=await api('POST',`/api/orgs/${ORG}/ssh/cas`,{name:$('ssh-ca-name').value||'ssh-ca'});
-  $('ssh-ca-name').value='';$('ca-out').textContent='SSH CA id: '+d.id+'\nFingerprint '+d.fingerprint;
+  $('ssh-ca-name').value='';$('ssh-ca-out').textContent='SSH CA id: '+d.id+'\nFingerprint '+d.fingerprint;
   loadSshCAs();openSshCA(d.id)}catch(e){toast(e.message,true)}}
 async function loadSshCAs(){let host=$('ssh-ca-list');if(!host)return;try{let d=await api('GET',`/api/orgs/${ORG}/ssh/cas`);
   host.innerHTML=d.length?`<table><thead><tr><th data-i18n="SSH CA">SSH CA</th><th data-i18n="Fingerprint">Fingerprint</th><th></th></tr></thead><tbody>`+d.map(c=>`<tr><td>${esc(c.name)}</td><td class="mono small">${esc(c.fingerprint)}</td><td><button onclick="openSshCA('${jsq(c.id)}')" data-i18n="Manage">Manage</button></td></tr>`).join('')+'</tbody></table>':'<p class="mut small" data-i18n="No SSH CA yet. A host accepts these certificates only after TrustedUserCAKeys names this CA.">No SSH CA yet. A host accepts these certificates only after TrustedUserCAKeys names this CA.</p>'}catch(e){host.textContent=e.message}}
@@ -1074,12 +1324,85 @@ async function deleteAccount(){try{
   toast(r.body.error||'Could not delete account',true)
 }catch(e){toast(e.message,true)}}
 
+let AI_SETTINGS=null, AI_CONTEXT={envs:[],integrations:[]}, AI_PLAN=null, AI_REFS=[], AI_OPS=[], AI_DRAFTS=[], AI_FINDINGS=[], AI_EPOCH=0;
+function aiReset(){AI_EPOCH++;AI_SETTINGS=null;AI_CONTEXT={envs:[],integrations:[]};AI_PLAN=null;AI_REFS=[];AI_OPS=[];AI_DRAFTS=[];AI_FINDINGS=[]}
+function aiUrl(org,suffix){return `/api/orgs/${encodeURIComponent(org)}/ai/${suffix}`}
+function aiCurrent(org,epoch,view){return ORG===org&&AI_EPOCH===epoch&&VIEW===view}
+function aiEnvOptions(empty=true){return (empty?'<option value="">All permitted managed environments</option>':'')+(AI_CONTEXT.envs||[]).map(e=>`<option value="${esc(e.id)}">${esc(e.app_name)} / ${esc(e.name)}</option>`).join('')}
+function aiError(id,e){let el=$(id);if(el){el.textContent=e.message||String(e);el.setAttribute('role','alert')}}
+async function renderAssistant(){let org=ORG,epoch=++AI_EPOCH;AI_PLAN=null;AI_REFS=[];AI_OPS=[];
+  owDataText($('pagetitle'),'Assistant');owDataText($('crumb'),'');$('view').innerHTML='<p class="mut" role="status">Loading workspace AI policy...</p>';
+  if(!org){$('view').innerHTML='<p class="mut">Select a workspace first.</p>';return}
+  try{let s=await api('GET',aiUrl(org,'settings'));if(!aiCurrent(org,epoch,'assistant'))return;AI_SETTINGS=s;
+    if(s.enabled){AI_CONTEXT=await api('GET',aiUrl(org,'context'));if(!aiCurrent(org,epoch,'assistant'))return}else AI_CONTEXT={envs:[],integrations:[]};
+    $('view').innerHTML=`<div class="row" style="justify-content:space-between;flex-wrap:wrap;margin-bottom:16px"><div><h3 style="margin:0">Find records and prepare changes</h3><span class="small mut">Workspace-scoped. Stored values never enter model context.</span></div>${s.can_admin?'<button onclick="aiSettingsModal()">Assistant settings</button>':''}</div>
+    ${!s.enabled?'<div class="card"><h3>Assistant is off</h3><p>A workspace administrator must enable it. Local security findings remain available in Security insights.</p></div>':`
+    <div class="card"><h3>Search inside OpenWarp</h3><p>Metadata search stays on this instance. Local value matching returns references, excludes sealed secrets, and requires one environment.</p>
+      <div class="field"><label for="ai-scope">Environment scope</label><select id="ai-scope" style="max-width:100%">${aiEnvOptions()}</select></div>
+      <div class="field"><label for="ai-search">Name, path, or local value fragment</label><input id="ai-search" maxlength="256" onkeydown="if(event.key==='Enter')aiSearch(false)"></div>
+      <div class="row" style="flex-wrap:wrap"><button id="ai-search-btn" onclick="aiSearch(false)">Search metadata</button><button id="ai-local-btn" onclick="aiSearch(true)" ${s.allow_local_search?'':'disabled'}>Match values locally</button></div><div id="ai-search-results" aria-live="polite" style="margin-top:12px"></div></div>
+    <div class="card"><h3>Ask the workspace assistant</h3><p id="ai-disclosure">Your question and authorised managed-environment metadata go to <span class="mono">${esc(s.endpoint||'the configured endpoint')}</span>. Do not type passwords, keys, or connection strings here. Replies can be wrong; check the sources.</p>
+      <div class="row" style="flex-wrap:wrap;align-items:flex-start"><div class="field"><label for="ai-task">Task</label><select id="ai-task" onchange="aiTaskChanged()"><option value="search">Find a secret</option><option value="troubleshoot">Troubleshoot integration</option><option value="drift">Compare environment metadata</option>${s.can_admin?'<option value="incident">Investigate activity</option><option value="access">Review access</option>':''}<option value="rotation">Plan a rotation</option><option value="import">Organise an import</option></select></div><div class="field" id="ai-compare-wrap" hidden><label for="ai-compare">Compare with environment</label><select id="ai-compare">${aiEnvOptions(false)}</select></div></div>
+      <div class="field"><label for="ai-question">Question (sent to the model)</label><textarea id="ai-question" rows="3" maxlength="4000" aria-describedby="ai-disclosure" placeholder="Where is the staging database credential?"></textarea></div>
+      <div class="field" id="ai-import-wrap" hidden><label for="ai-import">Import input (parsed locally, values excluded from model context)</label><textarea id="ai-import" rows="5" maxlength="32768" autocomplete="off" spellcheck="false"></textarea></div>
+      <button class="primary" id="ai-ask" onclick="aiAsk()" ${s.allow_metadata&&s.inference_available!==false?'':'disabled'}>Send question and metadata</button>${s.inference_available===false?'<p class="small mut" style="margin-top:8px">Model inference is unavailable in this runtime. Local search and confirmed plans remain available.</p>':s.allow_metadata?'':'<p class="small mut" style="margin-top:8px">Metadata disclosure is disabled. Local metadata search is still available.</p>'}<div id="ai-answer" aria-live="polite" style="margin-top:16px"></div></div>
+    <div class="card"><h3>Prepare setup</h3><p>Preview folders or integration drafts. Nothing contacts a provider. Every plan needs a separate confirmation.</p><div class="row" style="flex-wrap:wrap"><button onclick="aiSetupModal('create_folder')" ${s.allow_actions?'':'disabled'}>Prepare folder</button><button onclick="aiSetupModal('draft_integration')" ${s.allow_actions?'':'disabled'}>Prepare integration draft</button></div><div id="ai-plan" aria-live="polite" style="margin-top:14px"></div></div>
+    <div class="card"><h3>Integration drafts</h3><p>Drafts have no credentials and cannot sync. Complete one through the normal integration form.</p><div id="ai-drafts" aria-live="polite">Loading drafts...</div></div>`}`;
+    if(s.enabled){if(ENV&&AI_CONTEXT.envs.some(e=>e.id===ENV.id))$('ai-scope').value=ENV.id;await aiLoadDrafts(org,epoch)}
+  }catch(e){if(aiCurrent(org,epoch,'assistant'))aiError('view',e)}}
+function aiTaskChanged(){let task=$('ai-task').value;$('ai-import-wrap').hidden=task!=='import';$('ai-compare-wrap').hidden=task!=='drift'}
+function aiRefMarkup(refs){let base=AI_REFS.length;AI_REFS.push(...refs);return refs.length?refs.map((r,i)=>`<div class="row" style="justify-content:space-between;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line)"><span style="min-width:0;overflow-wrap:anywhere"><span class="mono">${esc(r.key||r.title||r.name||r.id)}</span><br><span class="small mut">${esc(r.app_name||r.app||'')} / ${esc(r.env_name||r.env||'')} ${esc(r.path||'')}</span></span><button onclick="aiOpenRef(${base+i})">${r.env_id&&r.app_id?'Open record':'View evidence'}</button></div>`).join(''):'<p class="mut">No matching records in the permitted scope.</p>'}
+async function aiSearch(local){let org=ORG,epoch=AI_EPOCH,query=$('ai-search').value.trim(),eid=$('ai-scope').value;if(!query)return;
+  if(local&&!eid){aiError('ai-search-results',new Error('Choose one environment before matching values.'));return}
+  let btn=$(local?'ai-local-btn':'ai-search-btn');btn.disabled=true;$('ai-search-results').textContent=local?'Matching values on this instance...':'Searching metadata...';
+  try{let d=local?await api('POST',aiUrl(org,'local-search'),{env_id:eid,query}):await api('GET',aiUrl(org,'search?q='+encodeURIComponent(query)+(eid?'&env_id='+encodeURIComponent(eid):'')));
+    if(!aiCurrent(org,epoch,'assistant'))return;$('ai-search-results').innerHTML=aiRefMarkup(d.results||[])+(d.truncated?'<p class="small mut">Results truncated. Narrow the scope or query.</p>':'');
+  }catch(e){if(aiCurrent(org,epoch,'assistant'))aiError('ai-search-results',e)}finally{if(aiCurrent(org,epoch,'assistant'))btn.disabled=false}}
+async function aiAsk(){let org=ORG,epoch=AI_EPOCH,task=$('ai-task').value,body={message:$('ai-question').value.trim(),task};if(!body.message)return;
+  let eid=$('ai-scope').value;if(eid)body.env_id=eid;if(task==='drift')body.compare_env_id=$('ai-compare').value;if(task==='import')body.import_text=$('ai-import').value;
+  $('ai-ask').disabled=true;$('ai-answer').textContent='Waiting for the configured model...';AI_OPS=[];
+  try{let d=await api('POST',aiUrl(org,'chat'),body);if(!aiCurrent(org,epoch,'assistant'))return;
+    AI_OPS=(d.suggested_operations||[]).filter(o=>['create_folder','draft_integration'].includes(o.kind));
+    $('ai-answer').innerHTML=`<pre class="ai-prose">${esc(d.answer||'The model returned no answer.')}</pre>${d.context_truncated?'<p class="small mut">The context was truncated. This answer does not cover every record.</p>':''}<h4>Sources</h4>${aiRefMarkup(d.citations||[])}${AI_OPS.length?`<h4>Suggested operations</h4><pre class="ai-prose mono">${esc(JSON.stringify(AI_OPS,null,2))}</pre><button onclick="aiPreviewSuggestions()" ${AI_SETTINGS.allow_actions?'':'disabled'}>Preview suggested changes</button>`:''}`;
+    if(task==='import')$('ai-import').value='';
+  }catch(e){if(aiCurrent(org,epoch,'assistant'))aiError('ai-answer',e)}finally{if(aiCurrent(org,epoch,'assistant'))$('ai-ask').disabled=false}}
+async function aiOpenRef(index){let r=AI_REFS[index];if(!r)return;if(!r.env_id||!r.app_id){await nav('audit');return}let org=ORG,epoch=AI_EPOCH;
+  try{let apps=await api('GET',`/api/orgs/${org}/apps`);if(org!==ORG||epoch!==AI_EPOCH)return;let app=apps.find(a=>a.id===r.app_id);if(!app)throw new Error('This source is no longer available.');let envs=await api('GET',`/api/apps/${app.id}/envs`);if(org!==ORG||epoch!==AI_EPOCH)return;let env=envs.find(e=>e.id===r.env_id);if(!env)throw new Error('This environment is no longer available.');APPS=apps;APP=app;ENVS=envs;ENV=env;AI_PLAN=null;await renderEnv();if($('sfilter')&&r.key){$('sfilter').value=r.key;drawSecrets()}
+  }catch(e){toast(e.message,true)}}
+function aiSetupModal(kind){if(!AI_SETTINGS?.allow_actions)return;let integration=kind==='draft_integration';
+  modal(`<h3>${integration?'Prepare integration draft':'Prepare folder'}</h3><p class="mut">The next step shows an immutable preview. It does not execute changes.</p><div class="field"><label for="ai-op-env">Environment</label><select id="ai-op-env" style="max-width:100%">${aiEnvOptions(false)}</select></div>${integration?`<div class="field"><label for="ai-op-kind">Provider</label><select id="ai-op-kind">${(AI_CONTEXT.integration_kinds||KINDS).map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('')}</select></div><div class="field"><label for="ai-op-name">Draft name</label><input id="ai-op-name" maxlength="128"></div>`:'<div class="field"><label for="ai-op-path">Folder path</label><input id="ai-op-path" placeholder="/payments" maxlength="256"></div>'}<div id="ai-op-error" role="alert"></div><div class="row" style="margin-top:12px"><button class="primary" onclick="aiPreviewSetup('${kind}')">Preview changes</button><button onclick="closeModal()">Cancel</button></div>`,'Prepare setup');if(ENV&&AI_CONTEXT.envs.some(e=>e.id===ENV.id))$('ai-op-env').value=ENV.id}
+async function aiPreviewSetup(kind){let op={kind,env_id:$('ai-op-env').value};if(kind==='create_folder')op.path=$('ai-op-path').value.trim();else{op.provider_kind=$('ai-op-kind').value;op.name=$('ai-op-name').value.trim()||op.provider_kind}await aiCreatePlan([op],true)}
+async function aiPreviewSuggestions(){await aiCreatePlan(AI_OPS,false)}
+async function aiCreatePlan(operations,fromModal){let org=ORG,epoch=AI_EPOCH;try{let p=await api('POST',aiUrl(org,'plans'),{operations});if(!aiCurrent(org,epoch,'assistant'))return;AI_PLAN={...p,org,epoch};if(fromModal)closeModal();$('ai-plan').innerHTML=`<h4>Review exact changes</h4><pre class="ai-prose mono">${esc(JSON.stringify(p.operations,null,2))}</pre><p class="small mut">Expires ${esc(new Date(p.expires_at*1000).toLocaleString())}. No provider test or sync is included.</p><div class="row" style="flex-wrap:wrap"><button class="primary" id="ai-confirm" onclick="aiExecutePlan()">Confirm these changes</button><button onclick="aiCancelPlan()">Discard preview</button></div>`;$('ai-confirm').focus()}catch(e){if(aiCurrent(org,epoch,'assistant'))aiError(fromModal?'ai-op-error':'ai-plan',e)}}
+function aiCancelPlan(){AI_PLAN=null;if($('ai-plan'))$('ai-plan').textContent='Preview discarded. No changes executed.'}
+async function aiExecutePlan(){let p=AI_PLAN;if(!p||!aiCurrent(p.org,p.epoch,'assistant'))return;AI_PLAN=null;$('ai-confirm').disabled=true;
+  try{let d=await api('POST',aiUrl(p.org,`plans/${encodeURIComponent(p.id)}/execute`),{confirm:true});if(!aiCurrent(p.org,p.epoch,'assistant'))return;$('ai-plan').innerHTML=`<h4>Execution results</h4><pre class="ai-prose mono">${esc(JSON.stringify(d,null,2))}</pre><p class="small mut">A completed local step does not mean a provider was contacted. Check each result before preparing another plan.</p>`;await aiLoadDrafts(p.org,p.epoch)}catch(e){if(aiCurrent(p.org,p.epoch,'assistant'))aiError('ai-plan',new Error(e.message+' Create a new preview before retrying.'))}}
+async function aiLoadDrafts(org=ORG,epoch=AI_EPOCH){try{let d=await api('GET',aiUrl(org,'drafts'));if(!aiCurrent(org,epoch,'assistant'))return;AI_DRAFTS=d.drafts||[];$('ai-drafts').innerHTML=AI_DRAFTS.length?AI_DRAFTS.map((r,i)=>`<div class="row" style="justify-content:space-between;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)"><span style="overflow-wrap:anywhere">${esc(r.name)} <span class="chip">${esc(r.provider_kind)}</span></span><span><button onclick="aiCompleteDraft(${i})">Configure integration</button> <button onclick="aiRemoveDraft(${i})">Remove draft</button></span></div>`).join(''):'<p class="mut">No integration drafts.</p>'}catch(e){if(aiCurrent(org,epoch,'assistant'))aiError('ai-drafts',e)}}
+function aiCompleteDraft(index){let d=AI_DRAFTS[index];if(!d)return;modal(`<h3>Configure ${esc(d.name)}</h3><p class="mut">${esc(KIND_HINTS[d.provider_kind]||('Configuration for '+d.provider_kind+' as JSON.'))}</p><p class="small mut">These credentials go to OpenWarp storage, not the model. Adding the integration does not test or sync it, but future normal deployments can sync configured integrations.</p><div class="field"><label for="ai-draft-config">Provider configuration</label><textarea id="ai-draft-config" rows="6" spellcheck="false" autocomplete="off"></textarea></div><div id="ai-draft-error" role="alert"></div><div class="row"><button class="primary" id="ai-draft-save" onclick="aiActivateDraft(${index})">Add configured integration</button><button onclick="closeModal()">Cancel</button></div>`,'Configure integration')}
+async function aiActivateDraft(index){let d=AI_DRAFTS[index],org=ORG,epoch=AI_EPOCH;if(!d)return;let config;try{config=JSON.parse($('ai-draft-config').value||'{}')}catch(e){aiError('ai-draft-error',new Error('Enter valid JSON configuration.'));return}$('ai-draft-save').disabled=true;
+  try{await api('POST',`/api/envs/${encodeURIComponent(d.env_id)}/integrations`,{kind:d.provider_kind,name:d.name,config});if(!aiCurrent(org,epoch,'assistant'))return;closeModal();try{await api('DELETE',aiUrl(org,'drafts/'+encodeURIComponent(d.id)))}catch(e){toast('Integration added, but draft cleanup failed. Remove the draft manually; do not add it again.',true)}await aiLoadDrafts(org,epoch);toast('Integration added. Test or sync it separately in Integrations.')}catch(e){if(aiCurrent(org,epoch,'assistant')){aiError('ai-draft-error',e);if($('ai-draft-save'))$('ai-draft-save').disabled=false}}}
+async function aiRemoveDraft(index){let d=AI_DRAFTS[index],org=ORG,epoch=AI_EPOCH;if(!d||!confirm('Remove this unconfigured integration draft?'))return;try{await api('DELETE',aiUrl(org,'drafts/'+encodeURIComponent(d.id)));await aiLoadDrafts(org,epoch)}catch(e){if(aiCurrent(org,epoch,'assistant'))aiError('ai-drafts',e)}}
+function aiSettingsModal(){let s=AI_SETTINGS;if(!s?.can_admin)return;let endpoints=s.allowed_endpoints||[];let toggles=[['enabled','Enable workspace assistant'],['allow_metadata','Allow questions and authorised metadata to reach the model'],['allow_actions','Allow separately confirmed folder and integration-draft plans'],['allow_local_search','Allow local non-sealed value matching (no model request)'],['monitoring_enabled','Enable background deterministic monitoring']];
+  modal(`<h3>Assistant settings</h3><p class="mut">BYOK does not mean local processing. Only choose an endpoint whose data policy you accept. Stored values and provider configuration are excluded from model context.</p>${toggles.map(([k,label])=>`<label class="row" style="gap:8px;margin:10px 0;align-items:flex-start"><input id="ai-set-${k}" type="checkbox" ${s[k]?'checked':''}> ${esc(label)}</label>`).join('')}<div class="field"><label for="ai-set-endpoint">Operator-approved completion endpoint</label><select id="ai-set-endpoint" style="width:100%"><option value="">No endpoint</option>${endpoints.map(u=>`<option value="${esc(u)}" ${u===s.endpoint?'selected':''}>${esc(u)}</option>`).join('')}</select></div>${endpoints.length?'':'<p class="small mut">The operator has not configured OPENWARP_AI_ENDPOINTS. Local features can still work.</p>'}<div class="field"><label for="ai-set-model">Model identifier</label><input id="ai-set-model" value="${esc(s.model||'')}" maxlength="128"></div><div class="field"><label for="ai-set-key">Replacement provider key</label><input id="ai-set-key" type="password" autocomplete="new-password" placeholder="${s.has_api_key?'Saved key exists. Blank keeps it.':'Optional for a local endpoint'}"></div><label class="row" style="gap:8px;margin-bottom:12px"><input id="ai-set-clear" type="checkbox"> Clear saved provider key</label><div class="field"><label for="ai-set-requests">Daily request limit</label><input id="ai-set-requests" type="number" min="1" value="${esc(s.request_limit||100)}"></div><div class="field"><label for="ai-set-tokens">Daily reservation-unit limit (not provider billing)</label><input id="ai-set-tokens" type="number" min="1" value="${esc(s.token_limit||100000)}"></div><div class="field"><label for="ai-set-output">Maximum output tokens per request</label><input id="ai-set-output" type="number" min="1" value="${esc(s.max_output_tokens||1024)}"></div><div id="ai-settings-error" role="alert"></div><div class="row"><button class="primary" id="ai-settings-save" onclick="aiSaveSettings()">Save AI policy</button><button onclick="closeModal()">Cancel</button></div>`,'Assistant settings')}
+async function aiSaveSettings(){let org=ORG,epoch=AI_EPOCH,view=VIEW,body={};for(let k of ['enabled','allow_metadata','allow_actions','allow_local_search','monitoring_enabled'])body[k]=$('ai-set-'+k).checked;body.endpoint=$('ai-set-endpoint').value;body.model=$('ai-set-model').value.trim();body.clear_api_key=$('ai-set-clear').checked;if($('ai-set-key').value)body.api_key=$('ai-set-key').value;for(let [field,id] of [['request_limit','requests'],['token_limit','tokens'],['max_output_tokens','output']])body[field]=Number($('ai-set-'+id).value);$('ai-settings-save').disabled=true;
+  try{await api('PUT',aiUrl(org,'settings'),body);if(!aiCurrent(org,epoch,view))return;closeModal();toast('AI policy saved');if(VIEW==='insights')await renderInsights();else await renderAssistant()}catch(e){if(org===ORG&&epoch===AI_EPOCH){aiError('ai-settings-error',e);if($('ai-settings-save'))$('ai-settings-save').disabled=false}}}
+async function renderInsights(){let org=ORG,epoch=++AI_EPOCH;AI_PLAN=null;owDataText($('pagetitle'),'Security insights');owDataText($('crumb'),'');$('view').innerHTML='<p class="mut" role="status">Checking available activity evidence...</p>';if(!org)return;
+  try{let d=await api('GET',aiUrl(org,'findings'));if(!aiCurrent(org,epoch,'insights'))return;AI_FINDINGS=d.findings||[];AI_SETTINGS=await api('GET',aiUrl(org,'settings'));if(!aiCurrent(org,epoch,'insights'))return;
+    $('view').innerHTML=`<div class="row" style="justify-content:space-between;flex-wrap:wrap;margin-bottom:16px"><div><h3 style="margin:0">Evidence-backed findings</h3><span class="small mut">Rules run without a model. No automatic revocation or remote actions.</span></div><div class="row"><button onclick="renderInsights()">Refresh findings</button><button onclick="aiSettingsModal()">AI and monitoring settings</button></div></div><div class="card"><h3>Coverage and history</h3><p>Missing history is not evidence of safe activity. New baselines can be insufficient, and earlier audit events may be incomplete.</p><pre class="ai-prose mono">${esc(JSON.stringify(d.coverage||{},null,2))}</pre></div><div id="ai-findings-list">${AI_FINDINGS.length?AI_FINDINGS.map((f,i)=>`<section class="card"><div class="row" style="flex-wrap:wrap"><span class="chip">${esc(f.severity)}</span><span class="chip">${esc(f.status||'open')}</span><h3 style="margin:0">${esc(f.title)}</h3></div><p style="margin-top:12px;white-space:pre-wrap">${esc(f.rationale)}</p><p class="small mono">Rule: ${esc(f.rule)}</p>${f.exception_until?`<p class="small mut">Exception expires ${esc(new Date(f.exception_until*1000).toLocaleString())}</p>`:''}${f.maintenance_note?`<p class="small">${esc(f.maintenance_note)}</p>`:''}<details><summary>Evidence (${(f.evidence||[]).length})</summary>${(f.evidence||[]).map(e=>`<div class="small mono" style="overflow-wrap:anywhere;padding:7px 0">${esc(new Date(e.created_at*1000).toLocaleString())} ${esc(e.action)}<br>Event ${esc(e.id)} ${esc(e.env_id||'')}</div>`).join('')}</details><div class="row" style="margin-top:12px;flex-wrap:wrap"><button onclick="aiFindingState(${i},'acknowledged')">Acknowledge</button><button onclick="aiExceptionModal(${i})">Set expiring exception</button><button onclick="aiFindingState(${i},'open')">Reopen</button><button onclick="aiExplainFinding(${i})" ${AI_SETTINGS.enabled&&AI_SETTINGS.allow_metadata&&AI_SETTINGS.inference_available!==false?'':'disabled'}>Ask AI to explain</button></div><div id="ai-finding-${i}" aria-live="polite" style="margin-top:12px"></div></section>`).join(''):'<div class="card"><h3>No findings in the available window</h3><p>This does not establish complete monitoring coverage. Review the history limits above.</p></div>'}</div>`;
+  }catch(e){if(aiCurrent(org,epoch,'insights'))aiError('view',e)}}
+async function aiFindingState(index,status,extra={}){let f=AI_FINDINGS[index],org=ORG,epoch=AI_EPOCH;if(!f)return;try{await api('PUT',aiUrl(org,'findings/'+encodeURIComponent(f.id)),{status,...extra});if(!aiCurrent(org,epoch,'insights'))return;closeModal();await renderInsights()}catch(e){if(aiCurrent(org,epoch,'insights')){if($('ai-exception-error'))aiError('ai-exception-error',e);else aiError('ai-finding-'+index,e)}}}
+function aiExceptionModal(index){if(!AI_FINDINGS[index])return;modal(`<h3>Expiring finding exception</h3><p class="mut">This applies to one finding. The maintenance note stays out of model context.</p><div class="field"><label for="ai-exception-hours">Duration in hours</label><input id="ai-exception-hours" type="number" min="1" max="168" value="1"></div><div class="field"><label for="ai-exception-note">Maintenance or investigation note</label><textarea id="ai-exception-note" rows="3" maxlength="500"></textarea></div><div id="ai-exception-error" role="alert"></div><div class="row"><button class="primary" onclick="aiSaveException(${index})">Save exception</button><button onclick="closeModal()">Cancel</button></div>`,'Finding exception')}
+async function aiSaveException(index){let hours=Number($('ai-exception-hours').value);if(!Number.isFinite(hours)||hours<1||hours>168){aiError('ai-exception-error',new Error('Choose a duration between 1 and 168 hours.'));return}await aiFindingState(index,'exception',{exception_until:Math.floor(Date.now()/1000+hours*3600),maintenance_note:$('ai-exception-note').value})}
+async function aiExplainFinding(index){let f=AI_FINDINGS[index],org=ORG,epoch=AI_EPOCH;if(!f)return;$('ai-finding-'+index).textContent='Sending selected finding evidence to the configured model...';try{let d=await api('POST',aiUrl(org,'chat'),{task:'explain',finding_id:f.id,message:'Explain this finding and suggest investigation steps. Separate evidence from hypotheses.'});if(aiCurrent(org,epoch,'insights'))$('ai-finding-'+index).innerHTML=`<pre class="ai-prose">${esc(d.answer||'No explanation returned.')}</pre>`}catch(e){if(aiCurrent(org,epoch,'insights'))aiError('ai-finding-'+index,e)}}
+
 // ---------- command palette ----------
 function openPalette(){if(EMERGENCY||PROJECT_EMERGENCY||!AUTH_READY)return;$('palette').style.display='block';$('paletteinput').value='';$('paletteresults').innerHTML='';setTimeout(()=>$('paletteinput').focus(),30)}
 async function paletteSearch(){let q=$('paletteinput').value;if(q.length<2){$('paletteresults').innerHTML='';return}
   try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${jsq(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
 function paletteGo(key){$('palette').style.display='none';if(APP&&ENV){nav('apps');renderEnv().then(()=>{let f=$('sfilter');if(f){f.value=key;drawSecrets()}})}}
 $('palette').addEventListener('click',e=>{if(e.target.id==='palette')$('palette').style.display='none'});
+document.addEventListener('click',e=>{if(!orgMenuOpen())return;let t=e.target;if(t.closest&&(t.closest('#orgmenu')||t.closest('#orgbtn')))return;closeOrgMenu()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeOrgMenu()});
 
 loadProviders();
 applyThemeIcons();
@@ -1116,8 +1439,9 @@ function boot(){
     history.replaceState(null,'',location.pathname);toast(msg,true);}
 }
 boot();
-if(typeof window!=='undefined'&&window.addEventListener){window.addEventListener('hashchange',boot);window.addEventListener('hashchange',applyHashRoute);}
-$('auth').style.display='none';enterApp().catch(()=>{T='';$('auth').style.display='grid';$('shell').style.display='none'})
+if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);
+if(!INVITE&&!MFA&&!location.hash.startsWith('#reset=')&&!location.hash.startsWith('#mfa=')){$('auth').style.display='none';enterApp().catch(e=>toast(e.message,true))}
+if(typeof window!=='undefined'&&window.addEventListener){window.addEventListener('hashchange',applyHashRoute);}
 </script>
 <script src="/libsodium.js" integrity="sha384-3KUAqev6nUaNHDSTa/UjyEycVN8iMfq/UtzKf3ZDTuGSb+P3y9kMu/WCVqnLAxUB"></script>
 <script src="/libsodium-wrappers.js" integrity="sha384-uj62oy76l27Bkf3eEP5knMYc094z6HzwAR7Rn8ZZcBBsg5nMibZXSvjRqgZMFg/L"></script>

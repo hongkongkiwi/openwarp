@@ -10,6 +10,9 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
 | Audit log | Inspect workspace activity, sync outcomes, and log-stream delivery attempts |
+| Assistant | Search permitted metadata, ask contextual questions, preview folders and integration drafts |
+| Security insights | Inspect rule-based findings, evidence, acknowledgments, and expiring exceptions |
+| Audit log | Inspect workspace activity |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
 Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority. An unknown hash route renders a Not found screen with links back to Apps and Members & access instead of leaving a blank view.
@@ -23,6 +26,10 @@ The interface is translated into English, Traditional Chinese, Simplified Chines
 ## Accounts and recovery
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
+
+Signing in is account-level, not workspace-level. One account can hold memberships in several workspaces; when it holds more than one, the console asks which workspace to open and remembers that choice for the account on this device. The switcher at the top of the sidebar lists the workspaces with the role held in each, keeps **Account settings** and **Sign out** apart from them, and closes on Escape or an outside click. Sign-in through a workspace's single sign-on needs the workspace ID, because an address alone cannot reveal which workspace is meant; the dialog offers SAML and OIDC.
+
+The sign-in card also names the data jurisdiction the instance serves, and offers **Change region** only when the operator lists another jurisdiction in `OPENWARP_REGIONS`. The hand-off is a link to that origin; a jurisdiction is never selected inside the current server, because it is where the account and its data live.
 
 Save the recovery kit shown during account creation. It is your private key, not an API token. If password reset asks for the kit, supplying it preserves the existing key. Choosing to discard a lost key prevents that account from decrypting existing E2E grants.
 
@@ -39,6 +46,10 @@ Members & access lists members, role controls, removal and Make owner. Ownership
 A workspace owner can use Delete workspace in Settings after typing its exact name and confirming. This removes the workspace's stored applications, secrets, grants, identities, runners, certificates and configuration. It does not erase copies already delivered to clients or providers, or uninstall an SSH CA from hosts. The local deletion batch rolls back on database failure, including on Workers. Provider operations are separate from the local transaction. Revoke dynamic leases first; an unresolved lease prevents workspace deletion. Failed issuance can leave a pending reservation that requires operator reconciliation.
 
 ## Workspaces and applications
+
+The sidebar offers New workspace when creation is enabled and Join workspace regardless of that policy. Accounts with no workspaces see these recovery actions instead of application controls and can still open account and instance Settings. Workspace Settings offers rename and leave; the last owner must transfer ownership before leaving.
+
+Members & access issues invitations for both existing and new accounts, without adding membership immediately. Share the returned link securely. The preview names the workspace, email, role and expiry. Existing accounts must sign in with the invited account and choose Join workspace; a different signed-in account must sign out first. New invitees can create a client-derived account or sign in with a configured provider, then explicitly join. Provider sign-in alone does not consume a pending social invitation. Pending invitations can be revoked or resent; resend rotates the token, invalidating the previous link and starting a new seven-day lifetime. The console displays a link for manual delivery, not an email delivery confirmation.
 
 Select the workspace before changing membership or application data. Create an application from Apps and give it a descriptive name. Application readme content can record ownership, purpose, and operational notes; do not put plaintext credentials there.
 
@@ -121,6 +132,13 @@ E2E environments show a dedicated decrypt panel rather than the ordinary SSE edi
 
 Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, read, and grant wrapped keys. Removing a grant prevents future access to that wrapped key through the server; it cannot erase plaintext or keys that a recipient already copied.
 
+## Assistant and insights
+
+The assistant starts disabled for each workspace. Administrators select an operator-approved endpoint and separately enable metadata disclosure, confirmed actions, and local value matching. Metadata search stays on the instance. Model questions go to the selected endpoint with authorised managed-environment metadata; do not type credentials into a question. Stored values, comments, and provider configuration are excluded. Use the separate import input for local parsing rather than pasting dotenv into a question.
+
+Setup suggestions first become a preview with an expiry. Only "Confirm these changes" executes its stored operations. Folder previews create real empty paths; integration previews create drafts without credentials. Complete an integration draft through its configuration form, then test or sync it separately. Future normal deployments can sync configured integrations.
+
+Security insights are administrator-only and work without a model. Inspect the coverage report before interpreting an empty findings list. Acknowledgments and expiring exceptions record investigation state; AI explanations do not change evidence or revoke credentials. See [assistant and security insights](AI.md) for API boundaries, encryption limits, and endpoint policy.
 ## Emergency lockdown
 
 Workspace owners can halt a whole workspace from Settings, or choose **Project lockdown** on an app card to halt that project. A project is an application in the API. Confirm the selected scope before activation.
@@ -149,6 +167,18 @@ Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certifica
 
 Register hosts here too: a host certificate is only issued for a hostname and public key pair an admin registered, because a host certificate is exactly as trustworthy as the key it names. Removing a registration is how a host key is rotated. Revoking records the certificate, but a host enforces it only after refreshing its `RevokedKeys` file, served here as both the plain list and an OpenSSH KRL.
 
-Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
+Closing signups and disabling workspace creation are separate instance-owner policies. Inviting members is a workspace action and remains available when either policy is closed. `OPENWARP_SIGNUPS` and `OPENWARP_WORKSPACE_CREATION` lock their respective console toggles. The last workspace cannot be deleted while creation is disabled; reopen creation first. The API refuses to disable creation on an empty instance so a signed-in account can create a replacement workspace.
+
+## Device certificates without a TPM
+
+The PKI card creates root and intermediate CAs, selects the active CA, lists the device inventory and mints one-time enrollment or renewal codes. It also shows expiring-certificate counts, imports and exports CSV, manages groups, and configures the enrollment hook and hardware attestation. Select the CA, add a device name and optional environment or group, then use **Enroll** to copy the single-use code and nonce to the device. **Renew** mints a code that revokes the previous certificate when the replacement enrolls. The CA certificate shown below the table is the trust anchor for the MQTT broker. **Revoke** retires the device's active certificate. The console never displays a device private key, because enrollment only accepts a CSR.
+
+Select device checkboxes, or use Select all, then Mint selected codes to provision
+up to 500 existing devices. The result lists successful codes and per-device
+errors. Download codes CSV includes each device id, code, nonce and expiry;
+protect this file as a credential and remove it after provisioning. Switching
+workspace or CA clears selected devices and downloadable code results. Expiry
+summaries are also emailed through the configured mailer to verified, active
+workspace owners and admins.
 
 [Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Development](DEVELOPMENT.md) · [Documentation index](README.md)

@@ -1,5 +1,6 @@
 [package]
 name = "openwarp-server"
+default-run = "openwarp-server"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -12,6 +13,10 @@ crate-type = ["rlib", "cdylib"]
 [[bin]]
 name = "openwarp-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "openwarp-migrate"
+path = "src/bin/migrate.rs"
 
 [dependencies]
 openwarp-crypto = { path = "../crypto" }
@@ -31,6 +36,7 @@ x509-cert = { version = "0.2.5", features = ["builder", "pem"], optional = true 
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"], optional = true }
 rsa = { version = "0.9", features = ["pem"] }
 ssh-key = { version = "0.6", features = ["ed25519", "rsa"], optional = true }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query", "form", "matched-path", "tokio", "http1", "ws"] }
@@ -54,18 +60,18 @@ risaml = { version = "0.7", default-features = false, features = ["crypto-rustcr
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
 native-tls = { version = "0.2", optional = true }
-webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = { version = "0.8", features = ["tokio-postgres"] }
+worker = { version = "0.8", features = ["tokio-postgres", "d1"] }
+# Sync primitives and io traits for the Workers MySQL lease socket.
+tokio = { version = "1", default-features = false, features = ["sync", "io-util"] }
 js-sys = "0.3"
+uuid = { version = "1", features = ["js"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-util = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen-futures = "0.4"
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
-# Only the io traits: the Workers MySQL lease client reads and writes a socket.
-tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [features]
 # Core only by default. The enterprise add-ons are opt-in because they pull in
@@ -82,6 +88,9 @@ transit = []
 workload-identity = []
 change-requests = []
 enterprise = ["saml", "scim", "pki", "ssh-ca", "transit", "workload-identity", "change-requests", "ldap"]
+# Test-only Worker route that runs the migration manifest against a D1 binding.
+# The production Worker build does not enable it.
+d1-smoke = []
 live-db-tests = []
 
 [[test]]
@@ -89,7 +98,16 @@ name = "rotation_regressions"
 path = "tests/rotation_regressions.rs"
 required-features = ["live-db-tests"]
 
+[[test]]
+name = "worker_saml"
+path = "tests/worker_saml.rs"
+required-features = ["saml"]
+
 [dev-dependencies]
+rcgen = "0.13"
+risaml = { version = "0.7", default-features = false, features = ["crypto-rustcrypto"] }
+keystore-pki = "1.0"
+keystore-ocsp = "1.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 lber = "0.4"
 x509-parser = { version = "0.16", features = ["verify"] }

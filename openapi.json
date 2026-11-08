@@ -259,6 +259,27 @@
               "open",
               "invite"
             ]
+          },
+          "region": {
+            "type": "string",
+            "description": "Jurisdiction this deployment serves, from its own configuration",
+            "example": "global"
+          },
+          "regions": {
+            "type": "array",
+            "description": "Jurisdictions the sign-in card may hand off to; empty when this deployment is the only one",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            }
           }
         }
       },
@@ -276,6 +297,10 @@
           },
           "role": {
             "type": "string"
+          },
+          "members": {
+            "type": "integer",
+            "description": "Number of members in the workspace"
           }
         }
       },
@@ -924,6 +949,33 @@
           },
           "username": {
             "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "description": "Child database password for postgres, mysql and planetscale leases."
+          },
+          "host": {
+            "type": "string",
+            "description": "Connection host for planetscale and instabox leases."
+          },
+          "database": {
+            "type": "string",
+            "description": "Connectable database name for planetscale leases."
+          },
+          "port": {
+            "type": "integer",
+            "description": "SSH port for instabox leases."
+          },
+          "command": {
+            "type": "string",
+            "description": "Ready SSH command for instabox leases."
+          },
+          "remote_id": {
+            "type": "string",
+            "description": "Provider id of the issued credential, for provider leases."
+          },
+          "credentials": {
+            "description": "AWS STS response for aws_iam leases."
           },
           "expires_at": {
             "type": "integer"
@@ -5630,6 +5682,7 @@
       },
       "post": {
         "summary": "Create a dynamic lease",
+        "description": "Supports postgres, mysql, aws_iam, planetscale and instabox types plus inference provider child keys; other types create generic random tokens. planetscale needs config.service_token, organization, database and branch (optional service_token_id for tokens that authenticate as id:token) and accepts engine mysql or postgres; instabox needs config.api_key and machine_id. ttl_secs defaults to 3600 and is clamped to 60-2592000.",
         "tags": [
           "leases"
         ],
@@ -6728,6 +6781,1167 @@
             }
           }
         ]
+      }
+    },
+    "/api/orgs/{oid}/pki/cas": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "List workspace certificate authorities",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "oid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Create a root or intermediate certificate authority",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "oid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/orgs/{oid}/pki/expiring": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "List device certificates expiring within a window",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "oid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/issue": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Issue a certificate with a server-generated key",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/certs": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "List certificates issued by a CA",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "List devices under a CA",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Create a device record",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/import": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Bulk create devices and optionally mint enrollment codes",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/codes": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Mint enrollment codes for existing devices",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/export": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Export the device inventory as CSV",
+        "responses": {
+          "200": {
+            "description": "CSV inventory",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/groups": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "List device groups",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Create a device group",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/hook": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Read the enrollment policy hook configuration",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Configure the enrollment policy hook",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/attestation": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Read the attestation configuration",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Configure the attestation issuer and key",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/revoke": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Revoke a CA and every certificate it issued",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/crl": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Fetch the signed CRL (public)",
+        "responses": {
+          "200": {
+            "description": "PEM CRL",
+            "content": {
+              "application/pkix-crl": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": []
+      }
+    },
+    "/api/pki/cas/{caid}/ocsp": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Answer an OCSP request (public)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "caid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/ocsp-request": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/pki/devices/{did}": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Read a device and its certificate history",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Update a device",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Delete a device and revoke its certificates",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/revoke": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Revoke a device's active certificate",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/renew": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Mint a renewal code that revokes the previous certificate",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/enrollment": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Mint a single-use enrollment code",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/groups/{gid}": {
+      "patch": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Update a device group",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Delete a device group",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/groups/{gid}/revoke": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Revoke every certificate in a group",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/enroll": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Enroll a device with a CSR and a one-time code (public)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/pki/certs/{cid}/revoke": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Revoke a certificate",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/pki/renew/challenge": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Create a five-minute renewal challenge for an active device certificate",
+        "security": [],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "description": "Request device_id and new PEM CSR. Returns challenge_id, exact challenge text and expires_at. A proof must use the existing active certificate key, not the CSR key."
+      }
+    },
+    "/api/pki/renew": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Renew with a detached proof signed by the active certificate key",
+        "security": [],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "description": "Request challenge_id and padded base64 detached signature of the exact returned challenge text. P256 ECDSA SHA256 or P384 ECDSA SHA384 ASN.1 DER, Ed25519, or RSA PKCS1 SHA256. Optional attestation JWT or tpm_evidence follows the current CA policy, with nonce equal to challenge_id. Replacement issuance and previous-certificate revocation commit atomically."
+      }
+    },
+    "/api/pki/devices/{did}/tpm": {
+      "get": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Read the trusted TPM AK and PCR policy",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Provision a trusted TPM AK public area and PCR policy",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "did",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ak_public",
+                  "pcr_digest"
+                ],
+                "properties": {
+                  "ak_public": {
+                    "type": "string",
+                    "description": "Padded base64 exact TPM2B_PUBLIC, provisioned out of band"
+                  },
+                  "pcr_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{64}$",
+                    "description": "SHA256 of concatenated SHA256 PCR values 0 through 7"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/pki/expiry-notify": {
+      "post": {
+        "tags": [
+          "PKI"
+        ],
+        "summary": "Send pending expiry email to verified active workspace owners and admins",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "oid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        }
       }
     }
   }

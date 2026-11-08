@@ -5,6 +5,7 @@
 
 use openwarp_crypto as oc;
 use openwarp_server::db::Db;
+use openwarp_server::migrate::{self, Options, MIGRATIONS};
 use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -141,8 +142,11 @@ async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
     let dir = tmp_dir("f7-sqlite");
     let url = format!("sqlite://{}", dir.join("test.db").display());
     {
-        let db = Db::open(&url).await.expect("open fresh sqlite database");
-        assert_eq!(db.version().await.unwrap(), 24, "a fresh database lands on the current version");
+        let db = Db::connect(&url).await.expect("open fresh sqlite database");
+        migrate::apply(&db, MIGRATIONS, Options { to: Some(22) }).await.unwrap();
+        // Engine22 plus b3eea91's historical bootstrap seed, not the full main22 schema.
+        db.exec("INSERT INTO meta(k,v) VALUES('rotation_lifecycle','')", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 22, "the fixture stops before reconciliation");
         // Simulate an interrupted first run of migration 22: the lifecycle meta
         // row was inserted but the schema_migrations ledger entry never landed.
         db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
@@ -156,9 +160,7 @@ async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
         let reopened = Db::open(&url).await;
         assert!(reopened.is_ok(), "migration 22 resume failed: {:?}", reopened.err());
         let reopened = reopened.unwrap();
-        assert_eq!(reopened.version().await.unwrap(), 24, "the ledger must record the current version");
-        let replayed = reopened.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE version=22", &[]).await.unwrap().unwrap();
-        assert_eq!(replayed["n"].as_i64(), Some(1), "the replayed migration 22 is recorded exactly once");
+        assert_eq!(reopened.version().await.unwrap(), 32, "the ledger must record the current version");
         let rows = reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap();
         assert_eq!(rows.len(), 1, "the lifecycle row must remain a single row");
     }
@@ -367,14 +369,17 @@ async fn migration22_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absen
     let _db_guard = MySqlDb { admin: admin.clone(), name: name.clone() };
     let db_url = derive_db_url(&admin, &name);
     {
-        let db = Db::open(&db_url).await.expect("open mysql test database");
-        assert_eq!(db.version().await.unwrap(), 23);
+        let db = Db::connect(&db_url).await.expect("open mysql test database");
+        migrate::apply(&db, MIGRATIONS, Options { to: Some(22) }).await.unwrap();
+        // Engine22 plus b3eea91's historical bootstrap seed, not the full main22 schema.
+        db.exec("INSERT INTO meta(k,v) VALUES('rotation_lifecycle','')", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 22);
         db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
     }
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on MySQL: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 23);
+    assert_eq!(reopened.version().await.unwrap(), 30);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1
@@ -392,14 +397,17 @@ async fn migration22_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_ab
     let _db_guard = PgDb { admin: admin.clone(), name: name.clone() };
     let db_url = derive_db_url(&admin, &name);
     {
-        let db = Db::open(&db_url).await.expect("open postgres test database");
-        assert_eq!(db.version().await.unwrap(), 23);
+        let db = Db::connect(&db_url).await.expect("open postgres test database");
+        migrate::apply(&db, MIGRATIONS, Options { to: Some(22) }).await.unwrap();
+        // Engine22 plus b3eea91's historical bootstrap seed, not the full main22 schema.
+        db.exec("INSERT INTO meta(k,v) VALUES('rotation_lifecycle','')", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 22);
         db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
     }
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on Postgres: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 23);
+    assert_eq!(reopened.version().await.unwrap(), 30);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1

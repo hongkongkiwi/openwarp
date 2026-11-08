@@ -52,7 +52,7 @@ jobs:
       # tests need their own pass or they stop being compiled at all.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features -- --test-threads=2
-      - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs
+      - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs crates/server/tests/workers-mfa.test.cjs crates/server/tests/workers-runtime.test.cjs crates/server/tests/workers-atomic.test.cjs crates/server/tests/workers-parity.test.cjs crates/server/tests/workers-protocol.test.cjs crates/server/tests/workers-live.test.cjs
       - run: python3 scripts/check-openapi.py
       # The SDK tests spawn the binary cargo test just built.
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
@@ -106,8 +106,16 @@ jobs:
         run: node --test scripts/tests/portable-runtime/worker-deployment.test.cjs
       - name: Workerd smoke test
         run: |
-          npm install --no-save wrangler@4.151.1
-          WRANGLER=node_modules/.bin/wrangler scripts/worker-smoke.sh
+          npm install --no-save wrangler@4.158.0
+          export WRANGLER="$PWD/node_modules/.bin/wrangler"
+          scripts/worker-smoke.sh
+          node scripts/worker-runtime-smoke.mjs
+          node scripts/worker-protocol-smoke.mjs
+          node scripts/worker-live-smoke.mjs
+          node scripts/worker-key-smoke.mjs
+          sh scripts/worker-saml-smoke.sh
+      - name: D1 migration driver
+        run: WRANGLER="$PWD/node_modules/.bin/wrangler" scripts/d1-migrate-smoke.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -131,6 +139,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8080/health
           docker exec openwarp-ci openwarp --help >/dev/null
+          docker exec openwarp-ci openwarp-migrate status >/dev/null
           docker stop openwarp-ci
 
   sdks-and-provider:

@@ -1,5 +1,6 @@
 use reqwest::{redirect::Policy, Client, Method};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ const REDIRECT: &str = "http://127.0.0.1:8917/callback";
 const VERIFIER: &str = "account-merge-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
 
 struct Resp { status: u16, body: Value, location: String }
-struct Server { child: Child, base: String, dir: PathBuf, client: Client, inbox: Arc<Mutex<Vec<Value>>> }
+struct Server { child: Child, base: String, dir: PathBuf, client: Client, inbox: Arc<Mutex<Vec<Value>>>, sessions: Mutex<HashMap<String, String>> }
 struct User { id: String, org: String, session: String }
 struct OAuth { access: String, refresh: String, client: String }
 
@@ -69,7 +70,7 @@ impl Server {
             .env_remove("OPENWARP_SIGNUPS").stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().expect("spawn server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().unwrap();
-        let s = Self { child, base, dir, client, inbox };
+        let s = Self { child, base, dir, client, inbox, sessions: Mutex::new(HashMap::new()) };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
@@ -125,12 +126,18 @@ impl Server {
         self.verify(email).await;
         let login = self.call(Method::POST, "/api/auth/login", "", Some(json!({"email": email, "password": PASSWORD}))).await;
         assert_eq!(login.status, 200, "verified password login");
-        User { id: field(&r.body, "user_id"), org: field(&r.body, "org_id"), session: field(&login.body, "token") }
+        let session = field(&login.body, "token");
+        self.sessions.lock().unwrap().insert(email.trim().to_lowercase(), session.clone());
+        User { id: field(&r.body, "user_id"), org: field(&r.body, "org_id"), session }
     }
 
     async fn add_member(&self, owner: &User, email: &str, role: &str) {
-        assert_eq!(self.call(Method::POST, &format!("/api/orgs/{}/members", owner.org), &owner.session,
-            Some(json!({"email": email, "role": role}))).await.status, 200, "add member");
+        let session = self.sessions.lock().unwrap().get(&email.trim().to_lowercase()).expect("registered invitee session").clone();
+        let invite = self.call(Method::POST, &format!("/api/orgs/{}/members", owner.org), &owner.session,
+            Some(json!({"email": email, "role": role}))).await;
+        assert_eq!(invite.status, 200, "add member");
+        assert_eq!(self.call(Method::POST, "/api/auth/accept-invite", &session,
+            Some(json!({"token": field(&invite.body, "invite_token")}))).await.status, 200, "accept member invitation");
     }
 
     async fn app(&self, user: &User, org: &str) -> String {

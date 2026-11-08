@@ -37,7 +37,9 @@ Password reset with a recovery kit re-wraps the same private key under the new p
 
 ## Integrated schema and Transit boundaries
 
-Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts) and 21 (Transit) remain unchanged. Migration 22 retains main's workspace feature grants. Migration 23 adds external-JWKS workload bindings, path policies, static rotation state and the separate compatibility Transit tables. Migration 24 adds stable account session IDs. Databases from the unpublished feature branch's former migration 19 are not supported upgrades. Reset disposable fixtures; if that schema was used for persistent data, preserve a backup and reconcile it explicitly before starting this version. Do not delete migration ledger rows or reinterpret the old feature Transit tables as the shipped engine's schema.
+Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts) and 21 (Transit) remain unchanged. Migration 22 adds external-JWKS workload bindings, path policies, static rotation state and the separate compatibility Transit tables. Migration-engine databases converge on the same objects through version 23, which adds only what a database lacks; shipped main22 ledger rows carry no checksum and stay unverified. Databases from the unpublished feature branch's former migration 19 are not supported upgrades. Reset disposable fixtures; if that schema was used for persistent data, preserve a backup and reconcile it explicitly before starting this version. Do not delete migration ledger rows or reinterpret the old feature Transit tables as the shipped engine's schema.
+
+Migration 31 adds workspace feature grants. Migration 32 adds stable account session IDs.
 
 The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Online root rotation preflights and atomically updates both stores, v2 authentication keys, LDAP passwords and TOTP state, while retaining the main Transit root-generation fence. It is available only on native single-process SQLite without configured or persisted KMS root state.
 
@@ -94,6 +96,22 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## Workspace creation and invitation consent
+
+Workspace creation is an instance-owner policy separate from self-signup. `OPENWARP_WORKSPACE_CREATION` pins it for native and Worker deployments. Disabling it prevents explicit creation and automatic personal workspaces, not invitation acceptance. Policy changes and last-workspace deletion share a database lock row; existing ownership and unresolved-lease checks still apply. An operator can pin creation closed on an empty database, but must reopen it to bootstrap a workspace.
+
+Inviting an existing account does not add membership. `GET /api/auth/invite?token=...` previews only the workspace, email, role, expiry and whether an account exists. It does not return token hashes, passwords or key material. Existing accounts must consent with a matching active, verified account session; a valid session for another account cannot create the invitee on either password protocol. New accounts may redeem a token through legacy or client-derived creation without a personal workspace. Social sign-in may admit an invited address while signup is closed but leaves the invitation unconsumed until explicit acceptance. Workspace-specific directory provisioning retains its separate admission rules.
+
+Invitations expire after seven days. Acceptance consumes the token and inserts membership in one checked database batch; failure rolls both back. Workspace admins list pending invitations by opaque management IDs, revoke them, or resend a rotated token. Resending invalidates the old token. Privileged role grants remain owner-only. Tracked invitations recheck the inviter's current grant authority in the token-consumption transaction, including admin and custom privileged roles. Human inviters must still be active and verified; machine inviters must still exist in the destination workspace. Legacy invitations without an inviter retain their unexpired token/email contract. Preview and acceptance enforce the destination workspace's IP allowlist even before membership exists, and acceptance is refused while the destination workspace is under emergency lockdown. Deliver links over trusted channels; possession authorises new-account creation for the named address. The consume-time check does not serialize all membership and role mutations; cross-backend concurrent role-change behavior still needs runtime validation. The policy guards avoid same-table UPDATE subqueries, but this repair has not been exercised against a live MySQL/MariaDB server.
+
+## Jurisdictions and tenant boundaries
+
+A deployment serves one jurisdiction, labelled by `OPENWARP_REGION` (`global` when unset). A jurisdiction is a deployment boundary, not a tenant attribute: it means this database and this master key. No row records a jurisdiction, so a workspace cannot claim one, and the label the console reports is read from the deployment's own configuration rather than from tenant data. Two jurisdictions that share a database are not separated, whatever their labels say.
+
+An account belongs to one jurisdiction, because the server that verifies the credential is the server that holds the data. The same person needing access in two jurisdictions therefore has two accounts. The sign-in card names its jurisdiction and, when the operator lists other origins in `OPENWARP_REGIONS`, links to them. It never switches jurisdiction inside the current server, and an email address alone is not used to discover which jurisdiction an account lives in: that would disclose account existence across a boundary the operator drew for separation.
+
+Inside a jurisdiction, a workspace remains the access boundary described above. Isolation between workspaces is enforced per request by `require_org` and `require_env`, not by the session, which is account-wide. A per-workspace session would add a second workspace value to check without removing any of those checks.
+
 ## Emergency workspace and project lockdown
 
 A workspace owner can halt the workspace or one project (an application). The console uses `PUT /api/orgs/{org_id}/emergency` or `PUT /api/apps/{app_id}/emergency` with `{"locked":true}` to activate and `{"locked":false}` to restore the selected scope. Both require a cookie-backed database account session and the actual workspace `owner` role. Admins, custom administrative roles and owner-created automation credentials cannot restore access. Member console sessions can read status through `GET` on the same routes. Project status reports `locked` (effective state), `direct_locked` and `workspace_locked`.
@@ -130,6 +148,75 @@ A certificate for `root`, or one issued under a bare `*` grant, is root-equivale
 
 Machine certificates use the same path: a workspace identity signs with its own role, so a token minted for a developer identity cannot request a principal outside that role's grant.
 
+## Device certificates
+
+Device certificates are client certificates for an external broker. Neither the OpenWarp server nor the device needs a TPM. Ordinary CSR enrollment and signed self-renewal work with software-held keys; attestation is optional and not required by default. Enable a hardware-attestation requirement only for a fleet provisioned to satisfy it. OpenWarp does not terminate mTLS with device certificates or treat them as workspace credentials; the broker is the relying party.
+
+Device enrollment consumes a one-time code and a PKCS#10 CSR. The server verifies the CSR self-signature, ignores its subject, SAN and extension requests, and issues a certificate for the device record's name and SANs with the CSR's public key. The device private key never reaches the server on this path. The older `POST /api/pki/cas/:id/issue` path still generates a key on the server and returns it once; it requires workspace admin and exists for devices that cannot produce a CSR.
+
+Enrollment codes are 256-bit random values. Only a SHA-256 hash is stored, the code is consumed atomically on first use, and it expires between five minutes and seven days. Treat a code as a credential: anyone holding it can obtain one certificate for that device until it is used or expires. Mint codes per device, not per fleet, and delete the device record when the code is no longer needed.
+
+CN and SANs are taken from the device record, never from the CSR, so one enrolled device cannot claim another device's identity. Device certificates are client-auth only and default to 90 days. Issuing a new certificate moves the device's active pointer but does not revoke the previous one, so revoke it explicitly when the old key may be compromised. Prefer a dedicated CA per fleet or environment: the CA private key is encrypted with the instance master key, so an attacker with the database and master key can forge any certificate under that CA. Replacing the CA is the rotation boundary; existing broker trust must be updated deliberately.
+
+The CRL and OCSP endpoints are public. A CRL is a signed public artifact and brokers fetch it without credentials; it reveals the serial numbers and revocation state of that CA's certificates. CA identifiers are random and not enumerable. Revocation times come from the stored `revoked_at` value, and the CRL's `nextUpdate` is seven days, so short-lived certificates are the more reliable revocation mechanism for a fleet.
+
+A workspace can run a root CA and intermediates signed by it. The root is the broker's trust anchor; an intermediate has a path length of zero and can sign leaves only. Revoking an intermediate marks it revoked, revokes every certificate it issued and lists its serial in the root's CRL, so one environment or factory can be distrusted without replacing the root. The intermediate private key is encrypted with the master key exactly like a root key.
+
+The pre-issuance hook is a policy gate, not an advisory call. The configured URL is part of the trust boundary: the server sends the device identity, CA and CSR hash, signs the body with the configured HMAC secret when one is set, and requires `{"allow":true}`. A deny, an error, a non-2xx response, a timeout or an egress rejection blocks enrollment, and the code remains usable. The endpoint inherits the egress guards; `OPENWARP_ALLOW_PRIVATE_EGRESS` is needed to call a private-network hook. Redirects are not followed, and in production the host is resolved, a private answer is refused, and the checked address is pinned for the request.
+
+Hardware attestation trusts one operator-configured issuer and public key per CA. The server verifies the JWT signature, issuer, audience, expiry, device subject, the enrollment nonce and the SHA-256 of the submitted CSR, and requires `hardware_backed: true`. It does not inspect the device itself: a compromised attestation service can assert hardware backing, so the issuer and key are the trust anchor. The nonce is single-enrollment, the assertion is checked before the code is consumed, and an accepted assertion is recorded on the device.
+
+Device revocation, deletion, group revocation and CA revocation run as a single database transaction. The delete and revoke paths still carry the epoch and tombstone checks, so a concurrent enrollment cannot attach a certificate while the transaction is in flight; a failed transaction leaves the prior state rather than a half-revoked device.
+
+Renewal (`POST /api/pki/devices/:id/renew`) sets `revoke_previous` on the new code. The previous active certificate is revoked only after the replacement attaches, so a failed enrollment leaves the old certificate valid.
+
+### Built-in TPM profile
+
+The `tpm2` attestation mode verifies evidence locally. A workspace owner or admin
+pins an AK's exact TPM2B_PUBLIC through a trusted provisioning channel. OpenWarp
+does not infer hardware provenance from a self-signed AK or from the TPM attribute
+bits alone. The pin and expected PCR digest are the trust anchors. There is no
+automatic EK certificate discovery or vendor-root trust store.
+
+`tpm_evidence` contains padded base64 `ak_public` and `key_public` TPM2B_PUBLIC
+values, `certify` and `quote` raw TPMS_ATTEST values without the outer TPM2B size,
+`certify_signature` and `quote_signature` TPMT_SIGNATURE values, and `pcrs`, an
+array of eight padded base64 32-byte PCR values. Only SHA-256 Names and RSA
+2048/3072/4096 RSASSA SHA-256 are accepted. The restricted AK and certified key
+must have fixedTPM, fixedParent, sensitiveDataOrigin and sign attributes; the
+certified key cannot have restricted or decrypt attributes. Unknown structures,
+trailing bytes, unsafe clocks and mismatched signatures fail closed.
+
+For both attestations, qualifying data is
+`SHA256("OpenWarp/TPM2/enroll/v1\0" || nonce_utf8 || SHA256(csr_spki_der))`.
+For code enrollment the nonce is returned with the code; for self-renewal it is
+the challenge id. Certify must name the exact TPM public area whose key matches
+the CSR. Quote must select only the SHA-256 bank, PCRs 0 through 7, and its digest
+must match both the supplied PCR values and the provisioned policy. Qualified
+Names are not object Names: both attestations must report the same qualified
+signer, but OpenWarp does not reconstruct the AK's parent ancestry.
+
+The checked-in interoperability fixture was generated by swtpm and independently
+verified with tpm2-tools and OpenSSL. It proves protocol interoperability, not
+physical hardware provenance. `scripts/tpm-fixture.sh` documents generation;
+physical devices still require trusted AK provisioning and an appropriate PCR
+baseline for their boot state.
+
+### Device renewal and notification boundaries
+
+Public renewal requires a proof signed by the existing active certificate key.
+Its single-use challenge covers the device, certificate, new CSR hash, purpose,
+instance destination and random nonce. Database predicates recheck expiration
+using database wall time. A device policy edit advances its enrollment epoch, so
+a hook response for an obsolete device snapshot cannot commit a new certificate.
+The application does not trust forwarded client-certificate headers.
+
+Expiry emails contain aggregate counts only. Recipients are active, verified
+managed owners and admins who can read PKI. Delivery claims are per workspace,
+recipient and day; failed sends can retry. As with other email delivery, a crash
+after the provider accepts a message but before acknowledgement is recorded can
+cause a duplicate. No private keys or enrollment codes enter these messages.
+
 ## Network and operational controls
 
 Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They are not a replacement for a firewall: authentication/bootstrap routes have different handling. Keep the server and database on trusted networks and expose only the intended HTTPS entry point.
@@ -141,6 +228,14 @@ The PostgreSQL driver connects without TLS, and the MySQL/MariaDB driver uses TL
 Provider integrations receive plaintext SSE values. Their credentials, destination URLs, permissions, and remote retention policy are part of your trust boundary. Integration sync excludes sealed values and user-specific overrides. Do not treat sealed secrets as a mechanism for delivering values to providers.
 
 Log streams, email relays, OIDC endpoints, and generic webhooks are outbound connections. Apply network egress controls as well as application validation. Allowing private egress intentionally broadens the destinations the server can contact. See [configuration](CONFIGURATION.md).
+
+## AI disclosure and actions
+
+BYOK does not keep inference local. An explicitly configured model endpoint can receive questions and permitted managed-environment metadata. Stored secret values, comments, provider configurations, and arbitrary audit detail are excluded from model context. Credentials pasted into a question are user-supplied disclosure, not protected retrieval. Local value matching returns authorised non-sealed record references without calling a model. E2E and delegated keys remain outside server-side AI processing.
+
+AI endpoints initially require account sessions and refuse service, machine, and OAuth tokens. Retrieval and plan execution recheck workspace and environment access. Model text and retrieved metadata are untrusted input. Only typed folder and integration-draft plans can execute, after a separate confirmation bound to the stored operations and author. Plans cannot run provider tests, syncs, permission grants, or arbitrary code.
+
+Security findings use bounded deterministic evidence and report history limits. AI explanations are interpretation, not additional evidence. Read the [AI guide](AI.md) before enabling disclosure or private model endpoints.
 
 ## Secret handling on clients
 

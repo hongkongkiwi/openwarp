@@ -153,6 +153,7 @@ async function consoleUI(opts = {}) {
       [`/api/orgs/${org}/members`]: [{ id: uid, email: 'fixture@test.invalid', role }],
       [`/api/orgs/${org}/roles`]: [{ name: role, managed: true, permissions: role === 'admin' || role === 'owner' ? ['*'] : [] }],
       [`/api/orgs/${org}/teams`]: [],
+      [`/api/orgs/${org}/invites`]: [],
       [`/api/orgs/${org}/identities`]: [{ id: 'identity-a', org_id: org, name: opts.identityName || 'CI identity', role: 'developer' }],
       [`/api/orgs/${org}/emergency`]: { locked: false },
       [`/api/orgs/${org}/identities/identity-a/workload-trust`]: [clone(trust)],
@@ -163,7 +164,8 @@ async function consoleUI(opts = {}) {
   routes['/api/apps/app-b/envs'] = [{ id: 'env-other', name: 'Other environment', mode: 'sse' }];
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
-    localStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
+    // The workspace-memory key is console chrome state from the picker, not a product value.
+    localStorage: { getItem: key => key.startsWith('ow.org.') ? 'org-a' : '', setItem: (...args) => { if (!String(args[0]).startsWith('ow.org.')) storage.push(args); }, removeItem() {} },
     sessionStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
     navigator: { language: 'en', languages: ['en'], clipboard: { writeText: async text => clipboard.push(text) } },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },

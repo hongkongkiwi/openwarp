@@ -148,6 +148,6 @@ The repository includes crypto tests, database tests, HTTP integration suites, a
 
 ## Project boundaries
 
-OpenWarp is a native Rust service, not a Cloudflare Worker. Its server needs operating-system networking and a database driver. Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
+OpenWarp runs as a native Rust service or as a Cloudflare Worker with Durable Object storage. Platform-specific features and deployment limits are listed in the [deployment guide](docs/DEPLOY.md). Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
 
 The [documentation index](docs/README.md) links every guide. Start with [security](docs/SECURITY.md) and [backup and restore](docs/BACKUP.md) before storing secrets you cannot afford to lose.

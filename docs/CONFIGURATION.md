@@ -22,6 +22,8 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | `OPENWARP_PG_POOL_SIZE` | `8` | Postgres connections per process, clamped to 1..64. Multiply by the replica count before sizing the database |
 | `OPENWARP_MYSQL_POOL_SIZE` | `8` | MySQL/MariaDB connections per process, clamped to 1..64 |
 | `OPENWARP_SECURE_COOKIES` | Unset | `1` forces Secure cookies; an HTTPS public URL also enables the flag |
+| `OPENWARP_REGION` | `global` | Jurisdiction label for this deployment, 1 to 32 characters of `a-z`, `0-9` or `-`. It describes the data in this deployment's own database and is not stored on tenant rows. An empty value is treated as unset |
+| `OPENWARP_REGIONS` | Unset | Optional `label=origin` list such as `global=https://global.example.com,eu=https://eu.example.com`. The sign-in card offers a hand-off to these origins. Origins must be HTTPS, or HTTP on a loopback host, carry no credentials, query or path, are published to the console in canonical `scheme://host[:port]` form, and startup fails unless the list names this deployment's own region |
 | `OPENWARP_METRICS_TOKEN` | Unset | Enables `/metrics`; callers must supply this bearer token |
 
 The SQLite path is relative to the process working directory unless absolute, for example `sqlite:///var/lib/openwarp/openwarp.db`. Create the parent directory and grant the service account access.
@@ -49,10 +51,13 @@ The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap resp
 | Variable | Default | Behavior |
 | --- | --- | --- |
 | `OPENWARP_SIGNUPS` | Stored instance policy; initially open | `open` or `closed` pins the policy and overrides the console toggle |
+| `OPENWARP_WORKSPACE_CREATION` | Stored instance policy; initially open | Pins workspace creation independently of signup. `closed`, `invite`, `invite_only`, `disabled`, `0` and `false` disable it (case-insensitive); other values enable it. Native environment and Worker bindings use the same setting. |
 | `OPENWARP_EMAIL_WEBHOOK` | Unset | HTTP relay receiving `{to,subject,text}` for account mail |
 | `OPENWARP_EMAIL_TOKEN` | Unset | Optional bearer authentication for the mail relay |
 
 Password signups always require a verified email address: registration issues no session until the link is opened, and the first verified account claims instance ownership. Emails asserted by a configured identity provider (Google, GitHub, Apple, OpenAI, workspace OIDC, SAML, an accepted invite or SCIM) are treated as verified and do not trigger a second round-trip. Without a mail provider the server still starts: outside production it writes verification and reset links to its log, while a production server refuses new password signups and leaves SSO sign-in available. Set the public URL before sending account links. Forgot-password responses are intentionally generic and do not prove message delivery.
+
+Without the override, the instance owner changes workspace creation in Settings or with `PUT /api/instance/workspaces` and `{"open":false}`. `GET /api/instance` reports `workspace_creation_open` and `workspace_creation_env_locked`; the public `GET /api/auth/providers` reports the effective creation policy. Closing creation suppresses personal workspaces for password and social registration, including the first account, but does not disable signup or invitation acceptance. Login never recreates a deleted workspace. The API refuses to close creation with no workspaces, or delete the last workspace while creation is closed. If an operator pins creation closed on an empty database, change the deployment setting to bootstrap a workspace.
 
 ## Social authentication
 
@@ -121,6 +126,14 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.
 
 Private egress is an intentional exception, not a general recommendation. Do not assume one setting constrains every provider-specific request. Apply network-layer egress policy and give integrations only the credentials they need.
+
+## AI endpoints
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `OPENWARP_AI_ENDPOINTS` | Empty | JSON array of exact allowed chat-completion URLs. Workspace administrators can select only these destinations, including explicitly trusted private endpoints |
+
+AI is off per workspace until an administrator enables it. Provider keys are encrypted and write-only. Metadata disclosure, confirmed actions, and local value matching have separate switches. Native inference refuses redirects and ambient proxies; Workers inference is unavailable. BYOK does not imply local processing: the configured endpoint receives permitted context and the question. See [assistant and security insights](AI.md) for the disclosure policy and limits.
 
 ## Workspace settings
 

@@ -54,6 +54,8 @@ class Element {
   set className(value) { this.setAttribute('class', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { value ? this.setAttribute('hidden', '') : this.removeAttribute('hidden'); }
+  get checked() { return this._checked ?? this.hasAttribute('checked'); }
+  set checked(value) { this._checked = Boolean(value); }
   get disabled() { return this.hasAttribute('disabled'); }
   set disabled(value) { value ? this.setAttribute('disabled', '') : this.removeAttribute('disabled'); }
   get value() {
@@ -185,20 +187,24 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   document.body = document.querySelector('body');
   document.documentElement = document.querySelector('html');
   document.activeElement = document.body;
-  const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
+  // A remembered workspace keeps the existing flows inside the shell. The
+  // picker tests clear it to exercise the choice itself.
+  const calls = [], unexpected = [], confirmations = [], timers = [], store = { 'ow.org.fixture@example.invalid': 'org-a', ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
     '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
     '/api/instance': { instance_owner: false },
     '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },
-    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
+    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin', members: 3 }, { id: 'org-b', name: 'Second org', role: 'admin', members: 1 }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
     // Fixture workspaces hold every grant; a test that wants an ungranted
     // surface overrides this entry.
     '/api/orgs/org-a/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
+    '/api/orgs/org-b/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
+    '/api/orgs/org-a/pki/cas': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -207,8 +213,13 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-b/secrets': { secrets: [] },
     '/api/envs/env-c/secrets': { secrets: [] },
     '/api/envs/env-d/secrets': { secrets: [] },
+    '/api/envs/env-a/folders': { folders: [] },
+    '/api/envs/env-b/folders': { folders: [] },
+    '/api/envs/env-c/folders': { folders: [] },
+    '/api/envs/env-d/folders': { folders: [] },
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/ssh/cas': [],
+    '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/emergency': { locked: false },
     '/api/orgs/org-b/emergency': { locked: false },
     '/api/apps/app-a/emergency': { locked: false, direct_locked: false, workspace_locked: false },
@@ -219,6 +230,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
     ...opts.responses,
   };
+  const session = new Map();
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
     localStorage: {
@@ -226,6 +238,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       setItem: (key, value) => { store[key] = String(value); },
       removeItem: key => { delete store[key]; },
     },
+    sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
@@ -237,7 +250,15 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     fetch: async (url, options) => {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
+      const fixtureKey = call.method + ' ' + url;
+      if (Object.hasOwn(opts.responses || {}, fixtureKey)) {
+        const fixture = opts.responses[fixtureKey];
+        const response = typeof fixture === 'function' ? await fixture(call) : fixture;
+        const status = response.status ?? 200;
+        return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(response.body) };
+      }
       let body;
+      if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
       else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
         if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
@@ -256,6 +277,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'POST' && url === '/api/ssh/certs/ssh-cert-1/revoke') body = { revoked: 'ssh-cert-1' };
       else if (options.method === 'POST' && url === '/api/ssh/cas/ca-ssh-1/hosts') body = { id: 'host-2', hostname: call.body.hostname, fingerprint: 'SHA256:newhost' };
       else if (options.method === 'DELETE' && url === '/api/ssh/cas/ca-ssh-1/hosts/host-1') body = { deleted: 'host-1' };
+      else if (opts.pki && options.method === 'POST' && url === '/api/pki/cas/ca-a/devices/codes') body = { codes: call.body.device_ids.map(id => id === 'dev-b' ? { id, error: 'device no longer available' } : { id, name: 'sensor-a', code: 'test-code', nonce: 'test-nonce', expires_at: 1900000000 }) };
+      else if (options.method === 'GET' && opts.responses && Object.hasOwn(opts.responses, url)) body = opts.responses[url];
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -308,8 +331,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   // Browser load order: the i18n runtime executes before the inline console script.
   vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
-  await ui.invoke('enterApp()');
-  await ui.invoke("openApp('app-a')");
+  if (!opts.manualBoot) { await ui.invoke('enterApp()'); await ui.invoke("openApp('app-a')"); }
   calls.length = 0;
   return ui;
 }
@@ -427,10 +449,8 @@ for (const boundary of ['navigation', 'app', 'organization']) {
     } else if (boundary === 'app') {
       await ui.invoke("openApp('app-b')");
     } else {
-      ui.el('orgs').value = 'org-b';
-      await ui.invoke('switchOrg()');
-      ui.el('orgs').value = 'org-a';
-      await ui.invoke('switchOrg()');
+      await ui.invoke("switchOrg('org-b')");
+      await ui.invoke("switchOrg('org-a')");
     }
     await ui.invoke("openApp('app-a')");
     assert.ok(ui.row(draft.key), 'the original environment must still expose its staged draft');
@@ -598,14 +618,32 @@ test('project lockdown leaves metadata readable and blocks secrets and changes',
   assert.match(ui.run('emergencyCard(true)'), /workspace lockdown also applies/);
 });
 
+test('a sibling project lockdown clears an open AI view without recursive polling', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/settings': { status: 403, body: { error: 'a project emergency lockdown is active' } },
+  } });
+  await ui.invoke("APP=null;ENV=null;VIEW='assistant';AI_REFS=[{key:'private-name'}];AI_PLAN={id:'pending'};$('view').innerHTML='<p>private-name</p>'");
+  ui.calls.length = 0;
+  await ui.invoke('refreshEmergency()');
+  assert.doesNotMatch(ui.el('view').textContent, /private-name/);
+  assert.match(ui.el('view').textContent, /Project emergency lockdown active/);
+  assert.equal(ui.run('AI_REFS.length'), 0);
+  assert.equal(ui.run('AI_PLAN'), null);
+  assert.equal(ui.calls.filter(c => c.url === '/api/orgs/org-a/ai/settings').length, 1, 'a single poll must not recursively trigger another probe');
+});
+
 test('an ended session removes plaintext and returns to sign-in', async () => {
   const ui = await consoleUI();
-  await ui.invoke("E2E_KIT='private-kit';applyEmergency(true);sessionEnded()");
+  await ui.invoke("E2E_KIT='private-kit';PKI_SELECTED.add('dev-a');PKI_CODE_RESULTS=[{code:'stale'}];PKI_HOOK={ca:'ca-a',render:PKI_RENDER};PKI_ATT={ca:'ca-a',render:PKI_RENDER};applyEmergency(true);sessionEnded()");
   assert.equal(ui.el('shell').style.display, 'none');
   assert.equal(ui.el('auth').style.display, 'grid');
   assert.equal(ui.el('view').innerHTML, '');
   assert.equal(ui.run('E2E_KIT'), '');
   assert.equal(ui.run('AUTH_READY'), false);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
   assert.equal(ui.run('EMERGENCY'), false, 'an ended session must not block the next sign-in');
 });
 
@@ -744,7 +782,7 @@ test('SSH CA settings create a CA, edit grants and revoke a certificate', async 
   const create = ui.calls.find(c => c.method === 'POST' && c.url === '/api/orgs/org-a/ssh/cas');
   assert.ok(create, 'creating a CA must reach the workspace');
   assert.equal(create.body.name, 'ssh-ca');
-  assert.ok(ui.el('ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
+  assert.ok(ui.el('ssh-ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
   assert.ok(ui.el('ssh-ca-detail').textContent.includes('TrustedUserCAKeys'), 'the new CA opens straight to the sshd block');
   await ui.invoke("openSshCA('ca-ssh-1')");
   assert.ok(ui.el('ssh-grants').value.includes('developer: web-*'), 'existing grants load into the editor');
@@ -799,6 +837,434 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+const aiPolicy = {
+  enabled: true, allow_metadata: true, allow_actions: true, allow_local_search: false,
+  monitoring_enabled: false, can_admin: true, has_api_key: true,
+  endpoint: 'https://ai.test.invalid/v1/chat/completions', model: 'fixture-model',
+  allowed_endpoints: ['https://ai.test.invalid/v1/chat/completions'],
+  request_limit: 100, token_limit: 100000, max_output_tokens: 1024,
+};
+const folderOps = [{ kind: 'create_folder', env_id: 'env-a', path: '/reviewed-folder' }];
+const aiPlan = { id: 'plan-fixture', status: 'pending', operations: folderOps, expires_at: 2000000000 };
+function aiFixtures(policy = {}, extra = {}) {
+  return {
+    'GET /api/orgs/org-a/ai/settings': { body: { ...aiPolicy, ...policy } },
+    'GET /api/orgs/org-a/ai/context': { body: { envs: [{ id: 'env-a', app_id: 'app-a', app_name: 'First app', name: 'Development', mode: 'sse' }], integrations: [] } },
+    'GET /api/orgs/org-a/ai/drafts': { body: { drafts: [] } },
+    ...extra,
+  };
+}
+async function assistantUI(policy = {}, extra = {}) {
+  const ui = await consoleUI([saved], [], { responses: aiFixtures(policy, extra) });
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  return ui;
+}
+async function prepareFolder(ui) {
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-env').value = 'env-a';
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  await ui.click(ui.button(ui.el('modal'), /^Preview changes$/));
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test('assistant defaults off without context fetch, questions or inference', async () => {
+  const ui = await assistantUI({ enabled: false, allow_metadata: false, allow_actions: false });
+  assert.match(ui.el('view').textContent, /assistant is off/i);
+  assert.equal(ui.document.getElementById('ai-question'), null);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/settings']]);
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  for (const flag of ['enabled', 'allow_metadata', 'allow_actions']) assert.equal(ui.el('ai-set-' + flag).checked, false);
+  assert.deepEqual(ui.writes(), [], 'opening disabled assistant and policy must never infer or persist');
+});
+
+test('metadata search stays a GET without secret values or model requests', async () => {
+  const ui = await assistantUI({}, {
+    'GET /api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a': { body: { results: [{ id: saved.id, key: saved.key, path: saved.path, env_id: 'env-a', app_id: 'app-a' }] } },
+  });
+  ui.calls.length = 0;
+  ui.el('ai-search').value = 'DATABASE';
+  await ui.click(ui.el('ai-search-btn'));
+  assert.deepEqual(ui.calls, [{ method: 'GET', url: '/api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a', body: undefined }]);
+  assert.match(ui.el('ai-search-results').textContent, /DATABASE_URL/);
+  assert.ok(!ui.el('view').textContent.includes(saved.value));
+  assert.ok(!JSON.stringify(ui.calls).includes(saved.value), 'stored secret values must not be assembled into search requests');
+});
+
+test('assistant answers and source labels render hostile model text without HTML elements', async () => {
+  const hostile = '<img src=x onerror="alert(1)"><script>bad()</script>';
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: hostile, citations: [{ id: 'source-fixture', key: hostile, path: hostile, app_name: hostile, env_name: hostile, app_id: 'app-a', env_id: 'env-a' }], suggested_operations: [] } },
+  });
+  ui.el('ai-question').value = 'Where is the database key?';
+  await ui.click(ui.el('ai-ask'));
+  assert.ok(ui.el('ai-answer').textContent.includes(hostile), 'escaping must preserve the literal answer and citation text');
+  assert.equal(ui.el('ai-answer').querySelectorAll('img,script').length, 0, 'model and citation content must never create markup');
+  assert.ok(ui.el('ai-answer').querySelectorAll('button').every(b => /^aiOpenRef\(\d+\)$/.test(b.getAttribute('onclick'))), 'source actions use local references, not model-authored handlers');
+});
+
+test('import content uses its dedicated field and never becomes the model question', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: 'Use a service folder.', citations: [], suggested_operations: [] } },
+  });
+  ui.el('ai-task').value = 'import';
+  await ui.invoke('aiTaskChanged()');
+  assert.ok(!hidden(ui.el('ai-import-wrap')));
+  assert.match(ui.el('ai-disclosure').textContent, /do not type passwords, keys, or connection strings/i);
+  const importText = 'DATABASE_URL=fake-import-private-value\nAPI_KEY=fake-import-key';
+  ui.el('ai-question').value = 'Suggest folder names for this import';
+  ui.el('ai-import').value = importText;
+  await ui.click(ui.el('ai-ask'));
+  const request = ui.calls.find(c => c.method === 'POST' && c.url.endsWith('/ai/chat'));
+  assert.deepEqual(request.body, { message: 'Suggest folder names for this import', task: 'import', env_id: 'env-a', import_text: importText });
+  assert.ok(!request.body.message.includes('fake-import-'));
+  assert.ok(!request.body.message.includes(saved.value));
+  assert.equal(ui.el('ai-import').value, '', 'discard raw import input after a successful response');
+});
+
+test('folder setup previews exact operations and executes only after Confirm with a minimal body', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/plans/plan-fixture/execute': { body: { results: [{ kind: 'create_folder', status: 'created' }] } },
+  });
+  ui.calls.length = 0;
+  await prepareFolder(ui);
+  assert.deepEqual(ui.writes(), [{ method: 'POST', url: '/api/orgs/org-a/ai/plans', body: { operations: folderOps } }]);
+  assert.match(ui.el('ai-plan').textContent, /reviewed-folder/);
+  assert.equal(ui.el('ai-plan').querySelectorAll('input,textarea,select').length, 0, 'preview operations are not editable');
+  await ui.click(ui.el('ai-confirm'));
+  const execute = ui.calls.filter(c => c.url.endsWith('/execute'));
+  assert.deepEqual(execute, [{ method: 'POST', url: '/api/orgs/org-a/ai/plans/plan-fixture/execute', body: { confirm: true } }]);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 1, 'repeated activation cannot reuse the consumed preview');
+});
+
+test('workspace switches discard previews and stale chat responses cannot populate the new workspace', async () => {
+  const pending = deferred();
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/chat': () => pending.promise,
+    'GET /api/orgs/org-b/ai/settings': { body: { ...aiPolicy, enabled: false } },
+  });
+  await prepareFolder(ui);
+  ui.el('ai-question').value = 'Ask the old workspace';
+  const asking = ui.run('aiAsk()');
+  await ui.settle();
+  await ui.invoke("switchOrg('org-b')");
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  const newWorkspace = ui.el('view').textContent;
+  pending.resolve({ body: { answer: 'STALE_ORG_A_PRIVATE_RESPONSE', citations: [], suggested_operations: folderOps } });
+  await asking;
+  await ui.settle();
+  assert.equal(ui.el('view').textContent, newWorkspace);
+  assert.ok(!ui.el('view').textContent.includes('STALE_ORG_A_PRIVATE_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0, 'old workspace preview must no longer execute');
+});
+
+test('reset discards a preview and a pending plan response cannot restore it', async () => {
+  const pending = deferred();
+  let requests = 0;
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': () => ++requests === 1 ? { body: aiPlan } : pending.promise,
+  });
+  await prepareFolder(ui);
+  await ui.invoke('aiReset(); aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  const planning = ui.run("aiPreviewSetup('create_folder')");
+  await ui.settle();
+  await ui.invoke('aiReset(); closeModal()');
+  pending.resolve({ body: { ...aiPlan, id: 'stale-plan', operations: [{ ...folderOps[0], path: '/STALE_PLAN_RESPONSE' }] } });
+  await planning;
+  await ui.settle();
+  assert.ok(!ui.el('view').textContent.includes('STALE_PLAN_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+});
+
+test('settings preserve a saved provider key when blank and clear it only explicitly', async () => {
+  const ui = await assistantUI({}, { 'PUT /api/orgs/org-a/ai/settings': { body: { ok: true } } });
+  for (const clear of [false, true]) {
+    await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+    assert.equal(ui.el('ai-set-key').value, '', 'saved key must never populate the password field');
+    ui.el('ai-set-clear').checked = clear;
+    await ui.click(ui.el('ai-settings-save'));
+    const request = ui.calls.filter(c => c.method === 'PUT' && c.url.endsWith('/ai/settings')).at(-1);
+    assert.equal(Object.hasOwn(request.body, 'api_key'), false, 'blank replacement must be omitted rather than clearing the key');
+    assert.equal(request.body.clear_api_key, clear);
+  }
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  ui.el('ai-set-key').value = 'fake-new-provider-key';
+  await ui.click(ui.el('ai-settings-save'));
+  assert.equal(ui.calls.filter(c => c.method === 'PUT').at(-1).body.api_key, 'fake-new-provider-key');
+});
+
+test('security insights display admin authorization failures instead of an empty findings claim', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/findings': { status: 403, body: { error: 'Workspace administrator access required.' } },
+  } });
+  await ui.click(ui.document.querySelector('[data-nav="insights"]'));
+  assert.match(ui.el('view').textContent, /Workspace administrator access required/);
+  assert.equal(ui.el('view').getAttribute('role'), 'alert');
+  assert.doesNotMatch(ui.el('view').textContent, /No findings/);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/findings']]);
+});
+
+test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {
+  let releaseMint, releaseRender, holdRender=false;
+  const opts={pki:true,responses:{
+    '/api/orgs/org-a/pki/cas':[{id:'ca-a',name:'A',kind:'root',certificate:'A-CERT'}],
+    '/api/orgs/org-b/pki/cas':[{id:'ca-b',name:'B',kind:'root',certificate:'B-CERT'}],
+    '/api/orgs/org-b/settings':{}, '/api/orgs/org-b/saml':{configured:false}, '/api/orgs/org-b/ssh/cas':[],
+    '/api/pki/cas/ca-a/devices':[{id:'dev-a',name:'sensor-a'}], '/api/pki/cas/ca-b/devices':[],
+    '/api/pki/cas/ca-a/groups':[], '/api/pki/cas/ca-b/groups':[],
+    '/api/orgs/org-a/pki/expiring?days=30':{counts:{7:0,14:0,30:0}}, '/api/orgs/org-b/pki/expiring?days=30':{counts:{7:0,14:0,30:0}},
+    '/api/pki/cas/ca-a/hook':{url:''}, '/api/pki/cas/ca-b/hook':{url:''},
+    '/api/pki/cas/ca-a/attestation':{}, '/api/pki/cas/ca-b/attestation':{},
+  },fetchOverride:call=>{
+    if(call.url==='/api/pki/cas/ca-a/devices/codes')return new Promise(resolve=>{releaseMint=resolve});
+    if(holdRender&&call.url==='/api/orgs/org-a/pki/cas')return new Promise(resolve=>{releaseRender=resolve});
+  }};
+  const ui=await consoleUI([saved],[],opts);await ui.invoke('renderSettings()');await ui.invoke('selectAllPki()');
+  ui.run('pendingMint=mintSelectedPki()');await ui.settle();holdRender=true;ui.run('pendingRender=renderPki()');await ui.settle();
+  await ui.invoke("ORG='org-b';renderSettings()");
+  releaseRender(opts.responses['/api/orgs/org-a/pki/cas']);await ui.invoke('pendingRender');
+  releaseMint({codes:[{id:'dev-a',name:'sensor-a',code:'A-SECRET-CODE',nonce:'a'}]});await ui.invoke('pendingMint');
+  assert.equal(ui.run('PKI_CA'),'ca-b');assert.equal(ui.el('pki-codes-out').textContent,'');
+  assert.ok(ui.el('pki-download-codes').disabled);assert.ok(!ui.el('view').textContent.includes('A-SECRET-CODE'));
+});
+
+test('PKI bulk codes use explicit selection and show partial failures', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('pki-mint-selected').disabled);
+  await ui.invoke('selectAllPki()');
+  assert.equal(ui.el('pki-selection-count').textContent, '2 selected');
+  await ui.click(ui.el('pki-mint-selected'));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/codes');
+  assert.deepEqual(Array.from(call.body.device_ids), ['dev-a', 'dev-b']);
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.match(ui.el('pki-codes-out').textContent, /device no longer available/);
+  assert.equal(ui.el('pki-download-codes').disabled, false);
+  await ui.invoke('clearPkiSelection()');
+  assert.equal(ui.el('pki-mint-selected').disabled, true);
+  opts.responses['/api/orgs/org-a/pki/cas'] = [{ id: 'ca-b', name: 'Other root', kind: 'root', certificate: 'OTHER PUBLIC CERT' }];
+  opts.responses['/api/pki/cas/ca-b/devices'] = [];
+  opts.responses['/api/pki/cas/ca-b/groups'] = [];
+  opts.responses['/api/pki/cas/ca-b/hook'] = { url: '' };
+  opts.responses['/api/pki/cas/ca-b/attestation'] = { issuer: '', algorithm: 'ES256' };
+  await ui.invoke("PKI_CODE_RESULTS=[{code:'stale'}];PKI_SELECTED.add('dev-a');renderPki()");
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
+});
+
+test('PKI device import accepts exported headers, quoted cells and the legacy headerless rows', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => call.method === 'POST' && call.url === '/api/pki/cas/ca-a/devices/import'
+    ? { created: 2, failed: 0, results: [] } : undefined };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  const rows = JSON.parse(ui.run(`JSON.stringify(parseCsvRows(${JSON.stringify('name,model\r\n"a,b","say ""hi"""\r\n')}))`));
+  assert.deepEqual(rows, [['name', 'model'], ['a,b', 'say "hi"']],
+    'quoted cells keep commas, newlines and doubled quotes');
+  ui.el('pki-import').value = [
+    'name,model,hardware_serial,tags,env_id,group_id,sans,cert_days,serial,expires_at,revoked,attested',
+    'sensor-1,model-a,S123,"site=a,b",env-9,group-9,"gw.local;192.0.2.10",45,ABC,1900000000,false,false',
+    'sensor-2,model-b,S456,site=c,env-9,,"gw2.local,192.0.2.11",30,DEF,1900000000,false,false',
+  ].join('\r\n');
+  await ui.click(ui.button(ui.el('pki-body'), /Import and mint codes/));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/import');
+  assert.deepEqual(call.body.devices, [
+    { name: 'sensor-1', model: 'model-a', hardware_serial: 'S123', tags: 'site=a,b', env_id: 'env-9', group_id: 'group-9', sans: ['gw.local', '192.0.2.10'], cert_days: 45 },
+    { name: 'sensor-2', model: 'model-b', hardware_serial: 'S456', tags: 'site=c', env_id: 'env-9', sans: ['gw2.local', '192.0.2.11'], cert_days: 30 },
+  ], 'exported columns map by header and status columns are ignored');
+  const legacy = JSON.parse(ui.run(`JSON.stringify(deviceImportRows(${JSON.stringify('sensor-3,model-c,S789,site=d,env-9,gw.local;192.0.2.12,60')}))`));
+  assert.deepEqual(legacy, [{ name: 'sensor-3', model: 'model-c', hardware_serial: 'S789', tags: 'site=d', env_id: 'env-9', sans: ['gw.local', '192.0.2.12'], cert_days: 60 }],
+    'the previous headerless line format keeps working');
+  assert.throws(() => ui.run(`parseCsvRows(${JSON.stringify('"open')})`), /Unterminated quoted CSV cell/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('model,tags\nsensor,site=a')})`), /must include a name column/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('name,cert_days\nsensor,soon')})`), /invalid cert_days/);
+  assert.ok(!JSON.stringify(call.body.devices).includes('private'), 'imports never carry private key material');
+});
+
+test('minted PKI codes are repopulated after a render', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  const minted = ui.el('pki-codes-out').textContent;
+  assert.match(minted, /sensor-a: test-code/);
+  await ui.invoke('renderPki()');
+  assert.equal(ui.el('pki-codes-out').textContent, minted, 'the issued codes stay visible after a full render');
+  assert.equal(ui.el('pki-download-codes').disabled, false, 'a render keeps the download control usable');
+});
+
+test('device CSV download checks the response status', async () => {
+  const ui = await consoleUI();
+  ui.run("fetch=async()=>({ok:false,status:403,text:async()=>JSON.stringify({error:'pki:read denied'})})");
+  await ui.invoke('downloadDevices()');
+  assert.match(ui.el('toasts').textContent, /pki:read denied/, 'a rejected export must report the server error');
+});
+
+test('hook and attestation settings fail closed when their reads fail', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook') throw new Error('hook read denied');
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation') throw new Error('attestation read denied');
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  for (const id of ['hook-url', 'hook-secret', 'hook-save', 'att-issuer', 'att-alg', 'att-required', 'att-key', 'att-save'])
+    assert.ok(ui.el(id).disabled, id + ' must stay disabled after a failed read');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'a failed read must never let a save overwrite the stored policy');
+  assert.match(ui.el('toasts').textContent, /hook read denied/);
+  assert.match(ui.el('toasts').textContent, /attestation read denied/);
+});
+
+test('policy forms enable only after their reads and attestation keeps the stored mode', async () => {
+  let resolveHook, resolveAtt;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook')
+      return new Promise(resolve => { resolveHook = () => resolve({ url: 'https://inventory.example/pki/enroll' }); });
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation')
+      return new Promise(resolve => { resolveAtt = () => resolve({ mode: 'tpm2', issuer: 'att-svc', algorithm: 'ES256', required: true }); });
+    if (call.method === 'PUT' && call.url === '/api/pki/cas/ca-a/attestation')
+      return { mode: call.body.mode, issuer: call.body.issuer, algorithm: call.body.algorithm, required: call.body.required };
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('hook-save').disabled);
+  assert.ok(ui.el('att-save').disabled);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'no save may run before the reads complete');
+  resolveHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://inventory.example/pki/enroll');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.ok(ui.el('att-save').disabled, 'attestation stays locked until its own read returns');
+  resolveAtt(); await ui.settle();
+  assert.equal(ui.el('att-required').checked, true);
+  assert.equal(ui.run('PKI_ATT.mode'), 'tpm2');
+  await ui.click(ui.el('att-save'));
+  const put = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/pki/cas/ca-a/attestation');
+  assert.ok(put, 'the loaded form saves');
+  assert.equal(put.body.mode, 'tpm2', 'an ordinary save preserves the stored tpm2 mode');
+  assert.equal(put.body.required, true);
+});
+
+test('switching CA discards the previous policy form before the new settings load', async () => {
+  let holdB = false, resolveBHook;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root A', kind: 'root', certificate: 'A-CERT' }, { id: 'ca-b', name: 'Root B', kind: 'root', certificate: 'B-CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-b/devices': [],
+    '/api/pki/cas/ca-a/groups': [], '/api/pki/cas/ca-b/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: 'https://a.example/hook' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: 'a-svc', algorithm: 'ES256', required: true },
+    '/api/pki/cas/ca-b/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => {
+    if (holdB && call.method === 'GET' && call.url === '/api/pki/cas/ca-b/hook')
+      return new Promise(resolve => { resolveBHook = () => resolve({ url: 'https://b.example/hook' }); });
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.settle();
+  const oldSave = ui.el('att-save');
+  assert.equal(oldSave.disabled, false);
+  assert.equal(ui.run('PKI_ATT.ca'), 'ca-a');
+  holdB = true;
+  ui.run("switchPkiCA('ca-b')");
+  assert.equal(ui.document.getElementById('att-save'), null, 'the old form is replaced immediately');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  assert.equal(ui.run('PKI_CA'), 'ca-b');
+  await ui.click(oldSave);
+  await ui.invoke('saveHook()');
+  assert.deepEqual(ui.writes(), [], 'detached handlers must not save under the new CA');
+  assert.ok(ui.el('att-save').disabled, 'the new attestation form waits for its own read');
+  assert.ok(ui.el('hook-save').disabled, 'the new hook form waits for its own read');
+  resolveBHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://b.example/hook');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.equal(ui.el('att-required').checked, false);
+  assert.equal(ui.run('PKI_ATT.mode'), 'jwt');
+  assert.deepEqual(ui.writes(), [], 'loading the new policy must not write anything');
+});
+
+test('switching workspace clears PKI selections, codes and cached policy for the same CA id', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/orgs/org-b/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/orgs/org-b/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+    '/api/orgs/org-b/settings': {}, '/api/orgs/org-b/saml': { configured: false }, '/api/orgs/org-b/ssh/cas': [],
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.equal(ui.run('PKI_SELECTED.size'), 1);
+  await ui.invoke("switchOrg('org-b')");
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_SELECTION_CA'), '');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.el('pki-codes-out').textContent, '');
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
 });
 
 test('the theme resolves from the system by default and the toggle persists an override', async () => {
@@ -1042,4 +1508,89 @@ test('an enterprise edition unlocks the settings forms', async () => {
   assert.match(view.textContent, /Licensed to Acme Ltd/);
   assert.equal(ui.el('set-oidc-iss').disabled, false, 'OIDC fields are editable with a license');
   assert.ok(ui.button(view, /^Save SAML$/), 'the SAML form is available with a license');
+});
+// A stale digest silently blocks the console's translation script in every
+// browser, so each SRI hash must match the file it names.
+test('console script digests match the files they load', () => {
+  const crypto = require('node:crypto');
+  const files = {
+    'i18n.js': path.join(__dirname, '../src/i18n.js'),
+    'libsodium.js': path.join(__dirname, '../src/vendor/libsodium.js'),
+    'libsodium-wrappers.js': path.join(__dirname, '../src/vendor/libsodium-wrappers.js'),
+  };
+  for (const [name, file] of Object.entries(files)) {
+    const digest = crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64');
+    assert.ok(html.includes(`<script src="/${name}" integrity="sha384-${digest}"`),
+      `${name} must carry the digest of its current contents`);
+  }
+});
+test('a member of several workspaces chooses one, and the choice survives the next visit', async () => {
+  const ui = await consoleUI([saved], [], { manualBoot: true, store: { 'ow.org.fixture@example.invalid': '' } });
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'grid', 'a member of two workspaces must be asked which one to open');
+  assert.equal(ui.el('shell').style.display, 'none', 'the shell must not open behind the picker');
+  const rows = ui.el('pickerlist').children.filter(child => typeof child !== 'string');
+  assert.equal(rows.length, 2, 'both workspaces must be offered');
+  assert.match(rows[0].textContent, /First org/);
+  assert.match(rows[0].textContent, /3 members/, 'the picker shows how large a workspace is');
+  assert.match(rows[1].textContent, /1 member\b/, 'a single-member workspace is not pluralised');
+  assert.match(rows[1].textContent, /admin/, 'the picker shows the role held there');
+
+  await ui.invoke("pickOrg('org-b')");
+  assert.equal(ui.el('picker').style.display, 'none', 'picking a workspace closes the picker');
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'the switcher names the chosen workspace');
+
+  // The remembered choice is what a returning browser lands in.
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'none', 'a remembered workspace must not ask again');
+  assert.equal(ui.el('orgname').textContent, 'Second org');
+});
+
+test('the login screen names its jurisdiction and offers another only when one exists', async () => {
+  const local = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'global', regions: [], google: false, signups: 'open' },
+  } });
+  await local.invoke('loadProviders()');
+  assert.match(local.el('regionline').textContent, /global/, 'a single deployment still states its jurisdiction');
+  assert.doesNotMatch(local.el('regionline').textContent, /Change region/, 'no switch is offered when there is nowhere to go');
+
+  const multi = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'eu', regions: [
+      { label: 'global', origin: 'https://global.example.test' },
+      { label: 'eu', origin: 'https://eu.example.test' },
+    ] },
+  } });
+  await multi.invoke('loadProviders()');
+  assert.match(multi.el('regionline').textContent, /eu/, 'the login screen names the jurisdiction it will authenticate against');
+  assert.match(multi.el('regionline').textContent, /Change region/, 'a second jurisdiction is offered as a hand-off');
+  await multi.invoke('regionPick()');
+  assert.match(multi.el('modal').textContent, /GLOBAL/, 'the picker lists the jurisdictions by name');
+  assert.match(multi.el('modal').textContent, /EU/, 'the picker lists the jurisdictions by name');
+});
+
+test('the workspace menu keeps workspace actions apart from account actions', async () => {
+  const ui = await consoleUI();
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false', 'the menu starts closed');
+  await ui.invoke('toggleOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'true', 'the trigger reports the open state');
+  const menu = ui.el('orgmenu').textContent;
+  assert.match(menu, /First org/);
+  assert.match(menu, /Second org/);
+  assert.match(menu, /fixture@example\.invalid/, 'the account holding the session is named once');
+  assert.match(menu, /Account settings/);
+  assert.match(menu, /Sign out/);
+  assert.ok(menu.indexOf('Second org') < menu.indexOf('Account settings'), 'workspaces come before account actions');
+  const items = ui.el('orgmenu').querySelectorAll('button.orgitem');
+  assert.ok(items.length >= 4, 'the menu exposes its actions as buttons');
+  assert.equal(ui.document.activeElement, items[0], 'opening the menu focuses its first action');
+  await ui.invoke('orgMenuKey({key: "ArrowDown", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[1], 'ArrowDown moves within the menu');
+  await ui.invoke('orgMenuKey({key: "ArrowUp", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[0], 'ArrowUp moves back');
+  await ui.invoke('closeOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false');
+  await ui.invoke("switchOrg('org-b')");
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'switching updates the trigger, not just the state');
+  await ui.invoke('toggleOrgMenu()');
+  assert.match(ui.el('orgmenu').textContent, /✓\s*Second org/, 'the open menu marks the selected workspace');
 });

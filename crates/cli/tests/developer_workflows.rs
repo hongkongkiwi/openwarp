@@ -58,15 +58,14 @@ fn bounded(cmd: &mut Command) -> Output {
     // Drain both pipes while the child runs so a full pipe cannot mask its exit status.
     let stdout = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).expect("read CLI stdout"); bytes });
     let stderr = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).expect("read CLI stderr"); bytes });
-    // Guards against a hung child, not against a slow one. The largest fixture
-    // encrypts 16 MiB through the debug build, which takes seconds on an idle
-    // machine and much longer when the host is busy, so the budget is generous.
+    // A hung CLI still fails, but keypair work and process startup can exceed a
+    // tight budget when the machine is busy, so this guards hangs, not speed.
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return Output { status, stdout: stdout.join().expect("stdout reader"), stderr: stderr.join().expect("stderr reader") };
         }
-        if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); panic!("CLI exceeded 120 second deadline"); }
+        if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); panic!("CLI exceeded 20 second deadline"); }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -236,30 +235,11 @@ impl Api {
         let thread = std::thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() { Ok(v) => v, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(5)); continue; }, Err(_) => break };
-                // A nonblocking listener hands out nonblocking connections on
-                // macOS, so a read that finds no data yet returns WouldBlock and
-                // the client is dropped mid-request. Linux does not inherit the
-                // flag, which is why this only showed up locally.
                 stream.set_nonblocking(false).unwrap();
-                // These bound a hung client, not a slow one: the CLI under test
-                // shares the host with the rest of the suite, so a two second
-                // budget drops requests that are merely waiting for a CPU slot.
-                stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap(); stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
-                let mut bytes = Vec::new(); let mut buf = [0u8; 8192];
-                // Reply only once the whole body has arrived. Answering at the
-                // header terminator closes the socket while the client is still
-                // writing, and the client then reports a spurious send error.
-                loop {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap(); stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut bytes = Vec::new(); let mut buf = [0u8; 2048];
+                while bytes.len() < 16384 && !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
                     match stream.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => bytes.extend_from_slice(&buf[..n]) }
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&bytes[..end]).to_string();
-                        let need = head.lines().find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None }
-                        }).unwrap_or(0);
-                        if bytes.len() >= end + 4 + need { break; }
-                    }
-                    if bytes.len() > 8 * 1024 * 1024 { break; }
                 }
                 if !bytes.windows(4).any(|w| w == b"\r\n\r\n") { continue; }
                 let request = String::from_utf8_lossy(&bytes); let line = request.lines().next().unwrap_or("").to_string();

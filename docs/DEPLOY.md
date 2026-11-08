@@ -247,7 +247,7 @@ ADDR=127.0.0.1:8080 \
 
 This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL or MySQL/MariaDB, set `DATABASE_URL` to your database connection string instead (`mysql://` or `mariadb://`). Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
 
-OpenWarp is a native service. Cloudflare Workers cannot run this binary as-is; the storage and networking layers would need a separate port.
+The native executable runs directly or in Docker. Cloudflare Workers uses a separate WebAssembly artifact from the same application library; see [Cloudflare Workers](#cloudflare-workers).
 
 Cloudflare as a proxy in front of the native server is supported. Orange-cloud the hostname, set `OPENWARP_TRUST_PROXY=1`, and set `OPENWARP_TRUSTED_PROXIES` to the addresses your origin actually sees, which are Cloudflare's egress ranges rather than the visitor's address. The server reads `X-Forwarded-For` only from a peer in that list, so an IP allowlist still sees the visitor. WebSockets pass through Cloudflare, and `/api/live` sends a ping every 30 seconds so the edge's idle timeout does not close a quiet console. A dropped socket reconnects with `?since=<id>`. This does not make the server run on Workers.
 
@@ -288,18 +288,23 @@ npx wrangler secret put OPENWARP_MASTER_KEY    # 32 random bytes, base64
 npx wrangler deploy
 ```
 
-The Workers build must use `--no-default-features`: the LDAP feature, ring,
-SAML, SMTP and the native Postgres/Redis clients are excluded there. Runtime
-configuration is read from Worker variables and secrets; the full key list is
-`crates/server/src/envcfg.rs`. `OPENWARP_EMAIL_WEBHOOK` (an HTTP relay) is the
-email provider on Workers; password signup is otherwise unavailable in
-production.
+The Workers build must use `--no-default-features`: LDAP, ring, SMTP and the
+native database drivers are excluded there. `jsonwebtoken` uses its
+`rust_crypto` backend for OIDC verification; PKI issuance uses `x509-cert` and
+`p256`. Neither path requires ring on Workers. Dynamic PostgreSQL leases use
+the Workers socket transport rather than the native connection pool.
+
+Runtime configuration comes from Worker variables and secrets; the key list is
+`crates/server/src/envcfg.rs`. Set `OPENWARP_PUBLIC_URL` to the public HTTPS
+origin before enabling sign-in. The shared application uses it for callback
+URLs and Secure session cookies. Configure an HTTP email provider, such as
+`OPENWARP_EMAIL_WEBHOOK`; production password signup requires email delivery.
 
 What works on Workers: registration with emailed verification, password and
-GitHub sign-in, OIDC login (pure-Rust JWT verification), TOTP, SCIM, tokens,
-E2E and SSE secrets, approvals, log streams, audit webhooks, integrations,
-PKI CA and certificate issuance, dynamic PostgreSQL, MySQL and MariaDB leases,
-and the rotation and delivery maintenance cron.
+GitHub sign-in, OIDC login (pure-Rust JWT verification), TOTP, email second
+factors, recovery codes, SCIM, tokens, E2E and SSE secrets, approvals, log streams,
+audit webhooks, HTTP integrations, PKI CA and certificate issuance, dynamic
+PostgreSQL, MySQL and MariaDB leases, and the rotation and delivery maintenance cron.
 
 The MySQL lease client is built into the Worker because no MySQL library
 compiles for wasm; it speaks the protocol directly over the socket and uses TLS
@@ -307,29 +312,50 @@ when the lease URL sets `require_ssl=true`. MySQL is a lease target only on
 Workers: the deployment's own storage stays in the Durable Object, and a
 `DATABASE_URL` of `mysql://` is native-only.
 
-Answers 501 with a clear error on Workers: LDAP sign-in, SAML, SSH file sync,
-SMTP (use the HTTP relay), OCI Vault (RSA request signing), and the WebSocket
-`/api/live` stream. `/api/live` exists only natively; poll the audit endpoint
-instead. OCSP/CRL endpoints and master-key rotation are also native-only.
+SAML and passkeys share the native verification libraries. The vendored clock
+patches select the Workers clock without replacing signature verification.
+OCSP and CRL generation use portable timestamps and Rust signing libraries.
+Use `scripts/worker-protocol-smoke.mjs` to exercise passkey assertions and
+independently verify OCSP and CRL signatures with OpenSSL. Run
+`scripts/worker-saml-smoke.sh` for signed SAML login, invalid-signature rejection
+and replay rejection against workerd. `scripts/worker-key-smoke.mjs` checks KMS
+outage recovery, rotation failure safety and restart key validation. OCI Vault uses the shared Rust RSA
+signer.
 
-Operational limits: every request serialises through the single Durable
-Object; `OPENWARP_TRUST_PROXY` is inert (the runtime address is the client);
-`X-Forwarded-For` is ignored; session cookies are always `Secure` and the
-OAuth issuer defaults to `https://`. Metrics counters are per isolate and reset
-on a cold start. Durable Object SQLite point-in-time recovery covers 30 days
-and is not available under `wrangler dev`; see [BACKUP.md](BACKUP.md).
+The `/api/live` WebSocket transport uses hibernating Durable Object sockets.
+Admission and each delivered event check the current credential, workspace,
+environment, scope and IP policy. Reconnect with `since` to replay retained
+events. Attachments retain a credential hash and cursor, not a bearer token.
+Environment-scoped tokens cannot open the workspace-wide stream.
+
+LDAP routes are compiled out. SSH file sync, SMTP and integrations that need
+client TLS certificates return errors rather than running native implementations.
+
+The KMS bridge uses asynchronous HTTP on both deployments. A configured bridge
+must unwrap the existing root successfully before requests are served. Master
+rotation validates encrypted records and commits their replacements together;
+update the external master-key setting before restarting. A stale setting fails
+the persisted key check. Rotation is disabled on shared PostgreSQL and MySQL/MariaDB because
+replicas do not yet reload a changed master key.
+
+All requests go through one Durable Object. This gives one storage location,
+not a separate application replica in every region. The Worker supplies
+`CF-Connecting-IP` as the client address; leave forwarded-proxy trust disabled.
+Metrics counters are per isolate and reset on a cold start. Durable Object
+recovery is separate from a native database backup; see [BACKUP.md](BACKUP.md).
 
 ## Platform limits
 
-OpenWarp is a native service. A Cloudflare Workers or other WASM port, which is
-not part of this repository, cannot open raw TCP/TLS sockets and cannot offer
-LDAP. The `ldap` cargo feature carries the directory client, its routes and its
-console entry: building with `--no-default-features` produces a binary with no
-LDAP code at all, `/api/auth/providers` reports `ldap: false`, and the console
-hides the directory card and sign-in button. The rest of the server still needs
-its database driver and OS networking, so that build is not a Workers
-deployment by itself. Directories that publish OIDC (Entra ID, Keycloak,
-Authentik, Dex) remain reachable through the OIDC flow on any target.
+The current Workers artifact excludes LDAP. The `ldap` Cargo feature carries
+the native directory client and routes. With it disabled,
+`/api/auth/providers` reports `ldap: false` and the console hides directory
+configuration and sign-in. Directories that publish OIDC, including Entra ID,
+Keycloak, Authentik and Dex, can use the shared OIDC flow instead.
+
+Workers supports outbound sockets, which the PostgreSQL lease adapter uses.
+That does not make the native LDAP, SMTP or SSH subprocess implementations
+portable. Those features need their own Workers transport or must run in the
+native deployment.
 
 On a native deployment the directory is usually on a private network. Add its
 CA to the host trust store, or paste the CA PEM into the directory settings.
@@ -337,4 +363,4 @@ CA to the host trust store, or paste the CA PEM into the directory settings.
 egress; set `OPENWARP_ALLOW_PRIVATE_EGRESS=1` to allow the internal directory,
 exactly as for a self-hosted OIDC issuer.
 
-[Configuration](CONFIGURATION.md) · [Backup and restore](BACKUP.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Configuration](CONFIGURATION.md) · [Backup and restore](BACKUP.md) · [Development](DEVELOPMENT.md) · [Documentation index](README.md)
