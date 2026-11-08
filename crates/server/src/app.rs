@@ -6107,8 +6107,6 @@ async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receive
         }
         if !full { break; }
     }
-    // Revalidate by hash on a timer too: a revoked token must close the socket even while the stream is quiet.
-    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
             _ = auth_tick.tick() => { if st.live_identity(&admission).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
