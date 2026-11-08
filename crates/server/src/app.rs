@@ -317,9 +317,14 @@ impl AppState {
         let token=bearer.map(str::to_string).unwrap_or_else(|| cookie_val(headers,"ow_session"));
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
         let hash = oc::hash_token(&token);
+        self.token_user_by_hash(&hash, cookie_only).await
+    }
+    // The live-event socket keeps the credential hash, not the token, so the
+    // identity checks must run from the hash without a header.
+    async fn token_user_by_hash(&self, hash: &str, cookie_only: bool) -> Result<String, (StatusCode, Json<Value>)> {
         #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
-        if self.cache_revoked(&hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
-        if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.is_none() {
+        if self.cache_revoked(hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
+        if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?.is_none() {
             return Err(err(StatusCode::UNAUTHORIZED, "ow_session requires an account session")); }
         if !cookie_only {
         // OAuth 2.1 access tokens (CLI / MCP clients)
@@ -3627,12 +3632,17 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let transit_root = transit::root(&st, &old).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
-    let mut updates = master_updates(&st.db, &old, &new).await.map_err(|e| bad(&e))?;
-    let count = updates.len();
-    if st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() {
-        let kms = st.kms().ok_or_else(|| bad("restore the KMS bridge before rotating its root"))?;
-        let wrapped = kms.wrap(&new, "master").await.map_err(|e| bad(&e))?;
-        updates.push(("UPDATE meta SET v=? WHERE k='kms_root'".into(), vec![json!(wrapped)]));
+    // Preflight every encrypted value before touching the database.
+    let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
+    let mut env_updates = Vec::new();
+    for r in &envs {
+        let wrapped = db::s(r, "env_key_wrapped");
+        // KMS-wrapped and client-encrypted environments do not depend on the
+        // local master key, so leave their blobs untouched.
+        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
+        let plain = oc::decrypt_symmetric(&old, &wrapped)
+            .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
+        env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
     }
     let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%'", &[]).await.map_err(|e| bad(&e))?;
     let mut meta_updates = Vec::new();
@@ -4393,7 +4403,7 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     // table once instead of doing a database lookup per certificate.
     let certs = st.db.query("SELECT serial,revoked,revoked_at FROM pki_certs WHERE ca_id=?", &[json!(&caid)]).await.unwrap_or_default();
     let status: HashMap<String, (bool, i64)> = certs.iter().map(|r| (db::s(r, "serial").to_lowercase(), (db::n(r, "revoked") == 1, db::n(r, "revoked_at")))).collect();
-    let response = match responder.respond(&request, |cert_id| {
+    let response = match responder.respond_at(&request, |cert_id| {
         let serial = cert_id.serial_hex().to_lowercase();
         match status.get(&serial) {
             Some((true, at)) => keystore_ocsp::CertStatus::Revoked { revocation_time: if *at > 0 { *at } else { now() }, reason: None },
@@ -5860,12 +5870,15 @@ async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(
 pub(crate) struct LiveAdmission {
     pub uid: String,
     pub credential_hash: String,
+    /// The credential arrived in the session cookie, so the per-event identity
+    /// check must keep requiring an account session.
+    pub via_cookie: bool,
     pub cursor: i64,
     pub peer: String,
 }
 impl AppState {
     pub(crate) async fn live_identity(&self, admission: &LiveAdmission) -> Result<String, (StatusCode, Json<Value>)> {
-        let uid = self.token_user_by_hash(&admission.credential_hash).await?;
+        let uid = self.token_user_by_hash(&admission.credential_hash, admission.via_cookie).await?;
         if uid != admission.uid { return Err(err(StatusCode::UNAUTHORIZED, "live credential changed")); }
         if let Some(row) = self.db.one("SELECT scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(admission.credential_hash), json!(now())]).await.map_err(|e| bad(&e))? {
             if !db::s(&row, "scope").split_whitespace().any(|s| s == "*" || s == "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "OAuth token lacks secrets:read")); }
@@ -5894,8 +5907,9 @@ impl AppState {
 async fn live_admission(st: &S, h: &HeaderMap, q: &HashMap<String,String>, peer: PeerAddr) -> Result<LiveAdmission, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
     st.check_scope(h, "").await?;
-    let token = bearer_token(h);
-    let token = if token.is_empty() { cookie_val(h, "ow_session") } else { token };
+    let bearer = bearer_token(h);
+    let via_cookie = bearer.is_empty();
+    let token = if via_cookie { cookie_val(h, "ow_session") } else { bearer };
     let cursor = match q.get("since").and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0) {
         Some(since) => since,
         None => st.db.one("SELECT COALESCE(MAX(id),0) AS cursor FROM live_events", &[]).await.map_err(|e| bad(&e))?.map(|r| db::n(&r,"cursor")).unwrap_or(0),
@@ -5906,7 +5920,7 @@ async fn live_admission(st: &S, h: &HeaderMap, q: &HashMap<String,String>, peer:
     let client_ip = if trust_proxy && proxy_ok {
         h.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| peer.0.to_string())
     } else { peer.0.to_string() };
-    let admission = LiveAdmission { uid, credential_hash: oc::hash_token(&token), cursor, peer: client_ip };
+    let admission = LiveAdmission { uid, credential_hash: oc::hash_token(&token), via_cookie, cursor, peer: client_ip };
     st.live_identity(&admission).await?;
     Ok(admission)
 }
@@ -5927,6 +5941,7 @@ async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<Stri
 #[cfg(not(target_arch = "wasm32"))]
 async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
     if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut sent = admission.cursor;
     loop {
         let Ok(missed) = st.live_replay(sent).await else { return };
@@ -5940,7 +5955,7 @@ async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receive
     }
     loop {
         tokio::select! {
-            _ = auth_tick.tick() => { if st.token_user(&h).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
+            _ = auth_tick.tick() => { if st.live_identity(&admission).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,

@@ -56,7 +56,7 @@ impl Bridge {
 async fn seed(db: &Db, name: &str, value: &str) {
     db.exec("INSERT INTO meta(k,v) VALUES(?,?)", &[json!(name), json!(value)]).await.unwrap();
 }
-async fn roots(db: &Db) -> Vec<Value> {
+async fn roots(db: &Db) -> Vec<openwarp_server::db::Row> {
     db.query("SELECT k,v FROM meta WHERE k IN ('master','kms_root','master_key_check') ORDER BY k", &[]).await.unwrap()
 }
 async fn meta(db: &Db, name: &str) -> Option<String> {
