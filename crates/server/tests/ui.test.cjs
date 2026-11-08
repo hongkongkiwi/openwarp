@@ -242,6 +242,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
       else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
+      else if (options.method === 'DELETE' && /^\/api\/me\/sessions\/[^/]+$/.test(url)) body = { revoked: url.split('/').pop(), current: false };
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
@@ -934,4 +935,50 @@ test('language follows the browser, translates the chrome, and the override pers
   assert.equal(ui.el('authtitle').textContent, 'おかえりなさい', 'switching languages re-translates the chrome');
   await ui.run(`owSetLang('en')`);
   assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
+});
+
+test('settings lists browser sessions and revokes only the chosen one', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/me/sessions': [
+      { id: 'session-current', created_at: 1700000000, current: true },
+      { id: 'session-other', created_at: 1699990000, current: false },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  await ui.invoke('loadSessions()');
+  const rows = ui.el('session-list').querySelectorAll('tbody tr');
+  assert.equal(rows.length, 2, 'one row per browser session');
+  assert.match(rows[0].textContent, /this session/, 'the current session is marked');
+  ui.confirm = true;
+  await ui.click(ui.button(rows[1], /^Revoke$/));
+  assert.deepEqual(ui.writes().map(c => [c.method, c.url]), [['DELETE', '/api/me/sessions/session-other']],
+    'revoking one session targets that id only');
+});
+
+test('the logs screen separates audit, sync activity and delivery attempts', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/audit': [
+      { action: 'secret.read', detail: '1 key', actor: 'fixture-user', created_at: 1700000000 },
+      { action: 'integration.sync_failed', detail: 'int-1: provider rejected the token', actor: 'fixture-user', created_at: 1700000001 },
+      { action: 'rotation.run', detail: 'STRIPE_KEY', actor: 'fixture-user', created_at: 1700000002 },
+    ],
+    '/api/orgs/org-a/log-streams/deliveries': [
+      { id: 'd1', stream_name: 'SIEM', stream_url: 'https://siem.example/ingest', event: 'secret.read', status: 'failed', attempts: 3, created_at: 1700000003 },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderAudit()');
+  assert.match(ui.el('auditrows').textContent, /secret\.read/, 'the audit tab lists workspace events');
+  await ui.invoke("setLogTab('sync')");
+  const sync = ui.el('auditrows').textContent;
+  assert.match(sync, /integration\.sync_failed/);
+  assert.match(sync, /rotation\.run/);
+  assert.doesNotMatch(sync, /secret\.read/, 'sync activity hides unrelated events');
+  await ui.invoke("setLogTab('delivery')");
+  const deliveries = ui.el('auditrows').textContent;
+  assert.match(deliveries, /SIEM/, 'delivery rows name the target stream');
+  assert.match(deliveries, /failed/);
+  assert.match(deliveries, /3/);
+  assert.equal(ui.el('auditcount').textContent, '1 attempts shown');
 });

@@ -540,7 +540,7 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
     Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))))
 }
-pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
+pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(id,token_hash,user_id,created_at) VALUES(?,?,?,?)", &[json!(id()), json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; use a configured provider")); }
     let key = format!("login:{}:{}", addr, r.email.trim().to_lowercase());
@@ -743,6 +743,34 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r)
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     // A caller can always learn the environment its own credential is confined to.
     let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await?); Ok(j(out)) }
+// Browser sessions are listable by a stable id. Older rows predate the id column,
+// so one is assigned on first listing instead of exposing token hashes.
+async fn list_sessions(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
+    let current = oc::hash_token(&bearer_token_or_cookie(&h));
+    let rows = st.db.query("SELECT id,token_hash,created_at FROM sessions WHERE user_id=? ORDER BY created_at DESC", &[json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let mut out = Vec::new();
+    for r in rows { let mut sid = db::s(&r, "id");
+        if sid.is_empty() { sid = id(); let _ = st.db.exec("UPDATE sessions SET id=? WHERE token_hash=?", &[json!(&sid), json!(&db::s(&r, "token_hash"))]).await; }
+        out.push(json!({"id": sid, "created_at": db::n(&r, "created_at"), "current": db::s(&r, "token_hash") == current})); }
+    Ok(j(json!(out))) }
+fn bearer_token_or_cookie(h: &HeaderMap) -> String { let t = bearer_token(h); if t.is_empty() { cookie_val(h, "ow_session") } else { t } }
+async fn revoke_session(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let current = oc::hash_token(&bearer_token_or_cookie(&h));
+    let row = st.db.one("SELECT token_hash FROM sessions WHERE id=? AND user_id=?", &[json!(&sid), json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "session not found"))?;
+    st.db.exec("DELETE FROM sessions WHERE id=? AND user_id=?", &[json!(&sid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let was_current = db::s(&row, "token_hash") == current;
+    st.audit("", "", "", &uid, "auth.session_revoked", &sid).await;
+    Ok(j(json!({"revoked": sid, "current": was_current}))) }
+async fn revoke_all_sessions(State(st): State<S>, h: HeaderMap) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let uid = st.token_user(&h).await?;
+    let token = bearer_token_or_cookie(&h);
+    if st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=?", &[json!(oc::hash_token(&token)), json!(&uid)]).await.map_err(|e| bad(&e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "sign in to the console to end browser sessions; API keys and OAuth tokens cannot do this")); }
+    let n = st.db.exec("DELETE FROM sessions WHERE user_id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?;
+    st.audit("", "", "", &uid, "auth.sessions_revoked", &format!("{n} session(s)")).await;
+    let mut headers=HeaderMap::new();
+    headers.insert(axum::http::header::SET_COOKIE, session_cookie("").replace("Max-Age=604800", "Max-Age=0").parse().unwrap());
+    Ok((headers, j(json!({"ok": true, "revoked": n})))) }
 // Ownership grants and account deletion serialize on the same user rows.
 async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize]) -> Result<(), (StatusCode, Json<Value>)> {
     let mut users = users.to_vec(); users.sort_unstable(); users.dedup();
@@ -1100,12 +1128,19 @@ async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): P
     let deleted = st.db.exec("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)", &[json!(oid), json!(target), json!(oid)]).await.map_err(|e| bad(&e))?;
     if deleted == 0 { return Err(bad("cannot remove the last owner")); }
     st.audit(&oid, "", "", &uid, "member.remove", &target).await; Ok(j(json!({"ok": true}))) }
-async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
+async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
     let org = db::s(&app, "org_id"); st.check_admin(&org, &uid).await?;
-    if r.name.trim().is_empty() { return Err(bad("name required")); }
-    st.db.exec("UPDATE apps SET name=? WHERE id=?", &[json!(r.name.trim()), json!(aid)]).await.map_err(|e| bad(&e))?;
-    st.audit(&org, &aid, "", &uid, "app.rename", &r.name).await; Ok(j(json!({"ok": true}))) }
+    let name = body.get("name").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+    let readme = body.get("readme").and_then(|v| v.as_str());
+    if name.is_empty() && readme.is_none() { return Err(bad("name or readme required")); }
+    if !name.is_empty() {
+        st.db.exec("UPDATE apps SET name=? WHERE id=?", &[json!(name), json!(aid)]).await.map_err(|e| bad(&e))?;
+        st.audit(&org, &aid, "", &uid, "app.rename", name).await; }
+    if let Some(readme) = readme {
+        st.db.exec("UPDATE apps SET readme=? WHERE id=?", &[json!(readme), json!(aid)]).await.map_err(|e| bad(&e))?;
+        st.audit(&org, &aid, "", &uid, "app.readme", &format!("{} bytes", readme.len())).await; }
+    Ok(j(json!({"ok": true}))) }
 async fn get_app_settings(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT org_id,reuse_check FROM apps WHERE id=?", &[json!(&aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
     st.require_org(&db::s(&row,"org_id"), &uid).await?;
@@ -1702,6 +1737,12 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let kind = db::s(&row, "kind");
     if integrations::has_test(&kind) { let msg = integrations::test(&kind, &config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
+async fn integration_history(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "integration not found"))?;
+    let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let prefix = format!("{}%", iid);
+    let rows = st.db.query("SELECT action,detail,created_at,actor FROM audit WHERE org_id=? AND action IN ('integration.sync','integration.sync_failed') AND detail LIKE ? ORDER BY created_at DESC LIMIT 50", &[json!(&org), json!(&prefix)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -1735,7 +1776,15 @@ async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<S
     }
     errors
 }
-async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { sync_one_inner(st, iid, uid, true, true).await }
+async fn sync_one(st: &S, iid: &str, uid: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let out = sync_one_inner(st, iid, uid, true, true).await;
+    if let Err((_, Json(v))) = &out {
+        if let Ok(Some(row)) = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await {
+            let eid = db::s(&row, "env_id");
+            if let Ok((org, app)) = st.env_org_app(&eid).await {
+                let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("integration sync failed");
+                st.audit(&org, &app, &eid, uid, "integration.sync_failed", &format!("{}: {}", iid, msg)).await; } } }
+    out }
 async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: bool) -> Result<String, (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id");
@@ -1810,9 +1859,9 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
             for n in &managed { let base = integrations::local_name(&config, n); let hv = pairs.iter().find(|(k, _)| k.as_str() == base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
                 st.db.exec("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)", &[json!(iid), json!(n), json!(hv)]).await.map_err(|e| bad(&format!("sync succeeded but state could not be saved: {}", e)))?; }
         }
-        st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; return Ok(msg); }
+        st.audit(&org, &app, &eid, uid, "integration.sync", &format!("{}: {}", iid, msg)).await; return Ok(msg); }
     let msg = integrations::sync_with_tags(&kind, &config, &pairs, &tags_by_name).await.map_err(|e| bad(&e))?;
-    st.audit(&org, &app, &eid, uid, "integration.sync", &msg).await; Ok(msg)
+    st.audit(&org, &app, &eid, uid, "integration.sync", &format!("{}: {}", iid, msg)).await; Ok(msg)
 }
 
 async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
@@ -2412,7 +2461,19 @@ fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, 
 #[cfg(not(target_arch = "wasm32"))]
 async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
-    let cfg = saml_config_row(&st, &oid).await?; let base = issuer(&st, &h);
+    let base = issuer(&st, &h);
+    let Some(cfg) = st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(&oid)]).await.map_err(|e| bad(&e))? else {
+        return Ok(j(json!({
+            "configured": false,
+            "idp_entity_id": "",
+            "metadata_xml": "",
+            "sp_metadata_url": saml_sp_entity(&base, &oid),
+            "acs_url": saml_acs_url(&base, &oid),
+            "allow_unsigned_metadata": false,
+            "metadata_trusted_cert_set": false,
+            "auto_provision": false,
+            "allowed_domains": "",
+        }))); };
     Ok(j(json!({
         "configured": true,
         "idp_entity_id": db::s(&cfg,"idp_entity_id"),
@@ -4488,7 +4549,7 @@ async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
 async fn list_streams(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let rows = st.db.query("SELECT id,org_id,name,url,created_at FROM log_streams WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn list_deliveries(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
-    let rows = st.db.query("SELECT d.id,d.stream_id,d.event,d.status,d.attempts,d.created_at FROM log_deliveries d JOIN log_streams s ON s.id=d.stream_id WHERE s.org_id=? ORDER BY d.created_at DESC LIMIT 200", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT d.id,d.stream_id,s.name AS stream_name,s.url AS stream_url,d.event,d.status,d.attempts,d.created_at FROM log_deliveries d JOIN log_streams s ON s.id=d.stream_id WHERE s.org_id=? ORDER BY d.created_at DESC LIMIT 200", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 
 // ---------- lease renew + rotation schedules (T09) ----------
 async fn renew_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
@@ -5167,7 +5228,7 @@ pub fn router(state: S) -> Router {
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
         .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))
-        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
+        .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me)).route("/api/me/sessions", get(list_sessions).delete(revoke_all_sessions)).route("/api/me/sessions/{sid}", delete(revoke_session))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org).delete(delete_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
@@ -5185,7 +5246,7 @@ pub fn router(state: S) -> Router {
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets)).route("/api/envs/{eid}/scan", get(scan_env)).route("/api/envs/{eid}/meta", get(env_meta)).route("/api/envs/{eid}/wrap", post(create_wrap)).route("/api/unwrap", get(lookup_wrap).post(consume_wrap))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
         .route("/api/envs/{eid}/dynamic", get(list_leases).post(create_lease_v2)).route("/api/leases/{lid}", get(lookup_lease).delete(revoke_lease)).route("/api/leases/{lid}/renew", post(renew_lease)).route("/api/envs/{eid}/rotations", get(list_rotations).post(create_rotation)).route("/api/rotations/{rid}", delete(delete_rotation)).route("/api/envs/{eid}/rotate", post(rotate_secret)).route("/api/envs/{eid}/restore-point", post(pitr))
-        .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
+        .route("/api/integrations/{iid}/sync", post(sync_integration)).route("/api/integrations/{iid}/history", get(integration_history)).route("/api/integrations/{iid}/test", post(test_integration)).route("/api/integrations/{iid}", axum::routing::patch(update_integration).delete(delete_integration))
         .route("/api/secrets/{sid}", delete(delete_secret)).route("/api/secrets/{sid}/history", get(history))
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", get(get_override).post(set_override).delete(delete_override))
         .route("/api/secrets/{sid}/undelete", post(undelete_secret)).route("/api/secrets/{sid}/destroy", post(destroy_secret))

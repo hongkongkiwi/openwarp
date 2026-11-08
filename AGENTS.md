@@ -28,7 +28,7 @@ Run from the repository root, serially. Never run two builds or suites at once. 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace -- --test-threads=2
-node --test crates/server/tests/ui.test.cjs
+node --test crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs
 ```
 
 Local-only: `cargo check --workspace`, `cargo build --workspace`.

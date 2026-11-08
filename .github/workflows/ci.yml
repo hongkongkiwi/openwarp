@@ -48,7 +48,7 @@ jobs:
           node-version: "24"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=2
-      - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs
+      - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs
       - run: python3 scripts/check-openapi.py
       # The SDK tests spawn the binary cargo test just built.
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts

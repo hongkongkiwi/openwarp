@@ -9,10 +9,10 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Apps | Create applications, select environments, manage secrets |
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
-| Audit log | Inspect workspace activity |
+| Audit log | Inspect workspace activity, sync outcomes, and log-stream delivery attempts |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
-Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority.
+Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority. An unknown hash route renders a Not found screen with links back to Apps and Members & access instead of leaving a blank view.
 
 ## Appearance and languages
 
@@ -27,6 +27,8 @@ Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Au
 Save the recovery kit shown during account creation. It is your private key, not an API token. If password reset asks for the kit, supplying it preserves the existing key. Choosing to discard a lost key prevents that account from decrypting existing E2E grants.
 
 Enable TOTP MFA from settings and keep the recovery codes somewhere other than your authenticator device. If verification email or reset delivery fails, contact your instance operator; a generic success message does not prove the relay sent the email.
+
+Settings also manages passkeys and browser sessions. Adding a passkey asks for your password first and then creates the WebAuthn credential in the browser; the recovery codes shown afterwards are the only fallback if the authenticator is lost. Removing a passkey requires the password again. The sessions card lists each signed-in browser session with its sign-in time and marks the current one; revoking another session ends it immediately, and revoking the current session signs this browser out. End all sessions revokes every browser session for the account, including the one you are using; API keys and OAuth tokens are unaffected. My tokens opens the API token list instead of browser sessions.
 
 ## Delete an account or workspace
 
@@ -75,7 +77,7 @@ Standard environment reads can resolve references such as `${KEY}` and `${/path/
 
 Import accepts dotenv text. Review both the destination and any keys that already exist before applying it. Export produces plaintext, which needs the same protection as the original credentials.
 
-Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [OpenAPI contract](../openapi.json) for documented API operations when a task is not available in the console.
+Compare and Clone sit in the environment toolbar. Compare lists keys only in this environment, only in the other one, and keys whose base values differ; it shows key names, never values, and needs read access to both. Clone copies readable base secrets into another server-encrypted environment of the same app, skips sealed values, and optionally overwrites keys that already exist. Neither action copies personal overrides, policies, integrations, grants, rotation schedules or history, and client-encrypted environments require the CLI instead. Consult the [OpenAPI contract](../openapi.json) when a task has no console control.
 
 ## Members and automation access
 
@@ -95,17 +97,19 @@ Review screens and transit decrypt responses display plaintext in the browser. U
 
 ## Managing apps, environments and teams
 
-App settings (from an app's environment toolbar) rename or delete the app and toggle its reuse warning. The delete action requires confirmation and removes the app's environments, secrets and grants; revoke dynamic leases first.
+App settings (from an app's environment toolbar) edits the app name and its plain-text readme, toggles its reuse warning, or deletes the app. The readme is stored and shown as text, not rendered; do not put credentials in it. The delete action requires confirmation and removes the app's environments, secrets and grants; revoke dynamic leases first.
 
 Env settings rename the environment, set how many versions history keeps (`0` keeps every version), restrict access to explicit grants, require an approved proposal for non-admin writes, or delete the environment. Policy changes apply immediately.
 
 Teams group members for environment grants. Manage a team from Members & access to add or remove workspace members; roles are unchanged by team membership.
 
-The audit log includes a client-side filter over the loaded events and a Load older events control. Large workspaces should also use log streams for durable forwarding.
+The audit log has three tabs. Audit shows workspace activity with a client-side filter over the loaded events and a Load older events control. Sync activity narrows the same events to integration, runner and rotation work. Delivery attempts lists log-stream deliveries with their stream, event, status and attempt count; failed rows name the stream so you can fix or remove it. Large workspaces should also use log streams for durable forwarding.
 
 ## Integrations and sharing
 
 Select the source environment and destination before creating an integration. Sync sends shared, non-sealed SSE values to the provider. Test is implemented for Trigger.dev, Instabox, Boat, and Daytona; other kinds require a sync to exercise their connection, which can write remote data.
+
+Each integration row can Edit it, open its sync History, run a sync, or delete it. Edit renames the integration, changes its kind, and replaces its stored configuration; the encrypted configuration is never shown back, so leave the field empty to keep the existing one. Configuration fields validate JSON as you type, name the exact error, and offer Format JSON. History lists the last 50 sync and sync-failure audit entries for that integration.
 
 Only supported providers understand dry-run and mirror options. Mirror can delete previously managed remote names. Review the [integration guide](INTEGRATIONS.md) before using it.
 

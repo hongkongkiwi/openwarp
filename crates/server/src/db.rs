@@ -871,6 +871,11 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
         "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
     ]),
+    // Account session management: stable ids for listing and revocation.
+    (23, &[
+        "ALTER TABLE sessions ADD COLUMN id TEXT DEFAULT ''",
+        "CREATE INDEX idx_sessions_id ON sessions(id)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -906,10 +911,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 23, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 22, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 23, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {
