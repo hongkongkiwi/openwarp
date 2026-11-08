@@ -82,7 +82,13 @@ pub(super) async fn consume(st: &S, row: &Row, token: &str) -> Result<(String, V
 pub(super) async fn invite_batch(st: &S, row: &Row, users: &[&str], statements: &[(String, Vec<Value>)], checked: &[usize]) -> Result<(), Failure> {
     let inviter = db::s(row,"invited_by"); let mut users = users.to_vec();
     if !inviter.is_empty() && st.db.one("SELECT id FROM users WHERE id=?", &[json!(&inviter)]).await.map_err(|e| bad(&e))?.is_some() { users.push(&inviter); }
-    user_guarded_batch(st,&users,statements,checked).await.map_err(invite_error)
+    // The leading org-row guard row-locks the workspace against emergency
+    // transitions and enforces the running check atomically with acceptance.
+    let org = db::s(row,"org_id");
+    let mut guarded = vec![("UPDATE orgs SET name=name WHERE id=? AND emergency_locked=0 AND NOT EXISTS (SELECT 1 FROM apps WHERE org_id=? AND emergency_locked<>0)".into(), vec![json!(&org), json!(&org)])];
+    let shifted = std::iter::once(0usize).chain(checked.iter().map(|i| i + 1)).collect::<Vec<_>>();
+    guarded.extend_from_slice(statements);
+    user_guarded_batch(st,&users,&guarded,&shifted).await.map_err(invite_error)
 }
 pub(super) async fn existing(st: &S, row: &Row, token: &str, h: &HeaderMap) -> Result<Option<(HeaderMap,Json<Value>)>, Failure> {
     let user = st.db.one("SELECT id FROM users WHERE email=?", &[json!(db::s(row,"email"))]).await.map_err(|e| bad(&e))?;
@@ -90,6 +96,7 @@ pub(super) async fn existing(st: &S, row: &Row, token: &str, h: &HeaderMap) -> R
         let uid = human(st,h).await?;
         if uid != db::s(&user,"id") { return Err(err(StatusCode::FORBIDDEN,"invitation belongs to a different account")); }
         let org = db::s(row,"org_id"); let role = db::s(row,"role");
+        st.require_org_running(&org).await?;
         invite_batch(st,row,&[&uid],&[
             consume(st,row,token).await?,
             ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(),vec![json!(&uid)]),

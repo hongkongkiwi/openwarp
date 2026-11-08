@@ -33,6 +33,10 @@ function invitationConsole({ bearer = 'fixture-social-session', cookie = false, 
     sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     location: { pathname: '/', hash: '' }, history: { replaceState() {} },
     toast: message => errors.push(message), modal: () => assert.fail('existing account must not receive a new recovery kit'),
+    // The shipped functions under test call the console's i18n and emergency
+    // helpers; standalone evaluation only needs their side effects.
+    owText: (el, text) => { el.textContent = text; },
+    refreshEmergency: async () => {}, setInterval: () => 1, clearInterval() {},
     nav: async page => { navigations.push(page); },
     fetch: async (url, options) => {
       const call = { url, method: options.method, authorization: options.headers.Authorization, body: options.body && JSON.parse(options.body) };
@@ -53,7 +57,7 @@ function invitationConsole({ bearer = 'fixture-social-session', cookie = false, 
   });
   const headers = script.match(/^const H=.*$/m)?.[0];
   assert.ok(headers, 'evaluate the shipped request header builder');
-  vm.runInContext(`let T=${JSON.stringify(bearer)}, INVITE='', INVITE_META=null, PENDING_ORG=null, E2E_KIT='', ORG='', APP=null, ENV=null, ME=null, MY_PUBKEY='', MY_UID='', CREATION_OPEN=true;
+    vm.runInContext(`let T=${JSON.stringify(bearer)}, INVITE='', INVITE_META=null, PENDING_ORG=null, E2E_KIT='', ORG='', APP=null, ENV=null, ME=null, MY_PUBKEY='', MY_UID='', CREATION_OPEN=true, EMERGENCY=false, PROJECT_EMERGENCY=false, EMERGENCY_POLL=null, AUTH_READY=false;
     const $=id=>document.getElementById(id);\n${headers}\n` +
     ['api', 'esc', 'showInvite', 'acceptInvite', 'enterApp'].map(shippedFunction).join('\n'), context);
   return { calls, errors, navigations, session, elements, run: code => vm.runInContext(code, context) };

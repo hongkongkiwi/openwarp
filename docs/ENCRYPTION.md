@@ -98,15 +98,61 @@ POST {OPENWARP_KMS_URL}/unwrap
 `context` to the provider's encryption context (AWS KMS), additional
 authenticated data (GCP KMS), or the equivalent. `OPENWARP_KMS_KEY_ID` is stored
 with each wrapped value so a key rotation can still unwrap old data; run
-`POST /api/instance/rewrap` as the instance owner after switching key IDs.
+`POST /api/instance/rewrap` as the instance owner after switching key IDs. It
+rewraps the persisted root and every nonempty environment key, including legacy
+root-wrapped keys, and verifies their unwrap roundtrips before writing anything.
+The updates commit together with old-value checks. An unreadable key, failed
+verification or concurrent key change aborts the batch without changing the root
+or any environment key. Empty client-managed keys are excluded.
+
+The bridge URL may be `http://` as well as `https://`. With plain HTTP, the
+wrap requests and unwrap responses carry plaintext root or environment keys
+without transport encryption, and the bridge has no egress allowlist of its
+own. Use HTTPS, a loopback listener, or a protected private network; treat
+`OPENWARP_KMS_TOKEN` as a deployment secret with only the access the adapter
+needs.
 
 A fresh KMS deployment stores only `meta.kms_root`; the database then has no
 usable root key. An existing deployment that already has `meta.master` adopts
-that key under the KMS on first boot, stores the same root as `kms_root` and
-deletes the plaintext `meta.master` row. TOTP secrets, OIDC client secrets, PKI
+that key under the KMS on first boot, verifies that the candidate wrapped blob
+unwraps to the same root, stores it as `kms_root` and deletes the plaintext
+`meta.master` row. A failed roundtrip leaves the plaintext root intact. TOTP secrets, OIDC client secrets, PKI
 keys, lockbox values and environment keys all use that same root, so no record
 needs re-encryption. Back up the KMS key: removing it makes the data unreadable
 unless `OPENWARP_MASTER_KEY` still holds the same key.
+
+### Production auto-unseal
+
+On the native server, `OPENWARP_KMS_URL` permits production startup without
+`OPENWARP_MASTER_KEY`. The first boot wraps a newly generated root, or adopts an
+existing development root. Later boots unwrap that same persisted root. A failed
+unwrap, an invalid root length or a missing bridge for a KMS-wrapped database
+stops startup; none is a reason to create a replacement root.
+
+Precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise the persisted
+KMS-wrapped `meta.kms_root`; otherwise a plaintext `meta.master` adopted under
+the KMS; otherwise a newly generated root. Adoption of a plaintext development
+root runs only when the master-key variable is absent. If `meta.master` and the
+unwrapped `meta.kms_root` hold different roots, startup stops and neither row is
+deleted: the database is not safe to serve and an operator must restore the
+matching root or a backup. A KMS-wrapped database without `OPENWARP_KMS_URL` is
+also fatal.
+Test a restart with the configured bridge before removing any recovery copy.
+The bridge credential is itself a deployment secret and must have access to the
+stored key identifiers. This is not Shamir unseal or a recovery-share protocol.
+The native bridge is unavailable on Workers, which still require an external
+master-key binding.
+
+Online instance-root rotation is refused when a KMS is configured or a wrapped
+KMS root is persisted. Changing the external KMS key identifier and rewrapping
+keys is a separate operation. The native SQLite root-rotation path also rewraps
+transit wrapping keys and version-2 authentication keys in the same transaction.
+A lifecycle lock prevents HTTP and maintenance work from persisting old-root
+records during that operation. PostgreSQL and MySQL/MariaDB online rotation are
+refused: OpenWarp does not provide an offline multi-replica root-rotation
+command. Keep the existing
+root until a coordinated migration has been designed and verified. Do not change
+a startup key value as a substitute for re-encrypting stored key material.
 
 ## The honest limit on "we cannot read it"
 
@@ -186,6 +232,12 @@ Dynamic Postgres leases, server-generated rotation values, PKI issuance,
 approval workflows that inspect plaintext, and server-side search require the
 server to read or create the secret. They stay in `sse` mode. A zero-knowledge
 deployment gives those up or moves them into a client.
+
+## Offline encrypted files and transit
+
+The CLI's [encrypted-file commands](CLI.md#encrypted-files) use a separate file data key wrapped to explicit X25519 recipients. Files do not depend on an instance master key or environment grant. The JSON envelope authenticates the complete encrypted payload and recipient metadata. Rekey changes recipient wrappers without re-encrypting the payload; old saved envelopes remain readable to their old recipients.
+
+[Transit encryption](TRANSIT.md) is server-managed, workspace-scoped application encryption. Its versioned keys are wrapped by the instance master and are included in native master rotation. Permission to rewrap is separate from permission to decrypt, though the server decrypts internally during rewrap. Transit is not an E2E environment operation.
 
 ## Not yet implemented
 
