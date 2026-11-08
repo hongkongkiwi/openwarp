@@ -36,7 +36,7 @@ pub enum Backend { Sqlite, Postgres, Mysql }
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
-    out
+    out.replace("OW_NOW()", "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn pg_err(error: tokio_postgres::Error) -> String {
@@ -45,6 +45,21 @@ fn pg_err(error: tokio_postgres::Error) -> String {
         None => error.to_string(),
     }
 }
+
+fn sqlite_sql(sql: &str) -> String { sql.replace("OW_NOW()", "CAST(strftime('%s','now') AS INTEGER)") }
+#[cfg(not(target_arch = "wasm32"))]
+fn pg_row(r: &tokio_postgres::Row) -> Row {
+    let mut m = Row::new();
+    for (i, col) in r.columns().iter().enumerate() {
+        let v = if let Ok(v) = r.try_get::<_, Option<String>>(i) { v.map(Value::String).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<i64>>(i) { v.map(|n| Value::Number(n.into())).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<bool>>(i) { v.map(Value::Bool).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<Value>>(i) { v.unwrap_or(Value::Null) } else { Value::Null };
+        m.insert(col.name().to_string(), v);
+    } m
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn mysql_row(r: &mysql_async::Row) -> Row { let mut m = Row::new(); for (i, col) in r.columns_ref().iter().enumerate() { m.insert(col.name_str().to_string(), mysql_value(r.as_ref(i))); } m }
 
 impl Db {
     #[cfg(not(target_arch = "wasm32"))]
@@ -104,7 +119,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s, _) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
                 Ok(cursor.rows_written() as u64)
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -149,7 +164,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s, _) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
                 for row in cursor.raw() {
@@ -178,6 +193,84 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    pub async fn tx(&self, statements: &[(&str, Vec<Value>)]) -> Result<Vec<u64>, String> { self.tx_checked(statements, &[]).await }
+    pub async fn tx_checked(&self, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String> {
+        self.tx_locked("SELECT 1 AS guard", &[], |_| true, statements, expect).await
+    }
+    /// The row predicate and writes share one transaction; cancellation drops the native transaction guards.
+    pub async fn tx_locked<F>(&self, lock_sql: &str, lock_params: &[Value], ok: F, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String>
+    where F: Fn(&Row) -> bool + Send + Sync {
+        let verify = |index: usize, count: u64| match expect.iter().find(|(i, _)| *i == index) {
+            Some((_, want)) if count != *want => Err(format!("statement {} affected {} rows, expected {}", index, count, want)), _ => Ok(()) };
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let mut conn = c.lock().unwrap();
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let rows = query_sqlite(&tx, lock_sql, lock_params)?;
+                if !rows.first().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (index, (sql, params)) in statements.iter().enumerate() { let count = exec_sqlite(&tx, sql, params)?; verify(index, count)?; counts.push(count); }
+                tx.commit().map_err(|e| e.to_string())?; Ok(counts)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                let sql = pg_sql(&format!("{} FOR UPDATE", lock_sql)); let params = PgParams::new(lock_params); let refs = params.refs();
+                let rows = tx.query(sql.as_str(), &refs).await.map_err(pg_err)?;
+                if !rows.first().map(pg_row).as_ref().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (index, (sql, params)) in statements.iter().enumerate() {
+                    let sql = pg_sql(sql); let params = PgParams::new(params); let refs = params.refs();
+                    let count = tx.execute(sql.as_str(), &refs).await.map_err(pg_err)?; verify(index, count)?; counts.push(count); }
+                tx.commit().await.map_err(pg_err)?; Ok(counts)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+                let mut opts = mysql_async::TxOpts::default(); opts.with_isolation_level(mysql_async::IsolationLevel::ReadCommitted);
+                let mut tx = client.start_transaction(opts).await.map_err(|e| e.to_string())?;
+                let result = async {
+                    let sql = mysql_sql(&format!("{} FOR UPDATE", lock_sql));
+                    let rows: Vec<mysql_async::Row> = tx.exec(sql.as_str(), mysql_params(lock_params)).await.map_err(|e| e.to_string())?;
+                    if !rows.first().map(mysql_row).as_ref().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                    let mut counts = Vec::with_capacity(statements.len());
+                    for (index, (sql, params)) in statements.iter().enumerate() {
+                        tx.exec_drop(mysql_sql(sql), mysql_params(params)).await.map_err(|e| e.to_string())?;
+                        let count = tx.affected_rows(); verify(index, count)?; counts.push(count); }
+                    Ok(counts)
+                }.await;
+                match result { Ok(counts) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(counts) }, Err(e) => { let _ = tx.rollback().await; Err(e) } }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(sql, storage) => {
+                use worker::wasm_bindgen::{closure::ScopedClosure, JsCast, JsValue};
+                let raw: &JsValue = storage.as_raw().as_ref();
+                let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync")).map_err(|e| worker::Error::from(e).to_string())?
+                    .dyn_into::<js_sys::Function>().map_err(|_| "Durable Object transactionSync is unavailable".to_string())?;
+                let mut counts = Vec::with_capacity(statements.len());
+                let mut run = || -> Result<JsValue, JsValue> {
+                    let convert = |e: String| JsValue::from_str(&e);
+                    let cursor = sql.exec(&sqlite_sql(lock_sql), do_binds(lock_params)).map_err(|e| convert(e.to_string()))?;
+                    let cols = cursor.column_names(); let mut rows = Vec::new();
+                    for row in cursor.raw() { let mut r = Row::new(); for (i, v) in row.map_err(|e| convert(e.to_string()))?.into_iter().enumerate() { if let Some(name) = cols.get(i) { r.insert(name.clone(), do_value(v)); } } rows.push(r); }
+                    if !rows.first().map(&ok).unwrap_or(false) { return Err(convert("lock condition failed".into())); }
+                    for (index, (statement, params)) in statements.iter().enumerate() {
+                        let cursor = sql.exec(&sqlite_sql(statement), do_binds(params)).map_err(|e| convert(e.to_string()))?;
+                        for row in cursor.raw() { row.map_err(|e| convert(e.to_string()))?; }
+                        let changes: Value = sql.exec("SELECT changes() AS affected", None).map_err(|e| convert(e.to_string()))?.one().map_err(|e| convert(e.to_string()))?;
+                        let count = changes["affected"].as_u64().ok_or_else(|| convert("missing affected row count".into()))?;
+                        verify(index, count).map_err(convert)?; counts.push(count);
+                    }
+                    Ok(JsValue::UNDEFINED)
+                };
+                let callback = ScopedClosure::borrow_mut_aborting(&mut run);
+                transaction.call1(raw, callback.as_ref()).map_err(|e| worker::Error::from(e).to_string())?;
+                drop(callback); Ok(counts)
+            }
+        }
+    }
     /// Insert a meta row unless the key exists; true when this call created it.
     /// MySQL has no ON CONFLICT, so a duplicate key there is the expected losing
     /// branch while every other driver error still fails the caller.
@@ -199,8 +292,7 @@ impl Db {
             Ok(changes["n"].as_u64() == Some(1))
         }
         #[cfg(not(target_arch = "wasm32"))]
-        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }
-    }
+        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }    }
     pub async fn rate_increment(&self, key: &str, current: i64, window: i64) -> Result<i64, String> {
         let cutoff = current - window;
         #[cfg(not(target_arch = "wasm32"))]
@@ -297,7 +389,7 @@ impl Db {
                 // Returning Err throws into transactionSync so the runtime rolls back SQL writes.
                 let callback = Closure::wrap(Box::new(move || -> Result<JsValue, JsValue> {
                     for (index, (statement, params)) in statements.iter().enumerate() {
-                        let cursor = sql.exec(statement, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                        let cursor = sql.exec(&sqlite_sql(statement), do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
                         for row in cursor.raw() { row.map_err(|e| JsValue::from_str(&e.to_string()))?; }
                         if let Some(count) = expected[index] {
                             // rowsWritten includes index writes; changes() counts affected table rows.
@@ -432,13 +524,13 @@ impl Db {
     }
     fn exec_now(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
         match self {
-            Db::DoSqlite(s, _) => { let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
+            Db::DoSqlite(s, _) => { let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?; Ok(cursor.rows_written() as u64) }
         }
     }
     fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         match self {
             Db::DoSqlite(s, _) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
                 for row in cursor.raw() {
@@ -545,13 +637,15 @@ fn sqlite_val(v: &rusqlite::types::Value) -> Value {
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<u64, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = sqlite_sql(sql);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let n = stmt.execute(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     Ok(n as u64)
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = sqlite_sql(sql);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -587,7 +681,7 @@ fn mysql_sql(sql: &str) -> String {
     // uses, so a future `key_enc` or a joined alias is not rewritten.
     if sql.contains("rate_limits") || sql.contains("saml_replay") || sql.contains("workload_replay") {
         return sql.replace("(key,", "(`key`,").replace("WHERE key=", "WHERE `key`=").replace("SELECT key,", "SELECT `key`,") }
-    sql.to_string() }
+    sql.replace("OW_NOW()", "UNIX_TIMESTAMP()") }
 #[cfg(not(target_arch = "wasm32"))]
 fn split_sql_list(s: &str) -> Vec<&str> {
     let mut out = Vec::new(); let mut depth = 0i32; let mut quoted = false; let mut start = 0;
@@ -871,6 +965,122 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
         "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
     ]),
+    (23, &[
+        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
+        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
+        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
+    ]),
+    (24, &[
+        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
+        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
+        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
+        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
+        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
+        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN ca_kind TEXT DEFAULT 'root'",
+        "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
+        "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
+    ]),
+    (25, &[
+        "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
+        "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
+    ]),
+    // Device-lineage databases recorded 17-21 before canonical product shipped,
+    // so the canonical product tables they skipped must be replayed here.
+    (26, &[
+        "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
+        "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS workload_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN trust_id TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
+        "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE envs ADD COLUMN max_versions BIGINT DEFAULT 0",
+        "ALTER TABLE leases ADD COLUMN attempted_at BIGINT DEFAULT 0",
+        "ALTER TABLE audit ADD COLUMN seq BIGINT DEFAULT 0",
+        "ALTER TABLE audit ADD COLUMN prev_hash TEXT DEFAULT ''",
+        "ALTER TABLE audit ADD COLUMN hash TEXT DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS audit_heads(org_id TEXT PRIMARY KEY,seq BIGINT NOT NULL,hash TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS wrap_tokens(token_hash TEXT PRIMARY KEY,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
+        "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
+        "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_devices_env ON pki_devices(env_id)",
+        "CREATE TABLE IF NOT EXISTS pki_enrollments(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0,created_by TEXT DEFAULT '',created_at BIGINT NOT NULL,enroll_epoch BIGINT DEFAULT 0)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_enrollments_hash ON pki_enrollments(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_enrollments_device ON pki_enrollments(device_id)",
+        "ALTER TABLE pki_certs ADD COLUMN device_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
+        "ALTER TABLE pki_cas ADD COLUMN hook_url TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN hook_secret_enc TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_issuer TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_key_pem TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_alg TEXT DEFAULT 'ES256'",
+        "ALTER TABLE pki_cas ADD COLUMN attest_required BIGINT DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS pki_groups(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,name TEXT NOT NULL,env_id TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,tags TEXT DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_groups_ca_name ON pki_groups(ca_id,name)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_groups_org ON pki_groups(org_id)",
+        "ALTER TABLE pki_devices ADD COLUMN group_id TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN attested BIGINT DEFAULT 0",
+        "ALTER TABLE pki_devices ADD COLUMN attestation TEXT DEFAULT ''",
+        "ALTER TABLE pki_enrollments ADD COLUMN revoke_previous BIGINT DEFAULT 0",
+        "ALTER TABLE pki_enrollments ADD COLUMN nonce TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN ca_kind TEXT DEFAULT 'root'",
+        "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
+        "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
+        "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
+        "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
+        "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
+        "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
+        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
+        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
+        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
+        "CREATE TABLE compat_transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX idx_compat_transit_keys_name ON compat_transit_keys(org_id,name)",
+        "CREATE TABLE compat_transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
+        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
+        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
+        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
+        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
+    ]),
+    // Device lookups and expiry scans never had an index on the columns they filter.
+    (27, &[
+        "CREATE INDEX IF NOT EXISTS idx_pki_certs_device ON pki_certs(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_certs_expiry ON pki_certs(expires_at)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -906,11 +1116,67 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 27, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 22, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 27, "each migration must be recorded exactly once");
     }
+    fn seeded(seed: impl FnOnce(&rusqlite::Connection)) -> Db {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in SCHEMA { conn.execute_batch(sql).unwrap(); }
+        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(1,0)", []).unwrap();
+        seed(&conn);
+        Db::Sqlite(std::sync::Mutex::new(conn))
+    }
+    fn recorded(conn: &rusqlite::Connection, version: i64) {
+        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,0)", [version]).unwrap(); }
+    fn applied(conn: &rusqlite::Connection, version: i64) {
+        for sql in MIGRATIONS.iter().find(|(v, _)| *v == version).unwrap().1 {
+            if let Err(e)=conn.execute_batch(sql) { assert!(e.to_string().contains("duplicate column"),"{}: {}",sql,e); }
+        }
+        recorded(conn, version); }
+    // Canonical main stops at 21; device migrations append after it.
+    #[tokio::test] async fn main_21_upgrades_to_device_schema() {
+        let db = seeded(|conn| {
+            for version in 2..=21 { applied(conn, version); }
+            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
+        });
+        db.migrate().await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 27);
+        assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
+        db.query("SELECT id FROM change_requests", &[]).await.unwrap();
+        db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
+        db.query("SELECT id FROM transit_keys", &[]).await.unwrap();
+        db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();
+        db.query("SELECT payload_enc FROM wrap_tokens", &[]).await.unwrap();
+        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();
+        db.query("SELECT emergency_locked FROM orgs", &[]).await.unwrap();
+    }
+    // A device-lineage database recorded 17-20 before canonical product shipped,
+    // so those ledger rows cover device tables rather than the product tables.
+    #[tokio::test] async fn feature_20_upgrades_to_canonical_product() {
+        let db = seeded(|conn| {
+            for version in 2..=16 { applied(conn, version); }
+            applied(conn, 18);
+            // The legacy lineage's 19-20 held the device schema now numbered 23-24.
+            for version in [23, 24] {
+                for sql in MIGRATIONS.iter().find(|(v, _)| *v == version).unwrap().1 { conn.execute_batch(sql).unwrap(); }
+            }
+            recorded(conn, 17); recorded(conn, 19); recorded(conn, 20);
+            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
+            conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind,ca_kind,parent_id) VALUES('child','org','child','cert','sealed',1,'x509','intermediate','root')", []).unwrap();
+        });
+        db.migrate().await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 27);
+        assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
+        assert_eq!(s(&db.one("SELECT ca_kind FROM pki_cas WHERE id='child'", &[]).await.unwrap().unwrap(), "ca_kind"), "intermediate");
+        // The canonical product the ledger skipped must be replayed by 26.
+        db.query("SELECT id FROM change_requests", &[]).await.unwrap();
+        db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
+        db.query("SELECT id FROM transit_keys", &[]).await.unwrap();
+        db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();
+        db.query("SELECT payload_enc FROM wrap_tokens", &[]).await.unwrap();
+        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();    }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {
         let users = mysql_sql("CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL)");

@@ -130,6 +130,75 @@ A certificate for `root`, or one issued under a bare `*` grant, is root-equivale
 
 Machine certificates use the same path: a workspace identity signs with its own role, so a token minted for a developer identity cannot request a principal outside that role's grant.
 
+## Device certificates
+
+Device certificates are client certificates for an external broker. Neither the OpenWarp server nor the device needs a TPM. Ordinary CSR enrollment and signed self-renewal work with software-held keys; attestation is optional and not required by default. Enable a hardware-attestation requirement only for a fleet provisioned to satisfy it. OpenWarp does not terminate mTLS with device certificates or treat them as workspace credentials; the broker is the relying party.
+
+Device enrollment consumes a one-time code and a PKCS#10 CSR. The server verifies the CSR self-signature, ignores its subject, SAN and extension requests, and issues a certificate for the device record's name and SANs with the CSR's public key. The device private key never reaches the server on this path. The older `POST /api/pki/cas/:id/issue` path still generates a key on the server and returns it once; it requires workspace admin and exists for devices that cannot produce a CSR.
+
+Enrollment codes are 256-bit random values. Only a SHA-256 hash is stored, the code is consumed atomically on first use, and it expires between five minutes and seven days. Treat a code as a credential: anyone holding it can obtain one certificate for that device until it is used or expires. Mint codes per device, not per fleet, and delete the device record when the code is no longer needed.
+
+CN and SANs are taken from the device record, never from the CSR, so one enrolled device cannot claim another device's identity. Device certificates are client-auth only and default to 90 days. Issuing a new certificate moves the device's active pointer but does not revoke the previous one, so revoke it explicitly when the old key may be compromised. Prefer a dedicated CA per fleet or environment: the CA private key is encrypted with the instance master key, so an attacker with the database and master key can forge any certificate under that CA. Replacing the CA is the rotation boundary; existing broker trust must be updated deliberately.
+
+The CRL and OCSP endpoints are public. A CRL is a signed public artifact and brokers fetch it without credentials; it reveals the serial numbers and revocation state of that CA's certificates. CA identifiers are random and not enumerable. Revocation times come from the stored `revoked_at` value, and the CRL's `nextUpdate` is seven days, so short-lived certificates are the more reliable revocation mechanism for a fleet.
+
+A workspace can run a root CA and intermediates signed by it. The root is the broker's trust anchor; an intermediate has a path length of zero and can sign leaves only. Revoking an intermediate marks it revoked, revokes every certificate it issued and lists its serial in the root's CRL, so one environment or factory can be distrusted without replacing the root. The intermediate private key is encrypted with the master key exactly like a root key.
+
+The pre-issuance hook is a policy gate, not an advisory call. The configured URL is part of the trust boundary: the server sends the device identity, CA and CSR hash, signs the body with the configured HMAC secret when one is set, and requires `{"allow":true}`. A deny, an error, a non-2xx response, a timeout or an egress rejection blocks enrollment, and the code remains usable. The endpoint inherits the egress guards; `OPENWARP_ALLOW_PRIVATE_EGRESS` is needed to call a private-network hook. Redirects are not followed, and in production the host is resolved, a private answer is refused, and the checked address is pinned for the request.
+
+Hardware attestation trusts one operator-configured issuer and public key per CA. The server verifies the JWT signature, issuer, audience, expiry, device subject, the enrollment nonce and the SHA-256 of the submitted CSR, and requires `hardware_backed: true`. It does not inspect the device itself: a compromised attestation service can assert hardware backing, so the issuer and key are the trust anchor. The nonce is single-enrollment, the assertion is checked before the code is consumed, and an accepted assertion is recorded on the device.
+
+Device revocation, deletion, group revocation and CA revocation run as a single database transaction. The delete and revoke paths still carry the epoch and tombstone checks, so a concurrent enrollment cannot attach a certificate while the transaction is in flight; a failed transaction leaves the prior state rather than a half-revoked device.
+
+Renewal (`POST /api/pki/devices/:id/renew`) sets `revoke_previous` on the new code. The previous active certificate is revoked only after the replacement attaches, so a failed enrollment leaves the old certificate valid.
+
+### Built-in TPM profile
+
+The `tpm2` attestation mode verifies evidence locally. A workspace owner or admin
+pins an AK's exact TPM2B_PUBLIC through a trusted provisioning channel. OpenWarp
+does not infer hardware provenance from a self-signed AK or from the TPM attribute
+bits alone. The pin and expected PCR digest are the trust anchors. There is no
+automatic EK certificate discovery or vendor-root trust store.
+
+`tpm_evidence` contains padded base64 `ak_public` and `key_public` TPM2B_PUBLIC
+values, `certify` and `quote` raw TPMS_ATTEST values without the outer TPM2B size,
+`certify_signature` and `quote_signature` TPMT_SIGNATURE values, and `pcrs`, an
+array of eight padded base64 32-byte PCR values. Only SHA-256 Names and RSA
+2048/3072/4096 RSASSA SHA-256 are accepted. The restricted AK and certified key
+must have fixedTPM, fixedParent, sensitiveDataOrigin and sign attributes; the
+certified key cannot have restricted or decrypt attributes. Unknown structures,
+trailing bytes, unsafe clocks and mismatched signatures fail closed.
+
+For both attestations, qualifying data is
+`SHA256("OpenWarp/TPM2/enroll/v1\0" || nonce_utf8 || SHA256(csr_spki_der))`.
+For code enrollment the nonce is returned with the code; for self-renewal it is
+the challenge id. Certify must name the exact TPM public area whose key matches
+the CSR. Quote must select only the SHA-256 bank, PCRs 0 through 7, and its digest
+must match both the supplied PCR values and the provisioned policy. Qualified
+Names are not object Names: both attestations must report the same qualified
+signer, but OpenWarp does not reconstruct the AK's parent ancestry.
+
+The checked-in interoperability fixture was generated by swtpm and independently
+verified with tpm2-tools and OpenSSL. It proves protocol interoperability, not
+physical hardware provenance. `scripts/tpm-fixture.sh` documents generation;
+physical devices still require trusted AK provisioning and an appropriate PCR
+baseline for their boot state.
+
+### Device renewal and notification boundaries
+
+Public renewal requires a proof signed by the existing active certificate key.
+Its single-use challenge covers the device, certificate, new CSR hash, purpose,
+instance destination and random nonce. Database predicates recheck expiration
+using database wall time. A device policy edit advances its enrollment epoch, so
+a hook response for an obsolete device snapshot cannot commit a new certificate.
+The application does not trust forwarded client-certificate headers.
+
+Expiry emails contain aggregate counts only. Recipients are active, verified
+managed owners and admins who can read PKI. Delivery claims are per workspace,
+recipient and day; failed sends can retry. As with other email delivery, a crash
+after the provider accepts a message but before acknowledgement is recorded can
+cause a duplicate. No private keys or enrollment codes enter these messages.
+
 ## Network and operational controls
 
 Workspace IP allowlists protect authenticated API, MCP, and SCIM access. They are not a replacement for a firewall: authentication/bootstrap routes have different handling. Keep the server and database on trusted networks and expose only the intended HTTPS entry point.

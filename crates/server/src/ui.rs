@@ -129,7 +129,7 @@ async function api(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m
   if(AUTH_READY&&(r.status===423||(r.status===403&&String(d.error||'').includes('emergency lockdown')))){clearSecretState();refreshEmergency()}
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
 function toastUI(key,args,err){if(typeof args==='boolean'){err=args;args=undefined}return toast(owT(key,args),err,key,args)}
-function clearSecretState(){SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOADING={};E2E_LOCKED={};E2E_ERR={};
+function clearSecretState(){SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOADING={};E2E_LOCKED={};E2E_ERR={};clearPkiState();
   closeModal();$('modal').innerHTML='';$('palette').style.display='none';$('paletteresults').innerHTML='';$('deploybar').classList.remove('show')}
 function sessionEnded(){AUTH_READY=false;EMERGENCY_REQUEST++;clearInterval(EMERGENCY_POLL);T='';clearSecretState();applyEmergency(false,false);PROJECT_DIRECT=false;EMERGENCY_OWNER=false;APP=null;ENV=null;APPS=[];ENVS=[];MY_PUBKEY='';MY_UID='';
   $('view').innerHTML='';$('shell').style.display='none';$('auth').style.display='grid';$('pw').value='';toastUI('Your session ended. Sign in again.', true)}
@@ -258,7 +258,7 @@ async function doAuth(){try{
   T='';enterApp();
 }catch(e){toast(e.message,true)}}
 async function doMfa(){try{let d=await api('POST','/api/auth/mfa',{mfa_token:MFA,code:$('mfacode').value});T='';enterApp()}catch(e){toast(e.message,true)}}
-async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';location.reload()}
+async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T='';clearPkiState();location.reload()}
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
@@ -266,7 +266,7 @@ async function enterApp(){$('auth').style.display='none';$('shell').style.displa
   $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
   await refreshEmergency();clearInterval(EMERGENCY_POLL);EMERGENCY_POLL=setInterval(refreshEmergency,5000);
   await nav(EMERGENCY?'settings':'apps')}
-async function switchOrg(){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
+async function switchOrg(){if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;clearPkiState();APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
 async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner'}
 
 // ---------- navigation ----------
@@ -843,11 +843,11 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <div class="card"><h3 data-i18n="Authenticator app (TOTP)">Authenticator app (TOTP)</h3><p data-i18n="Add a second factor to your login.">Add a second factor to your login.</p><div class="row"><button onclick="totpSetup()" data-i18n="Set up TOTP">Set up TOTP</button></div><pre class="val" id="totp-out"></pre><div class="row"><input id="totp-code" placeholder="code from authenticator" data-i18n-placeholder="code from authenticator"><button onclick="totpVerify()" data-i18n="Verify and enable">Verify and enable</button></div></div>
   <div class="card"><h3 data-i18n="End-to-end environments">End-to-end environments</h3><p data-i18n="Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.">Paste your recovery kit to decrypt an E2E environment in this browser only. The kit never leaves this page.</p>
   <div class="row"><input id="e2e-kit" placeholder="recovery kit (base64)" data-i18n-placeholder="recovery kit (base64)" style="min-width:320px"><input id="e2e-env" placeholder="E2E env ID" data-i18n-placeholder="E2E env ID"><button class="primary" onclick="loadE2E()" data-i18n="Decrypt">Decrypt</button></div><pre class="val" id="e2e-out"></pre></div>
-  <div class="card"><h3 data-i18n="PKI">PKI</h3><p data-i18n="Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.">Internal X.509 certificates from your own CA, and short-lived SSH certificates for server access.</p><div class="row"><input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()" data-i18n="Create CA">Create CA</button></div><pre class="val" id="ca-out"></pre>
-  <div class="row" style="margin-top:10px"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>
+  <div class="card"><h3 data-i18n="Device certificates">Device certificates</h3><p data-i18n="Client certificates for devices and services, issued from your own CA after a CSR.">Client certificates for devices and services, issued from your own CA after a CSR.</p><p data-i18n="CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.">CSR enrollment and signed renewal work without a TPM on the server or device. Hardware attestation is optional.</p><div id="pki-body" class="small mut" data-i18n="Loading…">Loading…</div></div>
+  <div class="card"><h3 data-i18n="SSH certificates">SSH certificates</h3><div class="row"><input id="ssh-ca-name" placeholder="ssh-ca"><button onclick="mkSshCA()" data-i18n="Create SSH CA">Create SSH CA</button></div><pre class="val" id="ssh-ca-out"></pre><div id="ssh-ca-list"></div><div id="ssh-ca-detail"></div></div>
   <div class="card"><h3 data-i18n="Session">Session</h3><div class="row"><button onclick="loadTokensSettings()" data-i18n="My tokens">My tokens</button><button class="danger" onclick="logout()" data-i18n="Sign out everywhere (this device)">Sign out everywhere (this device)</button></div><pre class="val" id="sess-out"></pre></div>
   ${myOrg.role==='owner'?`<div class="card"><h3 data-i18n="Delete workspace">Delete workspace</h3><p><span data-i18n="Type">Type</span> <span class="mono">${esc(myOrg.name||'')}</span> <span data-i18n="to confirm. Every app, environment, secret, token and identity in this workspace is removed.">to confirm. Every app, environment, secret, token and identity in this workspace is removed.</span></p><div class="row"><label for="del-org-name" data-i18n="Workspace name">Workspace name</label><input id="del-org-name" style="min-width:240px"><button class="danger" onclick="deleteWorkspace('${jsq(myOrg.name||'')}')" data-i18n="Delete workspace">Delete workspace</button></div></div>`:''}
-  <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;loadSshCAs()}
+  <div class="card"><h3 data-i18n="Account">Account</h3><p><span data-i18n="Signed in as">Signed in as</span> <span class="mono">${esc(ME?.email||'')}</span>. <span data-i18n="Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.">Deleting your account revokes every key and signs you out everywhere. Transfer or delete each workspace you own first.</span></p><button class="danger" onclick="deleteAccount()" data-i18n="Delete account">Delete account</button></div>`;loadSshCAs();renderPki()}
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked,oidc_auto_provision:$('set-oidc-auto').checked,oidc_allowed_domains:$('set-oidc-domains').value};
   if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
   if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
@@ -866,9 +866,114 @@ async function totpSetup(){try{let d=await api('POST','/api/me/totp/setup',{});$
 async function totpVerify(){try{await api('POST','/api/me/totp/verify',{code:$('totp-code').value});toastUI('TOTP enabled', false)}catch(e){toast(e.message,true)}}
 async function loadE2E(envId){try{let id=envId||$('e2e-env')?.value;let d=await api('GET',`/api/envs/${id}/e2e/secrets`);let k=await OW.decryptAsymmetric($('e2e-kit').value,d.wrapped_key);
   $('e2e-out').textContent=d.secrets.map(s=>new TextDecoder().decode(OW.decryptSymmetric(k,s.key_enc))+'='+new TextDecoder().decode(OW.decryptSymmetric(k,s.value_enc))).join('\n')||'(no secrets)'}catch(e){$('e2e-out').textContent='Error: '+(e.message||e)}}
-async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});$('ca-out').textContent='CA id: '+d.id+'\n'+d.certificate}catch(e){toast(e.message,true)}}
+let PKI_CAS=[],PKI_CA='',PKI_GROUPS=[],PKI_IMPORT_OUT='',PKI_SELECTED=new Set(),PKI_SELECTION_CA='',PKI_CODE_RESULTS=[],PKI_RENDER=0,PKI_HOOK=null,PKI_ATT=null;
+function clearPkiState(){PKI_RENDER++;PKI_CAS=[];PKI_CA='';PKI_GROUPS=[];PKI_IMPORT_OUT='';PKI_SELECTED=new Set();PKI_SELECTION_CA='';PKI_CODE_RESULTS=[];PKI_HOOK=null;PKI_ATT=null;let el=$('pki-body');if(el)el.innerHTML='Loading…'}
+function switchPkiCA(id){PKI_CA=id;PKI_SELECTED.clear();PKI_CODE_RESULTS=[];PKI_IMPORT_OUT='';PKI_SELECTION_CA='';PKI_HOOK=null;PKI_ATT=null;let el=$('pki-body');if(el)el.innerHTML='Loading…';renderPki()}
+async function renderPki(){let el=$('pki-body');if(!el)return;let org=ORG,render=++PKI_RENDER;let current=()=>ORG===org&&render===PKI_RENDER&&$('pki-body')===el;
+  try{let cas=await api('GET',`/api/orgs/${org}/pki/cas`);if(!current())return;PKI_CAS=cas;
+    if(!PKI_CAS.some(c=>c.id===PKI_CA))PKI_CA=PKI_CAS.length?PKI_CAS[0].id:'';
+    let ca=PKI_CAS.find(c=>c.id===PKI_CA);
+    let caSel=PKI_CAS.length?`<select id="pki-ca" onchange="switchPkiCA(this.value)" style="min-width:220px">${PKI_CAS.map(c=>`<option value="${esc(c.id)}"${c.id===PKI_CA?' selected':''}>${esc(c.name)} (${esc(c.kind||'root')}${c.revoked?' revoked':''})</option>`).join('')}</select>`:'';
+    let roots=PKI_CAS.filter(c=>(c.kind||'root')==='root'&&!c.revoked);
+    let parentSel=roots.length?`<select id="ca-parent" style="min-width:180px">${roots.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}</select><input id="int-name" placeholder="intermediate-ca"><button onclick="mkIntermediate()">Create intermediate</button>`:'';
+    let devices=PKI_CA?await api('GET',`/api/pki/cas/${PKI_CA}/devices`):[];if(!current())return;
+    if(PKI_SELECTION_CA!==PKI_CA){PKI_SELECTED.clear();PKI_CODE_RESULTS=[];PKI_IMPORT_OUT='';PKI_SELECTION_CA=PKI_CA;}
+    PKI_SELECTED=new Set([...PKI_SELECTED].filter(id=>devices.some(d=>d.id===id)));
+    let groups=PKI_CA?await api('GET',`/api/pki/cas/${PKI_CA}/groups`):[];if(!current())return;PKI_GROUPS=groups;
+    let expiring=PKI_CA?await api('GET',`/api/orgs/${org}/pki/expiring?days=30`).catch(()=>null):null;if(!current())return;
+    let expLine=expiring?`<span class="chip">Expiring: ${expiring.counts['7']} in 7d, ${expiring.counts['14']} in 14d, ${expiring.counts['30']} in 30d</span>`:'';
+    let groupOpts=PKI_GROUPS.map(g=>`<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+    let rows=devices.map(d=>`<tr><td><input type="checkbox" class="pki-select" data-device="${esc(d.id)}" aria-label="Select ${esc(d.name)}"${PKI_SELECTED.has(d.id)?' checked':''} onchange="selectPkiDevice(this)"></td><td class="mono">${esc(d.name)}</td><td class="small mut">${esc(d.env_id||'-')}</td><td class="small mut">${esc((PKI_GROUPS.find(g=>g.id===d.group_id)||{}).name||'-')}</td><td class="small">${d.active_cert?esc(d.active_cert.revoked?'revoked':'active')+' '+esc((d.active_cert.serial||'').slice(0,12)):'none'}</td><td class="small mut">${d.active_cert?new Date(d.active_cert.expires_at*1000).toLocaleDateString():'-'}</td><td class="small">${d.attested?'attested':'not attested'}</td><td class="row"><button onclick="mintEnrollment('${esc(d.id)}')">Enroll</button><button onclick="renewDevice('${esc(d.id)}')">Renew</button><button class="danger" onclick="revokeDevice('${esc(d.id)}')">Revoke</button></td></tr>`).join('')||'<tr><td colspan="8" class="mut small">No devices yet.</td></tr>';
+    el.innerHTML=`<div class="row">${caSel}<input id="ca-name" placeholder="internal-ca"><button onclick="mkCA()" data-i18n="Create CA">Create CA</button></div>
+      ${parentSel?`<div class="row" style="margin-top:8px">${parentSel}</div>`:''}
+      ${ca?`<p class="small mut" style="margin:8px 0">${esc(ca.kind||'root')} CA${ca.revoked?' · revoked':''} ${expLine} ${ca.revoked?'':'<button class="danger" onclick="revokeCA()">Revoke CA</button>'}</p>`:''}
+      ${PKI_CA?`<div class="row" style="margin-top:10px"><input id="dev-name" placeholder="device name (CN)"><input id="dev-env" placeholder="environment id (optional)" style="min-width:170px"><select id="dev-group" style="min-width:140px"><option value="">no group</option>${groupOpts}</select><button class="primary" onclick="mkDevice()">Add device</button></div>
+      <div class="row" style="margin-top:8px"><button onclick="selectAllPki()">Select all</button><button onclick="clearPkiSelection()">Clear selection</button><span id="pki-selection-count" role="status">${PKI_SELECTED.size} selected</span><button id="pki-mint-selected" onclick="mintSelectedPki()"${PKI_SELECTED.size?'':' disabled'}>Mint selected codes</button><button id="pki-download-codes" onclick="downloadPkiCodes()"${PKI_CODE_RESULTS.some(r=>r.code)?'':' disabled'}>Download codes CSV</button></div>
+      <pre class="val" id="pki-codes-out" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+      <table class="table"><thead><tr><th>Select</th><th>Device</th><th>Environment</th><th>Group</th><th>Certificate</th><th>Expires</th><th>Key</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      <details style="margin-top:10px"${PKI_IMPORT_OUT?' open':''}><summary class="small mut">Bulk import and export (export headers name,model,hardware_serial,tags,env_id,group_id,sans,cert_days are honoured; SANs separated by semicolons or commas)</summary>
+        <textarea id="pki-import" rows="4" style="width:100%;margin-top:8px" placeholder="sensor-1,model-a,S123,site=a,ENV_ID,gw.local;192.0.2.10,45"></textarea>
+        <div class="row"><button onclick="importDevices()">Import and mint codes</button><button onclick="downloadDevices()">Download CSV</button></div><pre class="val" id="pki-import-out"></pre></details>
+      <details style="margin-top:8px"><summary class="small mut">Groups (defaults for SANs, lifetime, environment and tags)</summary>
+        <div class="row" style="margin-top:8px"><input id="grp-name" placeholder="group name"><input id="grp-env" placeholder="environment id (optional)"><input id="grp-sans" placeholder="gw.local"><input id="grp-days" type="number" value="90" style="width:80px"><button onclick="mkGroup()">Add group</button></div>
+        <div class="row">${PKI_GROUPS.map(g=>`<span class="chip">${esc(g.name)} · ${g.device_count} device(s)</span><button onclick="revokeGroup('${esc(g.id)}')">Revoke</button><button class="danger" onclick="deleteGroup('${esc(g.id)}')">Delete</button>`).join(' ')||'<span class="small mut">No groups yet.</span>'}</div></details>
+      <details style="margin-top:8px"><summary class="small mut">Enrollment policy hook</summary>
+        <div class="row" style="margin-top:8px"><input id="hook-url" placeholder="https://inventory.example/pki/enroll" style="min-width:320px" disabled><input id="hook-secret" type="password" placeholder="HMAC secret (blank keeps)" disabled><button id="hook-save" onclick="saveHook()" disabled>Save hook</button></div>
+        <p class="small mut">Called before every issuance. A deny, an error or a timeout blocks enrollment and leaves the code usable.</p></details>
+      <details style="margin-top:8px"><summary class="small mut">Optional hardware attestation</summary>
+        <p class="small mut">No TPM is required on the server or device. Leave attestation optional for ordinary CSR enrollment and signed renewal. Enable a requirement only for a fleet provisioned for it.</p>
+        <div class="row" style="margin-top:8px"><input id="att-issuer" placeholder="attestation issuer" disabled><input id="att-alg" value="ES256" style="width:90px" disabled><label class="row" style="gap:6px"><input type="checkbox" id="att-required" disabled> required</label><button id="att-save" onclick="saveAttestation()" disabled>Save</button></div>
+        <textarea id="att-key" rows="3" style="width:100%;margin-top:6px" placeholder="attestation service public key (PEM)" disabled></textarea></details>
+      <pre class="val" id="ca-out"></pre>`:''}`;
+    if(PKI_CA&&ca){$('ca-out').textContent='CA certificate (trust this in the broker):\n'+ca.certificate;}
+    if(PKI_IMPORT_OUT&&$('pki-import-out'))$('pki-import-out').textContent=PKI_IMPORT_OUT;
+    if(PKI_CA&&$('pki-codes-out'))$('pki-codes-out').textContent=pkiCodesText();
+    if($('pki-download-codes'))$('pki-download-codes').disabled=!PKI_CODE_RESULTS.some(r=>r.code);
+    PKI_HOOK=null;PKI_ATT=null;
+    if(PKI_CA){let caId=PKI_CA;
+      try{let hook=await api('GET',`/api/pki/cas/${caId}/hook`);if(!current()||PKI_CA!==caId)return;PKI_HOOK={ca:caId,render,url:(hook&&hook.url)||''};
+        if($('hook-url')){$('hook-url').value=PKI_HOOK.url;$('hook-url').disabled=false}
+        if($('hook-secret'))$('hook-secret').disabled=false;
+        if($('hook-save'))$('hook-save').disabled=false;
+      }catch(e){if(current()&&PKI_CA===caId)toast('Enrollment hook settings failed to load: '+(e.message||e),true)}
+      try{let att=await api('GET',`/api/pki/cas/${caId}/attestation`);if(!current()||PKI_CA!==caId)return;
+        PKI_ATT={ca:caId,render,mode:typeof att?.mode==='string'?att.mode:''};
+        if($('att-issuer')){$('att-issuer').value=(att&&att.issuer)||'';$('att-alg').value=(att&&att.algorithm)||'ES256';$('att-required').checked=!!(att&&att.required)}
+        for(let id of ['att-issuer','att-alg','att-required','att-key','att-save']){let f=$(id);if(f)f.disabled=false}
+      }catch(e){if(current()&&PKI_CA===caId)toast('Attestation settings failed to load: '+(e.message||e),true)}
+    }
+  }catch(e){if(current()){el.textContent='PKI unavailable: '+(e.message||e);PKI_HOOK=null;PKI_ATT=null}}}
+async function mkCA(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('ca-name').value||'internal-ca'});PKI_CA=d.id;toast('CA created');renderPki()}catch(e){toast(e.message,true)}}
+async function mkIntermediate(){try{let d=await api('POST',`/api/orgs/${ORG}/pki/cas`,{name:$('int-name').value||'intermediate-ca',parent_id:$('ca-parent').value});PKI_CA=d.id;toast('Intermediate created');renderPki()}catch(e){toast(e.message,true)}}
+async function revokeCA(){if(!confirm('Revoke this CA and every certificate it issued?'))return;try{await api('POST',`/api/pki/cas/${PKI_CA}/revoke`,{});toast('CA revoked');renderPki()}catch(e){toast(e.message,true)}}
+async function mkDevice(){try{let b={name:$('dev-name').value};if($('dev-env').value)b.env_id=$('dev-env').value;if($('dev-group').value)b.group_id=$('dev-group').value;await api('POST',`/api/pki/cas/${PKI_CA}/devices`,b);toast('Device added');renderPki()}catch(e){toast(e.message,true)}}
+function syncPkiSelection(){let count=$('pki-selection-count');if(count)count.textContent=PKI_SELECTED.size+' selected';let mint=$('pki-mint-selected');if(mint)mint.disabled=!PKI_SELECTED.size;document.querySelectorAll('.pki-select').forEach(el=>{el.checked=PKI_SELECTED.has(el.getAttribute('data-device'))})}
+function selectPkiDevice(el){let id=el.getAttribute('data-device');if(el.checked)PKI_SELECTED.add(id);else PKI_SELECTED.delete(id);syncPkiSelection()}
+function selectAllPki(){document.querySelectorAll('.pki-select').forEach(el=>PKI_SELECTED.add(el.getAttribute('data-device')));syncPkiSelection()}
+function clearPkiSelection(){PKI_SELECTED.clear();syncPkiSelection()}
+async function mintSelectedPki(){if(!PKI_SELECTED.size)return;let ca=PKI_CA,org=ORG,render=PKI_RENDER,el=$('pki-body');try{if(PKI_SELECTED.size>500)throw Error('Select at most 500 devices per request');let d=await api('POST',`/api/pki/cas/${ca}/devices/codes`,{device_ids:[...PKI_SELECTED],ttl_seconds:3600});if(PKI_CA!==ca||ORG!==org||PKI_RENDER!==render||$('pki-body')!==el)return;PKI_CODE_RESULTS=d.codes||[];$('pki-codes-out').textContent=pkiCodesText();$('pki-download-codes').disabled=!PKI_CODE_RESULTS.some(r=>r.code)}catch(e){toast(e.message,true)}}
+function pkiCodesText(){return PKI_CODE_RESULTS.map(r=>r.error?(r.name||r.id)+': '+r.error:(r.name||r.id)+': '+r.code+' (nonce '+r.nonce+')').join('\n')}
+function pkiCsvField(value){let s=String(value??'');if(/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
+function downloadPkiCodes(){let rows=PKI_CODE_RESULTS.filter(r=>r.code);if(!rows.length)return;let csv='device_id,name,code,nonce,expires_at\r\n'+rows.map(r=>[r.id,r.name,r.code,r.nonce,r.expires_at].map(pkiCsvField).join(',')).join('\r\n');let url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='openwarp-enrollment-codes.csv';a.click();URL.revokeObjectURL(url)}
+function enrollmentText(d,prefix){return prefix+' (valid until '+new Date(d.expires_at*1000).toLocaleString()+'):\n'+d.code+'\nnonce: '+d.nonce+'\n\nPOST '+location.origin+'/api/pki/enroll from the device with JSON {"code":"<code>","csr":"<PEM CSR>"}.\nNo TPM is required. Supply attestation only when configured by your fleet administrator.\nThe code is single use; only its hash is stored.'}
+async function mintEnrollment(id){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let d=await api('POST',`/api/pki/devices/${id}/enrollment`,{ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;$('ca-out').textContent=enrollmentText(d,'One-time enrollment code')}catch(e){toast(e.message,true)}}
+async function renewDevice(id){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let d=await api('POST',`/api/pki/devices/${id}/renew`,{ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;$('ca-out').textContent=enrollmentText(d,'Renewal code (the previous certificate is revoked on enrollment)')}catch(e){toast(e.message,true)}}
+async function revokeDevice(id){if(!confirm('Revoke the active certificate for this device?'))return;try{let d=await api('POST',`/api/pki/devices/${id}/revoke`,{});toast('Revoked '+d.revoked+' certificate(s)');renderPki()}catch(e){toast(e.message,true)}}
+function parseCsvRows(text){let rows=[],row=[],field='',quoted=false;for(let i=0;i<text.length;i++){let c=text[i];
+  if(quoted){if(c==='"'){if(text[i+1]==='"'){field+='"';i++}else quoted=false}else field+=c}
+  else if(c==='"')quoted=true;
+  else if(c===','){row.push(field);field=''}
+  else if(c==='\n'||c==='\r'){if(c==='\r'&&text[i+1]==='\n')i++;row.push(field);if(row.some(v=>v.trim()))rows.push(row);row=[];field=''}
+  else field+=c}
+  if(quoted)throw Error('Unterminated quoted CSV cell');
+  row.push(field);if(row.some(v=>v.trim()))rows.push(row);return rows}
+const PKI_IMPORT_FIELDS=['name','model','hardware_serial','tags','env_id','group_id','sans','cert_days'];
+function deviceImportRows(text){let rows=parseCsvRows(text);if(!rows.length)return [];
+  let header=rows[0].map(v=>v.trim().toLowerCase()),known=header.filter(k=>PKI_IMPORT_FIELDS.includes(k));
+  let hasHeader=header.includes('name')||known.length>1;
+  if(hasHeader&&!header.includes('name'))throw Error('CSV header must include a name column');
+  let keys=hasHeader?header:['name','model','hardware_serial','tags','env_id','sans','cert_days'];
+  return (hasHeader?rows.slice(1):rows).map((cells,index)=>{let o={};keys.forEach((k,i)=>{if(PKI_IMPORT_FIELDS.includes(k))o[k]=(cells[i]||'').trim()});
+    let out={name:o.name};if(!out.name)throw Error('Row '+(index+1)+' has no device name');
+    for(let k of ['model','hardware_serial','tags','env_id','group_id'])if(o[k])out[k]=o[k];
+    if(o.sans)out.sans=o.sans.split(/[;,]/).map(s=>s.trim()).filter(Boolean);
+    if(o.cert_days){let days=Number(o.cert_days);if(!Number.isFinite(days)||days<=0)throw Error('Row '+(index+1)+' has an invalid cert_days value');out.cert_days=days}
+    return out})}
+async function importDevices(){let org=ORG,ca=PKI_CA,render=PKI_RENDER,el=$('pki-body');try{let devices=deviceImportRows($('pki-import').value);
+  if($('dev-group')&&$('dev-group').value)devices.forEach(o=>{if(!o.group_id)o.group_id=$('dev-group').value});
+  let d=await api('POST',`/api/pki/cas/${ca}/devices/import`,{devices,mint_codes:true,ttl_seconds:3600});if(ORG!==org||PKI_CA!==ca||PKI_RENDER!==render||$('pki-body')!==el)return;PKI_IMPORT_OUT='created '+d.created+', failed '+d.failed+'\n'+d.results.map(r=>r.error?(r.name||r.id)+': '+r.error:(r.name||r.id)+': '+(r.code||'ok')).join('\n');await renderPki()}catch(e){toast(e.message,true)}}
+async function downloadDevices(){try{let r=await fetch(`/api/pki/cas/${PKI_CA}/devices/export`,{headers:H()});let t=await r.text();
+  if(!r.ok){let m='';try{m=JSON.parse(t).error||''}catch(e){}throw Error(m||('Could not download devices (HTTP '+r.status+')'))}
+  let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='openwarp-devices.csv';a.click()}catch(e){toast(e.message,true)}}
+async function mkGroup(){try{let b={name:$('grp-name').value,cert_days:Number($('grp-days').value)||90};if($('grp-env').value)b.env_id=$('grp-env').value;if($('grp-sans').value)b.sans=$('grp-sans').value.split(',').map(s=>s.trim()).filter(Boolean);await api('POST',`/api/pki/cas/${PKI_CA}/groups`,b);toast('Group added');renderPki()}catch(e){toast(e.message,true)}}
+async function revokeGroup(id){if(!confirm('Revoke every certificate in this group?'))return;try{let d=await api('POST',`/api/pki/groups/${id}/revoke`,{});toast('Revoked '+d.revoked+' certificate(s)');renderPki()}catch(e){toast(e.message,true)}}
+async function deleteGroup(id){if(!confirm('Delete this group? Devices stay and lose their group defaults.'))return;try{await api('DELETE',`/api/pki/groups/${id}`);toast('Group deleted');renderPki()}catch(e){toast(e.message,true)}}
+async function saveHook(){let ca=PKI_CA;if(!ca||!PKI_HOOK||PKI_HOOK.ca!==ca||PKI_HOOK.render!==PKI_RENDER||!$('hook-url')){toast('Enrollment hook settings are not loaded yet',true);return}
+  try{let b={url:$('hook-url').value};if($('hook-secret').value)b.secret=$('hook-secret').value;await api('PUT',`/api/pki/cas/${ca}/hook`,b);toast('Hook saved');renderPki()}catch(e){toast(e.message,true)}}
+async function saveAttestation(){let ca=PKI_CA;if(!ca||!PKI_ATT||PKI_ATT.ca!==ca||PKI_ATT.render!==PKI_RENDER||!$('att-issuer')){toast('Attestation settings are not loaded yet',true);return}
+  try{let b={issuer:$('att-issuer').value,algorithm:$('att-alg').value||'ES256',required:$('att-required').checked};if(PKI_ATT.mode)b.mode=PKI_ATT.mode;if($('att-key').value)b.public_key_pem=$('att-key').value;await api('PUT',`/api/pki/cas/${ca}/attestation`,b);toast('Attestation saved');renderPki()}catch(e){toast(e.message,true)}}
 async function mkSshCA(){try{let d=await api('POST',`/api/orgs/${ORG}/ssh/cas`,{name:$('ssh-ca-name').value||'ssh-ca'});
-  $('ssh-ca-name').value='';$('ca-out').textContent='SSH CA id: '+d.id+'\nFingerprint '+d.fingerprint;
+  $('ssh-ca-name').value='';$('ssh-ca-out').textContent='SSH CA id: '+d.id+'\nFingerprint '+d.fingerprint;
   loadSshCAs();openSshCA(d.id)}catch(e){toast(e.message,true)}}
 async function loadSshCAs(){let host=$('ssh-ca-list');if(!host)return;try{let d=await api('GET',`/api/orgs/${ORG}/ssh/cas`);
   host.innerHTML=d.length?`<table><thead><tr><th data-i18n="SSH CA">SSH CA</th><th data-i18n="Fingerprint">Fingerprint</th><th></th></tr></thead><tbody>`+d.map(c=>`<tr><td>${esc(c.name)}</td><td class="mono small">${esc(c.fingerprint)}</td><td><button onclick="openSshCA('${jsq(c.id)}')" data-i18n="Manage">Manage</button></td></tr>`).join('')+'</tbody></table>':'<p class="mut small" data-i18n="No SSH CA yet. A host accepts these certificates only after TrustedUserCAKeys names this CA.">No SSH CA yet. A host accepts these certificates only after TrustedUserCAKeys names this CA.</p>'}catch(e){host.textContent=e.message}}

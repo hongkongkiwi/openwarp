@@ -194,6 +194,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
+    '/api/orgs/org-a/pki/cas': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -233,6 +234,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
       let body;
+      if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
       else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
         if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
@@ -250,6 +252,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'POST' && url === '/api/ssh/certs/ssh-cert-1/revoke') body = { revoked: 'ssh-cert-1' };
       else if (options.method === 'POST' && url === '/api/ssh/cas/ca-ssh-1/hosts') body = { id: 'host-2', hostname: call.body.hostname, fingerprint: 'SHA256:newhost' };
       else if (options.method === 'DELETE' && url === '/api/ssh/cas/ca-ssh-1/hosts/host-1') body = { deleted: 'host-1' };
+      else if (opts.pki && options.method === 'POST' && url === '/api/pki/cas/ca-a/devices/codes') body = { codes: call.body.device_ids.map(id => id === 'dev-b' ? { id, error: 'device no longer available' } : { id, name: 'sensor-a', code: 'test-code', nonce: 'test-nonce', expires_at: 1900000000 }) };
+      else if (options.method === 'GET' && opts.responses && Object.hasOwn(opts.responses, url)) body = opts.responses[url];
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -594,12 +598,16 @@ test('project lockdown leaves metadata readable and blocks secrets and changes',
 
 test('an ended session removes plaintext and returns to sign-in', async () => {
   const ui = await consoleUI();
-  await ui.invoke("E2E_KIT='private-kit';applyEmergency(true);sessionEnded()");
+  await ui.invoke("E2E_KIT='private-kit';PKI_SELECTED.add('dev-a');PKI_CODE_RESULTS=[{code:'stale'}];PKI_HOOK={ca:'ca-a',render:PKI_RENDER};PKI_ATT={ca:'ca-a',render:PKI_RENDER};applyEmergency(true);sessionEnded()");
   assert.equal(ui.el('shell').style.display, 'none');
   assert.equal(ui.el('auth').style.display, 'grid');
   assert.equal(ui.el('view').innerHTML, '');
   assert.equal(ui.run('E2E_KIT'), '');
   assert.equal(ui.run('AUTH_READY'), false);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
   assert.equal(ui.run('EMERGENCY'), false, 'an ended session must not block the next sign-in');
 });
 
@@ -711,7 +719,7 @@ test('SSH CA settings create a CA, edit grants and revoke a certificate', async 
   const create = ui.calls.find(c => c.method === 'POST' && c.url === '/api/orgs/org-a/ssh/cas');
   assert.ok(create, 'creating a CA must reach the workspace');
   assert.equal(create.body.name, 'ssh-ca');
-  assert.ok(ui.el('ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
+  assert.ok(ui.el('ssh-ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
   assert.ok(ui.el('ssh-ca-detail').textContent.includes('TrustedUserCAKeys'), 'the new CA opens straight to the sshd block');
   await ui.invoke("openSshCA('ca-ssh-1')");
   assert.ok(ui.el('ssh-grants').value.includes('developer: web-*'), 'existing grants load into the editor');
@@ -766,6 +774,254 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {
+  let releaseMint, releaseRender, holdRender=false;
+  const opts={pki:true,responses:{
+    '/api/orgs/org-a/pki/cas':[{id:'ca-a',name:'A',kind:'root',certificate:'A-CERT'}],
+    '/api/orgs/org-b/pki/cas':[{id:'ca-b',name:'B',kind:'root',certificate:'B-CERT'}],
+    '/api/orgs/org-b/settings':{}, '/api/orgs/org-b/saml':{configured:false}, '/api/orgs/org-b/ssh/cas':[],
+    '/api/pki/cas/ca-a/devices':[{id:'dev-a',name:'sensor-a'}], '/api/pki/cas/ca-b/devices':[],
+    '/api/pki/cas/ca-a/groups':[], '/api/pki/cas/ca-b/groups':[],
+    '/api/orgs/org-a/pki/expiring?days=30':{counts:{7:0,14:0,30:0}}, '/api/orgs/org-b/pki/expiring?days=30':{counts:{7:0,14:0,30:0}},
+    '/api/pki/cas/ca-a/hook':{url:''}, '/api/pki/cas/ca-b/hook':{url:''},
+    '/api/pki/cas/ca-a/attestation':{}, '/api/pki/cas/ca-b/attestation':{},
+  },fetchOverride:call=>{
+    if(call.url==='/api/pki/cas/ca-a/devices/codes')return new Promise(resolve=>{releaseMint=resolve});
+    if(holdRender&&call.url==='/api/orgs/org-a/pki/cas')return new Promise(resolve=>{releaseRender=resolve});
+  }};
+  const ui=await consoleUI([saved],[],opts);await ui.invoke('renderSettings()');await ui.invoke('selectAllPki()');
+  ui.run('pendingMint=mintSelectedPki()');await ui.settle();holdRender=true;ui.run('pendingRender=renderPki()');await ui.settle();
+  await ui.invoke("ORG='org-b';renderSettings()");
+  releaseRender(opts.responses['/api/orgs/org-a/pki/cas']);await ui.invoke('pendingRender');
+  releaseMint({codes:[{id:'dev-a',name:'sensor-a',code:'A-SECRET-CODE',nonce:'a'}]});await ui.invoke('pendingMint');
+  assert.equal(ui.run('PKI_CA'),'ca-b');assert.equal(ui.el('pki-codes-out').textContent,'');
+  assert.ok(ui.el('pki-download-codes').disabled);assert.ok(!ui.el('view').textContent.includes('A-SECRET-CODE'));
+});
+
+test('PKI bulk codes use explicit selection and show partial failures', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('pki-mint-selected').disabled);
+  await ui.invoke('selectAllPki()');
+  assert.equal(ui.el('pki-selection-count').textContent, '2 selected');
+  await ui.click(ui.el('pki-mint-selected'));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/codes');
+  assert.deepEqual(Array.from(call.body.device_ids), ['dev-a', 'dev-b']);
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.match(ui.el('pki-codes-out').textContent, /device no longer available/);
+  assert.equal(ui.el('pki-download-codes').disabled, false);
+  await ui.invoke('clearPkiSelection()');
+  assert.equal(ui.el('pki-mint-selected').disabled, true);
+  opts.responses['/api/orgs/org-a/pki/cas'] = [{ id: 'ca-b', name: 'Other root', kind: 'root', certificate: 'OTHER PUBLIC CERT' }];
+  opts.responses['/api/pki/cas/ca-b/devices'] = [];
+  opts.responses['/api/pki/cas/ca-b/groups'] = [];
+  opts.responses['/api/pki/cas/ca-b/hook'] = { url: '' };
+  opts.responses['/api/pki/cas/ca-b/attestation'] = { issuer: '', algorithm: 'ES256' };
+  await ui.invoke("PKI_CODE_RESULTS=[{code:'stale'}];PKI_SELECTED.add('dev-a');renderPki()");
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
+});
+
+test('PKI device import accepts exported headers, quoted cells and the legacy headerless rows', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => call.method === 'POST' && call.url === '/api/pki/cas/ca-a/devices/import'
+    ? { created: 2, failed: 0, results: [] } : undefined };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  const rows = JSON.parse(ui.run(`JSON.stringify(parseCsvRows(${JSON.stringify('name,model\r\n"a,b","say ""hi"""\r\n')}))`));
+  assert.deepEqual(rows, [['name', 'model'], ['a,b', 'say "hi"']],
+    'quoted cells keep commas, newlines and doubled quotes');
+  ui.el('pki-import').value = [
+    'name,model,hardware_serial,tags,env_id,group_id,sans,cert_days,serial,expires_at,revoked,attested',
+    'sensor-1,model-a,S123,"site=a,b",env-9,group-9,"gw.local;192.0.2.10",45,ABC,1900000000,false,false',
+    'sensor-2,model-b,S456,site=c,env-9,,"gw2.local,192.0.2.11",30,DEF,1900000000,false,false',
+  ].join('\r\n');
+  await ui.click(ui.button(ui.el('pki-body'), /Import and mint codes/));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/import');
+  assert.deepEqual(call.body.devices, [
+    { name: 'sensor-1', model: 'model-a', hardware_serial: 'S123', tags: 'site=a,b', env_id: 'env-9', group_id: 'group-9', sans: ['gw.local', '192.0.2.10'], cert_days: 45 },
+    { name: 'sensor-2', model: 'model-b', hardware_serial: 'S456', tags: 'site=c', env_id: 'env-9', sans: ['gw2.local', '192.0.2.11'], cert_days: 30 },
+  ], 'exported columns map by header and status columns are ignored');
+  const legacy = JSON.parse(ui.run(`JSON.stringify(deviceImportRows(${JSON.stringify('sensor-3,model-c,S789,site=d,env-9,gw.local;192.0.2.12,60')}))`));
+  assert.deepEqual(legacy, [{ name: 'sensor-3', model: 'model-c', hardware_serial: 'S789', tags: 'site=d', env_id: 'env-9', sans: ['gw.local', '192.0.2.12'], cert_days: 60 }],
+    'the previous headerless line format keeps working');
+  assert.throws(() => ui.run(`parseCsvRows(${JSON.stringify('"open')})`), /Unterminated quoted CSV cell/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('model,tags\nsensor,site=a')})`), /must include a name column/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('name,cert_days\nsensor,soon')})`), /invalid cert_days/);
+  assert.ok(!JSON.stringify(call.body.devices).includes('private'), 'imports never carry private key material');
+});
+
+test('minted PKI codes are repopulated after a render', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  const minted = ui.el('pki-codes-out').textContent;
+  assert.match(minted, /sensor-a: test-code/);
+  await ui.invoke('renderPki()');
+  assert.equal(ui.el('pki-codes-out').textContent, minted, 'the issued codes stay visible after a full render');
+  assert.equal(ui.el('pki-download-codes').disabled, false, 'a render keeps the download control usable');
+});
+
+test('device CSV download checks the response status', async () => {
+  const ui = await consoleUI();
+  ui.run("fetch=async()=>({ok:false,status:403,text:async()=>JSON.stringify({error:'pki:read denied'})})");
+  await ui.invoke('downloadDevices()');
+  assert.match(ui.el('toasts').textContent, /pki:read denied/, 'a rejected export must report the server error');
+});
+
+test('hook and attestation settings fail closed when their reads fail', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook') throw new Error('hook read denied');
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation') throw new Error('attestation read denied');
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  for (const id of ['hook-url', 'hook-secret', 'hook-save', 'att-issuer', 'att-alg', 'att-required', 'att-key', 'att-save'])
+    assert.ok(ui.el(id).disabled, id + ' must stay disabled after a failed read');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'a failed read must never let a save overwrite the stored policy');
+  assert.match(ui.el('toasts').textContent, /hook read denied/);
+  assert.match(ui.el('toasts').textContent, /attestation read denied/);
+});
+
+test('policy forms enable only after their reads and attestation keeps the stored mode', async () => {
+  let resolveHook, resolveAtt;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook')
+      return new Promise(resolve => { resolveHook = () => resolve({ url: 'https://inventory.example/pki/enroll' }); });
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation')
+      return new Promise(resolve => { resolveAtt = () => resolve({ mode: 'tpm2', issuer: 'att-svc', algorithm: 'ES256', required: true }); });
+    if (call.method === 'PUT' && call.url === '/api/pki/cas/ca-a/attestation')
+      return { mode: call.body.mode, issuer: call.body.issuer, algorithm: call.body.algorithm, required: call.body.required };
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('hook-save').disabled);
+  assert.ok(ui.el('att-save').disabled);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'no save may run before the reads complete');
+  resolveHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://inventory.example/pki/enroll');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.ok(ui.el('att-save').disabled, 'attestation stays locked until its own read returns');
+  resolveAtt(); await ui.settle();
+  assert.equal(ui.el('att-required').checked, true);
+  assert.equal(ui.run('PKI_ATT.mode'), 'tpm2');
+  await ui.click(ui.el('att-save'));
+  const put = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/pki/cas/ca-a/attestation');
+  assert.ok(put, 'the loaded form saves');
+  assert.equal(put.body.mode, 'tpm2', 'an ordinary save preserves the stored tpm2 mode');
+  assert.equal(put.body.required, true);
+});
+
+test('switching CA discards the previous policy form before the new settings load', async () => {
+  let holdB = false, resolveBHook;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root A', kind: 'root', certificate: 'A-CERT' }, { id: 'ca-b', name: 'Root B', kind: 'root', certificate: 'B-CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-b/devices': [],
+    '/api/pki/cas/ca-a/groups': [], '/api/pki/cas/ca-b/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: 'https://a.example/hook' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: 'a-svc', algorithm: 'ES256', required: true },
+    '/api/pki/cas/ca-b/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => {
+    if (holdB && call.method === 'GET' && call.url === '/api/pki/cas/ca-b/hook')
+      return new Promise(resolve => { resolveBHook = () => resolve({ url: 'https://b.example/hook' }); });
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.settle();
+  const oldSave = ui.el('att-save');
+  assert.equal(oldSave.disabled, false);
+  assert.equal(ui.run('PKI_ATT.ca'), 'ca-a');
+  holdB = true;
+  ui.run("switchPkiCA('ca-b')");
+  assert.equal(ui.document.getElementById('att-save'), null, 'the old form is replaced immediately');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  assert.equal(ui.run('PKI_CA'), 'ca-b');
+  await ui.click(oldSave);
+  await ui.invoke('saveHook()');
+  assert.deepEqual(ui.writes(), [], 'detached handlers must not save under the new CA');
+  assert.ok(ui.el('att-save').disabled, 'the new attestation form waits for its own read');
+  assert.ok(ui.el('hook-save').disabled, 'the new hook form waits for its own read');
+  resolveBHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://b.example/hook');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.equal(ui.el('att-required').checked, false);
+  assert.equal(ui.run('PKI_ATT.mode'), 'jwt');
+  assert.deepEqual(ui.writes(), [], 'loading the new policy must not write anything');
+});
+
+test('switching workspace clears PKI selections, codes and cached policy for the same CA id', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/orgs/org-b/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/orgs/org-b/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+    '/api/orgs/org-b/settings': {}, '/api/orgs/org-b/saml': { configured: false }, '/api/orgs/org-b/ssh/cas': [],
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.equal(ui.run('PKI_SELECTED.size'), 1);
+  ui.run("$('orgs').value='org-b'");
+  await ui.invoke('switchOrg()');
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_SELECTION_CA'), '');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.el('pki-codes-out').textContent, '');
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
 });
 
 test('the theme resolves from the system by default and the toggle persists an override', async () => {

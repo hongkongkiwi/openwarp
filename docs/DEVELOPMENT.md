@@ -74,6 +74,28 @@ OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
 
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
 
+### Device certificate checks
+
+Ordinary device enrollment and renewal need no TPM. Run the focused regression:
+
+```bash
+cargo test -p openwarp-server --test device_delivery default_device_lifecycle_does_not_require_a_tpm -- --test-threads=2
+cargo test -p openwarp-server --test device_remaining -- --test-threads=2
+cargo test -p openwarp-server --test tpm_interoperability -- --test-threads=2
+```
+
+`device_postgres` creates private databases when `OPENWARP_TEST_POSTGRES_URL`
+points to a local test administrator database. It exercises transaction
+cancellation, expiry after row-lock waits and concurrent policy changes. Without
+that variable, the live database checks do not run. TPM interoperability uses
+swtpm evidence, not a physical TPM; its public fixtures and generation recipe are
+in `crates/server/tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
+
+Device schema migrations append after canonical main's existing migrations.
+The protocol discriminator `pki_cas.kind` remains `x509` or `ssh`; X.509 hierarchy
+uses `ca_kind`. Additive convergence also covers the earlier device branch's
+migration ledger without rewriting published statements.
+
 ## Container validation
 
 CI builds the [`Dockerfile`](../Dockerfile), starts the resulting image, checks `/health`, and executes `openwarp --help` inside it. Building an image alone cannot catch every runtime library mismatch.

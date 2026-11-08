@@ -179,6 +179,8 @@ fn builtin(kind: &str) -> (&'static str, &'static str) {
             "Open this link to choose a new password:\n{{link}}\n\nIt expires in one hour. You will be asked for your recovery kit unless you choose to replace your key."),
         "invite" => ("You are invited to OpenWarp",
             "{{inviter}} invited you to join {{org}} on OpenWarp.\n\nSet your password here:\n{{link}}\n\nThis link expires in seven days."),
+        "pki-expiry" => ("OpenWarp device certificates need renewal",
+            "Device certificates in {{org}} need renewal.\n\nExpires within 7 days: {{count7}}\nExpires within 14 days: {{count14}}\nExpires within 30 days: {{count30}}\n\nOpen your workspace PKI settings to review and renew them. Counts include expired certificates. No private keys or enrollment codes are included."),
         "test" => ("OpenWarp test email",
             "This is a test message from OpenWarp. If you can read it, outbound email is configured."),
         "stepup" => ("Your OpenWarp verification code",
