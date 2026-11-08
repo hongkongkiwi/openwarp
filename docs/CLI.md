@@ -36,7 +36,7 @@ The top-level token option supplies a token for the current invocation. The sepa
 | Sign out | `openwarp logout` | Sign out and clear saved credentials |
 | SSH certificates | `openwarp ssh cert --ca CA_ID --principal NAME` | Sign a public key for a granted principal |
 
-Browser login uses PKCE and a temporary loopback callback port. Browser OAuth credentials can refresh automatically when saved refresh metadata is available. Service tokens and machine credentials do not become renewable OAuth sessions simply because you saved them; respect their expiry and reauthenticate as needed. Machine-issued tokens last one hour.
+Browser login uses PKCE and a temporary loopback callback port. Browser OAuth credentials can refresh automatically when saved refresh metadata is available. Service tokens and machine credentials do not become renewable OAuth sessions simply because you saved them; respect their expiry and reauthenticate as needed. Universal Auth machine tokens last one hour. Workload-login tokens last at most 300 seconds.
 
 Avoid literal credentials in shell history. Even variable expansion into a command argument can expose that argument to local process inspection. Use a suitably protected automation environment.
 

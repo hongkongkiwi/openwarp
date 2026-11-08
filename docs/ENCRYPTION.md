@@ -101,7 +101,7 @@ with each wrapped value so a key rotation can still unwrap old data; run
 `POST /api/instance/rewrap` as the instance owner after switching key IDs.
 
 The bridge URL may be `http://` as well as `https://`. With plain HTTP, the
-unwrapped root and environment keys travel in request bodies over that network
+wrap requests and unwrap responses carry plaintext root or environment keys
 without transport encryption, and the bridge has no egress allowlist of its
 own. Use HTTPS, a loopback listener, or a protected private network; treat
 `OPENWARP_KMS_TOKEN` as a deployment secret with only the access the adapter

@@ -62,7 +62,7 @@ PostgreSQL dynamic leases use TLS by default and now require the server to accep
 
 ## Static PostgreSQL password rotation
 
-This is a rotation schedule, not a sync adapter or a dynamic database lease. It changes the password of an existing PostgreSQL login role, then saves that password to an existing unsealed SSE secret whose type is an unsealed string type (`secret`, `config` or untyped). SSH keys and sealed values are rejected both when the schedule is created and again before any remote connection during execution. It does not create roles, grant privileges or support MySQL.
+This rotation schedule changes the password of an existing PostgreSQL login role, then saves it to an existing SSE value of type `secret`, `config` or untyped. SSH keys and sealed values are rejected both when the schedule is created and again before any remote connection during execution. It does not create roles, grant privileges or support MySQL.
 
 Create with `POST /api/envs/{env_id}/rotations` and `rotations:write` authority:
 
@@ -73,7 +73,7 @@ Create with `POST /api/envs/{env_id}/rotations` and `rotations:write` authority:
   "interval_secs": 86400,
   "config": {
     "kind": "postgres-static",
-    "connection": "postgres://ADMIN:REPLACE_WITH_PASSWORD@DB_HOST:5432/DB_NAME",
+    "connection": "postgres://ADMIN:REPLACE_WITH_PASSWORD@DB_HOST:5432/DB_NAME?sslmode=require",
     "username": "payments_login"
   }
 }

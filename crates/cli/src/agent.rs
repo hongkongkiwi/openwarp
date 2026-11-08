@@ -82,7 +82,9 @@ pub fn run(host: &str, token: &str, env: &str, template: &Path, output: &Path, i
     if canonical_path(template)? == canonical_path(output)? {
         return Err("agent template and output must be different files".into());
     }
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "agent HTTP client could not be created")?;
+    let builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none());
+    let builder = if url.scheme() == "http" { builder.no_proxy() } else { builder };
+    let client = builder.build().map_err(|_| "agent HTTP client could not be created")?;
     url.path_segments_mut().map_err(|_| "host cannot contain path segments")?.pop_if_empty().extend(["api", "envs", env, "export"]);
     url.set_query(Some("base=1"));
     let mut cache: Option<(Instant, Vec<Value>)> = None;

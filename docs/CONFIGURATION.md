@@ -38,9 +38,9 @@ openssl rand -base64 32
 
 Store the result securely. A replacement value does not rotate existing ciphertext. Development promotion must preserve the database's existing generated key.
 
-Startup root precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise, with `OPENWARP_KMS_URL` set, the KMS-wrapped `meta.kms_root` (on first boot it wraps an existing plaintext `meta.master`, or mints a root when none exists); otherwise a stored plaintext `meta.master`; otherwise a generated development key stored in the database. If a plaintext `meta.master` and the unwrapped KMS root disagree, startup stops and neither row is deleted, because either deletion would lose key material. Online instance-root rotation is limited to single-process SQLite; PostgreSQL and MySQL/MariaDB return a conflict and need a coordinated offline procedure.
+Startup root precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise, with `OPENWARP_KMS_URL` set, the KMS-wrapped `meta.kms_root` (on first boot it wraps an existing plaintext `meta.master`, or mints a root when none exists); outside production, a stored plaintext `meta.master` or a generated development key stored in the database. Production without an external master key or configured KMS bridge aborts before either development fallback. If a plaintext `meta.master` and the unwrapped KMS root disagree, startup stops and neither row is deleted, because either deletion would lose key material. Online instance-root rotation is limited to single-process SQLite; PostgreSQL and MySQL/MariaDB return a conflict and need a coordinated offline procedure.
 
-The KMS bridge URL may be plain HTTP. In that case the unwrapped root and environment keys travel in request bodies over that unencrypted connection, and the bridge has no egress allowlist of its own. Use HTTPS, a loopback listener, or a protected private network, and give `OPENWARP_KMS_TOKEN` only to the adapter that terminates that trust boundary.
+The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap responses carry plaintext root or environment keys over that unencrypted connection, and the bridge has no egress allowlist of its own. Use HTTPS, a loopback listener, or a protected private network, and give `OPENWARP_KMS_TOKEN` only to the adapter that terminates that trust boundary.
 
 ## Registration and email
 
