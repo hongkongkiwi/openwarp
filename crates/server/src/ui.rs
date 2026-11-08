@@ -683,7 +683,7 @@ async function renderAccess(){if(!ORG)return;let org=ORG,view=VIEW,accessSerial=
   let members=await api('GET',`/api/orgs/${org}/members`).catch(()=>[]);let myRole=members.find(m=>m.id===ME?.id)?.role||'';
   let props=ENV?await api('GET',`/api/envs/${ENV.id}/proposals`).catch(()=>[]):[];
   let reqs=ENV?await api('GET',`/api/envs/${ENV.id}/access-requests`).catch(()=>[]):[];
-  if(ORG!==org||VIEW!==view||accessSerial!==PRODUCT_RENDER)return;
+  if(ORG!==org||accessSerial!==PRODUCT_RENDER||(view==='access'&&VIEW!=='access'))return;
   $('view').innerHTML=`
   <div class="card"><h3 data-i18n="Members">Members</h3><p data-i18n="Owners can transfer ownership; admins manage roles. A workspace always keeps at least one owner.">Owners can transfer ownership; admins manage roles. A workspace always keeps at least one owner.</p>
   <table class="members-table"><thead><tr><th data-i18n="Member">Member</th><th data-i18n="Role">Role</th><th></th></tr></thead><tbody>
