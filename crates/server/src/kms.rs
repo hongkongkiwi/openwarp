@@ -17,6 +17,9 @@ impl Kms {
             _ => return Ok(None) };
         let parsed = crate::http::Url::parse(&url).map_err(|_| "OPENWARP_KMS_URL must be an http(s) URL".to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() { return Err("OPENWARP_KMS_URL must be an http(s) URL without credentials, query or fragment".into()); }
+        let host = parsed.host_str().unwrap_or("");
+        let loopback = host.eq_ignore_ascii_case("localhost") || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false);
+        if crate::production() && parsed.scheme() == "http" && !loopback { return Err("OPENWARP_KMS_URL requires HTTPS except on loopback in production".into()); }
         let key_id = crate::envcfg::var("OPENWARP_KMS_KEY_ID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "primary".into());
         if key_id.contains(':') { return Err("OPENWARP_KMS_KEY_ID must not contain ':'".into()); }
         Ok(Some(Kms { url, token: crate::envcfg::var("OPENWARP_KMS_TOKEN").unwrap_or_default(), key_id }))
@@ -40,10 +43,13 @@ impl Kms {
             return Err("KMS request budget exhausted; try again".into());
         }
         let _budget = RequestBudget;
-        let mut req = crate::http::Client::new().post(format!("{}/{}", self.url, op)).timeout(Duration::from_secs(10)).json(&body);
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = crate::http::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "KMS client initialization failed")?;
+        #[cfg(target_arch = "wasm32")]
+        let client = crate::http::Client::new();
+        let mut req = client.post(format!("{}/{}", self.url, op)).timeout(Duration::from_secs(10)).json(&body);
         if !self.token.is_empty() { req = req.bearer_auth(&self.token); }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() { return Err(format!("KMS returned HTTP {}", resp.status())); }
-        resp.json::<Value>().await.map_err(|e| e.to_string())
+        let bytes = crate::http::provider_post_bounded(req, 1024 * 1024).await?;
+        serde_json::from_slice(&bytes).map_err(|_| "KMS response is not valid JSON".into())
     }
 }

@@ -1,5 +1,5 @@
 use openwarp_crypto as oc;
-use openwarp_server::{backfill_value_fingerprints, install_kms, kms, new_state, process_maintenance, production, router, try_leader, validate_auth_env};
+use openwarp_server::{backfill_value_fingerprints, install_kms, kms, load_master, new_state, process_maintenance, production, router, try_leader, validate_auth_env};
 use openwarp_server::db::{self, Db};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -70,10 +70,6 @@ async fn shutdown_signal() {
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     eprintln!("shutdown signal received; draining connections"); }
-
-async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String> {
-    openwarp_server::load_master(db, kms).await
-}
 
 #[cfg(test)]
 mod tests {

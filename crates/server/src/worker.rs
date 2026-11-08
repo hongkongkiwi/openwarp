@@ -20,6 +20,16 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Only compiled for the D1 smoke harness, which builds with `d1-smoke`.
+    // The production build never enables the feature, so this route is absent.
+    #[cfg(feature = "d1-smoke")]
+    if req.url()?.path() == "/__internal/migrate-d1" {
+        let d1 = env.d1("DB")?;
+        return match crate::migrate::apply(&d1, crate::migrate::MIGRATIONS, Default::default()).await {
+            Ok(report) => Response::ok(format!("applied={:?} squashed={}", report.applied, report.squashed)),
+            Err(error) => Response::error(format!("migration failed: {}", error), 500),
+        };
+    }
     if req.url()?.path().starts_with("/__internal/") { return Response::error("not found", 404); }
     let too_large = req.headers().get("content-length").ok().flatten().and_then(|v| v.parse::<usize>().ok()).map(|n| n > MAX_BODY).unwrap_or(false);
     if too_large { return Response::error("payload too large", 413); }
@@ -60,7 +70,7 @@ impl DurableObject for OpenWarp {
         }
         envcfg::init(cfg);
         crate::validate_auth_env().expect("invalid sign-in configuration");
-        let production = envcfg::var("OPENWARP_ENV").ok().as_deref() == Some("production");
+        let production = crate::production();
         let pub_url = match envcfg::var("OPENWARP_PUBLIC_URL") {
             Ok(url) => url,
             Err(_) if production => panic!("production requires OPENWARP_PUBLIC_URL"),

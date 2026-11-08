@@ -79,8 +79,13 @@ upgraded in place. Take a backup first; see [BACKUP.md](BACKUP.md).
   root and environment keys through an external KMS/HSM bridge. After changing
   key IDs, run `POST /api/instance/rewrap` as the instance owner. Back up the KMS
   key; the database alone is not enough.
+- The native server can auto-unseal in production with the KMS bridge alone;
+  `OPENWARP_MASTER_KEY` is not required in that configuration. KMS errors stop
+  startup rather than generating another root. Workers require the master-key
+  binding and do not use this native bridge.
 - An existing local database adopts its `meta.master` into `meta.kms_root` on
-  the first boot with a KMS and deletes the plaintext row.
+  the first boot with a KMS and deletes the plaintext row. If a master-key
+  variable is also set, it takes precedence and this adoption does not run.
 - Run `POST /api/instance/encrypt-metadata` once as the instance owner after
   upgrading a database written before secret metadata was encrypted.
 - Delegated and E2E environments keep the environment key on the client. See

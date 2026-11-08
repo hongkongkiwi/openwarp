@@ -73,6 +73,7 @@ mod inner {
             use futures_util::StreamExt;
             use worker::wasm_bindgen::JsValue;
             let request = request.0.build().map_err(|_| "provider request failed")?;
+            let timeout = request.timeout().copied().ok_or("provider request has no deadline")?;
             let headers = worker::Headers::new();
             for (name, value) in request.headers() {
                 headers.set(name.as_str(), value.to_str().map_err(|_| "provider request failed")?).map_err(|_| "provider request failed")?;
@@ -83,16 +84,30 @@ mod inner {
                 .with_redirect(worker::RequestRedirect::Error)
                 .with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
             let request = worker::Request::new_with_init(request.url().as_str(), &init).map_err(|_| "provider request failed")?;
-            let mut response = worker::Fetch::Request(request).send().await.map_err(|_| "provider request failed")?;
-            if !(200..300).contains(&response.status_code()) { return Err("provider request failed".into()); }
-            let mut stream = response.stream().map_err(|_| "provider response could not be read")?;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| "provider response could not be read")?;
-                if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
-                bytes.extend_from_slice(&chunk);
+            // Dropping the Rust future must also cancel the JS fetch and its body.
+            struct AbortOnDrop(Option<worker::AbortController>);
+            impl Drop for AbortOnDrop { fn drop(&mut self) { if let Some(controller) = self.0.take() { controller.abort(); } } }
+            let controller = worker::AbortController::default();
+            let signal = controller.signal();
+            let _abort = AbortOnDrop(Some(controller));
+            let operation = async {
+                let mut response = worker::Fetch::Request(request).send_with_signal(&signal).await.map_err(|_| "provider request failed")?;
+                if !(200..300).contains(&response.status_code()) { return Err("provider request failed".into()); }
+                let mut stream = response.stream().map_err(|_| "provider response could not be read")?;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|_| "provider response could not be read")?;
+                    if chunk.len() > limit - bytes.len() { return Err("provider response is too large".into()); }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes)
+            };
+            let deadline = worker::Delay::from(timeout);
+            futures_util::pin_mut!(operation, deadline);
+            match futures_util::future::select(deadline, operation).await {
+                futures_util::future::Either::Left(_) => Err("provider request timed out".into()),
+                futures_util::future::Either::Right((result, _)) => result,
             }
-            Ok(bytes)
         }).await
     }
 

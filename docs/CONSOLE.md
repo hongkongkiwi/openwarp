@@ -14,6 +14,12 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 
 Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority.
 
+## Appearance and languages
+
+The console ships a light and a dark theme. With nothing chosen it follows the system colour scheme and re-resolves when the system changes; a toggle in the top bar (and on the sign-in card) cycles system, light and dark, and the Settings page has an Appearance & language card with explicit picks. The theme preference and explicit language overrides are stored in the browser (`localStorage`), so they apply per device and before signing in; the sign-in screen, console and one-time lockbox page all honour the choice.
+
+The interface is translated into English, Traditional Chinese, Simplified Chinese, Japanese, Korean, Spanish, French, German and Brazilian Portuguese. The language defaults to the browser's own languages and can be overridden from the sign-in card, the top bar or Settings. Select System / browser to remove the override and detect the browser language again. Three limits are deliberate: text that comes from the server (error messages, audit details, provider hints with JSON examples) stays in English; a string a language has not yet translated falls back to English rather than vanishing; and values that come from your data (secret keys, app and environment names) are never rewritten even when they happen to match a UI label.
+
 ## Accounts and recovery
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
@@ -69,7 +75,7 @@ Standard environment reads can resolve references such as `${KEY}` and `${/path/
 
 Import accepts dotenv text. Review both the destination and any keys that already exist before applying it. Export produces plaintext, which needs the same protection as the original credentials.
 
-Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [API reference](API.md) for the implementation surface when a task is not available in the console.
+Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [OpenAPI contract](../openapi.json) for documented API operations when a task is not available in the console.
 
 ## Members and automation access
 
@@ -78,6 +84,14 @@ Invite people by email and choose the narrowest suitable role. Managed developer
 Teams organise members. Environment policy can restrict access or require approval for non-admin writes. Review proposals and access requests in context: the requester, target environment, permissions, and lifetime matter.
 
 Use app service tokens or machine identities for automation instead of a person's password. Record a newly issued credential securely, scope it, and revoke it when no longer needed. OAuth client scopes and workspace permissions both apply.
+
+Members & access also contains three workspace tools:
+
+- Batched change requests group managed-environment writes and deletions. Enter the environments and operations as JSON, then have a different admin review and approve the revision before applying it. An edit clears approval. See [batched change requests](CHANGE-REQUESTS.md).
+- Workload trust configures an existing machine identity with an explicit environment, issuer, audience, subject, public JWKS and optional bound claims. Revoking trust invalidates its issued tokens. See [workload identity](WORKLOAD-IDENTITY.md).
+- Transit encryption creates and rotates workspace keys and runs encrypt, decrypt or rewrap operations. Input plaintext is base64. The server processes plaintext, and rewrap permission is separate from decrypt permission. See [transit encryption](TRANSIT.md).
+
+Review screens and transit decrypt responses display plaintext in the browser. Use these controls only on a trusted device; do not paste real credentials into recordings or shared screens.
 
 ## Integrations and sharing
 
@@ -93,6 +107,20 @@ E2E environments show a dedicated decrypt panel rather than the ordinary SSE edi
 
 Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, read, and grant wrapped keys. Removing a grant prevents future access to that wrapped key through the server; it cannot erase plaintext or keys that a recipient already copied.
 
+## Emergency lockdown
+
+Workspace owners can halt a whole workspace from Settings, or choose **Project lockdown** on an app card to halt that project. A project is an application in the API. Confirm the selected scope before activation.
+
+The web console permits read-only inspection of authorised metadata while the affected scope is halted. Secret values, exports, history and E2E keys remain unavailable, including to owners. All SDK, CLI, service-token, OAuth, machine and runner requests targeting the halted scope are rejected for reads as well as writes. Existing integration settings are preserved, but syncs cannot run or be added or resumed.
+
+Only the actual workspace `owner` role can activate or restore either scope. These controls require the console's cookie-backed account session. Admins, custom roles and automation credentials cannot operate them. Workspace and project locks survive a restart and apply together: restoring a workspace leaves any separate project lockdown active, and restoring a project cannot bypass a workspace lockdown.
+
+Non-owner members lose their existing sessions and OAuth credentials. Sessions are account-wide, so even a project halt signs those workspace members out of other projects. They can sign in again for read-only console inspection or use an unaffected scope. Restoration never restores revoked credentials or turns on integrations that were already paused.
+
+The console clears cached secret values and drafts when it detects a halt. Open tabs check periodically, so they may take a few seconds to update.
+
+Lockdown cannot erase values already copied by a client, secrets already sent to a provider, or a runner payload already downloaded. Previously created Lockbox shares have no workspace association and remain usable. Rotate exposed credentials and revoke external access separately when responding to an incident.
+
 ## Administrative settings
 
 Workspace settings include IP allowlists and OIDC configuration. Test policy changes with a second authorised session before ending your working session. Only trust forwarded client IPs when the instance operator has configured the actual reverse proxies.
@@ -105,4 +133,16 @@ Register hosts here too: a host certificate is only issued for a hostname and pu
 
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 
-[Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+## Device certificates without a TPM
+
+The PKI card creates root and intermediate CAs, selects the active CA, lists the device inventory and mints one-time enrollment or renewal codes. It also shows expiring-certificate counts, imports and exports CSV, manages groups, and configures the enrollment hook and hardware attestation. Select the CA, add a device name and optional environment or group, then use **Enroll** to copy the single-use code and nonce to the device. **Renew** mints a code that revokes the previous certificate when the replacement enrolls. The CA certificate shown below the table is the trust anchor for the MQTT broker. **Revoke** retires the device's active certificate. The console never displays a device private key, because enrollment only accepts a CSR.
+
+Select device checkboxes, or use Select all, then Mint selected codes to provision
+up to 500 existing devices. The result lists successful codes and per-device
+errors. Download codes CSV includes each device id, code, nonce and expiry;
+protect this file as a credential and remove it after provisioning. Switching
+workspace or CA clears selected devices and downloadable code results. Expiry
+summaries are also emailed through the configured mailer to verified, active
+workspace owners and admins.
+
+[Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Development](DEVELOPMENT.md) · [Documentation index](README.md)

@@ -9,7 +9,10 @@ OpenWarp is a Rust workspace with a server, CLI, and cryptographic library. The 
 | [`crates/server/src/main.rs`](../crates/server/src/main.rs) | Native startup, listener and background tasks |
 | [`crates/server/src/app.rs`](../crates/server/src/app.rs) | Shared routing, authentication, authorisation and secret operations |
 | [`crates/server/src/worker.rs`](../crates/server/src/worker.rs) | Workers fetch/scheduled entrypoints and Durable Object |
-| [`crates/server/src/db.rs`](../crates/server/src/db.rs) | Native SQLite/PostgreSQL and Durable Object SQLite adapter, schema setup |
+| [`crates/server/src/db.rs`](../crates/server/src/db.rs) | SQLite, PostgreSQL, MariaDB and Durable Object storage adapter; MySQL DDL rewriting |
+| [`crates/server/src/migrate.rs`](../crates/server/src/migrate.rs) | Versioned migration runner and ledger checks |
+| [`crates/server/src/bin/migrate.rs`](../crates/server/src/bin/migrate.rs) | `openwarp-migrate` operator CLI |
+| [`crates/server/migrations`](../crates/server/migrations) | Immutable numbered SQL migrations; the consolidated baseline is version 1 |
 | [`crates/server/src/ui.rs`](../crates/server/src/ui.rs) | Embedded browser console |
 | [`crates/server/src/e2e.js`](../crates/server/src/e2e.js) | Browser E2E cryptography |
 | [`crates/server/src/integrations.rs`](../crates/server/src/integrations.rs) | Provider sync implementations |
@@ -27,8 +30,8 @@ flowchart TD
     Automation[REST / OAuth / MCP / SCIM clients] --> HTTP
     HTTP --> Auth[Identity, scope, role, and environment checks]
     Auth --> Operations[Secret and workspace operations]
-    Operations --> Storage[(SQLite or PostgreSQL)]
-    Auth -. optional session cache .-> Redis[(Redis)]
+    Operations --> Storage[(SQLite, PostgreSQL, MariaDB, or DO SQLite)]
+    Auth -. optional revocation cache .-> Redis[(Redis)]
     Operations --> Sync[Provider sync]
     Sync --> Remote[External destinations]
 ```
@@ -53,7 +56,7 @@ Accounts can participate in multiple workspaces. Workspace membership and instan
 
 ## Database adapter
 
-The async database API uses native SQLite, PostgreSQL or MySQL/MariaDB behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. MySQL keeps `?` and rewrites the canonical DDL where its rules differ: keyed or indexed `TEXT` columns become `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX` loses `IF NOT EXISTS`, and tables use a binary collation.
+The database abstraction uses SQLite, PostgreSQL or MySQL/MariaDB behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. MySQL keeps `?` and rewrites the canonical DDL where its rules differ: keyed or indexed `TEXT` columns become `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX` loses `IF NOT EXISTS`, and tables use a binary collation. Startup applies the numbered migrations from `crates/server/migrations` through that adapter; the ledger records a checksum and completion state for each version, and boot refuses on drift, gaps, an interrupted run, or a database newer than the binary. See [schema migrations](MIGRATIONS.md).
 
 Native SQLite uses a synchronous connection behind a mutex; PostgreSQL and MySQL/MariaDB use async pools (`deadpool-postgres`, `mysql_async`). This is not a claim of throughput characteristics. The PostgreSQL client does not enable TLS, and the MySQL/MariaDB client enables it only when the URL requests `require_ssl=true`, so transport security must be addressed in deployment.
 
