@@ -57,6 +57,9 @@ ldap3 = { version = "0.11", default-features = false, features = ["tls-native"],
 native-tls = { version = "0.2", optional = true }
 webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker = { version = "0.8", features = ["tokio-postgres"] }
 js-sys = "0.3"

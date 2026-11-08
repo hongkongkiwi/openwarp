@@ -19,6 +19,12 @@ async fn main() {
     // not a reason to fall back to a locally generated root key.
     let kms = match kms::Kms::from_env() { Ok(k) => k, Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
     let master = load_master(&db, kms.as_ref()).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+    // Lock and seed the instance key epoch before any traffic or background
+    // worker can decrypt or write with this root. A database fingerprint that
+    // disagrees with the configured root is a hard startup failure.
+    if let Err(e) = openwarp_server::app::seed_epoch(&db, &master).await {
+        eprintln!("instance key epoch: {}", e); std::process::exit(1);
+    }
     if let Err(e) = validate_auth_env() { eprintln!("{}", e); std::process::exit(1); }
     if !openwarp_server::mailer::MailConfig::from_env().enabled() {
         if production() {

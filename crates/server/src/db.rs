@@ -731,6 +731,14 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE webhook_attempts(id TEXT PRIMARY KEY,delivery_id TEXT NOT NULL,claim_id TEXT NOT NULL,status TEXT NOT NULL,http_status BIGINT NOT NULL DEFAULT 0,duration_ms BIGINT NOT NULL DEFAULT 0,error_code TEXT NOT NULL DEFAULT '',created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
         "CREATE INDEX idx_webhook_attempts_delivery ON webhook_attempts(delivery_id,created_at)",
     ]),
+    (20, &[
+        "CREATE TABLE webhook_outbox(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE TABLE webhook_outbox_targets(event_id TEXT NOT NULL,webhook_id TEXT NOT NULL,version BIGINT NOT NULL,delivery_id TEXT NOT NULL,PRIMARY KEY(event_id,webhook_id))",
+        "CREATE INDEX idx_webhook_outbox_created ON webhook_outbox(created_at)",
+    ]),
+    (21, &[
+        "ALTER TABLE webhook_serialization ADD COLUMN epoch BIGINT NOT NULL DEFAULT 0",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -766,10 +774,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 19, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 21, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 19, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 21, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

@@ -3274,6 +3274,7 @@ dependencies = [
  "lber",
  "ldap3",
  "lettre",
+ "libc",
  "mysql_async",
  "native-tls",
  "openwarp-crypto",
