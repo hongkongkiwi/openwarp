@@ -54,11 +54,11 @@ async fn sqlite_fresh_apply_status_and_rerun() {
     let report = fresh(&db).await;
     assert!(report.squashed, "a new database applies the consolidated baseline");
     assert_eq!(report.applied.first(), Some(&1));
-    assert_eq!(report.applied.last(), Some(&23));
+    assert_eq!(report.applied.last(), Some(&28));
 
-    assert_eq!(db.version().await.unwrap(), 23);
+    assert_eq!(db.version().await.unwrap(), 28);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 23);
+    assert_eq!(status.current, 28);
     assert!(status.problems.is_empty(), "{:?}", status.problems.iter().map(|p| p.describe()).collect::<Vec<_>>());
     assert!(status.pending().is_empty());
     assert!(status.entries.iter().any(|e| e.version == 1 && e.state == State::Applied));
@@ -101,7 +101,7 @@ async fn sqlite_refuses_a_newer_database() {
     let error = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap_err();
     assert!(error.contains("newer"), "{}", error);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
-    assert!(status.problems.iter().any(|p| matches!(p, migrate::Problem::Newer { version: 99, latest: 23 })));
+    assert!(status.problems.iter().any(|p| matches!(p, migrate::Problem::Newer { version: 99, latest: 28 })));
 }
 
 #[tokio::test]
@@ -152,10 +152,10 @@ async fn sqlite_upgrades_a_legacy_ledger_without_data() {
     db.exec("DELETE FROM schema_migrations WHERE version > 9", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
-    assert_eq!(report.applied, (10i64..=23).collect::<Vec<_>>());
+    assert_eq!(report.applied, (10i64..=28).collect::<Vec<_>>());
     assert!(!report.squashed);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 23);
+    assert_eq!(status.current, 28);
     assert!(status.problems.is_empty());
     // Versions that shipped as files are verified from now on; version 1 is
     // the consolidated baseline and stays unverified on an upgraded database.
@@ -181,9 +181,9 @@ async fn sqlite_upgrades_a_real_v9_schema() {
     assert!(before.problems.is_empty());
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
-    assert_eq!(report.applied, (10i64..=23).collect::<Vec<_>>());
+    assert_eq!(report.applied, (10i64..=28).collect::<Vec<_>>());
     assert!(!report.squashed);
-    assert_eq!(db.version().await.unwrap(), 23);
+    assert_eq!(db.version().await.unwrap(), 28);
     assert!(migrate::status(&db, MIGRATIONS).await.unwrap().problems.is_empty());
 
     // Old rows survive, and objects added by later versions are usable.
@@ -237,7 +237,7 @@ async fn sqlite_inspection_does_not_create_or_write() {
     fresh(&db).await;
     let reader = Db::connect_read_only(&format!("sqlite://{}", path.display())).await.unwrap();
     let status = migrate::status(&reader, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 23);
+    assert_eq!(status.current, 28);
     let error = reader.exec("DELETE FROM schema_migrations", &[]).await.unwrap_err();
     assert!(error.to_lowercase().contains("readonly"), "{}", error);
 }
@@ -282,7 +282,7 @@ async fn postgres_two_runners_serialize() {
         }
     }
     let status = migrate::status(&first, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 23);
+    assert_eq!(status.current, 28);
     assert!(status.problems.is_empty(), "{:?}", status.problems.iter().map(|p| p.describe()).collect::<Vec<_>>());
     drop((first, second));
     drop(guard);
@@ -307,7 +307,7 @@ async fn postgres_applies_the_same_manifest() {
     let db = Db::connect(&db_url).await.expect("open postgres database");
     let report = fresh(&db).await;
     assert!(report.squashed);
-    assert_eq!(db.version().await.unwrap(), 23);
+    assert_eq!(db.version().await.unwrap(), 28);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
     assert!(status.problems.is_empty(), "{:?}", status.problems.iter().map(|p| p.describe()).collect::<Vec<_>>());
     // A second process must see the same ledger and refuse drift.
@@ -360,7 +360,7 @@ async fn mariadb_applies_the_same_manifest() {
     let db = Db::connect(&db_url).await.expect("open mariadb database");
     let report = fresh(&db).await;
     assert!(report.squashed);
-    assert_eq!(db.version().await.unwrap(), 23);
+    assert_eq!(db.version().await.unwrap(), 28);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
     assert!(status.problems.is_empty(), "{:?}", status.problems.iter().map(|p| p.describe()).collect::<Vec<_>>());
     // MySQL rewrites keyed TEXT to VARCHAR; an insert against a rewritten

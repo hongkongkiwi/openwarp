@@ -83,12 +83,35 @@ plus unique names, on every apply.
   data; a pre-merge engine database gains only what it lacks. The lifecycle
   seed is guarded so the shipped row survives unchanged.
 
-New migrations start at version 24. SQL files 1 through 22 remain unchanged.
-Legacy main version 17 through 22 ledger rows have no checksum and remain
-unverified. A legacy main version 22 database applies only version 23; an engine
-version 20 database applies versions 21 through 23. The runner records checksums
-only for the new reconciliation files it actually executes, without relabelling
-occupied legacy versions.
+- Version 24 reconciles the main branch's shipped device version 23: device
+  identities and enrollment tokens with their indexes, and the device columns on
+  `pki_certs`.
+- Version 25 reconciles the main branch's shipped device version 24: the CA
+  hierarchy columns (`parent_id`, revocation, hooks, attestation, `ca_kind`),
+  device groups, and the device columns on `pki_devices` and `pki_enrollments`.
+  The kind normalisation update is a no-op on engine databases, which already
+  default `pki_cas.kind` to `x509`.
+- Version 26 reconciles the main branch's shipped device version 25: renewal
+  challenges, expiry deliveries and the TPM columns.
+- Version 27 reconciles the main branch's shipped version 27, the device lookup
+  and expiry indexes on `pki_certs`. Main's version 26 has no direct port: it
+  replayed canonical and device DDL unguarded for device-branch databases, and
+  its content is covered by version 28.
+- Version 28 is the full convergence sweep for every shipped lineage: engine 23,
+  main 23 through 27, and the device branch whose ledger rows 17 through 22 hold
+  device-era DDL. It replays the guarded canonical set (change requests, workload
+  trusts, transit, the audit chain, wrap tokens, emergency lockdown, and the
+  main 22 objects), the complete device schema, and the lifecycle meta guard. A
+  database that already carries an object keeps it and its data.
+
+New migrations start at version 29. SQL files 1 through 23 remain unchanged.
+Legacy main version 17 through 27 ledger rows have no checksum and remain
+unverified. A legacy main version 22 database applies versions 23 through 28; a
+legacy main version 23 database applies versions 24 through 28; each later main
+version applies the remaining tail, so a main version 27 database executes only
+version 28. An engine version 20 database applies versions 21 through 28. The
+runner records checksums only for the new reconciliation files it actually
+executes, without relabelling occupied legacy versions.
 
 ## The ledger
 
@@ -243,7 +266,7 @@ based on age or heartbeat absence.
 
 ## Adding a migration
 
-1. Add `crates/server/migrations/0023_your_change.sql`.
+1. Add `crates/server/migrations/0029_your_change.sql`.
 2. Add the matching entry to `MIGRATIONS` in `crates/server/src/migrate.rs` with
    the next version, a short name, and `tolerant: false`.
 3. Write canonical SQL:
@@ -293,9 +316,10 @@ newer-database refusal, history gaps, interrupted migrations and repair, lock
 contention and refusal of stale takeover, a legacy ledger catching up, and a full apply on
 live PostgreSQL and MariaDB. It also builds the real version 9 schema from
 `tests/fixtures/schema_v9.sql`, seeds rows, and upgrades it through versions 10
-to 22 without losing data. The SQLite cases always run. The other two run when
+to 28 without losing data. The SQLite cases always run. The other two run when
 their environment variables are set, as shown above; each test creates and drops
-its own database.
+its own database. The embedded ledger test in `db.rs` pins the full manifest
+explicitly: a fresh database records exactly 28 versions, 16 of them squashed.
 
 The D1 driver runs against a local workerd D1 database:
 
@@ -306,7 +330,7 @@ WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 
 The script builds the Worker with the test-only `d1-smoke` feature, which adds
 an internal route that calls the same runner with the D1 binding. It applies the
-manifest, checks version 22 and the 16 squashed rows, and verifies that a second
+manifest, checks version 28 and the 16 squashed rows, and verifies that a second
 apply is a no-op. The production Worker build in `wrangler.toml` does not enable
 the feature, so that route is absent from deployed bundles. CI runs this after
 the Workerd smoke test.

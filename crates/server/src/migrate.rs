@@ -61,6 +61,11 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 21, name: "change_requests", sql: include_str!("../migrations/0021_change_requests.sql"), tolerant: true },
     Migration { version: 22, name: "main21_reconciliation", sql: include_str!("../migrations/0022_main21_reconciliation.sql"), tolerant: true },
     Migration { version: 23, name: "main22_reconciliation", sql: include_str!("../migrations/0023_main22_reconciliation.sql"), tolerant: true },
+    Migration { version: 24, name: "main23_reconciliation", sql: include_str!("../migrations/0024_main23_reconciliation.sql"), tolerant: true },
+    Migration { version: 25, name: "main24_reconciliation", sql: include_str!("../migrations/0025_main24_reconciliation.sql"), tolerant: true },
+    Migration { version: 26, name: "main25_reconciliation", sql: include_str!("../migrations/0026_main25_reconciliation.sql"), tolerant: true },
+    Migration { version: 27, name: "main27_reconciliation", sql: include_str!("../migrations/0027_main27_reconciliation.sql"), tolerant: true },
+    Migration { version: 28, name: "lineage_convergence", sql: include_str!("../migrations/0028_lineage_convergence.sql"), tolerant: true },
 ];
 
 /// SQL profile used when splitting migration statements.

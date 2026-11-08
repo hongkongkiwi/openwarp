@@ -82,6 +82,30 @@ Schema changes are append-only. Add a numbered file under `crates/server/migrati
 
 `openwarp-migrate status`, `plan`, and `verify` inspect a database without changing it. `repair` modifies the migration ledger; follow the [repair guide](MIGRATIONS.md#operator-cli) before using it. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines. Run `WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh` to exercise the D1 driver against local workerd.
 
+### Device certificate checks
+
+Ordinary device enrollment and renewal need no TPM. Run the focused regression:
+
+```bash
+cargo test -p openwarp-server --test device_delivery default_device_lifecycle_does_not_require_a_tpm -- --test-threads=2
+cargo test -p openwarp-server --test device_remaining -- --test-threads=2
+cargo test -p openwarp-server --test tpm_interoperability -- --test-threads=2
+```
+
+`device_postgres` creates private databases when `OPENWARP_TEST_POSTGRES_URL`
+points to a local test administrator database. It exercises transaction
+cancellation, expiry after row-lock waits and concurrent policy changes. Without
+that variable, the live database checks do not run. TPM interoperability uses
+swtpm evidence, not a physical TPM; its public fixtures and generation recipe are
+in `crates/server/tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
+
+Device schema migrations ship as engine versions 24 through 28 under
+`crates/server/migrations/`; the [schema migrations](MIGRATIONS.md) guide covers
+the adoption paths. The protocol discriminator `pki_cas.kind` remains `x509` or
+`ssh`; X.509 hierarchy uses `ca_kind`. Version 28 converges every shipped
+lineage, including the earlier device branch's migration ledger, without
+rewriting published statements.
+
 ## Container validation
 
 CI builds the [`Dockerfile`](../Dockerfile), starts the resulting image, checks `/health`, and executes `openwarp --help` inside it. Building an image alone cannot catch every runtime library mismatch.

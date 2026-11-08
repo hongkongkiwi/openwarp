@@ -45,7 +45,7 @@ enum OpenMode { Create, Existing, ReadOnly }
 fn pg_sql(sql: &str) -> String {
     let mut out = String::new(); let mut n = 0;
     for c in sql.chars() { if c == '?' { n += 1; out.push_str(&format!("${}", n)); } else { out.push(c); } }
-    out
+    out.replace("OW_NOW()", "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn pg_err(error: tokio_postgres::Error) -> String {
@@ -54,6 +54,21 @@ fn pg_err(error: tokio_postgres::Error) -> String {
         None => error.to_string(),
     }
 }
+
+fn sqlite_sql(sql: &str) -> String { sql.replace("OW_NOW()", "CAST(strftime('%s','now') AS INTEGER)") }
+#[cfg(not(target_arch = "wasm32"))]
+fn pg_row(r: &tokio_postgres::Row) -> Row {
+    let mut m = Row::new();
+    for (i, col) in r.columns().iter().enumerate() {
+        let v = if let Ok(v) = r.try_get::<_, Option<String>>(i) { v.map(Value::String).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<i64>>(i) { v.map(|n| Value::Number(n.into())).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<bool>>(i) { v.map(Value::Bool).unwrap_or(Value::Null) }
+            else if let Ok(v) = r.try_get::<_, Option<Value>>(i) { v.unwrap_or(Value::Null) } else { Value::Null };
+        m.insert(col.name().to_string(), v);
+    } m
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn mysql_row(r: &mysql_async::Row) -> Row { let mut m = Row::new(); for (i, col) in r.columns_ref().iter().enumerate() { m.insert(col.name_str().to_string(), mysql_value(r.as_ref(i))); } m }
 
 impl Db {
     #[cfg(not(target_arch = "wasm32"))]
@@ -144,7 +159,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s, _) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
                 Ok(cursor.rows_written() as u64)
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -263,7 +278,7 @@ impl Db {
             }
             #[cfg(target_arch = "wasm32")]
             Db::DoSqlite(s, _) => {
-                let cursor = s.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+                let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
                 let cols = cursor.column_names();
                 let mut out = Vec::new();
                 for row in cursor.raw() {
@@ -292,6 +307,84 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    pub async fn tx(&self, statements: &[(&str, Vec<Value>)]) -> Result<Vec<u64>, String> { self.tx_checked(statements, &[]).await }
+    pub async fn tx_checked(&self, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String> {
+        self.tx_locked("SELECT 1 AS guard", &[], |_| true, statements, expect).await
+    }
+    /// The row predicate and writes share one transaction; cancellation drops the native transaction guards.
+    pub async fn tx_locked<F>(&self, lock_sql: &str, lock_params: &[Value], ok: F, statements: &[(&str, Vec<Value>)], expect: &[(usize, u64)]) -> Result<Vec<u64>, String>
+    where F: Fn(&Row) -> bool + Send + Sync {
+        let verify = |index: usize, count: u64| match expect.iter().find(|(i, _)| *i == index) {
+            Some((_, want)) if count != *want => Err(format!("statement {} affected {} rows, expected {}", index, count, want)), _ => Ok(()) };
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let mut conn = c.lock().unwrap();
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let rows = query_sqlite(&tx, lock_sql, lock_params)?;
+                if !rows.first().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (index, (sql, params)) in statements.iter().enumerate() { let count = exec_sqlite(&tx, sql, params)?; verify(index, count)?; counts.push(count); }
+                tx.commit().map_err(|e| e.to_string())?; Ok(counts)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client = pool.get().await.map_err(|e| e.to_string())?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                let sql = pg_sql(&format!("{} FOR UPDATE", lock_sql)); let params = PgParams::new(lock_params); let refs = params.refs();
+                let rows = tx.query(sql.as_str(), &refs).await.map_err(pg_err)?;
+                if !rows.first().map(pg_row).as_ref().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                let mut counts = Vec::with_capacity(statements.len());
+                for (index, (sql, params)) in statements.iter().enumerate() {
+                    let sql = pg_sql(sql); let params = PgParams::new(params); let refs = params.refs();
+                    let count = tx.execute(sql.as_str(), &refs).await.map_err(pg_err)?; verify(index, count)?; counts.push(count); }
+                tx.commit().await.map_err(pg_err)?; Ok(counts)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+                let mut opts = mysql_async::TxOpts::default(); opts.with_isolation_level(mysql_async::IsolationLevel::ReadCommitted);
+                let mut tx = client.start_transaction(opts).await.map_err(|e| e.to_string())?;
+                let result = async {
+                    let sql = mysql_sql(&format!("{} FOR UPDATE", lock_sql));
+                    let rows: Vec<mysql_async::Row> = tx.exec(sql.as_str(), mysql_params(lock_params)).await.map_err(|e| e.to_string())?;
+                    if !rows.first().map(mysql_row).as_ref().map(&ok).unwrap_or(false) { return Err("lock condition failed".into()); }
+                    let mut counts = Vec::with_capacity(statements.len());
+                    for (index, (sql, params)) in statements.iter().enumerate() {
+                        tx.exec_drop(mysql_sql(sql), mysql_params(params)).await.map_err(|e| e.to_string())?;
+                        let count = tx.affected_rows(); verify(index, count)?; counts.push(count); }
+                    Ok(counts)
+                }.await;
+                match result { Ok(counts) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(counts) }, Err(e) => { let _ = tx.rollback().await; Err(e) } }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(sql, storage) => {
+                use worker::wasm_bindgen::{closure::ScopedClosure, JsCast, JsValue};
+                let raw: &JsValue = storage.as_raw().as_ref();
+                let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync")).map_err(|e| worker::Error::from(e).to_string())?
+                    .dyn_into::<js_sys::Function>().map_err(|_| "Durable Object transactionSync is unavailable".to_string())?;
+                let mut counts = Vec::with_capacity(statements.len());
+                let mut run = || -> Result<JsValue, JsValue> {
+                    let convert = |e: String| JsValue::from_str(&e);
+                    let cursor = sql.exec(&sqlite_sql(lock_sql), do_binds(lock_params)).map_err(|e| convert(e.to_string()))?;
+                    let cols = cursor.column_names(); let mut rows = Vec::new();
+                    for row in cursor.raw() { let mut r = Row::new(); for (i, v) in row.map_err(|e| convert(e.to_string()))?.into_iter().enumerate() { if let Some(name) = cols.get(i) { r.insert(name.clone(), do_value(v)); } } rows.push(r); }
+                    if !rows.first().map(&ok).unwrap_or(false) { return Err(convert("lock condition failed".into())); }
+                    for (index, (statement, params)) in statements.iter().enumerate() {
+                        let cursor = sql.exec(&sqlite_sql(statement), do_binds(params)).map_err(|e| convert(e.to_string()))?;
+                        for row in cursor.raw() { row.map_err(|e| convert(e.to_string()))?; }
+                        let changes: Value = sql.exec("SELECT changes() AS affected", None).map_err(|e| convert(e.to_string()))?.one().map_err(|e| convert(e.to_string()))?;
+                        let count = changes["affected"].as_u64().ok_or_else(|| convert("missing affected row count".into()))?;
+                        verify(index, count).map_err(convert)?; counts.push(count);
+                    }
+                    Ok(JsValue::UNDEFINED)
+                };
+                let callback = ScopedClosure::borrow_mut_aborting(&mut run);
+                transaction.call1(raw, callback.as_ref()).map_err(|e| worker::Error::from(e).to_string())?;
+                drop(callback); Ok(counts)
+            }
+        }
+    }
     /// Insert a meta row unless the key exists; true when this call created it.
     /// MySQL has no ON CONFLICT, so a duplicate key there is the expected losing
     /// branch while every other driver error still fails the caller.
@@ -313,8 +406,7 @@ impl Db {
             Ok(changes["n"].as_u64() == Some(1))
         }
         #[cfg(not(target_arch = "wasm32"))]
-        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }
-    }
+        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }    }
     pub async fn rate_increment(&self, key: &str, current: i64, window: i64) -> Result<i64, String> {
         let cutoff = current - window;
         #[cfg(not(target_arch = "wasm32"))]
@@ -411,7 +503,7 @@ impl Db {
                 // Returning Err throws into transactionSync so the runtime rolls back SQL writes.
                 let callback = Closure::wrap(Box::new(move || -> Result<JsValue, JsValue> {
                     for (index, (statement, params)) in statements.iter().enumerate() {
-                        let cursor = sql.exec(statement, do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                        let cursor = sql.exec(&sqlite_sql(statement), do_binds(params)).map_err(|e| JsValue::from_str(&e.to_string()))?;
                         for row in cursor.raw() { row.map_err(|e| JsValue::from_str(&e.to_string()))?; }
                         if let Some(count) = expected[index] {
                             // rowsWritten includes index writes; changes() counts affected table rows.
@@ -565,13 +657,15 @@ fn sqlite_val(v: &rusqlite::types::Value) -> Value {
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<u64, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = sqlite_sql(sql);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let n = stmt.execute(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     Ok(n as u64)
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = sqlite_sql(sql);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -607,7 +701,7 @@ fn mysql_sql(sql: &str) -> String {
     // uses, so a future `key_enc` or a joined alias is not rewritten.
     if sql.contains("rate_limits") || sql.contains("saml_replay") || sql.contains("workload_replay") {
         return sql.replace("(key,", "(`key`,").replace("WHERE key=", "WHERE `key`=").replace("SELECT key,", "SELECT `key`,") }
-    sql.to_string() }
+    sql.replace("OW_NOW()", "UNIX_TIMESTAMP()") }
 #[cfg(not(target_arch = "wasm32"))]
 fn split_sql_list(s: &str) -> Vec<&str> {
     let mut out = Vec::new(); let mut depth = 0i32; let mut quoted = false; let mut start = 0;
@@ -711,10 +805,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 23, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 28, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 23, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 28, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }
