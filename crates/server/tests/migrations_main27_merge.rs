@@ -152,16 +152,29 @@ async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> { snapshot_except(db, &[])
 
 async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
+        if sql.contains(" FROM meta ") {
+            // The convergence migrations seed these keys when absent; every
+            // other meta change or removal is data loss. A migration that seeds
+            // a new key extends this list.
+            let mut expected = rows.clone();
+            for (k, v) in [("rotation_lifecycle", ""), ("workspace_creation_open", "1"), ("workspace_policy_lock", "1")] {
+                if !expected.iter().any(|row| s(row, "k") == k) { expected.push([("k".to_string(), serde_json::json!(k)), ("v".to_string(), serde_json::json!(v))].into_iter().collect()); }
+            }
+            expected.sort_by_key(|row| (s(row, "k").to_string(), s(row, "v").to_string()));
+            assert_eq!(&db.query(sql, &[]).await.unwrap(), &expected, "preserve rows for {}", sql);
+            continue;
+        }
         assert_eq!(&db.query(sql, &[]).await.unwrap(), rows, "preserve rows for {}", sql);
     }
 }
 
-// Canonical bootstrap (d39138e db.rs startup; convergence 0022/0023/0028) seeds
-// migration:env_restricted='0' and rotation_lifecycle='' only when absent and
-// never overwrites; every preexisting pair and nothing else must remain.
+// Canonical bootstrap (d39138e db.rs startup; convergence 0022/0023/0028/0029)
+// seeds these keys only when absent and never overwrites; every preexisting
+// pair and nothing else must remain. A migration that seeds a new key extends
+// this list.
 async fn assert_meta_contract(db: &Db, before: &[(String, String)]) {
     let mut expected = before.to_vec();
-    for (key, value) in [("migration:env_restricted", "0"), ("rotation_lifecycle", "")] {
+    for (key, value) in [("migration:env_restricted", "0"), ("rotation_lifecycle", ""), ("workspace_creation_open", "1"), ("workspace_policy_lock", "1")] {
         if !expected.iter().any(|(k, _)| k == key) { expected.push((key.to_string(), value.to_string())); }
     }
     expected.sort();
@@ -265,10 +278,12 @@ async fn historical_device20_restores_skipped_product_schema_and_keeps_ca_kinds(
     ] { guarded.exec(sql, &[]).await.unwrap(); }
     migrate::apply(&guarded, MIGRATIONS, Options::default()).await.expect("converge a device20 lineage carrying preexisting bootstrap meta");
     assert_eq!(guarded.version().await.unwrap(), 30);
-    assert_eq!(n(&guarded.one("SELECT COUNT(*) AS n FROM meta", &[]).await.unwrap().unwrap(), "n"), 3);
+    assert_eq!(n(&guarded.one("SELECT COUNT(*) AS n FROM meta", &[]).await.unwrap().unwrap(), "n"), 5);
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap().unwrap(), "v"), "device20-sentinel");
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='device20:marker'", &[]).await.unwrap().unwrap(), "v"), "preserve-me");
     assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().unwrap(), "v"), "");
+    assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='workspace_creation_open'", &[]).await.unwrap().unwrap(), "v"), "1");
+    assert_eq!(s(&guarded.one("SELECT v FROM meta WHERE k='workspace_policy_lock'", &[]).await.unwrap().unwrap(), "v"), "1");
 }
 
 // Main27 ends with versions 1..27 occupied, so only 28 through 30 run: the guarded
