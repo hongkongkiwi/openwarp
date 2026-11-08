@@ -987,7 +987,7 @@ function boot(){
     // A sign-in method the binary has but the workspace has not enabled sends
     // the browser back here instead of a JSON body.
     let code=decodeURIComponent(h.slice(6).split('&')[0]);
-    let msg=({saml_not_enabled:'SAML sign-in is not enabled for this workspace.',ldap_not_enabled:'Directory sign-in is not enabled for this workspace.'})[code]||owT('Sign-in failed. Ask a workspace administrator.');
+    let msg=owT(({saml_not_enabled:'SAML sign-in is not enabled for this workspace.',ldap_not_enabled:'Directory sign-in is not enabled for this workspace.'})[code]||'Sign-in failed. Ask a workspace administrator.');
     history.replaceState(null,'',location.pathname);toast(msg,true);}
 }
 boot();
