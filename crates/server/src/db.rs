@@ -601,7 +601,12 @@ impl Db {
         Ok(!self.query(sql, &[]).await?.is_empty())
     }
     pub async fn version(&self) -> Result<i64, String> {
-        Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations WHERE success=1", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)) }
+        // A ledger written before the engine has no success column and every
+        // row in it applied; the engine's own ledger marks interrupted rows.
+        match self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations WHERE success=1", &[]).await {
+            Ok(row) => Ok(row.map(|r| n(&r, "version")).unwrap_or(0)),
+            Err(_) => Ok(self.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await?.map(|r| n(&r, "version")).unwrap_or(0)),
+        } }
     async fn migrate(&self) -> Result<(), String> { crate::migrate::run(self).await }
 }
 
