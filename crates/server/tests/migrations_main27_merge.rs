@@ -150,7 +150,7 @@ async fn snapshot_except(db: &Db, except: &[&str]) -> Vec<(String, Vec<Row>)> {
 
 async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> { snapshot_except(db, &[]).await }
 
-async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)>) {
+async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
         assert_eq!(&db.query(sql, &[]).await.unwrap(), rows, "preserve rows for {}", sql);
     }

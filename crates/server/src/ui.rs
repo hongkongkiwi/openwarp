@@ -108,7 +108,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div class="modalwrap" id="modalwrap"><div class="modal" id="modal"></div></div>
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" data-i18n-placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
-<script src="/i18n.js" integrity="sha384-SNq7b1pECfLV1fuSsFTAwS2vW7hRnU9JenHEZxeMd14VvhJHc+P8bgdMoNhAmR19"></script>
+<script src="/i18n.js" integrity="sha384-EsiwwiH9dswrtCsLgYGybbwWLju5Zc1jwlP14L5B9XL8Zl1GZzXsUuUxZ2KQgKXt"></script>
 <script>
 let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0;
 let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,

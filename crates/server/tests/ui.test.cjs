@@ -1190,3 +1190,19 @@ test('language follows the browser, translates the chrome, and the override pers
   await ui.run(`owSetLang('en')`);
   assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
 });
+
+// A stale digest silently blocks the console's translation script in every
+// browser, so each SRI hash must match the file it names.
+test('console script digests match the files they load', () => {
+  const crypto = require('node:crypto');
+  const files = {
+    'i18n.js': path.join(__dirname, '../src/i18n.js'),
+    'libsodium.js': path.join(__dirname, '../src/vendor/libsodium.js'),
+    'libsodium-wrappers.js': path.join(__dirname, '../src/vendor/libsodium-wrappers.js'),
+  };
+  for (const [name, file] of Object.entries(files)) {
+    const digest = crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64');
+    assert.ok(html.includes(`<script src="/${name}" integrity="sha384-${digest}"`),
+      `${name} must carry the digest of its current contents`);
+  }
+});
