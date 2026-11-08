@@ -48,6 +48,10 @@ jobs:
           node-version: "24"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=2
+      # The default build is core only, so the enterprise surfaces and their
+      # tests need their own pass or they stop being compiled at all.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features -- --test-threads=2
       - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs
       - run: python3 scripts/check-openapi.py
       # The SDK tests spawn the binary cargo test just built.

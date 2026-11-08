@@ -158,6 +158,15 @@ impl Server {
     }
 }
 
+/// Enterprise surfaces need a workspace grant before their routes answer. The
+/// instance owner is the first account on a fresh server, which is the owner
+/// these fixtures register before anyone else.
+#[allow(dead_code)]
+async fn grant_features(s: &Server, owner_token: &str, org: &str, features: &[&str]) {
+    let r = s.call(Method::PUT, "/api/instance/features", Some(owner_token), Some(json!({"org": org, "features": features}))).await;
+    assert_eq!(r.status, 200, "feature grant failed: {} {}", r.status, r.text);
+}
+
 /// Minimal email relay: records each JSON body and answers 200.
 fn start_inbox() -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("inbox bind");
@@ -428,10 +437,12 @@ async fn custom_roles_are_enforced_on_reads() {
     assert_eq!(r.status, 403, "a reader role must not write secrets, got {} {}", r.status, r.text);
 }
 
+#[cfg(feature = "pki")]
 #[tokio::test]
 async fn custom_roles_cannot_change_org_security_settings() {
     let s = Server::start().await;
-    let (_, org, mt, _, _, _) = org_with_viewer(&s, "admin").await;
+    let (ot, org, mt, _, _, _) = org_with_viewer(&s, "admin").await;
+    grant_features(&s, &ot, &org, &["pki"]).await;
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&mt), Some(json!({"ip_allowlist": "127.0.0.1/32"}))).await;
     assert_eq!(r.status, 403, "a custom role must not write org settings, got {} {}", r.status, r.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&mt), Some(json!({"name": "escalate", "permissions": ["*"]}))).await;
@@ -593,12 +604,14 @@ async fn mcp_rejects_a_forged_origin() {
     assert!(r.text.contains("MCPKEY"), "{}", r.text);
 }
 
+#[cfg(feature = "scim")]
 #[tokio::test]
 async fn deactivated_accounts_stop_working_immediately() {
     let s = Server::start().await;
     let owner = register(&s, "deact-owner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap();
     let org = owner["org_id"].as_str().unwrap();
+    grant_features(&s, ot, org, &["scim"]).await;
     let (app, _) = app_with_envs(&s, ot, org).await;
     // A SCIM-provisioned user has no personal organisation, so removing their
     // last membership is real deactivation.
@@ -1056,12 +1069,14 @@ async fn environments_can_be_cloned_and_compared() {
     assert!(r.body["changed"].as_array().unwrap().iter().any(|k| k.as_str().unwrap_or("").ends_with("BETA")), "{}", r.text);
 }
 
+#[cfg(feature = "scim")]
 #[tokio::test]
 async fn scim_discovery_and_paging_are_available() {
     let s = Server::start().await;
     let u = register(&s, "scim-page@test.invalid").await;
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
+    grant_features(&s, token, org, &["scim"]).await;
     let r = s.call(Method::GET, "/scim/v2/ServiceProviderConfig", None, None).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}&startIndex=1&count=1", org), Some(token), None).await;
@@ -1156,12 +1171,14 @@ async fn secret_scanning_flags_high_confidence_keys() {
     assert!(!r.text.contains("AKIAABCDEFGHIJKLMNOP"), "the scanned value must not be returned: {}", r.text);
 }
 
+#[cfg(feature = "pki")]
 #[tokio::test]
 async fn crl_lists_revoked_certificates() {
     let s = Server::start().await;
     let u = register(&s, "crl@test.invalid").await;
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
+    grant_features(&s, token, org, &["pki"]).await;
     let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "test-ca"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let ca = r.body["id"].as_str().unwrap().to_string();
@@ -1196,12 +1213,14 @@ async fn master_key_rotation_keeps_existing_data_readable() {
     assert_eq!(r.body["oidc_client_secret_set"], true, "{}", r.text);
 }
 
+#[cfg(feature = "pki")]
 #[tokio::test]
 async fn ocsp_reports_good_then_revoked() {
     let s = Server::start().await;
     let u = register(&s, "ocsp@test.invalid").await;
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
+    grant_features(&s, token, org, &["pki"]).await;
     let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "ocsp-ca"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let ca = r.body["id"].as_str().unwrap().to_string();
@@ -1233,6 +1252,7 @@ async fn ocsp_reports_good_then_revoked() {
     assert!(matches!(basic.tbs_response_data.responses[0].cert_status, keystore_ocsp::CertStatus::Revoked { .. }), "expected Revoked");
 }
 
+#[cfg(feature = "saml")]
 #[tokio::test]
 async fn saml_sp_round_trip_signs_validates_and_provisions() {
     use risaml::{AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, IdpConfig,
@@ -1243,6 +1263,7 @@ async fn saml_sp_round_trip_signs_validates_and_provisions() {
     let owner = register(&s, "saml-owner@test.invalid").await;
     let token = owner["token"].as_str().unwrap();
     let org = owner["org_id"].as_str().unwrap();
+    grant_features(&s, token, org, &["saml"]).await;
 
     let idp_rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("idp rsa key");
     use rsa::pkcs8::EncodePrivateKey;
@@ -1767,23 +1788,29 @@ async fn pitr_restores_creates_deletes_and_tags() {
 
 // An SSH certificate's principal decides which local account it authenticates
 // as, so the grant table, not the signature, is the boundary under test here.
+#[cfg(feature = "ssh-ca")]
 const SSH_PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYQJZ7VR/OW5fqVOvmn+BRt5SLWDPx2UVO3ALmn21ZE openwarp-test";
+#[cfg(feature = "ssh-ca")]
 const SSH_HOSTKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7gwoGDIUdvHONhUdJsHLNmf0MpNCNbiyHbkC3vqzCl other-host";
 
+#[cfg(feature = "ssh-ca")]
 async fn ssh_sign(s: &Server, ca: &str, token: &str, body: Value) -> Resp {
     s.call(Method::POST, &format!("/api/ssh/cas/{}/sign", ca), Some(token), Some(body)).await
 }
 
+#[cfg(feature = "ssh-ca")]
 async fn ssh_grants(s: &Server, ca: &str, token: &str, body: Value) -> Resp {
     s.call(Method::PUT, &format!("/api/ssh/cas/{}/grants", ca), Some(token), Some(body)).await
 }
 
+#[cfg(feature = "ssh-ca")]
 #[tokio::test]
 async fn ssh_ca_principals_are_gated_by_role_grants() {
     let s = Server::start().await;
     let owner = register(&s, "sshowner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
+    grant_features(&s, &ot, &org, &["ssh-ca"]).await;
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
@@ -1890,12 +1917,14 @@ async fn ssh_ca_principals_are_gated_by_role_grants() {
     assert_eq!(r.status, 400, "an SSH CA's certificates are not X.509 rows: {}", r.text);
 }
 
+#[cfg(feature = "ssh-ca")]
 #[tokio::test]
 async fn ssh_host_certificates_need_a_registered_name_and_key() {
     let s = Server::start().await;
     let owner = register(&s, "hostowner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
+    grant_features(&s, &ot, &org, &["ssh-ca"]).await;
     let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "hosts-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
     let ca = r.body["id"].as_str().expect("ca id").to_string();
@@ -1958,16 +1987,19 @@ async fn ssh_host_certificates_need_a_registered_name_and_key() {
     assert_eq!(r.header("content-type"), "application/octet-stream");
 }
 
+#[cfg(feature = "ssh-ca")]
 fn six_digit(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_digit()).filter(|t| t.len() == 6).map(|t| t.to_string()).next()
 }
 
+#[cfg(feature = "ssh-ca")]
 #[tokio::test]
 async fn a_root_equivalent_certificate_needs_a_second_factor() {
     let s = Server::start().await;
     let owner = register(&s, "stepowner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
+    grant_features(&s, &ot, &org, &["ssh-ca"]).await;
     let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "step-ca"}))).await;
     let ca = r.body["id"].as_str().expect("ca id").to_string();
     let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "owner", "principals": ["*"]}]})).await;
@@ -2058,4 +2090,58 @@ async fn secret_metadata_is_encrypted_and_record_bound() {
     let row = listed.body["secrets"].as_array().expect("secrets").iter().find(|r| r["id"] == json!(&alpha)).expect("alpha row");
     assert_eq!(row["decrypt_error"], json!(true), "swapped ciphertext must not decrypt: {}", listed.text);
     assert_ne!(row["value"], json!("alpha-value"), "swapped ciphertext must not yield the old value: {}", listed.text);
+}
+
+/// Enterprise surfaces need two independent yeses: the binary must carry the
+/// feature and the workspace must hold a grant. Removing the grant closes the
+/// surface again without a rebuild.
+#[tokio::test]
+async fn enterprise_features_need_a_build_and_a_workspace_grant() {
+    let s = Server::start().await;
+    let owner = register(&s, "owner-features@test.invalid").await;
+    let token = owner["token"].as_str().expect("token").to_string();
+    let created = s.call(Method::POST, "/api/orgs", Some(&token), Some(json!({"name": "features"}))).await;
+    assert_eq!(created.status, 200, "create org failed: {}", created.text);
+    let org = created.body["id"].as_str().expect("org id").to_string();
+
+    let listed = s.call(Method::GET, &format!("/api/orgs/{}/features", org), Some(&token), None).await;
+    assert_eq!(listed.status, 200, "feature listing failed: {}", listed.text);
+    assert_eq!(listed.body["granted"], json!([]), "a new workspace starts with no grants");
+
+    // A name no build knows is refused, so a grant row cannot smuggle one in.
+    let unknown = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["teleport"]}))).await;
+    assert_eq!(unknown.status, 400, "unknown feature names must be rejected: {}", unknown.text);
+
+    // Granting is instance-owner only.
+    let other = register(&s, "other-features@test.invalid").await;
+    let other_token = other["token"].as_str().expect("token").to_string();
+    let denied = s.call(Method::PUT, "/api/instance/features", Some(&other_token), Some(json!({"org": org, "features": []}))).await;
+    assert_eq!(denied.status, 403, "a non-owner must not change grants: {}", denied.text);
+    let denied_read = s.call(Method::GET, "/api/instance/features", Some(&other_token), None).await;
+    assert_eq!(denied_read.status, 403, "a non-owner must not list grants: {}", denied_read.text);
+
+    #[cfg(feature = "pki")]
+    {
+        let compiled = listed.body["compiled"].as_array().cloned().unwrap_or_default();
+        assert!(compiled.contains(&json!("pki")), "this build reports the pki surface: {}", listed.text);
+        let closed = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "internal-ca"}))).await;
+        assert_eq!(closed.status, 403, "an ungranted workspace must not create a CA: {}", closed.text);
+
+        let granted = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["pki"]}))).await;
+        assert_eq!(granted.status, 200, "grant failed: {}", granted.text);
+        assert_eq!(granted.body["features"], json!(["pki"]));
+        let open = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "internal-ca"}))).await;
+        assert_eq!(open.status, 200, "a granted workspace must create a CA: {}", open.text);
+
+        go_ungranted(&s, &token, &org).await;
+        let closed_again = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "second-ca"}))).await;
+        assert_eq!(closed_again.status, 403, "revoking the grant must close the surface: {}", closed_again.text);
+    }
+}
+
+#[cfg(feature = "pki")]
+async fn go_ungranted(s: &Server, token: &str, org: &str) {
+    let cleared = s.call(Method::PUT, "/api/instance/features", Some(token), Some(json!({"org": org, "features": []}))).await;
+    assert_eq!(cleared.status, 200, "clearing grants failed: {}", cleared.text);
+    assert_eq!(cleared.body["features"], json!([]));
 }

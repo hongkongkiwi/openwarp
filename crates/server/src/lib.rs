@@ -5,6 +5,7 @@ pub mod app;
 pub mod clock;
 pub mod db;
 pub mod envcfg;
+pub mod features;
 pub mod http;
 pub mod inference_leases;
 pub mod integrations;
@@ -12,8 +13,10 @@ pub mod log;
 pub mod mailer;
 pub mod mysqllease;
 pub mod pglease;
+#[cfg(feature = "pki")]
 pub mod pki;
 pub mod social_extra;
+#[cfg(feature = "ssh-ca")]
 pub mod ssh_ca;
 pub mod ssh_keys;
 pub mod ui;

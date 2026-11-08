@@ -769,6 +769,12 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
         "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
     ]),
+    // Per-workspace grants for the enterprise add-ons. Rows survive a build
+    // that omits a feature, so rebuilding with it restores the workspace's
+    // choice instead of silently dropping it.
+    (22, &[
+        "CREATE TABLE IF NOT EXISTS feature_grants(org_id TEXT PRIMARY KEY,features TEXT NOT NULL DEFAULT '',updated_by TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL DEFAULT 0)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -804,10 +810,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 21, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 21, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 22, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {
