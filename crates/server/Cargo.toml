@@ -38,6 +38,9 @@ rsa = { version = "0.9", features = ["pem"] }
 keystore-pki = "1.0"
 keystore-ocsp = "1.0"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa"] }
+time = "0.3"
+risaml = { version = "0.7", default-features = false, features = ["crypto-rustcrypto"] }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query", "form", "matched-path", "tokio", "http1", "ws"] }
@@ -55,23 +58,21 @@ redis = { version = "0.27", optional = true }
 rcgen = "0.13"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
-time = "0.3"
-risaml = { version = "0.7", default-features = false, features = ["crypto-rustcrypto"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
 native-tls = { version = "0.2", optional = true }
-webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker = { version = "0.8", features = ["tokio-postgres", "d1"] }
+# Sync primitives and io traits for the Workers MySQL lease socket.
+tokio = { version = "1", default-features = false, features = ["sync", "io-util"] }
 js-sys = "0.3"
+uuid = { version = "1", features = ["js"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-util = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen-futures = "0.4"
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
-# Only the io traits: the Workers MySQL lease client reads and writes a socket.
-tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [features]
 default = ["redis-cache", "ldap"]
