@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use mysql_async::prelude::Queryable;
@@ -271,6 +271,28 @@ impl Db {
             }
         }
     }
+    /// Insert a meta row unless the key exists; true when this call created it.
+    /// MySQL has no ON CONFLICT, so a duplicate key there is the expected losing
+    /// branch while every other driver error still fails the caller.
+    pub async fn insert_if_absent(&self, k: &str, v: &str) -> Result<bool, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Db::Mysql(pool) = self {
+            let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+            return match client.exec_drop("INSERT INTO meta(k,v) VALUES(?,?)", mysql_params(&[json!(k), json!(v)])).await {
+                Ok(()) => Ok(true),
+                Err(mysql_async::Error::Server(e)) if e.code == 1062 => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Db::DoSqlite(s, _) = self;
+            s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
+            let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
+            Ok(changes["n"].as_u64() == Some(1))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }    }
     pub async fn rate_increment(&self, key: &str, current: i64, window: i64) -> Result<i64, String> {
         let cutoff = current - window;
         #[cfg(not(target_arch = "wasm32"))]
@@ -384,6 +406,55 @@ impl Db {
             }
         }
     }
+    // Serialize rotation claims and destructive cleanup on the same database row.
+    pub async fn rotation_batch(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)]) -> Result<bool,String> {
+        self.rotation_batch_checked(blocked, params, statements, &[]).await
+    }
+    pub async fn rotation_batch_checked(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)], require_one: &[usize]) -> Result<bool,String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let checked = |index: usize, rows: u64| {
+            if require_one.contains(&index) && rows != 1 { Err("version conflict: concurrent lifecycle change".to_string()) } else { Ok(()) }
+        };
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let mut conn=c.lock().unwrap(); let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                if !query_sqlite(&tx,blocked,params)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { checked(index,exec_sqlite(&tx,sql,p)?)?; }
+                tx.commit().map_err(|e| e.to_string())?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client=pool.get().await.map_err(|e| e.to_string())?; let tx=client.transaction().await.map_err(pg_err)?;
+                tx.query_one("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE",&[]).await.map_err(pg_err)?;
+                let pg=PgParams::new(params); let refs=pg.refs();
+                if !tx.query(pg_sql(blocked).as_str(),&refs).await.map_err(pg_err)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { let pg=PgParams::new(p); let refs=pg.refs(); checked(index,tx.execute(pg_sql(sql).as_str(),&refs).await.map_err(pg_err)?)?; }
+                tx.commit().await.map_err(pg_err)?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client=pool.get_conn().await.map_err(|e| e.to_string())?;
+                let mut tx=client.start_transaction(mysql_async::TxOpts::default()).await.map_err(|e| e.to_string())?;
+                let result = async {
+                    let _: Option<String> = tx.query_first("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE").await.map_err(|e| e.to_string())?;
+                    let rows: Vec<mysql_async::Row> = tx.exec(mysql_sql(blocked),mysql_params(params)).await.map_err(|e| e.to_string())?;
+                    if !rows.is_empty() { return Ok(false); }
+                    for (index,(sql,p)) in statements.iter().enumerate() {
+                        tx.exec_drop(mysql_sql(sql),mysql_params(p)).await.map_err(|e| e.to_string())?;
+                        checked(index,tx.affected_rows())?;
+                    }
+                    Ok(true)
+                }.await;
+                match result { Ok(true) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(true) }, other => { let _ = tx.rollback().await; other } }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_, _) => {
+                if !self.query(blocked,params).await?.is_empty() { return Ok(false); }
+                self.batch_checked(statements,require_one).await?; Ok(true)
+            }
+        }
+    }
     /// Checked mutations roll back together; secret snapshot guards additionally lock out normal writers.
     pub async fn checked_batch(&self, statements: &[(String, Vec<Value>, Option<u64>)], lock_secrets: bool) -> Result<(), String> {
         let expected: Vec<Option<u64>> = statements.iter().map(|(_, _, count)| *count).collect();
@@ -428,6 +499,11 @@ impl Db {
             }
             self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())]).await?;
         }
+        // Migration 22 seeds the lifecycle barrier row. A resumed run may have
+        // inserted it before the ledger entry landed, so this insert is idempotent.
+        if self.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await?.is_none() {
+            self.insert_if_absent("rotation_lifecycle", "").await?;
+        }
         // One-time backfill: environments that already had an allowlist keep it.
         if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
             let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
@@ -468,6 +544,15 @@ impl Db {
         }
     }
     fn one_now(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query_now(sql, params)?.into_iter().next()) }
+    fn insert_if_absent_now(&self, k: &str, v: &str) -> Result<bool, String> {
+        match self {
+            Db::DoSqlite(s, _) => {
+                s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
+                let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
+                Ok(changes["n"].as_u64() == Some(1))
+            }
+        }
+    }
     fn migrate_now(&self) -> Result<(), String> {
         for stmt in SCHEMA { self.exec_now(stmt, &[])?; }
         for alter in [
@@ -500,6 +585,9 @@ impl Db {
                 }
             }
             self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())])?;
+        }
+        if self.one_now("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[])?.is_none() {
+            self.insert_if_absent_now("rotation_lifecycle", "")?;
         }
         if self.one_now("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
             let _ = self.exec_now("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
@@ -865,6 +953,19 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
     ]),
     (22, &[
+        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
+        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
+        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
+        "CREATE TABLE compat_transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX idx_compat_transit_keys_name ON compat_transit_keys(org_id,name)",
+        "CREATE TABLE compat_transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
+        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
+        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
+        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
+        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
+    ]),
+    (23, &[
         "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
         "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
@@ -876,7 +977,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
         "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
     ]),
-    (23, &[
+    (24, &[
         "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
         "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
         "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
@@ -898,7 +999,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
         "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
     ]),
-    (24, &[
+    (25, &[
         "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
         "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
         "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
@@ -908,7 +1009,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     ]),
     // Device-lineage databases recorded 17-21 before canonical product shipped,
     // so the canonical product tables they skipped must be replayed here.
-    (25, &[
+    (26, &[
         "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
         "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
@@ -963,9 +1064,20 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_devices ADD COLUMN tpm_ak_public TEXT DEFAULT ''",
         "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
         "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
+        "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
+        "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
+        "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
+        "CREATE TABLE path_policies(env_id TEXT NOT NULL,role TEXT NOT NULL,rules TEXT NOT NULL,PRIMARY KEY(env_id,role))",
+        "CREATE TABLE compat_transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wrapping_key TEXT NOT NULL,created_at BIGINT NOT NULL)",
+        "CREATE UNIQUE INDEX idx_compat_transit_keys_name ON compat_transit_keys(org_id,name)",
+        "CREATE TABLE compat_transit_versions(key_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,version))",
+        "ALTER TABLE rotation_schedules ADD COLUMN pending_enc TEXT DEFAULT ''",
+        "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
+        "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
+        "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
     ]),
     // Device lookups and expiry scans never had an index on the columns they filter.
-    (26, &[
+    (27, &[
         "CREATE INDEX IF NOT EXISTS idx_pki_certs_device ON pki_certs(device_id)",
         "CREATE INDEX IF NOT EXISTS idx_pki_certs_expiry ON pki_certs(expires_at)",
     ]),
@@ -1004,10 +1116,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 26, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 27, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 26, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 27, "each migration must be recorded exactly once");
     }
     fn seeded(seed: impl FnOnce(&rusqlite::Connection)) -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1030,7 +1142,7 @@ mod tests {
             conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
         });
         db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 26);
+        assert_eq!(db.version().await.unwrap(), 27);
         assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
         db.query("SELECT id FROM change_requests", &[]).await.unwrap();
         db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
@@ -1046,8 +1158,8 @@ mod tests {
         let db = seeded(|conn| {
             for version in 2..=16 { applied(conn, version); }
             applied(conn, 18);
-            // The legacy lineage's 19-20 held the device schema now numbered 22-23.
-            for version in [22, 23] {
+            // The legacy lineage's 19-20 held the device schema now numbered 23-24.
+            for version in [23, 24] {
                 for sql in MIGRATIONS.iter().find(|(v, _)| *v == version).unwrap().1 { conn.execute_batch(sql).unwrap(); }
             }
             recorded(conn, 17); recorded(conn, 19); recorded(conn, 20);
@@ -1055,17 +1167,16 @@ mod tests {
             conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind,ca_kind,parent_id) VALUES('child','org','child','cert','sealed',1,'x509','intermediate','root')", []).unwrap();
         });
         db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 26);
+        assert_eq!(db.version().await.unwrap(), 27);
         assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
         assert_eq!(s(&db.one("SELECT ca_kind FROM pki_cas WHERE id='child'", &[]).await.unwrap().unwrap(), "ca_kind"), "intermediate");
-        // The canonical product the ledger skipped must be replayed by 25.
+        // The canonical product the ledger skipped must be replayed by 26.
         db.query("SELECT id FROM change_requests", &[]).await.unwrap();
         db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
         db.query("SELECT id FROM transit_keys", &[]).await.unwrap();
         db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();
         db.query("SELECT payload_enc FROM wrap_tokens", &[]).await.unwrap();
-        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();
-    }
+        db.query("SELECT tpm_ak_public,tpm_pcr_digest FROM pki_devices", &[]).await.unwrap();    }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {
         let users = mysql_sql("CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,pass_hash TEXT NOT NULL)");
