@@ -510,7 +510,7 @@ fn mysql_create_table(sql: &str) -> String {
     let mut keyed = mysql_indexed_columns().remove(&table).unwrap_or_default();
     for seg in split_sql_list(body) {
         let t = seg.trim();
-        if t.to_ascii_uppercase().starts_with("PRIMARY KEY") {
+        if t.to_ascii_uppercase().starts_with("PRIMARY KEY") || t.to_ascii_uppercase().starts_with("UNIQUE") {
             if let (Some(a), Some(b)) = (t.find('('), t.rfind(')')) { for c in t[a + 1..b].split(',') { keyed.push(c.trim().to_string()); } } } }
     let cols: Vec<String> = split_sql_list(body).iter().map(|seg| mysql_column_def(seg, &keyed)).collect();
     format!("{}({}) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin", head, cols.join(",")) }
@@ -790,5 +790,24 @@ mod tests {
         assert_eq!(mysql_sql("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)"), "INSERT INTO saml_replay(`key`,expires_at) VALUES(?,?)");
         assert_eq!(mysql_sql("SELECT count FROM rate_limits WHERE key=?"), "SELECT count FROM rate_limits WHERE `key`=?");
         assert_eq!(mysql_sql("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)"), "INSERT INTO rate_limits(`key`,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test] fn mysql_ddl_promotes_inline_unique_columns() {
+        // The actual migration-19 receipt DDL, read from MIGRATIONS so the test
+        // drifts with the shipped schema instead of a hand-written copy.
+        let receipt = MIGRATIONS.iter().flat_map(|(_, list)| list.iter().copied())
+            .find(|s| s.starts_with("CREATE TABLE webhook_receipts("))
+            .expect("migration 19 defines webhook_receipts");
+        let ddl = mysql_sql(receipt);
+        assert!(ddl.contains("`message_id` VARCHAR(255) NOT NULL"), "an inline UNIQUE column must be promoted to an indexable type: {}", ddl);
+        assert!(ddl.contains("`webhook_id` VARCHAR(255) NOT NULL"), "{}", ddl);
+        assert!(ddl.contains("UNIQUE(webhook_id,message_id)"), "the receipt uniqueness constraint must survive the rewrite: {}", ddl);
+        // A generic table-level UNIQUE(a,b) promotes both TEXT columns, while an
+        // unrelated payload column stays unbounded TEXT.
+        let generic = mysql_sql("CREATE TABLE IF NOT EXISTS pair_dedup(id TEXT PRIMARY KEY,a TEXT NOT NULL,b TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(a,b))");
+        assert!(generic.contains("`a` VARCHAR(255) NOT NULL"), "first inline UNIQUE column must be promoted: {}", generic);
+        assert!(generic.contains("`b` VARCHAR(255) NOT NULL"), "second inline UNIQUE column must be promoted: {}", generic);
+        assert!(generic.contains("`payload` TEXT NOT NULL"), "unbounded columns must stay TEXT: {}", generic);
+        assert!(generic.contains("UNIQUE(a,b)"), "the uniqueness constraint must be preserved: {}", generic);
     }
 }
