@@ -964,6 +964,11 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_devices ADD COLUMN tpm_pcr_digest TEXT DEFAULT ''",
         "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
     ]),
+    // Device lookups and expiry scans never had an index on the columns they filter.
+    (26, &[
+        "CREATE INDEX IF NOT EXISTS idx_pki_certs_device ON pki_certs(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pki_certs_expiry ON pki_certs(expires_at)",
+    ]),
 ];
 
 const INDEXES: &[&str] = &[
@@ -999,10 +1004,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 25, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 26, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 25, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 26, "each migration must be recorded exactly once");
     }
     fn seeded(seed: impl FnOnce(&rusqlite::Connection)) -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1025,7 +1030,7 @@ mod tests {
             conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
         });
         db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 25);
+        assert_eq!(db.version().await.unwrap(), 26);
         assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
         db.query("SELECT id FROM change_requests", &[]).await.unwrap();
         db.query("SELECT id FROM workload_trusts", &[]).await.unwrap();
@@ -1050,7 +1055,7 @@ mod tests {
             conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind,ca_kind,parent_id) VALUES('child','org','child','cert','sealed',1,'x509','intermediate','root')", []).unwrap();
         });
         db.migrate().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 25);
+        assert_eq!(db.version().await.unwrap(), 26);
         assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(), "kind"), "ssh");
         assert_eq!(s(&db.one("SELECT ca_kind FROM pki_cas WHERE id='child'", &[]).await.unwrap().unwrap(), "ca_kind"), "intermediate");
         // The canonical product the ledger skipped must be replayed by 25.

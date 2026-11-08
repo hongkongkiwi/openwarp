@@ -137,7 +137,12 @@ pub fn certificate_live(pem: &str) -> bool {
         c.tbs_certificate.validity.not_before.to_unix_duration().as_secs() <= t && c.tbs_certificate.validity.not_after.to_unix_duration().as_secs() > t
     }).unwrap_or(false)
 }
+pub fn certificate_expiry(pem: &str) -> Result<i64,String> {
+    let cert=Certificate::from_pem(pem).map_err(err)?;
+    i64::try_from(cert.tbs_certificate.validity.not_after.to_unix_duration().as_secs()).map_err(err)
+}
 pub fn create_intermediate(name: &str, parent_pem: &str, parent_key: &str) -> Result<Issued, String> {
+    if !certificate_live(parent_pem) { return Err("parent CA is not live".into()); }
     let parent = Certificate::from_pem(parent_pem).map_err(err)?;
     let parent_key = SecretKey::from_pkcs8_pem(parent_key).map_err(err)?;
     let key = SecretKey::random(&mut OsRng); let signer = SigningKey::from(&parent_key);
@@ -151,12 +156,15 @@ pub fn create_intermediate(name: &str, parent_pem: &str, parent_key: &str) -> Re
 pub fn issue_device(ca_pem: &str, ca_key: &str, cn: &str, sans: &[String], days: i64, csr: Option<&str>) -> Result<Issued, String> {
     use x509_cert::ext::pkix::ExtendedKeyUsage;
     use x509_cert::der::asn1::{ObjectIdentifier, OctetString};
+    if !certificate_live(ca_pem) { return Err("CA is not live".into()); }
     let ca = Certificate::from_pem(ca_pem).map_err(err)?;
     let ca_key = SecretKey::from_pkcs8_pem(ca_key).map_err(err)?; let signer = SigningKey::from(&ca_key);
     let key = if csr.is_none() { Some(SecretKey::random(&mut OsRng)) } else { None };
     let spki = match csr { Some(csr) => csr_public_key(csr)?, None => public_key(key.as_ref().ok_or("missing generated key")?)? };
     let (serial, serial_hex) = serial()?; let now = crate::clock::now();
-    let validity = Validity { not_before: time_at(now - 60)?, not_after: time_at(now + days.clamp(1,365)*86400)? };
+    let expires=(now + days.clamp(1,365)*86400).min(certificate_expiry(ca_pem)?);
+    if expires<=now { return Err("CA is not live".into()); }
+    let validity = Validity { not_before: time_at(now - 60)?, not_after: time_at(expires)? };
     let profile = Profile::Leaf { issuer: ca.tbs_certificate.subject.clone(), enable_key_agreement: false, enable_key_encipherment: false };
     let mut builder = CertificateBuilder::new(profile, serial, validity, subject(cn)?, spki, &signer).map_err(err)?;
     builder.add_extension(&ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2")])).map_err(err)?;
@@ -210,5 +218,36 @@ mod tests {
         let parsed = block.parse_x509().expect("decode ca");
         let common: Vec<&str> = parsed.subject().iter_common_name().filter_map(|cn| cn.as_str().ok()).collect();
         assert_eq!(common, vec!["Foo, Inc"], "the comma must stay inside one CN value");
+    }
+
+    /// A root with a caller-chosen window, so tests can build short-lived and expired CAs.
+    fn ca_with_validity(not_before: i64, not_after: i64) -> (String, String) {
+        let key = SecretKey::random(&mut OsRng);
+        let signer = SigningKey::from(&key);
+        let (serial, _) = serial().expect("serial");
+        let validity = Validity { not_before: time_at(not_before).expect("from"), not_after: time_at(not_after).expect("to") };
+        let builder = CertificateBuilder::new(Profile::Root, serial, validity, subject("Window CA").expect("name"), public_key(&key).expect("key"), &signer).expect("builder");
+        (builder.build::<DerSignature>().expect("build").to_pem(LineEnding::LF).expect("pem"), key.to_pkcs8_pem(LineEnding::LF).expect("key pem").to_string())
+    }
+
+    #[test]
+    fn issuance_never_outlives_the_ca() {
+        let now = crate::clock::now();
+        let (ca_pem, ca_key) = ca_with_validity(now - 60, now + 600);
+        let leaf = issue_device(&ca_pem, &ca_key, "device-1", &[], 30, None).expect("issue");
+        assert_eq!(certificate_expiry(&leaf.certificate_pem).unwrap(), certificate_expiry(&ca_pem).unwrap(), "a 30-day request must stop at the CA expiry");
+        assert!(certificate_live(&leaf.certificate_pem));
+        // An intermediate is bounded by its parent and can then issue down the chain.
+        let child = create_intermediate("Child CA", &ca_pem, &ca_key).expect("intermediate");
+        let grandchild = issue_device(&child.certificate_pem, &child.private_key_pem, "device-2", &[], 30, None).expect("issue under child");
+        assert_eq!(certificate_expiry(&grandchild.certificate_pem).unwrap(), certificate_expiry(&ca_pem).unwrap());
+    }
+
+    #[test]
+    fn an_expired_parent_cannot_mint_an_intermediate_or_a_leaf() {
+        let now = crate::clock::now();
+        let (ca_pem, ca_key) = ca_with_validity(now - 7200, now - 3600);
+        assert_eq!(create_intermediate("Child CA", &ca_pem, &ca_key).err().unwrap(), "parent CA is not live");
+        assert_eq!(issue_device(&ca_pem, &ca_key, "device-1", &[], 30, None).err().unwrap(), "CA is not live");
     }
 }

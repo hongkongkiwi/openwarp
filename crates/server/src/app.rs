@@ -4109,7 +4109,7 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     let names: Vec<String> = sans.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
     let issued = if device_id.is_empty() { crate::pki::issue(&db::s(&ca,"cert_pem"),&String::from_utf8_lossy(&key),&cn,&names,days) }
         else { crate::pki::issue_device(&db::s(&ca,"cert_pem"),&String::from_utf8_lossy(&key),&cn,&names,days,None) }.map_err(|e| bad(&e))?;
-    let cert_id = id(); let serial = issued.serial_hex.clone(); let t = now(); let expires = t+days*86400;
+    let cert_id = id(); let serial = issued.serial_hex.clone(); let t = now(); let expires = crate::pki::certificate_expiry(&issued.certificate_pem).map_err(|e| bad(&e))?;
     let mut stmts: Vec<(&str, Vec<Value>)> = vec![
         ("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'server')", vec![json!(&cert_id), json!(&caid), json!(&cn), json!(&issued.certificate_pem), json!(&serial), json!(expires), json!(t), json!(&device_id)]),
     ];
@@ -4374,7 +4374,7 @@ async fn enroll_device(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let key = oc::decrypt_symmetric(&st.master(),&db::s(&ca,"key_enc")).map_err(|e| bad(&e))?;
     let names = db::s(&row,"sans").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>();
     let issued = crate::pki::issue_device(&db::s(&ca,"cert_pem"),&String::from_utf8_lossy(&key),&db::s(&row,"name"),&names,days,Some(&csr_pem)).map_err(|e| bad(&e))?;
-    let t = now(); let cert_id = id(); let serial = issued.serial_hex.clone(); let expires = t+days*86400;
+    let t = now(); let cert_id = id(); let serial = issued.serial_hex.clone(); let expires = crate::pki::certificate_expiry(&issued.certificate_pem).map_err(|e| bad(&e))?;
     let mut stmts: Vec<(&str, Vec<Value>)> = vec![
         ("UPDATE pki_enrollments SET used_at=? WHERE id=? AND used_at=0 AND expires_at>OW_NOW()", vec![json!(t), json!(db::s(&row,"enrollment_id"))]),
         ("INSERT INTO pki_certs(id,ca_id,cn,cert_pem,serial,expires_at,created_at,device_id,revoked_at,issued_via) VALUES(?,?,?,?,?,?,?,?,0,'csr')", vec![json!(&cert_id), json!(&ca_id), json!(db::s(&row,"name")), json!(&issued.certificate_pem), json!(&serial), json!(expires), json!(t), json!(&did)]),
@@ -4455,7 +4455,7 @@ async fn self_renew_device(State(st): State<S>, Json(body): Json<Value>) -> Res 
     let key = oc::decrypt_symmetric(&st.master(),&db::s(&ca,"key_enc")).map_err(|e| bad(&e))?;
     let names = db::s(&dev,"sans").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>();
     let issued = crate::pki::issue_device(&db::s(&ca,"cert_pem"),&String::from_utf8_lossy(&key),&db::s(&dev,"name"),&names,days,Some(&csr_pem)).map_err(|e| bad(&e))?;
-    let serial = issued.serial_hex.clone(); let cert_id = id(); let t = now(); let expires=t+days*86400;
+    let serial = issued.serial_hex.clone(); let cert_id = id(); let t = now(); let expires=crate::pki::certificate_expiry(&issued.certificate_pem).map_err(|e| bad(&e))?;
     let stmts = [
         ("UPDATE pki_renew_challenges SET used_at=? WHERE id=? AND used_at=0 AND expires_at>OW_NOW()",vec![json!(t),json!(&cid)]),
         ("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE id=? AND device_id=? AND ca_id=? AND revoked=0 AND expires_at>OW_NOW()",vec![json!(t),json!(&old_id),json!(&did),json!(&ca_id)]),

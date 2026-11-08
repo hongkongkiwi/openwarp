@@ -477,7 +477,9 @@ Device records live under a CA: `POST/GET /api/pki/cas/:id/devices`,
 `POST /api/pki/devices/:id/enrollment`. A record carries the CN, optional DNS and
 IP SANs, the model, hardware serial, tags and an app/environment binding. Device
 certificates are client-auth only, default to 90 days (`cert_days`, clamped to 1
-to 365), and their SANs come from the record, never from the CSR.
+to 365), and their SANs come from the record, never from the CSR. Leaf validity is
+also capped at the issuing CA's expiry, and a CA outside its own validity window
+refuses leaf and intermediate issuance.
 
 Enrollment codes are 256-bit random values stored only as a SHA-256 hash, valid
 from five minutes to seven days, and consumed atomically on the first successful
@@ -533,7 +535,8 @@ A CA can be a root or an intermediate: `POST /api/orgs/:id/pki/cas` accepts
 `parent_id` for a root in the same workspace, and the leaf responses carry
 `ca_chain` from the issuing CA to the root. `POST /api/pki/cas/:id/revoke` marks
 the CA, its immediate children, their devices and their certificates revoked, and
-the parent's CRL lists a revoked child's serial.
+the parent's CRL lists a revoked child's serial. An intermediate inherits its
+parent's validity window, so no certificate in the chain outlives the root.
 
 Hardware attestation is an optional per-CA JWT requirement (`PUT
 /api/pki/cas/:id/attestation`). The enrollment response includes a nonce; the
