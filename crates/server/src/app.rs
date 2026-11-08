@@ -63,6 +63,8 @@ pub struct AppState {
     instance_id: String,
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
+    #[cfg(not(target_arch = "wasm32"))]
+    secret_health_credentials: Arc<tokio::sync::Mutex<()>>,
     #[cfg(not(target_arch="wasm32"))]
     pub(crate) ai_credentials: tokio::sync::Mutex<()>,
     #[cfg(not(target_arch="wasm32"))]
@@ -77,7 +79,7 @@ pub struct AppState {
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch = "wasm32"))] secret_health_credentials: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// Install the validated bridge before serving requests on either runtime.
 pub fn install_kms(st: &S, kms: Option<kms::Kms>) { assert!(st.kms.set(kms).is_ok(), "KMS already initialized"); }
@@ -789,6 +791,8 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
     if (api_keys > 0 || oauth_sessions > 0) && !confirm { return Err((StatusCode::CONFLICT, Json(json!({
         "error":format!("deleting this account revokes {} API key(s) and {} CLI/OAuth session(s) immediately", api_keys, oauth_sessions),
         "confirmation_required":true, "api_keys":api_keys, "oauth_sessions":oauth_sessions, "hint":"repeat with ?confirm=true to delete anyway"})))); }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _credential_guard = st.secret_health_credentials.lock().await;
     let mut stmts: Vec<(String, Vec<Value>)> = vec![
         ("UPDATE users SET active=active WHERE id=? AND NOT EXISTS (SELECT 1 FROM org_members WHERE user_id=? AND role='owner')".into(), vec![json!(&uid), json!(&uid)]),
         ("UPDATE meta SET v=v WHERE k='instance_owner' AND (v<>? OR NOT EXISTS (SELECT 1 FROM users WHERE id<>? AND active=1 AND email_verified=1))".into(), vec![json!(&uid), json!(&uid)]),
@@ -808,7 +812,7 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
         "DELETE FROM social_subjects WHERE user_id=?", "DELETE FROM identity_bindings WHERE user_id=?",
         "DELETE FROM saml_subjects WHERE user_id=?", "DELETE FROM ldap_subjects WHERE user_id=?",
     ].iter().map(|sql| (sql.to_string(), vec![json!(&uid)])));
-    for key in ["totp_enabled", "totp_secret", "totp_pending", "totp_recovery", "totp_last", "email_mfa_enabled", "password_known"] {
+    for key in ["totp_enabled", "totp_secret", "totp_pending", "totp_recovery", "totp_last", "email_mfa_enabled", "password_known", "hibp_api_key", "enzoic_credentials"] {
         stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("{}:{}", key, uid))])); }
     stmts.push(("DELETE FROM meta WHERE k='instance_owner' AND v=?".into(), vec![json!(&uid)]));
     stmts.push(("DELETE FROM users WHERE id=?".into(), vec![json!(&uid)]));
@@ -3766,6 +3770,8 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if !matches!(&*st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
     let _lifecycle = st.transit_lifecycle.write().await;
+    // Serialize personal credential snapshots and writes with this replica's rotation.
+    let credential_guard = st.secret_health_credentials.clone().lock_owned().await;
     let _ai_guard = st.ai_credentials.lock().await;
     let old = st.master();
     let ai_updates = crate::ai::rewrap(&st, &old, &new).await?;
@@ -3784,7 +3790,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
             .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
         env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
     }
-    let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%'", &[]).await.map_err(|e| bad(&e))?;
+    let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%' OR k LIKE 'hibp_api_key:%' OR k LIKE 'enzoic_credentials:%'", &[]).await.map_err(|e| bad(&e))?;
     let mut meta_updates = Vec::new();
     for r in &metas {
         let value = db::s(r, "v"); if value.is_empty() { continue; }
@@ -3850,6 +3856,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let counts = (env_updates.len(), meta_updates.len(), ca_updates.len(), stream_updates.len(), saml_updates.len(), hook_updates.len());
     let st2 = st.clone();
     let updates = tokio::task::spawn_blocking(move || {
+        let _credential_guard = credential_guard;
         let _lifecycle_guard=lifecycle_guard;
         let _transit_guard=transit_guard;
         let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
@@ -5255,6 +5262,10 @@ async fn emergency_transition(st: &S, oid: &str, app: Option<&str>, locked: bool
     }
     st.db.batch(&statements).await.map_err(|e| bad(&e))?;
     Ok(()) }
+async fn unscoped_emergency_locked(st: &S, uid: &str) -> Result<bool, (StatusCode, Json<Value>)> {
+    Ok(st.db.one("SELECT o.id FROM orgs o WHERE (EXISTS (SELECT 1 FROM org_members m WHERE m.org_id=o.id AND m.user_id=?) OR EXISTS (SELECT 1 FROM identities i WHERE i.org_id=o.id AND i.id=?)) AND (o.emergency_locked<>0 OR EXISTS (SELECT 1 FROM apps a WHERE a.org_id=o.id AND a.emergency_locked<>0))", &[json!(uid), json!(uid)]).await.map_err(|e| bad(&e))?.is_some()) }
+async fn secret_health_running(st: &S, uid: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if unscoped_emergency_locked(st, uid).await? { return Err(err(StatusCode::LOCKED, "cannot run unscoped secret health checks during workspace emergency lockdown")); } Ok(()) }
 async fn emergency_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path();
     // Resource identifiers are generated ASCII. Reject aliases before raw-path tenant resolution.
@@ -5280,10 +5291,12 @@ async fn emergency_middleware(State(st): State<S>, req: axum::extract::Request, 
             if !(metadata || (emergency && req.method() == axum::http::Method::PUT)) { return e.into_response(); }
             if let Err(e) = emergency_session(&st, req.headers()).await { return e.into_response(); }
         }
-    } else if path == "/api/lockbox" && req.method() == axum::http::Method::POST {
+    } else if req.method() == axum::http::Method::POST && matches!(path, "/api/lockbox" | "/api/me/secret-health/email" | "/api/me/secret-health/enzoic/password" | "/api/me/secret-health/enzoic/accounts" | "/api/me/secret-health/enzoic/credentials" | "/api/me/secret-health/leakcheck") {
         if let Ok(uid) = st.token_user(req.headers()).await {
-            match st.db.one("SELECT o.id FROM orgs o WHERE (EXISTS (SELECT 1 FROM org_members m WHERE m.org_id=o.id AND m.user_id=?) OR EXISTS (SELECT 1 FROM identities i WHERE i.org_id=o.id AND i.id=?)) AND (o.emergency_locked<>0 OR EXISTS (SELECT 1 FROM apps a WHERE a.org_id=o.id AND a.emergency_locked<>0))", &[json!(&uid), json!(&uid)]).await {
-                Ok(None) => {}, Ok(Some(_)) => return err(StatusCode::FORBIDDEN, "cannot create unscoped shares during workspace emergency lockdown").into_response(), Err(e) => return bad(&e).into_response(), }
+            if path == "/api/lockbox" {
+                match unscoped_emergency_locked(&st, &uid).await {
+                    Ok(false) => {}, Ok(true) => return err(StatusCode::FORBIDDEN, "cannot create unscoped shares during workspace emergency lockdown").into_response(), Err(e) => return e.into_response(), }
+            } else if let Err(e) = secret_health_running(&st, &uid).await { return e.into_response(); }
         }
     }
     next.run(req).await }
@@ -5796,6 +5809,341 @@ async fn process_rotations_inner(st: &S) {
 
 // ---------- OAuth 2.1 authorization server (shared by CLI login + MCP) ----------
 pub(crate) fn b64url(data: &[u8]) -> String { use base64ct::{Base64UrlUnpadded, Encoding}; Base64UrlUnpadded::encode_string(data) }
+fn secret_health_origin(st: &S, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    if h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") || h.get("origin").map(|v| !v.to_str().map(|o| origin_matches(st, h, o)).unwrap_or(false)).unwrap_or(false) { return Err(err(StatusCode::FORBIDDEN, "same-origin request required")); }
+    Ok(()) }
+async fn secret_health_session(st: &S, h: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
+    let uid = st.token_user(h).await?;
+    let row = st.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(oc::hash_token(&secret_health_token(h)))]).await.map_err(|e| bad(&e))?;
+    if !row.map(|r| db::s(&r, "user_id") == uid && db::n(&r, "created_at") + 7 * 86400 >= now()).unwrap_or(false) { return Err(err(StatusCode::UNAUTHORIZED, "session required")); }
+    Ok(uid) }
+fn secret_health_token(h: &HeaderMap) -> String {
+    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+    if bearer.is_empty() { cookie_val(h, "ow_session") } else { bearer.to_string() } }
+// Mutex, database and quota waits sit between entry authentication and each
+// provider dispatch or settings write; a session revoked in that window must
+// not finish the queued work, so the original session is revalidated in place.
+async fn secret_health_revalidate(st: &S, h: &HeaderMap, uid: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if secret_health_session(st, h).await?.as_str() != uid { return Err(err(StatusCode::UNAUTHORIZED, "session changed; sign in again")); }
+    Ok(()) }
+#[cfg(not(target_arch = "wasm32"))]
+async fn secret_health_quota(st: &S, key: &str, seconds: i64) -> Result<u64, (StatusCode, Json<Value>)> {
+    let insert = if st.db.backend() == db::Backend::Mysql {
+        "INSERT INTO rate_limits(key,window_start,count) VALUES(?,0,0) ON DUPLICATE KEY UPDATE count=count"
+    } else { "INSERT INTO rate_limits(key,window_start,count) VALUES(?,0,0) ON CONFLICT(key) DO NOTHING" };
+    st.db.exec(insert, &[json!(key)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "quota unavailable"))?;
+    let timestamp = now();
+    st.db.exec("UPDATE rate_limits SET window_start=?,count=1 WHERE key=? AND window_start<=?", &[json!(timestamp), json!(key), json!(timestamp-seconds)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "quota unavailable"))
+}
+async fn secret_health_store(st: &S, uid: &str, token: &str, name: &str, encrypted: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let sql = "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v";
+    #[cfg(not(target_arch = "wasm32"))]
+    let sql = if st.db.backend() == db::Backend::Mysql { "INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE v=VALUES(v)" } else { sql };
+    secret_health_write(st, uid, token, &[(sql.into(), vec![json!(name), json!(encrypted)])]).await }
+async fn secret_health_delete(st: &S, uid: &str, token: &str, name: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    secret_health_write(st, uid, token, &[("DELETE FROM meta WHERE k=?".into(), vec![json!(name)])]).await }
+// The session predicate runs inside the same transaction as the write, so a
+// revocation landing after the pre-write revalidation still refuses the write.
+// Expiry uses the database clock, evaluated after the transaction is acquired;
+// the entry and revalidation checks use the crate clock, so a session can fail
+// here milliseconds before the crate clock would expire it. Fail-closed.
+async fn secret_health_write(st: &S, uid: &str, token: &str, statements: &[(String, Vec<Value>)]) -> Result<(), (StatusCode, Json<Value>)> {
+    #[cfg(target_arch = "wasm32")]
+    let now_sql = "CAST(strftime('%s','now') AS INTEGER)";
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_sql = match st.db.backend() {
+        db::Backend::Sqlite => "CAST(strftime('%s','now') AS INTEGER)",
+        db::Backend::Postgres => "EXTRACT(EPOCH FROM clock_timestamp())::bigint",
+        db::Backend::Mysql => "UNIX_TIMESTAMP()",
+    };
+    let session_guard = format!("UPDATE sessions SET created_at=created_at WHERE token_hash=? AND user_id=? AND created_at + {} >= {}", 7 * 86400, now_sql);
+    let mut batch: Vec<(String, Vec<Value>)> = vec![
+        ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(uid)]),
+        (session_guard, vec![json!(oc::hash_token(token)), json!(uid)]),
+    ];
+    batch.extend_from_slice(statements);
+    st.db.batch_checked(&batch, &[0, 1]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::UNAUTHORIZED, "session revoked; sign in again") } else { bad(&e) }) }
+async fn secret_health_settings(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let _credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let row = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("hibp_api_key:{}", uid))]).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    Ok(j(json!({"api_key_set":row.map(|r| !db::s(&r,"v").is_empty()).unwrap_or(false)}))) }
+async fn secret_health_save(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_origin(&st, &h)?;
+    let key = body.get("api_key").ok_or_else(|| bad("api_key required"))?;
+    let name = format!("hibp_api_key:{}", uid);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let token = secret_health_token(&h);
+    if key.is_null() {
+        secret_health_delete(&st, &uid, &token, &name).await?;
+    } else {
+        let key = key.as_str().filter(|k| k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit())).ok_or_else(|| bad("api_key must be 32 hexadecimal characters"))?;
+        let encrypted = oc::encrypt_symmetric(&st.master(), key.as_bytes());
+        secret_health_store(&st, &uid, &token, &name, &encrypted).await?;
+    }
+    Ok(j(json!({"api_key_set":!key.is_null()}))) }
+async fn secret_health_email(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_running(&st, &uid).await?;
+    secret_health_origin(&st, &h)?;
+    if body.get("consent").and_then(Value::as_bool) != Some(true) { return Err(bad("explicit consent required")); }
+    let email = body.get("email").and_then(Value::as_str).unwrap_or("");
+    let parts: Vec<&str> = email.split('@').collect();
+    if email.len() > 254 || parts.len() != 2 || parts[0].is_empty() || !parts[1].contains('.') || parts[1].starts_with('.') || parts[1].ends_with('.') || email.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) { return Err(bad("valid email required")); }
+    #[cfg(not(target_arch = "wasm32"))]
+    let credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let row = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("hibp_api_key:{}", uid))]).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?.ok_or_else(|| bad("configure your own HIBP API key first"))?;
+    let key = oc::decrypt_symmetric(&st.master(), &db::s(&row,"v")).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    drop(credential_guard);
+    #[cfg(target_arch = "wasm32")]
+    { let _ = key; Err(err(StatusCode::NOT_IMPLEMENTED, "email checks require the native server's redirect-safe transport")) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Consume quota atomically before outbound work, including provider failures.
+        let quota = secret_health_quota(&st, &format!("hibp:{}",uid), 60).await?;
+        if quota != 1 { return Err(err(StatusCode::TOO_MANY_REQUESTS, "wait one minute between email checks")); }
+        let client = crate::http::Client::builder().timeout(std::time::Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "email check unavailable"))?;
+        let address: String = email.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect();
+        let url = format!("https://haveibeenpwned.com/api/v3/breachedaccount/{}?truncateResponse=true", address);
+        secret_health_running(&st, &uid).await?;
+        secret_health_revalidate(&st, &h, &uid).await?;
+        let response = client.get(url).header("hibp-api-key", String::from_utf8(key).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?).header("user-agent", "OpenWarp-secret-health").send().await;
+        let Ok(mut response) = response else { return Err(err(StatusCode::BAD_GATEWAY, "email check unavailable")); };
+        match response.status().as_u16() {
+            404 => return Ok(j(json!({"status":"not_found","breaches":[]}))),
+            401 => return Err(err(StatusCode::BAD_GATEWAY, "HIBP API key rejected (401)")),
+            403 => return Err(err(StatusCode::BAD_GATEWAY, "HIBP access forbidden (403); check your subscription")),
+            429 => return Err(err(StatusCode::TOO_MANY_REQUESTS, "HIBP rate limit reached")),
+            200 => (),
+            _ => return Err(err(StatusCode::BAD_GATEWAY, "email check unavailable")),
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| err(StatusCode::BAD_GATEWAY, "email check unavailable"))? {
+            if bytes.len() + chunk.len() > 65536 { return Err(err(StatusCode::BAD_GATEWAY, "email check unavailable")); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| err(StatusCode::BAD_GATEWAY, "email check unavailable"))?;
+        let rows = data.as_array().filter(|r| r.len() <= 1000).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "email check unavailable"))?;
+        let mut names = Vec::new();
+        for row in rows { let name = row.get("Name").and_then(Value::as_str).filter(|n| !n.is_empty() && n.len() <= 128 && n.chars().all(|c| c.is_alphanumeric() || " ._()-".contains(c))).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "email check unavailable"))?; names.push(name); }
+        Ok(j(json!({"status":if names.is_empty(){"not_found"}else{"found"},"breaches":names})))
+    } }
+async fn leakcheck_email(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_running(&st, &uid).await?;
+    secret_health_origin(&st, &h)?;
+    if body.get("consent").and_then(Value::as_bool) != Some(true) { return Err(bad("explicit consent required")); }
+    if body.as_object().map(|o| o.len() != 2).unwrap_or(true) { return Err(bad("only email_hash and consent are accepted")); }
+    let prefix = body.get("email_hash").and_then(Value::as_str).filter(|s| s.len() == 24 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).ok_or_else(|| bad("email_hash must be 24 lowercase hexadecimal characters"))?;
+    #[cfg(target_arch = "wasm32")]
+    { let _ = (uid, prefix); Err(err(StatusCode::NOT_IMPLEMENTED, "LeakCheck checks require the native server's redirect-safe transport")) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Two whole-second ticks ensure at least one second between shared-egress attempts.
+        for (key, seconds) in [(format!("leakcheck:{}", uid), 60), ("leakcheck:instance".to_string(), 2)] {
+            let quota = secret_health_quota(&st, &key, seconds).await?;
+            if quota != 1 { return Err(err(StatusCode::TOO_MANY_REQUESTS, "LeakCheck quota reached; wait before retrying")); }
+        }
+        let client = crate::http::Client::builder().timeout(std::time::Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "LeakCheck check unavailable"))?;
+        secret_health_running(&st, &uid).await?;
+        secret_health_revalidate(&st, &h, &uid).await?;
+        let response = client.get(format!("https://leakcheck.io/api/public?check={}", prefix)).send().await;
+        let Ok(mut response) = response else { return Err(err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable")); };
+        if response.status().as_u16() == 429 { return Err(err(StatusCode::TOO_MANY_REQUESTS, "LeakCheck rate limit reached")); }
+        if response.status().as_u16() != 200 { return Err(err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable")); }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))? {
+            if bytes.len() + chunk.len() > 65536 { return Err(err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable")); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))?;
+        if data.get("success").and_then(Value::as_bool) != Some(true) { return Err(err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable")); }
+        let found = data.get("found").and_then(Value::as_u64).filter(|n| *n <= 9007199254740991).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))?;
+        let rows = data.get("sources").and_then(Value::as_array).filter(|r| r.len() <= 1000).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))?;
+        if (found > 0) == rows.is_empty() { return Err(err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable")); }
+        let mut names = Vec::new();
+        for row in rows {
+            let name = row.get("name").and_then(Value::as_str).filter(|s| !s.trim().is_empty() && s.len() <= 128 && !s.chars().any(char::is_control)).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))?;
+            let _date = row.get("date").and_then(Value::as_str).filter(|s| s.len() <= 32 && !s.chars().any(char::is_control)).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "LeakCheck check unavailable"))?;
+            names.push(name);
+        }
+        Ok(j(json!({"status":if found > 0 {"found"} else {"not_found"},"breaches":names})))
+    } }
+async fn enzoic_settings(State(st): State<S>, h: HeaderMap) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let _credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let row = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("enzoic_credentials:{}", uid))]).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    Ok(j(json!({"configured":row.map(|r| !db::s(&r,"v").is_empty()).unwrap_or(false)}))) }
+async fn enzoic_save(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_origin(&st, &h)?;
+    let key = body.get("api_key").ok_or_else(|| bad("api_key required"))?;
+    let secret = body.get("api_secret").ok_or_else(|| bad("api_secret required"))?;
+    let name = format!("enzoic_credentials:{}", uid);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let token = secret_health_token(&h);
+    if key.is_null() && secret.is_null() {
+        secret_health_delete(&st, &uid, &token, &name).await?;
+    } else {
+        let valid = |v: &Value| v.as_str().filter(|s| !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| b.is_ascii_graphic() && b != b':')).map(str::to_string);
+        let key = valid(key).ok_or_else(|| bad("api_key must be 1-256 visible ASCII characters without a colon"))?;
+        let secret = valid(secret).ok_or_else(|| bad("api_secret must be 1-256 visible ASCII characters without a colon"))?;
+        let encrypted = oc::encrypt_symmetric(&st.master(), json!({"api_key":key,"api_secret":secret}).to_string().as_bytes());
+        secret_health_store(&st, &uid, &token, &name, &encrypted).await?;
+    }
+    Ok(j(json!({"configured":!key.is_null()}))) }
+async fn enzoic_password(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_running(&st, &uid).await?;
+    secret_health_origin(&st, &h)?;
+    if body.get("consent").and_then(Value::as_bool) != Some(true) { return Err(bad("explicit consent required")); }
+    if body.as_object().map(|o| o.len() != 2).unwrap_or(true) { return Err(bad("only prefix and consent are accepted")); }
+    let prefix = body.get("prefix").and_then(Value::as_str).filter(|s| s.len() == 10 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).ok_or_else(|| bad("prefix must be ten lowercase hexadecimal characters"))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let credential_guard = st.secret_health_credentials.lock().await;
+    secret_health_revalidate(&st, &h, &uid).await?;
+    let row = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("enzoic_credentials:{}", uid))]).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?.ok_or_else(|| bad("configure your own Enzoic credentials first"))?;
+    let decrypted = oc::decrypt_symmetric(&st.master(), &db::s(&row,"v")).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    drop(credential_guard);
+    let credentials: Value = serde_json::from_slice(&decrypted).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    let key = credentials.get("api_key").and_then(Value::as_str).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    let secret = credentials.get("api_secret").and_then(Value::as_str).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+    #[cfg(target_arch = "wasm32")]
+    { let _ = (prefix, key, secret); Err(err(StatusCode::NOT_IMPLEMENTED, "Enzoic checks require the native server's redirect-safe transport")) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Failed provider calls also spend the user's atomic quota slot.
+        let quota = secret_health_quota(&st, &format!("enzoic:{}",uid), 60).await?;
+        if quota != 1 { return Err(err(StatusCode::TOO_MANY_REQUESTS, "wait one minute between Enzoic checks")); }
+        let client = crate::http::Client::builder().timeout(std::time::Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "Enzoic check unavailable"))?;
+        secret_health_running(&st, &uid).await?;
+        secret_health_revalidate(&st, &h, &uid).await?;
+        let response = client.post("https://api.enzoic.com/v1/passwords").basic_auth(key, Some(secret)).json(&json!({"partialSHA256":prefix})).send().await;
+        let Ok(mut response) = response else { return Err(err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable")); };
+        match response.status().as_u16() {
+            404 => return Ok(j(json!({"candidates":[]}))),
+            401 => return Err(err(StatusCode::BAD_GATEWAY, "Enzoic credentials rejected (401)")),
+            403 => return Err(err(StatusCode::BAD_GATEWAY, "Enzoic access forbidden (403); check your subscription or quota")),
+            429 => return Err(err(StatusCode::TOO_MANY_REQUESTS, "Enzoic rate limit reached")),
+            200 => (),
+            _ => return Err(err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable")),
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))? {
+            if bytes.len() + chunk.len() > 1024 * 1024 { return Err(err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable")); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))?;
+        let rows = data.get("candidates").and_then(Value::as_array).filter(|r| r.len() <= 1000).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let hash = row.get("sha256").and_then(Value::as_str).filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))?;
+            let exposed = row.get("revealedInExposure").and_then(Value::as_bool).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))?;
+            let count = row.get("exposureCount").and_then(Value::as_u64).filter(|n| *n <= 9007199254740991).ok_or_else(|| err(StatusCode::BAD_GATEWAY, "Enzoic check unavailable"))?;
+            candidates.push(json!({"sha256":hash,"revealedInExposure":exposed,"exposureCount":count}));
+        }
+        Ok(j(json!({"candidates":candidates})))
+    } }
+#[cfg(not(target_arch = "wasm32"))]
+fn enzoic_plain_salt(value: &Value) -> bool {
+    value.as_str().map(|s| s.len() <= 1024 && !["$argon2", "base64:", "hex:"].iter().any(|p| s.to_ascii_lowercase().starts_with(p))).unwrap_or(false)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn enzoic_plain_encoding(value: Option<&Value>) -> bool { value.is_none() || value.and_then(Value::as_str) == Some("plain") }
+#[cfg(not(target_arch = "wasm32"))]
+fn enzoic_pair_response(data: &Value, accounts: bool) -> Result<Value, (StatusCode, Json<Value>)> {
+    let unavailable = || err(StatusCode::BAD_GATEWAY, "Enzoic credential-pair check unavailable");
+    if accounts {
+        let salt = data.get("salt").filter(|v| enzoic_plain_salt(v)).ok_or_else(unavailable)?;
+        if !enzoic_plain_encoding(data.get("saltEncoding")) { return Err(unavailable()); }
+        let rows = data.get("passwordHashesRequired").and_then(Value::as_array).filter(|r| !r.is_empty() && r.len() <= 32).ok_or_else(unavailable)?;
+        let mut requirements = Vec::new();
+        for row in rows {
+            let kind = row.get("hashType").and_then(Value::as_u64).filter(|k| matches!(*k, 1|2|3|13|14|19|25|27|32|35|37|40)).ok_or_else(unavailable)?;
+            if !enzoic_plain_encoding(row.get("saltEncoding")) { return Err(unavailable()); }
+            let mut spec = json!({"hashType":kind});
+            if let Some(s) = row.get("salt") { if !enzoic_plain_salt(s) { return Err(unavailable()); } spec["salt"] = s.clone(); }
+            if matches!(kind, 13|19|25|32|37|40) && spec.get("salt").and_then(Value::as_str).map(str::is_empty).unwrap_or(true) { return Err(unavailable()); }
+            requirements.push(spec);
+        }
+        Ok(json!({"found":true,"salt":salt,"passwordHashesRequired":requirements}))
+    } else {
+        let rows = data.get("candidateHashes").and_then(Value::as_array).filter(|r| r.len() <= 1000).ok_or_else(unavailable)?;
+        let mut hashes = Vec::new();
+        for row in rows { let hash = row.as_str().filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())).ok_or_else(unavailable)?; hashes.push(hash.to_ascii_lowercase()); }
+        Ok(json!({"candidateHashes":hashes}))
+    }
+}
+async fn enzoic_accounts(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { enzoic_pair_relay(st, h, body, true).await }
+async fn enzoic_credentials(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { enzoic_pair_relay(st, h, body, false).await }
+async fn enzoic_pair_relay(st: S, h: HeaderMap, body: Value, accounts: bool) -> Res {
+    let uid = secret_health_session(&st, &h).await?;
+    secret_health_running(&st, &uid).await?;
+    secret_health_origin(&st, &h)?;
+    if body.get("consent").and_then(Value::as_bool) != Some(true) { return Err(bad("explicit consent required")); }
+    if body.as_object().map(|o| o.len() != 2).unwrap_or(true) { return Err(bad("only the stage hash field and consent are accepted")); }
+    let lower_hex = |s: &str, length| s.len() == length && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let mut query = Vec::new();
+    if accounts {
+        let hash = body.get("username_hash").and_then(Value::as_str).filter(|s| lower_hex(s, 64)).ok_or_else(|| bad("username_hash must be 64 lowercase hexadecimal characters"))?;
+        query.push(("username", hash));
+    } else {
+        let hashes = body.get("partial_hashes").and_then(Value::as_array).filter(|r| !r.is_empty() && r.len() <= 32).ok_or_else(|| bad("partial_hashes must contain 1-32 prefixes"))?;
+        for hash in hashes { query.push(("partialHashes", hash.as_str().filter(|s| lower_hex(s, 10)).ok_or_else(|| bad("partial_hashes must contain ten-character lowercase hexadecimal prefixes"))?)); }
+    }
+    #[cfg(target_arch = "wasm32")]
+    { let _ = (uid, query); Err(err(StatusCode::NOT_IMPLEMENTED, "Enzoic checks require the native server's redirect-safe transport")) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let credential_guard = st.secret_health_credentials.lock().await;
+        secret_health_revalidate(&st, &h, &uid).await?;
+        let row = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("enzoic_credentials:{}", uid))]).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?.ok_or_else(|| bad("configure your own Enzoic credentials first"))?;
+        let decrypted = oc::decrypt_symmetric(&st.master(), &db::s(&row,"v")).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+        drop(credential_guard);
+        let credentials: Value = serde_json::from_slice(&decrypted).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+        let key = credentials.get("api_key").and_then(Value::as_str).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+        let secret = credentials.get("api_secret").and_then(Value::as_str).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "settings unavailable"))?;
+        let stage = if accounts { "accounts" } else { "credentials" };
+        // Separate atomic stage slots let a permitted account lookup finish its second request.
+        if secret_health_quota(&st, &format!("enzoic:{}:{}", stage, uid), 60).await? != 1 { return Err(err(StatusCode::TOO_MANY_REQUESTS, "wait one minute between Enzoic requests for this stage")); }
+        let unavailable = || err(StatusCode::BAD_GATEWAY, "Enzoic credential-pair check unavailable");
+        let client = crate::http::Client::builder().timeout(std::time::Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| unavailable())?;
+        let target = if accounts { "https://api.enzoic.com/v1/accounts" } else { "https://api.enzoic.com/v1/credentials" };
+        secret_health_running(&st, &uid).await?;
+        secret_health_revalidate(&st, &h, &uid).await?;
+        let mut response = client.get(target).query(&query).basic_auth(key, Some(secret)).send().await.map_err(|_| unavailable())?;
+        match response.status().as_u16() {
+            404 => return Ok(j(if accounts { json!({"found":false}) } else { json!({"candidateHashes":[]}) })),
+            429 => return Err(err(StatusCode::TOO_MANY_REQUESTS, "Enzoic rate limit reached")),
+            200 => (),
+            _ => return Err(unavailable()),
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if bytes.len() + chunk.len() > 1024 * 1024 { return Err(unavailable()); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+        Ok(j(enzoic_pair_response(&data, accounts)?))
+    }
+}
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "secret_health_rotation_tests.rs"]
+mod secret_health_rotation_tests;
+
 async fn oauth_user(st: &S, h: &HeaderMap) -> Option<String> {
     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let bearer = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
@@ -6234,7 +6582,7 @@ out.innerHTML='';var pre=document.createElement('pre');pre.textContent=d.value!=
 async fn index() -> Response {
     let mut r = Html(ui::INDEX).into_response();
     r.headers_mut().insert("content-security-policy", axum::http::HeaderValue::from_static(
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.pwnedpasswords.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
     r }
 #[cfg(not(target_arch = "wasm32"))]
 async fn peer_middleware(mut req: axum::extract::Request, next: Next) -> Response {
@@ -6326,6 +6674,17 @@ pub fn router(state: S) -> Router {
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
         .route("/i18n.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("i18n.js")) }))
         .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
+        .route("/api/me/secret-health", get(secret_health_settings).put(secret_health_save))
+        .route("/api/me/secret-health/email", post(secret_health_email))
+        .route("/api/me/secret-health/enzoic", get(enzoic_settings).put(enzoic_save))
+        .route("/api/me/secret-health/enzoic/password", post(enzoic_password))
+        .route("/api/me/secret-health/enzoic/accounts", post(enzoic_accounts))
+        .route("/api/me/secret-health/enzoic/credentials", post(enzoic_credentials))
+        .route("/enzoic-pairs.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("enzoic-pairs.js")) }))
+        .route("/hash-wasm.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/hash-wasm.js")) }))
+        .route("/api/me/secret-health/leakcheck", post(leakcheck_email))
+        .route("/secret-health.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("secret-health.js")) }))
+        .route("/zxcvbn.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/zxcvbn.js")) }))
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
         .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))

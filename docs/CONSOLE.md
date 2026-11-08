@@ -52,6 +52,72 @@ Select the workspace before changing membership or application data. Create an a
 
 New applications include Development, Staging, and Production environments. Custom environment names support letters, digits, hyphens, and underscores, up to 32 characters. Application and environment IDs are separate from these names. The CLI's discovery commands return IDs for automation.
 
+## Optional secret health
+
+SSE and E2E add/edit dialogs have a compact Secret health section. "Check as
+password" runs bundled zxcvbn 4.4.2 locally (up to 1024 characters). This is
+human password advice, not a requirement for API tokens or SSH keys.
+"Check password breaches" asks permission before sending only a five-character
+SHA-1 prefix directly to HIBP Pwned Passwords with padded responses. The full
+password and hash stay in the browser, including for E2E values. No checks run
+on keystrokes, save or import. Results are advisory and never prove safety.
+
+Settings has a personal HIBP key card. "Show stored status" reports whether a
+key exists; the key field is always blank on entry. Save replaces the key and
+Remove deletes it. A paid Core key supports the standard email endpoint.
+For email-looking values, opening Secret health offers an email action when
+your key is configured. Its confirmation discloses that the full email goes
+to the OpenWarp server and HIBP, breaking server-blind handling for that value.
+Only breach names are returned; results are not persisted. Email checks are
+limited to one attempt per user per minute and require the native server;
+Workers returns 501 rather than risk sending credentials through redirects.
+
+The same personal settings card accepts a separate Enzoic API key and secret.
+Both are password fields, blank on entry and cleared after Save or Remove.
+Stored status reports encrypted credentials, never their contents. Both values
+must be supplied together; Remove deletes both. A configured account gains a
+"Check password with Enzoic" button. Each click asks permission to relay the
+first ten lowercase hexadecimal characters of the exact password's SHA-256
+hash through OpenWarp to Enzoic. The password and full submitted hash stay in
+the browser. Only an exact full-hash candidate marked exposed reports found;
+not found does not prove safety. Checks require the native server and consume
+one attempt per user per minute. Operators need an applicable subscription
+and must meet Enzoic's terms and privacy obligations. Vendor approval and
+resale rights are not claimed.
+
+A configured Enzoic account also shows "Check email/password pair" with a
+separate labeled email input. The secret value is the password; the console
+never infers an email from other fields or stores the entered address. Each
+click warns that a stable full SHA-256 hash of the lowercased exact email,
+without trimming, and ten-character password-derived prefixes pass through
+OpenWarp to Enzoic. These identifiers permit correlation and guessing. Plain
+emails, passwords, legacy hashes and full derived hashes stay in the browser.
+
+Pair checks use bundled local hash-wasm, including MD5 and Argon2d, with no
+CDN or frontend build. Supported legacy hash types are
+1, 2, 3, 13, 14, 19, 25, 27, 32, 35, 37 and 40. Unknown requirements or encoded
+salts invalidate the whole check before the second request. Unavailable also
+covers malformed responses, primitive failures, quota and provider errors;
+it is not a clean result. Each of the two native relay stages has a separate
+one-attempt-per-user-per-minute limit. No results are stored. Editor changes,
+modal closure and lockdown invalidate pending work and stale results.
+See [the pair protocol and formula table](API.md#enzoic-credential-pairs).
+
+For email-looking values, "Check email with LeakCheck (free)" is available
+without configuring a key. Its per-request confirmation explains that the
+browser trims and lowercases the address, computes SHA-256, and sends its
+first 24 hexadecimal characters through OpenWarp to LeakCheck Public. A
+stable hash identifier is not anonymous and can reveal guesses. Only source
+names are shown, with "Powered by LeakCheck" attribution; results are not
+persisted. It requires the native server, with one attempt per user per minute
+and an instance-wide shared-egress throttle guaranteeing at least one second
+between attempts. Errors report unavailable, not unexposed.
+
+See [the API contract](API.md). Live provider calls, Rust execution and browser
+rendering were not executed for these extensions; local Node checks exercise
+fixture responses. LeakCheck's first-24-character interpretation has not been
+verified against the live provider. BreachDirectory is not implemented.
+
 ## Standard secrets and drafts
 
 1. Open an application and environment.
