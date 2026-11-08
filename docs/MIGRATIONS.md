@@ -73,12 +73,21 @@ plus unique names, on every apply.
   engine's version 21 without proving that its SQL ran. Existing ciphertext,
   revocation state, key versions and lockdown values are retained. The
   environment backfill still respects its existing sentinel.
+- Version 23 reconciles all objects from the main branch's shipped version 22:
+  external-JWKS workload bindings and assertions, path policies, the
+  compatibility Transit tables with their unique name index,
+  `tokens.workload_revision`, the static rotation columns on
+  `rotation_schedules` with their unique target index, and the
+  `rotation_lifecycle` meta row that main's runner seeds alongside that version.
+  A shipped main version 22 database already carries every object and keeps its
+  data; a pre-merge engine database gains only what it lacks. The lifecycle
+  seed is guarded so the shipped row survives unchanged.
 
-New migrations start at version 23. SQL files 1 through 20 remain unchanged.
-Legacy main version 17 through 21 ledger rows have no checksum and remain
-unverified. A legacy main version 21 database applies only version 22; an engine
-version 20 database applies versions 21 and 22. The runner records checksums only
-for the new reconciliation files it actually executes, without relabelling
+New migrations start at version 24. SQL files 1 through 22 remain unchanged.
+Legacy main version 17 through 22 ledger rows have no checksum and remain
+unverified. A legacy main version 22 database applies only version 23; an engine
+version 20 database applies versions 21 through 23. The runner records checksums
+only for the new reconciliation files it actually executes, without relabelling
 occupied legacy versions.
 
 ## The ledger

@@ -60,6 +60,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 20, name: "main18_reconciliation", sql: include_str!("../migrations/0020_main18_reconciliation.sql"), tolerant: true },
     Migration { version: 21, name: "change_requests", sql: include_str!("../migrations/0021_change_requests.sql"), tolerant: true },
     Migration { version: 22, name: "main21_reconciliation", sql: include_str!("../migrations/0022_main21_reconciliation.sql"), tolerant: true },
+    Migration { version: 23, name: "main22_reconciliation", sql: include_str!("../migrations/0023_main22_reconciliation.sql"), tolerant: true },
 ];
 
 /// SQL profile used when splitting migration statements.
@@ -468,7 +469,8 @@ fn is_convergence_duplicate(statement: &str, error: &str) -> bool {
             || message.contains(&format!("column \"{}\" of relation \"{}\" already exists", column, table));
     }
     // MySQL strips IF NOT EXISTS from index DDL; other engines keep the guard.
-    if let ["CREATE", "INDEX", "IF", "NOT", "EXISTS", index, ..] = words.as_slice() {
+    if let ["CREATE", "INDEX", "IF", "NOT", "EXISTS", index, ..]
+        | ["CREATE", "UNIQUE", "INDEX", "IF", "NOT", "EXISTS", index, ..] = words.as_slice() {
         return message.contains(&format!("duplicate key name '{}'", index));
     }
     false
@@ -1077,7 +1079,7 @@ mod tests {
         assert!(problems.contains(&Problem::Checksum { version: 2 }));
         assert!(problems.contains(&Problem::Gap { version: 3 }));
         let newer = vec![LedgerRow { version: 99, name: String::new(), checksum: String::new(), success: true, execution_ms: 0 }];
-        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest: 22 }]);
+        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest: 23 }]);
     }
 
     #[test]

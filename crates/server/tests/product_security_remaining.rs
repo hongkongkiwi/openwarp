@@ -138,9 +138,13 @@ async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext(
     f.transit(&key, "rotate", OWNER, json!({}), 200).await;
     let latest = f.transit(&key, "encrypt", OWNER, json!({"plaintext":plain,"context":"remaining"}), 200).await;
     assert_eq!(latest["version"], 2);
-    f.expect(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(json!({"new_key":oc::b64(&[9;32])})), 200).await;
+    f.expect(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(json!({"new_key":oc::b64(&[9;32])})), 409).await;
+    for encrypted in [&original, &latest] {
+        let input = json!({"ciphertext":encrypted["ciphertext"],"context":"remaining"});
+        assert_eq!(f.transit(&key, "decrypt", OWNER, input, 200).await["plaintext"], plain, "refused rotation must preserve existing ciphertext");
+    }
     drop(f);
-    let reopened = database.fixture([9;32], false).await;
+    let reopened = database.fixture([7;32], false).await;
     for encrypted in [&original, &latest] {
         let input = json!({"ciphertext":encrypted["ciphertext"],"context":"remaining"});
         assert_eq!(reopened.transit(&key, "decrypt", OWNER, input, 200).await["plaintext"], plain, "fresh state must decrypt every transit version after master rotation");

@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use mysql_async::prelude::Queryable;
@@ -292,6 +292,29 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    /// Insert a meta row unless the key exists; true when this call created it.
+    /// MySQL has no ON CONFLICT, so a duplicate key there is the expected losing
+    /// branch while every other driver error still fails the caller.
+    pub async fn insert_if_absent(&self, k: &str, v: &str) -> Result<bool, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Db::Mysql(pool) = self {
+            let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+            return match client.exec_drop("INSERT INTO meta(k,v) VALUES(?,?)", mysql_params(&[json!(k), json!(v)])).await {
+                Ok(()) => Ok(true),
+                Err(mysql_async::Error::Server(e)) if e.code == 1062 => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Db::DoSqlite(s, _) = self;
+            s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
+            let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
+            Ok(changes["n"].as_u64() == Some(1))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }
+    }
     pub async fn rate_increment(&self, key: &str, current: i64, window: i64) -> Result<i64, String> {
         let cutoff = current - window;
         #[cfg(not(target_arch = "wasm32"))]
@@ -402,6 +425,55 @@ impl Db {
                     Ok(JsValue::UNDEFINED)
                 }) as Box<dyn FnMut() -> Result<JsValue, JsValue>>);
                 transaction.call1(raw, callback.as_ref()).map(|_| ()).map_err(|e| worker::Error::from(e).to_string())
+            }
+        }
+    }
+    // Serialize rotation claims and destructive cleanup on the same database row.
+    pub async fn rotation_batch(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)]) -> Result<bool,String> {
+        self.rotation_batch_checked(blocked, params, statements, &[]).await
+    }
+    pub async fn rotation_batch_checked(&self, blocked: &str, params: &[Value], statements: &[(String,Vec<Value>)], require_one: &[usize]) -> Result<bool,String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let checked = |index: usize, rows: u64| {
+            if require_one.contains(&index) && rows != 1 { Err("version conflict: concurrent lifecycle change".to_string()) } else { Ok(()) }
+        };
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Sqlite(c) => {
+                let mut conn=c.lock().unwrap(); let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                if !query_sqlite(&tx,blocked,params)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { checked(index,exec_sqlite(&tx,sql,p)?)?; }
+                tx.commit().map_err(|e| e.to_string())?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Postgres(pool) => {
+                let mut client=pool.get().await.map_err(|e| e.to_string())?; let tx=client.transaction().await.map_err(pg_err)?;
+                tx.query_one("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE",&[]).await.map_err(pg_err)?;
+                let pg=PgParams::new(params); let refs=pg.refs();
+                if !tx.query(pg_sql(blocked).as_str(),&refs).await.map_err(pg_err)?.is_empty() { return Ok(false); }
+                for (index,(sql,p)) in statements.iter().enumerate() { let pg=PgParams::new(p); let refs=pg.refs(); checked(index,tx.execute(pg_sql(sql).as_str(),&refs).await.map_err(pg_err)?)?; }
+                tx.commit().await.map_err(pg_err)?; Ok(true)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Db::Mysql(pool) => {
+                let mut client=pool.get_conn().await.map_err(|e| e.to_string())?;
+                let mut tx=client.start_transaction(mysql_async::TxOpts::default()).await.map_err(|e| e.to_string())?;
+                let result = async {
+                    let _: Option<String> = tx.query_first("SELECT v FROM meta WHERE k='rotation_lifecycle' FOR UPDATE").await.map_err(|e| e.to_string())?;
+                    let rows: Vec<mysql_async::Row> = tx.exec(mysql_sql(blocked),mysql_params(params)).await.map_err(|e| e.to_string())?;
+                    if !rows.is_empty() { return Ok(false); }
+                    for (index,(sql,p)) in statements.iter().enumerate() {
+                        tx.exec_drop(mysql_sql(sql),mysql_params(p)).await.map_err(|e| e.to_string())?;
+                        checked(index,tx.affected_rows())?;
+                    }
+                    Ok(true)
+                }.await;
+                match result { Ok(true) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(true) }, other => { let _ = tx.rollback().await; other } }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::DoSqlite(_, _) => {
+                if !self.query(blocked,params).await?.is_empty() { return Ok(false); }
+                self.batch_checked(statements,require_one).await?; Ok(true)
             }
         }
     }
@@ -639,10 +711,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 23, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 22, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 23, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }
