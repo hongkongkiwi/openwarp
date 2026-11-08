@@ -320,11 +320,14 @@ impl AppState {
         let token=bearer.map(str::to_string).unwrap_or_else(|| cookie_val(headers,"ow_session"));
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
         let hash = oc::hash_token(&token);
-        #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
-        if self.cache_revoked(&hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
         if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.is_none() {
             return Err(err(StatusCode::UNAUTHORIZED, "ow_session requires an account session")); }
-        if !cookie_only {
+        self.token_user_by_hash(&hash).await
+    }
+    // Credential check by hash alone: the live socket retains only the hash, never the raw header.
+    pub(crate) async fn token_user_by_hash(&self, hash: &str) -> Result<String, (StatusCode, Json<Value>)> {
+        #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
+        if self.cache_revoked(hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
         // OAuth 2.1 access tokens (CLI / MCP clients)
         if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await.map_err(|e| bad(&e))? {
             let uid = db::s(&row, "user_id");
@@ -341,9 +344,8 @@ impl AppState {
             if !revision.is_empty() && self.db.one("SELECT w.revision FROM workload_bindings w JOIN identities i ON i.id=w.identity_id AND i.org_id=w.org_id WHERE w.identity_id=? AND w.revision=?", &[json!(&uid),json!(revision)]).await.map_err(|_| err(StatusCode::UNAUTHORIZED,"workload trust unavailable"))?.is_none() { return Err(err(StatusCode::UNAUTHORIZED,"workload trust revoked")); }
             if !uid.is_empty() {
                 if !self.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "token owner is deactivated")); }
-                if db::n(&row, "last_used_at") + 60 < now() { let _ = self.db.exec("UPDATE tokens SET last_used_at=? WHERE token_hash=?", &[json!(now()), json!(&hash)]).await; }
+                if db::n(&row, "last_used_at") + 60 < now() { let _ = self.db.exec("UPDATE tokens SET last_used_at=? WHERE token_hash=?", &[json!(now()), json!(hash)]).await; }
                 return Ok(uid); }
-        }
         }
         let row = self.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid token"))?;
         if db::n(&row, "created_at") + 7 * 86400 < now() { let _ = self.db.exec("DELETE FROM sessions WHERE token_hash=?", &[json!(hash)]).await; return Err(err(StatusCode::UNAUTHORIZED, "session expired (7d); login again")); }
@@ -3648,6 +3650,7 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let lifecycle_guard=st.lifecycle.clone().write_owned().await;
     let uid = st.token_user(&h).await?;
@@ -3756,6 +3759,15 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     { let st2 = st.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={} saml={} hooks={}", counts.0, counts.1, counts.2, counts.3, counts.4, counts.5)).await;
     Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
+
+// The Workers build has no blocking runtime, rusqlite, or OCSP/CRL signing;
+// these instance and PKI routes answer 501 there.
+#[cfg(target_arch = "wasm32")]
+async fn rotate_master(State(_): State<S>, _: HeaderMap, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
+#[cfg(target_arch = "wasm32")]
+async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
+#[cfg(target_arch = "wasm32")]
+async fn ca_crl() -> Response { err(StatusCode::NOT_IMPLEMENTED, "CRL generation requires the native server").into_response() }
 
 // ---------- SCIM groups + user lifecycle ----------
 async fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
@@ -4404,7 +4416,7 @@ async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes
     // table once instead of doing a database lookup per certificate.
     let certs = st.db.query("SELECT serial,revoked,revoked_at FROM pki_certs WHERE ca_id=?", &[json!(&caid)]).await.unwrap_or_default();
     let status: HashMap<String, (bool, i64)> = certs.iter().map(|r| (db::s(r, "serial").to_lowercase(), (db::n(r, "revoked") == 1, db::n(r, "revoked_at")))).collect();
-    let response = match responder.respond(&request, |cert_id| {
+    let response = match responder.respond_at(&request, |cert_id| {
         let serial = cert_id.serial_hex().to_lowercase();
         match status.get(&serial) {
             Some((true, at)) => keystore_ocsp::CertStatus::Revoked { revocation_time: if *at > 0 { *at } else { now() }, reason: None },
@@ -5950,9 +5962,11 @@ async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receive
         }
         if !full { break; }
     }
+    // Revalidate by hash on a timer too: a revoked token must close the socket even while the stream is quiet.
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
-            _ = auth_tick.tick() => { if st.token_user(&h).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
+            _ = auth_tick.tick() => { if st.live_identity(&admission).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,
