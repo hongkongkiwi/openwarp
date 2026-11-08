@@ -38,6 +38,10 @@ A workspace owner can use Delete workspace in Settings after typing its exact na
 
 ## Workspaces and applications
 
+The sidebar offers New workspace when creation is enabled and Join workspace regardless of that policy. Accounts with no workspaces see these recovery actions instead of application controls and can still open account and instance Settings. Workspace Settings offers rename and leave; the last owner must transfer ownership before leaving.
+
+Members & access issues invitations for both existing and new accounts, without adding membership immediately. Share the returned link securely. The preview names the workspace, email, role and expiry. Existing accounts must sign in with the invited account and choose Join workspace; a different signed-in account must sign out first. New invitees can create a client-derived account or sign in with a configured provider, then explicitly join. Provider sign-in alone does not consume a pending social invitation. Pending invitations can be revoked or resent; resend rotates the token, invalidating the previous link and starting a new seven-day lifetime. The console displays a link for manual delivery, not an email delivery confirmation.
+
 Select the workspace before changing membership or application data. Create an application from Apps and give it a descriptive name. Application readme content can record ownership, purpose, and operational notes; do not put plaintext credentials there.
 
 New applications include Development, Staging, and Production environments. Custom environment names support letters, digits, hyphens, and underscores, up to 32 characters. Application and environment IDs are separate from these names. The CLI's discovery commands return IDs for automation.
@@ -131,7 +135,7 @@ Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certifica
 
 Register hosts here too: a host certificate is only issued for a hostname and public key pair an admin registered, because a host certificate is exactly as trustworthy as the key it names. Removing a registration is how a host key is rotated. Revoking records the certificate, but a host enforces it only after refreshing its `RevokedKeys` file, served here as both the plain list and an OpenSSH KRL.
 
-Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
+Closing signups and disabling workspace creation are separate instance-owner policies. Inviting members is a workspace action and remains available when either policy is closed. `OPENWARP_SIGNUPS` and `OPENWARP_WORKSPACE_CREATION` lock their respective console toggles. The last workspace cannot be deleted while creation is disabled; reopen creation first. The API refuses to disable creation on an empty instance so a signed-in account can create a replacement workspace.
 
 ## Device certificates without a TPM
 

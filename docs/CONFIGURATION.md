@@ -47,10 +47,13 @@ The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap resp
 | Variable | Default | Behavior |
 | --- | --- | --- |
 | `OPENWARP_SIGNUPS` | Stored instance policy; initially open | `open` or `closed` pins the policy and overrides the console toggle |
+| `OPENWARP_WORKSPACE_CREATION` | Stored instance policy; initially open | Pins workspace creation independently of signup. `closed`, `invite`, `invite_only`, `disabled`, `0` and `false` disable it (case-insensitive); other values enable it. Native environment and Worker bindings use the same setting. |
 | `OPENWARP_EMAIL_WEBHOOK` | Unset | HTTP relay receiving `{to,subject,text}` for account mail |
 | `OPENWARP_EMAIL_TOKEN` | Unset | Optional bearer authentication for the mail relay |
 
 Password signups always require a verified email address: registration issues no session until the link is opened, and the first verified account claims instance ownership. Emails asserted by a configured identity provider (Google, GitHub, Apple, OpenAI, workspace OIDC, SAML, an accepted invite or SCIM) are treated as verified and do not trigger a second round-trip. Without a mail provider the server still starts: outside production it writes verification and reset links to its log, while a production server refuses new password signups and leaves SSO sign-in available. Set the public URL before sending account links. Forgot-password responses are intentionally generic and do not prove message delivery.
+
+Without the override, the instance owner changes workspace creation in Settings or with `PUT /api/instance/workspaces` and `{"open":false}`. `GET /api/instance` reports `workspace_creation_open` and `workspace_creation_env_locked`; the public `GET /api/auth/providers` reports the effective creation policy. Closing creation suppresses personal workspaces for password and social registration, including the first account, but does not disable signup or invitation acceptance. Login never recreates a deleted workspace. The API refuses to close creation with no workspaces, or delete the last workspace while creation is closed. If an operator pins creation closed on an empty database, change the deployment setting to bootstrap a workspace.
 
 ## Social authentication
 

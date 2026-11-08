@@ -103,13 +103,19 @@ plus unique names, on every apply.
   trusts, transit, the audit chain, wrap tokens, emergency lockdown, and the
   main 22 objects), the complete device schema, and the lifecycle meta guard. A
   database that already carries an object keeps it and its data.
+- Version 29 restores the workspace-policy schema PR7's former inline migration
+  18 carried before the engine merge: the invitation management id and inviter
+  columns on `invites`, the `idx_invites_id` unique index, and the guarded
+  `workspace_policy_lock` and `workspace_creation_open` meta rows. It is
+  tolerant: a database that already ran the inline original keeps its columns.
 
-New migrations start at version 29. SQL files 1 through 23 remain unchanged.
+New migrations start at version 30. SQL files 1 through 28 remain unchanged.
 Legacy main version 17 through 27 ledger rows have no checksum and remain
-unverified. A legacy main version 22 database applies versions 23 through 28; a
-legacy main version 23 database applies versions 24 through 28; each later main
-version applies the remaining tail, so a main version 27 database executes only
-version 28. An engine version 20 database applies versions 21 through 28. The
+unverified. A legacy main version 22 database applies versions 23 through 29; a
+legacy main version 23 database applies versions 24 through 29; each later main
+version applies the remaining tail, so a main version 27 database executes
+versions 28 and 29. An engine version 20 database applies versions 21 through
+29. The
 runner records checksums only for the new reconciliation files it actually
 executes, without relabelling occupied legacy versions.
 
