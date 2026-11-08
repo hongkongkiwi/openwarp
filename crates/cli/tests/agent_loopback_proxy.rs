@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
@@ -27,12 +27,17 @@ impl Mock {
         let worker = thread::spawn(move || { while !s.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    // Accepted sockets inherit the listener's O_NONBLOCK on macOS and Linux; read blocking
+                    // and serve only complete heads, so a losing first-write race cannot fabricate empty requests.
+                    // The 30s read timeout is a hang guard only; it exceeds the agent's 15s client timeout.
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
                     stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut request = Vec::new(); let mut buf = [0; 1024];
                     while !request.windows(4).any(|w| w == b"\r\n\r\n") {
                         match stream.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&buf[..n]) }
                     }
+                    if !request.windows(4).any(|w| w == b"\r\n\r\n") { continue; } // preconnect or truncated head: no request to record or answer
                     q.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
                     // The proxy records and answers locally; it never forwards traffic.
                     let body = r#"{"secrets":[{"key":"KEY","path":"/","value":"rendered-secret","type":"secret"}]}"#;
@@ -89,4 +94,28 @@ fn agent_loopback_http_bypasses_environment_proxies_without_leaking_bearer() {
     assert!(proxy_requests.is_empty(), "loopback agent request reached the environment proxy, exposing its bearer: {proxy_requests:?}");
     assert_direct(&direct_requests);
     assert_rendered(&temp, &output);
+}
+
+#[test]
+fn agent_loopback_mock_serves_complete_requests_and_ignores_abandoned_connections() {
+    let mock = Mock::new();
+    let addr = mock.host.trim_start_matches("http://").to_string();
+    // Abandoned connection (preconnect or killed client) is not a request.
+    { let _ = TcpStream::connect(&addr).unwrap(); }
+    // Truncated head (client died mid-request) is not a request either.
+    { let mut stream = TcpStream::connect(&addr).unwrap(); stream.write_all(b"GET /api/envs/env-test/export?base=1 HT").unwrap(); }
+    // A slow-but-complete request is recorded and answered once its head arrives.
+    let sender = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        stream.write_all(b"GET /api/envs/env-test/export?base=1 HTTP/1.1\r\nAuthorization: Bearer loopback-proxy-dummy-token\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "mock did not answer the completed request");
+    });
+    sender.join().unwrap();
+    let requests = mock.take_requests();
+    assert_eq!(requests.len(), 1, "only the completed request may be recorded: {requests:?}");
+    assert!(requests[0].starts_with("GET /api/envs/env-test/export?base=1 HTTP/1.1\r\n"), "unexpected recorded request: {requests:?}");
 }

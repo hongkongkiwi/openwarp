@@ -171,6 +171,100 @@ async fn register(s: &Server, email: &str) -> Resp {
     Resp { status: login.status, text: login.text, body, headers: login.headers }
 }
 
+#[tokio::test]
+async fn personal_secret_health_requires_session_consent_and_isolates_encrypted_keys() {
+    let s = Server::start().await;
+    let path = "/api/me/secret-health";
+    assert_eq!(s.get(path).await.status, 401);
+    assert_eq!(s.call(Method::PUT, path, None, Some(json!({"api_key":null}))).await.status, 401);
+    let a = register(&s, "health-a@example.test").await;
+    let b = register(&s, "health-b@example.test").await;
+    let at = a.body["token"].as_str().unwrap(); let bt = b.body["token"].as_str().unwrap();
+    let key = "0123456789abcdef0123456789abcdef";
+    let saved = s.call(Method::PUT, path, Some(at), Some(json!({"api_key":key}))).await;
+    assert_eq!(saved.status, 200, "{}", saved.text);
+    assert_eq!(saved.body, json!({"api_key_set":true}));
+    assert!(!saved.text.contains(key));
+    assert_eq!(s.call(Method::GET, path, Some(bt), None).await.body, json!({"api_key_set":false}));
+    assert_eq!(s.call(Method::GET, path, Some(at), None).await.body, json!({"api_key_set":true}));
+    let db = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    db.execute("INSERT INTO tokens(id,name,token_hash,created_at) VALUES('health-service','health',?,0)", [openwarp_crypto::hash_token("health-service-fixture")]).unwrap();
+    db.execute("INSERT INTO oauth_tokens(token_hash,client_id,user_id,expires_at,created_at,scope,resource) VALUES(?,'health-client',?,9999999999,0,'secrets:read secrets:write',?)", [openwarp_crypto::hash_token("health-oauth-fixture"), a.body["user_id"].as_str().unwrap().to_string(), s.base.clone()]).unwrap();
+    for token in ["health-service-fixture", "health-oauth-fixture"] {
+        assert_eq!(s.call(Method::GET, path, Some(token), None).await.status, 401);
+        assert_eq!(s.call(Method::PUT, path, Some(token), Some(json!({"api_key":null}))).await.status, 401);
+        assert_eq!(s.call(Method::POST, "/api/me/secret-health/email", Some(token), Some(json!({"email":"fixture@example.test","consent":true}))).await.status, 401);
+    }
+    let stored: String = db.query_row("SELECT v FROM meta WHERE k=?", [format!("hibp_api_key:{}", a.body["user_id"].as_str().unwrap())], |r| r.get(0)).unwrap();
+    assert_ne!(stored, key); assert!(!stored.contains(key));
+    let master: String = db.query_row("SELECT v FROM meta WHERE k='master'", [], |r| r.get(0)).unwrap();
+    let master: [u8;32] = openwarp_crypto::unb64(&master).unwrap().try_into().unwrap();
+    assert_eq!(openwarp_crypto::decrypt_symmetric(&master, &stored).unwrap(), key.as_bytes());
+    let cross = s.client.put(s.url(path)).bearer_auth(at).header("origin", "https://untrusted.example").json(&json!({"api_key":null})).send().await.unwrap();
+    assert_eq!(cross.status().as_u16(), 403);
+    for body in [json!({"email":"fixture@example.test"}), json!({"email":"fixture@example.test","consent":"true"}), json!({"email":"invalid","consent":true})] {
+        assert_eq!(s.call(Method::POST, "/api/me/secret-health/email", Some(at), Some(body)).await.status, 400);
+    }
+    assert_eq!(s.call(Method::POST, "/api/me/secret-health/email", Some(bt), Some(json!({"email":"fixture@example.test","consent":true}))).await.status, 400);
+    assert_eq!(s.call(Method::PUT, path, Some(at), Some(json!({"api_key":null}))).await.body, json!({"api_key_set":false}));
+    assert_eq!(s.call(Method::GET, path, Some(at), None).await.body, json!({"api_key_set":false}));
+}
+
+#[tokio::test]
+async fn personal_enzoic_and_leakcheck_boundaries_without_provider_calls() {
+    let s = Server::start().await;
+    let settings = "/api/me/secret-health/enzoic";
+    let password = "/api/me/secret-health/enzoic/password";
+    let leakcheck = "/api/me/secret-health/leakcheck";
+    for path in [settings, password, leakcheck] { assert_eq!(s.call(Method::POST, path, None, Some(json!({}))).await.status, if path == settings { 405 } else { 401 }); }
+    assert_eq!(s.get(settings).await.status, 401);
+    let a = register(&s, "enzoic-a@example.test").await;
+    let b = register(&s, "enzoic-b@example.test").await;
+    let at = a.body["token"].as_str().unwrap(); let bt = b.body["token"].as_str().unwrap();
+    let credentials = json!({"api_key":"fixture-enzoic-key","api_secret":"fixture-enzoic-secret"});
+    assert_eq!(s.call(Method::PUT, settings, Some(at), Some(credentials.clone())).await.body, json!({"configured":true}));
+    assert_eq!(s.call(Method::GET, settings, Some(bt), None).await.body, json!({"configured":false}));
+    assert_eq!(s.call(Method::GET, "/api/me/secret-health", Some(at), None).await.body, json!({"api_key_set":false}));
+    let db = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let stored: String = db.query_row("SELECT v FROM meta WHERE k=?", [format!("enzoic_credentials:{}", a.body["user_id"].as_str().unwrap())], |r| r.get(0)).unwrap();
+    assert!(!stored.contains("fixture-enzoic"));
+    let master: String = db.query_row("SELECT v FROM meta WHERE k='master'", [], |r| r.get(0)).unwrap();
+    let master: [u8;32] = openwarp_crypto::unb64(&master).unwrap().try_into().unwrap();
+    let plaintext = openwarp_crypto::decrypt_symmetric(&master, &stored).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&plaintext).unwrap(), credentials);
+    db.execute("INSERT INTO tokens(id,name,token_hash,created_at) VALUES('enzoic-service','health',?,0)", [openwarp_crypto::hash_token("enzoic-service-fixture")]).unwrap();
+    db.execute("INSERT INTO oauth_tokens(token_hash,client_id,user_id,expires_at,created_at,scope,resource) VALUES(?,'enzoic-client',?,9999999999,0,'secrets:read secrets:write',?)", [openwarp_crypto::hash_token("enzoic-oauth-fixture"), a.body["user_id"].as_str().unwrap().to_string(), s.base.clone()]).unwrap();
+    for token in ["enzoic-service-fixture", "enzoic-oauth-fixture"] {
+        assert_eq!(s.call(Method::GET, settings, Some(token), None).await.status, 401);
+        assert_eq!(s.call(Method::PUT, settings, Some(token), Some(credentials.clone())).await.status, 401);
+        for path in [password, leakcheck] { assert_eq!(s.call(Method::POST, path, Some(token), Some(json!({"consent":true}))).await.status, 401); }
+    }
+    for path in [settings, password, leakcheck] {
+        let method = if path == settings { Method::PUT } else { Method::POST };
+        let response = s.client.request(method, s.url(path)).bearer_auth(at).header("origin", "https://untrusted.example").json(&json!({})).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 403);
+    }
+    for body in [json!({"prefix":"0123456789"}), json!({"prefix":"0123456789","consent":"true"}), json!({"prefix":"A123456789","consent":true}), json!({"prefix":"a".repeat(64),"consent":true}), json!({"prefix":"0123456789","consent":true,"password":"forbidden"})] {
+        assert_eq!(s.call(Method::POST, password, Some(at), Some(body)).await.status, 400);
+    }
+    assert_eq!(s.call(Method::POST, password, Some(bt), Some(json!({"prefix":"0123456789","consent":true}))).await.status, 400);
+    for body in [json!({"email_hash":"a".repeat(24)}), json!({"email_hash":"A".repeat(24),"consent":true}), json!({"email_hash":"a".repeat(64),"consent":true}), json!({"email_hash":"a".repeat(24),"consent":true,"email":"forbidden@example.test"})] {
+        assert_eq!(s.call(Method::POST, leakcheck, Some(at), Some(body)).await.status, 400);
+    }
+    for body in [json!({"api_key":null,"api_secret":"partial"}), json!({"api_key":"key"}), json!({"api_key":"key:invalid","api_secret":"secret"})] {
+        assert_eq!(s.call(Method::PUT, settings, Some(at), Some(body)).await.status, 400);
+    }
+    // Pre-exhaust both quota paths so no real provider is contacted.
+    for key in [format!("enzoic:{}", a.body["user_id"].as_str().unwrap()), format!("leakcheck:{}", a.body["user_id"].as_str().unwrap()), "leakcheck:instance".to_string()] {
+        db.execute("INSERT INTO rate_limits(key,window_start,count) VALUES(?,9999999999,1)", [key]).unwrap();
+    }
+    assert_eq!(s.call(Method::POST, password, Some(at), Some(json!({"prefix":"0123456789","consent":true}))).await.status, 429);
+    assert_eq!(s.call(Method::POST, leakcheck, Some(at), Some(json!({"email_hash":"a".repeat(24),"consent":true}))).await.status, 429);
+    assert_eq!(s.call(Method::POST, leakcheck, Some(bt), Some(json!({"email_hash":"b".repeat(24),"consent":true}))).await.status, 429);
+    assert_eq!(s.call(Method::PUT, settings, Some(at), Some(json!({"api_key":null,"api_secret":null}))).await.body, json!({"configured":false}));
+    assert_eq!(s.call(Method::GET, settings, Some(at), None).await.body, json!({"configured":false}));
+}
+
 fn query_param(location: &str, key: &str) -> String {
     location.split_once('?').map(|(_, q)| q).unwrap_or("")
         .split('&').filter_map(|kv| kv.split_once('='))

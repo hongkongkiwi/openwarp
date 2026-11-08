@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
@@ -44,12 +44,17 @@ impl Mock {
             while !s.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        // Accepted sockets inherit the listener's O_NONBLOCK on macOS and Linux; read blocking
+                        // and serve only complete heads, so a losing first-write race cannot fabricate empty requests.
+                        // The 30s read timeout is a hang guard only; it exceeds the agent's 15s client timeout.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
                         let mut request = Vec::new();
                         let mut buf = [0; 1024];
                         while !request.windows(4).any(|w| w == b"\r\n\r\n") {
                             match stream.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&buf[..n]) }
                         }
+                        if !request.windows(4).any(|w| w == b"\r\n\r\n") { continue; } // preconnect or truncated head: no request to record or answer
                         q.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
                         let (status, body) = {
                             let mut replies = r.lock().unwrap();
@@ -229,4 +234,26 @@ fn agent_documents_thirty_second_interval_and_cache_defaults() {
         let line = help.lines().find(|line| line.contains(flag)).unwrap_or_else(|| panic!("missing {flag}"));
         assert!(line.contains("[default: 30]"), "missing 30-second default for {flag}: {line}");
     }
+}
+
+#[test]
+fn agent_mock_serves_complete_requests_and_ignores_abandoned_connections() {
+    let mock = Mock::new(secrets());
+    let addr = mock.host.trim_start_matches("http://").to_string();
+    // Abandoned connection (preconnect or killed client) is not a request.
+    { let _ = TcpStream::connect(&addr).unwrap(); }
+    // Truncated head (client died mid-request) is not a request either.
+    { let mut stream = TcpStream::connect(&addr).unwrap(); stream.write_all(b"GET /api/envs/env-test/export?base=1 HT").unwrap(); }
+    // A slow-but-complete request is recorded and answered once its head arrives.
+    let sender = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        stream.write_all(b"GET /api/envs/env-test/export?base=1 HTTP/1.1\r\nAuthorization: Bearer agent-test-token\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "mock did not answer the completed request");
+    });
+    sender.join().unwrap();
+    mock.assert_export();
 }
