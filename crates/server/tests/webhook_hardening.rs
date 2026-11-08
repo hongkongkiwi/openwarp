@@ -104,7 +104,7 @@ fn outgoing()->Value {json!({"url":"https://example.invalid/never","events":["ne
 async fn oauth_cookie_never_gains_workspace_admin_or_rest_audience() {
     let s=Server::start().await; let u=s.register("cookie-oauth@test.invalid").await; let t=u["token"].as_str().unwrap(); let org=u["org_id"].as_str().unwrap();
     let list=format!("/api/orgs/{org}/webhooks"); let sub=good(s.request(Method::POST,&list,t,true,Some(outgoing())).await);
-    let rest_read=s.oauth(t,"secrets:read","/api").await; let mcp_admin=s.oauth(t,"secrets:read secrets:write org:admin","/mcp").await;
+    let rest_read=s.oauth(t,"secrets:read","").await; let mcp_admin=s.oauth(t,"secrets:read secrets:write org:admin","/mcp").await;
     let mut failures=Vec::new();
     for (label,token) in [("read-only REST",rest_read),("MCP audience",mcp_admin)] {
         for path in [list.clone(),format!("/api/webhooks/{}/rotate",id(&sub))] {
@@ -119,7 +119,7 @@ async fn oauth_cookie_never_gains_workspace_admin_or_rest_audience() {
 #[tokio::test]
 async fn readonly_api_oauth_lists_existing_org_apps_without_webhook_admin_scope() {
     let s=Server::start().await; let u=s.register("readonly-apps@test.invalid").await; let t=u["token"].as_str().unwrap(); let org=u["org_id"].as_str().unwrap();
-    let (aid,_)=s.app(t,org).await; let token=s.oauth(t,"secrets:read","/api").await;
+    let (aid,_)=s.app(t,org).await; let token=s.oauth(t,"secrets:read","").await;
     let apps=good(s.call(Method::GET,&format!("/api/orgs/{org}/apps"),&token,None).await);
     assert!(apps.as_array().unwrap().iter().any(|v|v["id"]==aid));
     let hooks=s.call(Method::GET,&format!("/api/orgs/{org}/webhooks"),&token,None).await;

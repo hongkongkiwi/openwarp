@@ -66,7 +66,7 @@ Browser login keeps the existing default scopes. Workspace administration requir
 openwarp login --scope 'secrets:read secrets:write org:admin'
 ```
 
-The CLI requests the `/api` OAuth audience for REST operations. A hosted MCP access token has a different audience and is not interchangeable. Credentials saved by an older CLI that requested the MCP audience need a new browser login; refreshing the old token retains its old audience. Generic JSON requests do not replace browser sign-in, local encryption or protocol endpoints outside `/api`.
+The CLI discovers and requests the server's issuer OAuth audience for REST operations. A hosted MCP access token has a different audience and is not interchangeable. Credentials saved by an older CLI that requested the MCP audience need a new browser login; refreshing the old token retains its old audience. Generic JSON requests do not replace browser sign-in, local encryption or protocol endpoints outside `/api`.
 
 ## Project selection
 

@@ -17,6 +17,7 @@ impl Server {
         let mail=Arc::new(Mutex::new(Vec::new())); let sink=mail.clone(); let stop=Arc::new(AtomicBool::new(false)); let done=stop.clone();
         let thread=std::thread::spawn(move || { while !done.load(Ordering::SeqCst) {
             let (mut stream,_)=match relay.accept() {Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(5));continue;},Err(e)=>panic!("mail accept: {e}")};
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); let mut bytes=Vec::new(); let mut buf=[0;8192];
             loop {
                 let n=match stream.read(&mut buf){Ok(n)=>n,Err(e) if matches!(e.kind(),std::io::ErrorKind::TimedOut|std::io::ErrorKind::WouldBlock)=>break,Err(e)=>panic!("mail read: {e}")};

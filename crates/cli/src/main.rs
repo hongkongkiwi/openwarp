@@ -396,18 +396,20 @@ fn main() {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port for the OAuth redirect");
             let port = listener.local_addr().expect("loopback address").port();
             let redirect = format!("http://127.0.0.1:{}/callback", port);
+            let metadata: Value = client.get(format!("{}/.well-known/oauth-authorization-server", host)).send().expect("OAuth metadata").error_for_status().expect("OAuth metadata status").json().expect("OAuth metadata JSON");
+            let resource = metadata["issuer"].as_str().expect("OAuth issuer").to_string();
             let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":scope})).send().expect("req").json().expect("json");
             let cid = reg["client_id"].as_str().expect("client_id").to_string();
             let verifier = openwarp_crypto::random_token("verifier");
             let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
             let state = openwarp_crypto::random_token("state");
-            let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", host.trim_end_matches('/'))).expect("OAuth host");
-            url.query_pairs_mut().extend_pairs([("response_type", "code"), ("client_id", cid.as_str()), ("redirect_uri", redirect.as_str()),
-                ("scope", scope.as_str()), ("state", state.as_str()), ("code_challenge", challenge.as_str()), ("code_challenge_method", "S256"),
-                ("resource", format!("{}/api", host.trim_end_matches('/')).as_str())]);
+            let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", host)).expect("OAuth authorization URL");
+            url.query_pairs_mut().append_pair("response_type", "code").append_pair("client_id", &cid).append_pair("redirect_uri", &redirect)
+                .append_pair("scope", scope.as_str()).append_pair("state", &state).append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256").append_pair("resource", &resource);
             let url = url.to_string();
             println!("Open this URL to sign in and approve:\n{}", url);
-            let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(&url).status();
+            let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url.as_str()).status();
             let (mut stream, _) = listener.accept().expect("callback");
             let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
             let mut request_line = String::new(); { use std::io::BufRead; let _ = reader.read_line(&mut request_line); let mut line = String::new(); loop { line.clear(); match reader.read_line(&mut line) { Ok(0) => break, Ok(_) if line == "\r\n" || line == "\n" => break, Ok(_) => continue, Err(_) => break } } }

@@ -51,9 +51,9 @@ Accounts can participate in multiple workspaces. Workspace membership and instan
 
 ## Database adapter
 
-The database abstraction uses SQLite or PostgreSQL behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. Startup performs schema setup through the adapter.
+The database abstraction uses SQLite, PostgreSQL or MySQL/MariaDB behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. MySQL keeps `?` and rewrites the canonical DDL where its rules differ: keyed or indexed `TEXT` columns become `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX` loses `IF NOT EXISTS`, and tables use a binary collation. Startup performs schema setup through the adapter.
 
-The adapter uses synchronous connections protected by mutexes, with PostgreSQL work moved through threads. This is not a claim of connection-pool or throughput characteristics. PostgreSQL currently connects with `NoTls`, so transport security must be addressed in deployment.
+SQLite uses a synchronous connection behind a mutex; PostgreSQL and MySQL/MariaDB use async pools (`deadpool-postgres`, `mysql_async`). This is not a claim of throughput characteristics. The PostgreSQL client does not enable TLS, and the MySQL/MariaDB client enables it only when the URL requests `require_ssl=true`, so transport security must be addressed in deployment.
 
 Redis is an optional session cache. The database remains authoritative for persistent application state. Rate-limit state is stored in the database rather than solely in process memory.
 
