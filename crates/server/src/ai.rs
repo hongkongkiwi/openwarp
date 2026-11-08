@@ -360,7 +360,7 @@ mod tests {
         conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on MySQL");
-        assert_eq!(db.version().await.unwrap(),19);
+        assert_eq!(db.version().await.unwrap(),29);
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
         let outcome=tokio::spawn(assert_database_ai(st)).await;
@@ -377,7 +377,7 @@ mod tests {
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let outcome=tokio::spawn(async move {
             let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
-            assert_eq!(db.version().await.unwrap(),19);
+            assert_eq!(db.version().await.unwrap(),29);
             let (live,_)=tokio::sync::broadcast::channel(4);
             let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
             assert_database_ai(st).await;
