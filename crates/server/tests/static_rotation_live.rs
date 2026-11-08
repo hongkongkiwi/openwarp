@@ -97,9 +97,10 @@ async fn live_static_rotation_changes_postgres_login_and_matches_sse_secret() {
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone();
+    let f = Fixture::new().await;
     let result = async move {
         assert!(worker.authenticates(OLD).await, "old credential positive control");
-        let f = Fixture::new().await; let rid = f.schedule(&url,&worker.name).await;
+        let rid = f.schedule(&url,&worker.name).await;
         f.run(&rid).await;
         let password = f.value().await; assert_ne!(password, OLD);
         assert!(worker.authenticates(&password).await, "stored SSE password cannot authenticate");
@@ -117,8 +118,9 @@ async fn live_remote_success_local_failure_retains_same_pending_password_until_r
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone(); let connection = url.clone();
+    let f = Fixture::new().await;
     let outcome = tokio::spawn(async move {
-        let f = Fixture::new().await; let rid = f.schedule(&connection,&worker.name).await;
+        let rid = f.schedule(&connection,&worker.name).await;
         f.state.db().exec("CREATE TRIGGER reject_static_secret BEFORE UPDATE ON secrets BEGIN SELECT RAISE(ABORT,'injected local store failure'); END", &[]).await.unwrap();
         f.run(&rid).await;
         let pending = f.pending(&rid).await; assert!(!pending.is_empty(), "remote/local failure lost durable pending state");
@@ -145,8 +147,8 @@ async fn live_static_schedule_and_execution_reject_client_encrypted_sealed_and_d
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone();
+    let f = Fixture::new().await;
     let outcome = tokio::spawn(async move {
-        let f = Fixture::new().await;
         let rid = f.schedule(&url,&worker.name).await;
         let input = json!({"key":"DB_PASSWORD","interval_secs":3600,"config":{"kind":"postgres-static","connection":url,"username":worker.name}});
         for mode in ["e2e","delegated"] {
