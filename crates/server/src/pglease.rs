@@ -32,6 +32,7 @@ pub fn validate_static(conn: &str, username: &str) -> Result<(), String> {
     if !(conn.starts_with("postgres://") || conn.starts_with("postgresql://")) { return Err("postgres-static requires a PostgreSQL URL".into()); }
     let config: tokio_postgres::Config = conn.parse().map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
     if config.get_hosts().len()!=1 || !config.get_hostaddrs().is_empty() || config.get_ports().len()>1 || config.get_user().is_none_or(str::is_empty) || config.get_password().is_none_or(|p| p.is_empty()) { return Err("postgres-static requires one TCP host and explicit admin credentials; hostaddr is not allowed".into()); }
+    if config.get_user() == Some(username) { return Err("postgres-static admin and target usernames must differ".into()); }
     let host = match &config.get_hosts()[0] { tokio_postgres::config::Host::Tcp(h) => h, #[cfg(unix)] _ => return Err("Unix sockets are not allowed".into()) };
     let port = config.get_ports().first().copied().unwrap_or(5432);
     // Prefer is the driver default and silently retries without TLS. Require is

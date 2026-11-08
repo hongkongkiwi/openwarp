@@ -91,6 +91,8 @@ async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String>
         } else {
             let k = local.unwrap_or_else(oc::random_key);
             let wrapped = kms.wrap(&k, "master")?;
+            let verified = kms.unwrap(&wrapped, "master").map_err(|e| format!("KMS root roundtrip failed: {}", e))?;
+            if verified.as_slice() != k { return Err("KMS root roundtrip returned a different key; refusing to persist it".into()); }
             // The insert is atomic and portable across SQLite, PostgreSQL and
             // MySQL. A losing concurrent first boot adopts the stored winner
             // before writing anything encrypted by this process.

@@ -168,6 +168,15 @@ async fn transit_lifecycle(database: &Database, f: Fixture, other: Fixture, name
     let old = json!({"ciphertext":original["ciphertext"],"context":"portable-context"});
     let new = json!({"ciphertext":latest["ciphertext"],"context":"portable-context"});
     assert_eq!(f.transit(&key, "decrypt", old.clone()).await["plaintext"], plain);
+    if database.schema.is_some() {
+        f.expect(Method::POST, "/api/instance/rotate-master", OWNER, Some(json!({"new_key":oc::b64(&[9;32])})), 409).await;
+        assert_eq!(f.transit(&key, "decrypt", old.clone()).await["plaintext"], plain);
+        drop(f); drop(other);
+        let restarted = Fixture::open(database, [7;32], false, namespace).await;
+        assert_eq!(restarted.transit(&key, "decrypt", old).await["plaintext"], plain, "refused rotation preserves the original root across restart");
+        assert_eq!(restarted.transit(&key, "decrypt", new).await["plaintext"], plain);
+        return;
+    }
     f.expect(Method::POST, "/api/instance/rotate-master", OWNER, Some(json!({"new_key":oc::b64(&[9;32])})), 200).await;
     drop(f); drop(other);
     let restarted = Fixture::open(database, [9;32], false, namespace).await;

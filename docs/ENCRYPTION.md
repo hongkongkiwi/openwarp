@@ -98,7 +98,9 @@ POST {OPENWARP_KMS_URL}/unwrap
 `context` to the provider's encryption context (AWS KMS), additional
 authenticated data (GCP KMS), or the equivalent. `OPENWARP_KMS_KEY_ID` is stored
 with each wrapped value so a key rotation can still unwrap old data; run
-`POST /api/instance/rewrap` as the instance owner after switching key IDs.
+`POST /api/instance/rewrap` as the instance owner after switching key IDs. It
+rewraps the persisted root and available environment keys, verifies their unwrap
+roundtrips, then commits the updates together without changing the root itself.
 
 The bridge URL may be `http://` as well as `https://`. With plain HTTP, the
 wrap requests and unwrap responses carry plaintext root or environment keys
@@ -109,8 +111,9 @@ needs.
 
 A fresh KMS deployment stores only `meta.kms_root`; the database then has no
 usable root key. An existing deployment that already has `meta.master` adopts
-that key under the KMS on first boot, stores the same root as `kms_root` and
-deletes the plaintext `meta.master` row. TOTP secrets, OIDC client secrets, PKI
+that key under the KMS on first boot, verifies that the candidate wrapped blob
+unwraps to the same root, stores it as `kms_root` and deletes the plaintext
+`meta.master` row. A failed roundtrip leaves the plaintext root intact. TOTP secrets, OIDC client secrets, PKI
 keys, lockbox values and environment keys all use that same root, so no record
 needs re-encryption. Back up the KMS key: removing it makes the data unreadable
 unless `OPENWARP_MASTER_KEY` still holds the same key.

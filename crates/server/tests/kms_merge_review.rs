@@ -298,11 +298,17 @@ impl Drop for PgDb {
 
 /// Derive a database URL from an admin URL that already names a database.
 fn derive_db_url(admin_url: &str, name: &str) -> String {
-    let base = admin_url.split('?').next().unwrap_or(admin_url);
+    let (base, query) = admin_url.split_once('?').map(|(base, query)| (base, format!("?{}", query))).unwrap_or((admin_url, String::new()));
     match base.rfind('/') {
-        Some(index) => format!("{}/{}", &base[..index], name),
-        None => format!("{}/{}", base, name),
+        Some(index) => format!("{}/{}{}", &base[..index], name, query),
+        None => format!("{}/{}{}", base, name, query),
     }
+}
+
+#[test]
+fn database_url_replacement_preserves_query_options() {
+    assert_eq!(derive_db_url("mysql://root:pw@127.0.0.1/mysql?ssl-mode=REQUIRED", "test_db"), "mysql://root:pw@127.0.0.1/test_db?ssl-mode=REQUIRED");
+    assert_eq!(derive_db_url("postgres://u:p@127.0.0.1/postgres?sslmode=disable&connect_timeout=5", "test_db"), "postgres://u:p@127.0.0.1/test_db?sslmode=disable&connect_timeout=5");
 }
 
 #[tokio::test]

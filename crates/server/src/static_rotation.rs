@@ -3,7 +3,10 @@ use super::*;
 pub(super) async fn execute(st: &S, due: &Row) {
     if cfg!(target_arch="wasm32") { return; }
     let rid=db::s(due,"id"); let token=id(); let current=now();
-    let claimed=st.db.rotation_batch("SELECT 1 AS blocked WHERE NOT EXISTS (SELECT id FROM rotation_schedules WHERE id=? AND enabled=1 AND next_run<=? AND execution_token='')", &[json!(rid),json!(current)], &[("UPDATE rotation_schedules SET execution_token=?,next_run=? WHERE id=?".into(),vec![json!(token),json!(current+db::n(due,"interval_secs").max(60)),json!(rid)])]).await;
+    let eid=db::s(due,"env_id"); let name=db::s(due,"key_name"); let path=db::s(due,"path");
+    let Ok(key)=st.env_key(&eid).await else { return; };
+    let Ok(Some(target))=st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0 AND secret_type IN ('','secret','config')", &[json!(eid),json!(key_index(&key,&path,&name)),json!(oc::hash_token(&format!("{}:{}",path,name)))]).await else { return; };
+    let claimed=st.db.rotation_batch("SELECT 1 AS blocked WHERE NOT EXISTS (SELECT id FROM rotation_schedules WHERE id=? AND enabled=1 AND next_run<=? AND execution_token='') OR NOT EXISTS (SELECT id FROM secrets WHERE id=? AND version=? AND deleted=0 AND secret_type IN ('','secret','config'))", &[json!(rid),json!(current),json!(db::s(&target,"id")),json!(db::n(&target,"version"))], &[("UPDATE rotation_schedules SET execution_token=?,next_run=? WHERE id=?".into(),vec![json!(token),json!(current+db::n(due,"interval_secs").max(60)),json!(rid)])]).await;
     if !matches!(claimed,Ok(true)) { return; }
     let result=async {
         let r=st.db.one("SELECT * FROM rotation_schedules WHERE id=? AND execution_token=?", &[json!(rid),json!(token)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("rotation claim lost"))?;

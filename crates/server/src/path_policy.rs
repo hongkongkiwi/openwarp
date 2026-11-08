@@ -63,6 +63,9 @@ impl AppState {
 pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let path=req.uri().path();
     let route=req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("");
+    if matches!((req.method().as_str(),route),
+        ("GET","/api/auth/providers" | "/api/auth/kdf" | "/api/auth/verify" | "/api/auth/social/{provider}/start" | "/api/auth/social/{provider}/callback" | "/api/auth/oidc/{oid}/start" | "/api/auth/oidc/callback" | "/api/auth/saml/{oid}/metadata" | "/api/auth/saml/{oid}/start") |
+        ("POST","/api/auth/register" | "/api/auth/register-v2" | "/api/auth/login" | "/api/auth/login-v2" | "/api/auth/challenge" | "/api/auth/forgot" | "/api/auth/reset" | "/api/auth/reset-v2" | "/api/auth/reset-info" | "/api/auth/resend-verification" | "/api/auth/accept-invite" | "/api/auth/accept-invite-v2" | "/api/auth/social/{provider}/callback" | "/api/auth/saml/{oid}/acs" | "/api/auth/ldap" | "/api/auth/mfa" | "/api/auth/mfa/options" | "/api/auth/mfa/email/send" | "/api/auth/mfa/passkey/start" | "/api/auth/mfa/passkey/finish" | "/api/auth/logout" | "/api/v1/machine/auth/workload/login")) { return next.run(req).await; }
     // Runner and wrapping credentials have separate authenticators.
     if matches!((req.method().as_str(),route),("GET","/api/runner/jobs")|("POST","/api/runner/jobs/{jid}/result")|("GET","/api/unwrap")|("POST","/api/unwrap")) { return next.run(req).await; }
     if !path.starts_with("/api/") && !path.starts_with("/scim/") && path!="/mcp" { return next.run(req).await; }
