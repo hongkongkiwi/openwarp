@@ -187,7 +187,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
-    '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
     '/api/instance': { instance_owner: false },
     '/api/me': { email: 'fixture@example.invalid' },
     '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
@@ -644,6 +644,33 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+test('the SAML sign-in button follows the build, not the workspace grant', async () => {
+  // A build that carries SAML keeps the button even when a workspace has not
+  // enabled it; the attempt explains why. A build without it has no route, so
+  // the button would be dead and is hidden.
+  const withSaml = await consoleUI();
+  await withSaml.invoke('loadProviders()');
+  assert.ok(withSaml.document.getElementById('saml-signin'),
+    'the sign-in view always carries the SAML button node');
+  assert.notEqual(withSaml.el('saml-signin').style.display, 'none',
+    'a build with SAML shows the button regardless of workspace grants');
+
+  const withoutSaml = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { google: false, github: false, saml: false, signups: 'open' },
+  } });
+  await withoutSaml.invoke('loadProviders()');
+  assert.equal(withoutSaml.el('saml-signin').style.display, 'none',
+    'a build without SAML hides the button because the route does not exist');
+});
+
+test('a workspace-disabled sign-in method reports a readable reason, not JSON', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  assert.match(source, /saml_not_enabled:'SAML sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the saml_not_enabled code into a sentence');
+  assert.match(source, /ldap_not_enabled:'Directory sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the ldap_not_enabled code into a sentence');
 });
 
 const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };

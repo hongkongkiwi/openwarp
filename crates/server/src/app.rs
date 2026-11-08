@@ -2474,7 +2474,7 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     Ok(j(json!({"ok": true, "sp_metadata_url": saml_sp_entity(&issuer(&st,&h), &oid)}))) }
 #[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
-    if let Err(e) = st.require_feature(&oid, "saml").await { return e.into_response(); }
+    if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let sp = match saml_sp_config(&st, &issuer(&st,&h), &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
     let mut resp = sp.metadata_xml().to_string().into_response();
@@ -2482,7 +2482,10 @@ async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     resp }
 #[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
-    if let Err(e) = st.require_feature(&oid, "saml").await { return e.into_response(); }
+    // This endpoint is reached by a browser navigation, so a workspace without
+    // the grant gets the sign-in screen back with a readable reason rather
+    // than a JSON error body.
+    if !st.feature_granted(&oid, "saml").await { return axum::response::Redirect::temporary("/#error=saml_not_enabled").into_response(); }
     let cfg = match saml_config_row(&st, &oid).await { Ok(c) => c, Err(e) => return e.into_response() };
     let base = issuer(&st, &h);
     let sp = match saml_sp_config(&st, &base, &oid, &cfg).and_then(|c| Saml::sp(c).map_err(|e| e.to_string())) { Ok(s) => s, Err(e) => return bad(&e).into_response() };
@@ -2534,7 +2537,7 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     Ok(uid) }
 #[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
-    if let Err(e) = st.require_feature(&oid, "saml").await { return e.into_response(); }
+    if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
     let pending_row = match st.db.one("SELECT * FROM saml_pending WHERE org_id=? AND state=?", &[json!(&oid), json!(form.get("RelayState").cloned().unwrap_or_default())]).await { Ok(Some(r)) => r, _ => return bad("SAML request is missing, expired, or already used").into_response() };
     if db::n(&pending_row,"created_at") + 600 < now() { return bad("SAML request expired").into_response(); }
     let snapshot: Value = match serde_json::from_str(&db::s(&pending_row,"snapshot")) { Ok(v) => v, Err(_) => return bad("SAML pending request is corrupt").into_response() };
@@ -2706,7 +2709,7 @@ async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<S
 #[cfg(feature = "ldap")]
 async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<LdapLoginReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let org = r.org_id.trim().to_string();
-    st.require_feature(&org, "ldap").await?;
+    if !st.feature_granted(&org, "ldap").await { return Err(err(StatusCode::FORBIDDEN, "Directory sign-in is not enabled for this workspace")); }
     let username = r.username.trim().to_string();
     // Two budgets: one per account and one per address, so spraying many names
     // from one host is limited even when each name is tried only once.
@@ -3291,6 +3294,10 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
 async fn auth_providers(State(st): State<S>) -> Res {
     let mut out = auth_settings(&st).await;
     out["ldap"] = json!(cfg!(feature = "ldap"));
+    // Whether the binary can do SAML at all. The sign-in button stays visible
+    // when this is true, even for a workspace without the grant, so the click
+    // can explain itself.
+    out["saml"] = json!(cfg!(feature = "saml"));
     out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
     out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
     Ok(j(out)) }

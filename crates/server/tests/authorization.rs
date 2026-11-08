@@ -2120,6 +2120,16 @@ async fn enterprise_features_need_a_build_and_a_workspace_grant() {
     let denied_read = s.call(Method::GET, "/api/instance/features", Some(&other_token), None).await;
     assert_eq!(denied_read.status, 403, "a non-owner must not list grants: {}", denied_read.text);
 
+    #[cfg(feature = "saml")]
+    {
+        // Sign-in is a browser navigation, so an ungranted workspace gets the
+        // sign-in screen back with a reason, never a JSON error body.
+        let start = s.call(Method::GET, &format!("/api/auth/saml/{}/start", org), None, None).await;
+        assert_eq!(start.status, 307, "SAML start must redirect, not return JSON: {}", start.text);
+        assert!(start.header("location").contains("#error=saml_not_enabled"),
+            "the redirect must carry a readable reason, got {:?}", start.header("location"));
+    }
+
     #[cfg(feature = "pki")]
     {
         let compiled = listed.body["compiled"].as_array().cloned().unwrap_or_default();

@@ -74,7 +74,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="field" id="mfafield" style="display:none"><label for="mfacode" data-i18n="Authenticator / recovery code">Authenticator / recovery code</label><input id="mfacode" placeholder="123456" onkeydown="if(event.key==='Enter')doMfa()"></div>
       <button class="primary" style="width:100%;padding:11px" id="authbtn" onclick="doAuth()" data-i18n="Sign in">Sign in</button>
       <button class="ghost" style="width:100%;margin-top:6px" onclick="forgotPrompt()" data-i18n="Forgot password?">Forgot password?</button>
-      <button class="ghost" style="width:100%;margin-top:6px" onclick="samlPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
+      <button class="ghost" style="width:100%;margin-top:6px" id="saml-signin" onclick="samlPrompt()" data-i18n="Sign in with SAML">Sign in with SAML</button>
       <div id="social" class="row" style="margin-top:12px;flex-wrap:wrap"></div>
       <p class="small mut" id="signupnote" style="margin:14px 0 0" data-i18n="Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.">Your organisation, apps and environments are unlimited. Save the recovery kit shown once at registration.</p>
     </div>
@@ -191,6 +191,10 @@ function applyThemeIcons(){let p=themePref();let ic=p==='system'?'◐':p==='ligh
 // ---------- auth ----------
 async function loadProviders(){try{
   let p=await api('GET','/api/auth/providers');
+  // A method the binary lacks has no route at all, so its button is hidden. A
+  // method the binary has stays visible even when the workspace has not
+  // enabled it: the attempt explains why instead of failing silently.
+  let saml=$('saml-signin');if(saml)saml.style.display=p.saml?'':'none';
   let btns=[];
   for(const [id,name] of [['google','Google'],['microsoft','Microsoft'],['apple','Apple'],['github','GitHub'],['okta','Okta'],['auth0','Auth0'],['gitlab','GitLab'],['atlassian','Atlassian'],['slack','Slack'],['salesforce','Salesforce'],['openai','OpenAI'],['x','X'],['discord','Discord'],['linkedin','LinkedIn'],['workos','WorkOS']]){
     if(p[id])btns.push(`<button style="flex:1 1 45%" onclick="location.href='/api/auth/social/${id}/start'">${owHTML('Continue with {x}',{x:name})}</button>`)}
@@ -979,6 +983,12 @@ function boot(){
     owText($('authbtn'),'Verify code');$('authbtn').onclick=doMfa;}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
+  else if(h.startsWith('error=')){
+    // A sign-in method the binary has but the workspace has not enabled sends
+    // the browser back here instead of a JSON body.
+    let code=decodeURIComponent(h.slice(6).split('&')[0]);
+    let msg=({saml_not_enabled:'SAML sign-in is not enabled for this workspace.',ldap_not_enabled:'Directory sign-in is not enabled for this workspace.'})[code]||owT('Sign-in failed. Ask a workspace administrator.');
+    history.replaceState(null,'',location.pathname);toast(msg,true);}
 }
 boot();
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('hashchange',boot);

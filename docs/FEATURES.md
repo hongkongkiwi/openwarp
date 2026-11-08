@@ -65,6 +65,12 @@ GET  /api/orgs/:id/features        # any member: {"compiled": [...], "granted": 
 
 A surface compiled out has no route at all, so requests get 404. A surface that
 is compiled in but not granted answers 403 with a message naming the feature.
+OCSP is the one exception: it stays reachable without a grant, because a client
+checking a certificate must still learn that it was revoked after a workspace
+loses the grant. Elsewhere authentication and workspace membership run before
+the grant check, so an ungranted request never reveals whether an object
+exists; the SAML metadata and start endpoints are unauthenticated by design and
+return no object data.
 The `PUT` body is the full set the workspace should hold, and an empty array
 revokes everything. Grant rows survive a build that omits the feature, so
 rebuilding with it restores the previous choice. The console hides a settings
