@@ -57,7 +57,7 @@ Both `orgs.reuse_check` and `apps.reuse_check` default to on, and the warning re
 
 ## Identity and authentication
 
-- Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag.
+- Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag. The cookie authenticates sessions only. OAuth, personal/service and workload credentials must use the Bearer header so their credential scopes cannot be bypassed through cookie transport.
 - Password signup requires a verified email address before any session is issued. Emails asserted by a configured identity provider (Google, GitHub, Apple, OpenAI, Microsoft Entra, Okta, Auth0, GitLab, Slack, Salesforce, Atlassian, X, Discord, LinkedIn, WorkOS, custom OIDC, workspace OIDC, SAML, SCIM, or an accepted invite) are treated as verified; a provider-asserted email never silently links to an existing password account.
 - TOTP multi-factor authentication adds a challenge and recovery codes. Store recovery codes separately from the device that generates TOTP codes.
 - Google, GitHub, Apple, OpenAI, Microsoft Entra, Okta, Auth0, GitLab, Slack, Salesforce, Atlassian, X, Discord, LinkedIn, WorkOS and custom OIDC sign-in require configured provider credentials. They are not advertised when unconfigured. Apple posts its authorization response and authenticates with a signed client-secret JWT; OpenAI, Microsoft, Okta, Auth0, GitLab, Salesforce, Atlassian, X and custom OIDC use PKCE where the provider supports it. A custom provider authenticates the client secret with the method discovery advertises (POST by default, HTTP Basic when that is the only supported method) and accepts RS, PS and ES `id_token` signatures only.
@@ -210,6 +210,12 @@ Log streams, email relays, OIDC endpoints, and generic webhooks are outbound con
 The CLI attempts to store access and refresh tokens in the operating system credential store. If that is unavailable, it can fall back to its configuration file. Unix file permissions are restricted; other platforms need their own access controls. `OPENWARP_NO_KEYRING=1` explicitly selects file storage.
 
 `get`, `secrets --show`, exports, and child-process injection expose plaintext to the local user and process. Avoid terminal recordings, shared CI logs, checked-in export files, and command-line arguments containing real secrets. Environment variables are not a protection from a compromised child process or privileged local account.
+
+`file encrypt` creates an authenticated whole-file envelope locally; its identity file contains a private key and must not be committed alongside encrypted data. Recipient rekeying does not revoke previously saved envelopes. `inject` and `run --refs-file` resolve explicit secret references at consumption time, but their output and child environment are plaintext. They do not sandbox the child or provide biometric approval. See [CLI reference](CLI.md).
+
+[Workload identity](WORKLOAD-IDENTITY.md) exchanges issuer-signed JWTs for short-lived, single-environment tokens. Trust is an administrator's decision about a public key and exact claims, not proof that every job at that issuer should be trusted. The server does not fetch keys automatically; revoke and replace trust when keys change.
+
+[Transit](TRANSIT.md) keeps versioned workspace keys on the server. A rewrap-only principal receives ciphertext rather than plaintext, but rewrapping decrypts internally. Transit therefore has the managed-encryption operator trust boundary, not the E2E boundary.
 
 Lockbox shares are intended for one-time viewing. Anyone with the complete link can attempt to consume it. Treat the URL fragment containing the decryption key as secret material; do not send the link through a system that rewrites or previews sensitive links without testing that behavior.
 
