@@ -29,11 +29,17 @@ Browser E2E decryption uses the JavaScript implementation in [`e2e.js`](../crate
 | Database backup | Ciphertext, accounts, wrapped keys, policies, and history | Encrypted backup storage with restricted access |
 | Deployment secrets | Database credentials, provider sign-in credentials, email relay token | Your deployment secret store |
 
-The master key is exactly 32 random bytes encoded in base64. Production startup requires it. Development can generate a key and save it in the database's `meta` table. In that mode, copying the database also copies the key needed to decrypt SSE data.
+The master key is exactly 32 random bytes encoded in base64. Native production startup requires either `OPENWARP_MASTER_KEY` or a configured `OPENWARP_KMS_URL` bridge. With the bridge alone, startup recovers the root from `meta.kms_root`; an unavailable bridge or malformed root stops startup. Workers still require the master-key binding because the bridge is native-only. Development without a KMS can generate a key and save it in the database's `meta` table. In that mode, copying the database also copies the key needed to decrypt SSE data.
 
 Do not replace the master key for an existing database with a newly generated one. The setting is not a key-rotation operation: existing wrapped keys still require the original key. When promoting a development database, preserve its existing key.
 
 Password reset with a recovery kit re-wraps the same private key under the new password. The explicit `discard_e2e_key` alternative creates a different key pair; existing E2E grants to the old key become unreadable to that account. Reset revokes the account's sessions and OAuth credentials. An instance master key does not recover a lost client-held E2E private key.
+
+## Integrated schema and Transit boundaries
+
+Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts) and 21 (Transit) remain unchanged. Migration 22 adds external-JWKS workload bindings, path policies, static rotation state and the separate compatibility Transit tables. Databases from the unpublished feature branch's former migration 19 are not supported upgrades. Reset disposable fixtures; if that schema was used for persistent data, preserve a backup and reconcile it explicitly before starting this version. Do not delete migration ledger rows or reinterpret the old feature Transit tables as the shipped engine's schema.
+
+The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Online root rotation preflights and atomically updates both stores, v2 authentication keys, LDAP passwords and TOTP state, while retaining the main Transit root-generation fence. It is available only on native single-process SQLite without configured or persisted KMS root state.
 
 ## Cryptographic building blocks
 
@@ -57,7 +63,7 @@ Both `orgs.reuse_check` and `apps.reuse_check` default to on, and the warning re
 
 ## Identity and authentication
 
-- Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag. The cookie authenticates sessions only. OAuth, personal/service and workload credentials must use the Bearer header so their credential scopes cannot be bypassed through cookie transport.
+- Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag. Cookie authentication accepts session records only. Service, OAuth and workload credentials use the Authorization header so their scopes, environment ceilings and credential class remain enforced.
 - Password signup requires a verified email address before any session is issued. Emails asserted by a configured identity provider (Google, GitHub, Apple, OpenAI, Microsoft Entra, Okta, Auth0, GitLab, Slack, Salesforce, Atlassian, X, Discord, LinkedIn, WorkOS, custom OIDC, workspace OIDC, SAML, SCIM, or an accepted invite) are treated as verified; a provider-asserted email never silently links to an existing password account.
 - TOTP multi-factor authentication adds a challenge and recovery codes. Store recovery codes separately from the device that generates TOTP codes.
 - Google, GitHub, Apple, OpenAI, Microsoft Entra, Okta, Auth0, GitLab, Slack, Salesforce, Atlassian, X, Discord, LinkedIn, WorkOS and custom OIDC sign-in require configured provider credentials. They are not advertised when unconfigured. Apple posts its authorization response and authenticates with a signed client-secret JWT; OpenAI, Microsoft, Okta, Auth0, GitLab, Salesforce, Atlassian, X and custom OIDC use PKCE where the provider supports it. A custom provider authenticates the client secret with the method discovery advertises (POST by default, HTTP Basic when that is the only supported method) and accepts RS, PS and ES `id_token` signatures only.
@@ -153,7 +159,7 @@ Lockbox shares are intended for one-time viewing. Anyone with the complete link 
 ## Before production use
 
 1. Obtain an independent review appropriate to the data you will store.
-2. Set the public HTTPS URL, external master key, and production mode.
+2. Set the public HTTPS URL, production mode and either an external master key or a native KMS bridge.
 3. Bootstrap the instance owner privately; choose signup and invitation policies.
 4. Verify database transport, proxy trust, provider egress, and least-privilege tokens.
 5. Rehearse restoration with the original master key and an E2E user's recovery kit.

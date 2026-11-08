@@ -27,13 +27,53 @@ pub fn host_port(conn: &str) -> Result<(String, u16), String> {
     }
 }
 
+pub fn validate_static(conn: &str, username: &str) -> Result<(), String> {
+    if username.is_empty() || username.len()>63 || username.chars().any(char::is_control) { return Err("postgres-static requires an existing login username (1-63 bytes)".into()); }
+    if !(conn.starts_with("postgres://") || conn.starts_with("postgresql://")) { return Err("postgres-static requires a PostgreSQL URL".into()); }
+    let config: tokio_postgres::Config = conn.parse().map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
+    if config.get_hosts().len()!=1 || !config.get_hostaddrs().is_empty() || config.get_ports().len()>1 || config.get_user().is_none_or(str::is_empty) || config.get_password().is_none_or(|p| p.is_empty()) { return Err("postgres-static requires one TCP host and explicit admin credentials; hostaddr is not allowed".into()); }
+    if config.get_user() == Some(username) { return Err("postgres-static admin and target usernames must differ".into()); }
+    let host = match &config.get_hosts()[0] { tokio_postgres::config::Host::Tcp(h) => h, #[cfg(unix)] _ => return Err("Unix sockets are not allowed".into()) };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    // Prefer is the driver default and silently retries without TLS. Require is
+    // the only accepted mode, except an explicit Disable to a literal loopback
+    // address outside production for local development. Hostnames such as
+    // localhost are not loopback proof, and query parameters cannot fake mode.
+    match config.get_ssl_mode() {
+        tokio_postgres::config::SslMode::Require => {}
+        tokio_postgres::config::SslMode::Disable if matches!(host.as_str(), "127.0.0.1" | "::1") && !crate::production() => {}
+        _ => return Err("postgres-static requires sslmode=require; sslmode=disable is allowed only for a literal loopback host outside production".into()),
+    }
+    let allow=crate::envcfg::var("OPENWARP_ALLOWED_DB_HOSTS").unwrap_or_default();
+    if !allow.split(',').map(str::trim).filter(|s| !s.is_empty()).any(|entry| entry.eq_ignore_ascii_case(host) || entry.eq_ignore_ascii_case(&format!("{}:{}",host,port)) || entry.eq_ignore_ascii_case(&format!("[{}]:{}",host,port))) { return Err("PostgreSQL driver host is not in OPENWARP_ALLOWED_DB_HOSTS".into()); }
+    Ok(())
+}
+pub fn static_target(conn: &str, username: &str) -> Result<String,String> {
+    validate_static(conn,username)?;
+    let config: tokio_postgres::Config=conn.parse().map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
+    let host=match &config.get_hosts()[0] { tokio_postgres::config::Host::Tcp(h)=>h.to_ascii_lowercase(), #[cfg(unix)] _=>return Err("TCP host required".into()) };
+    Ok(openwarp_crypto::hash_token(&serde_json::json!(["postgres-static",host,config.get_ports().first().copied().unwrap_or(5432),username]).to_string()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn rotate_static(conn: &str, username: &str, password: &str) -> Result<(), String> {
+    validate_static(conn,username)?;
+    tokio::time::timeout(std::time::Duration::from_secs(30),async {
+        let client=client(conn).await.map_err(|_| "PostgreSQL connection failed".to_string())?;
+        let sql=format!("ALTER ROLE {} PASSWORD {}",ident(username),literal(password));
+        client.execute(&sql,&[]).await.map_err(|_| "static rotation outcome uncertain".to_string())?;
+        Ok(())
+    }).await.map_err(|_| "static rotation outcome uncertain".to_string())?
+}
+#[cfg(target_arch = "wasm32")]
+pub async fn rotate_static(_conn: &str, _username: &str, _password: &str) -> Result<(), String> { Err("static PostgreSQL rotation requires the native server".into()) }
 /// Every target the driver would dial. The driver parses the URL, so a query
 /// parameter cannot point the connection somewhere the authority did not name.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn targets(conn: &str) -> Result<Vec<(String, u16)>, String> {
     let config: tokio_postgres::Config = conn.parse().map_err(|e| format!("invalid postgres connection string: {}", e))?;
     let hosts = config.get_hosts(); let ports = config.get_ports();
-    if hosts.len() > 1 { return Err("multi-host connection strings are not allowed".into()); }
+    if hosts.len() > 1 || ports.len() > 1 { return Err("multi-host connection strings are not allowed".into()); }
+    if !config.get_hostaddrs().is_empty() { return Err("hostaddr connections are not allowed".into()); }
     let Some(first) = hosts.first() else { return Err("connection string has no host".into()) };
     let host = match first {
         tokio_postgres::config::Host::Tcp(host) => host.clone(),
@@ -71,17 +111,19 @@ pub async fn drop_role(conn: &str, username: &str) -> Result<(), String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
-    // `sslmode=disable` keeps working for a local database without TLS; every
-    // other connection is encrypted, which the old plaintext client never did.
-    if conn.to_ascii_lowercase().contains("sslmode=disable") {
-        let (client, connection) = tokio_postgres::connect(conn, tokio_postgres::NoTls).await.map_err(|e| e.to_string())?;
+    // Decide transport from the parsed mode, never a substring of the URL.
+    let mut config = conn.parse::<tokio_postgres::Config>().map_err(|e| e.to_string())?;
+    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.map_err(|e| e.to_string())?;
         tokio::spawn(async move { let _ = connection.await; });
         return Ok(client);
     }
+    // A default or explicit Prefer would let the driver fall back to plaintext.
+    config.ssl_mode(tokio_postgres::config::SslMode::Require);
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let (client, connection) = tokio_postgres::connect(conn, tokio_postgres_rustls::MakeRustlsConnect::new(config)).await.map_err(|e| e.to_string())?;
+    let tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let (client, connection) = config.connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls)).await.map_err(|e| e.to_string())?;
     tokio::spawn(async move { let _ = connection.await; });
     Ok(client)
 }
@@ -89,9 +131,11 @@ async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
 #[cfg(target_arch = "wasm32")]
 async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
     let (host, port) = host_port(conn)?;
+    let mut config = conn.parse::<tokio_postgres::Config>().map_err(|e| e.to_string())?;
+    if config.get_ssl_mode() != tokio_postgres::config::SslMode::Disable { config.ssl_mode(tokio_postgres::config::SslMode::Require); }
     // StartTls covers the normal case (Hyperdrive or a TLS-enabled database).
     // A local database with TLS off needs the explicit opt-out, same as native.
-    let transport = if conn.to_ascii_lowercase().contains("sslmode=disable") {
+    let transport = if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
         worker::SecureTransport::Off
     } else {
         worker::SecureTransport::StartTls
@@ -100,7 +144,6 @@ async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
         .secure_transport(transport)
         .connect(host, port)
         .map_err(|e| e.to_string())?;
-    let config = conn.parse::<tokio_postgres::Config>().map_err(|e| e.to_string())?;
     // TLS is already inside the socket, so the Postgres client passes through.
     let (client, connection) = config.connect_raw(socket, worker::postgres_tls::PassthroughTls).await.map_err(|e| e.to_string())?;
     wasm_bindgen_futures::spawn_local(async move { let _ = connection.await; });
