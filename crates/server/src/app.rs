@@ -3507,6 +3507,16 @@ async fn verify_master_full(db: &Db, key: &[u8; 32]) -> Result<(), String> {
     master_updates(db, key, key).await?;
     Ok(())
 }
+/// Adopt the root another boot persisted first. The candidate this boot minted
+/// is discarded only after the winner proves itself against the inventory.
+async fn adopt_kms_root(db: &Db, kms: &kms::Kms, supplied: Option<[u8; 32]>) -> Result<[u8; 32], String> {
+    let row = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.ok_or("the concurrent KMS root is missing")?;
+    let raw = kms.unwrap(&db::s(&row, "v"), "master").await.map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
+    let winner: [u8; 32] = raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?;
+    if let Some(binding) = supplied { if binding != winner { return Err("OPENWARP_MASTER_KEY does not match the stored master root".into()); } }
+    verify_master_full(db, &winner).await?;
+    Ok(winner)
+}
 // Mint the boot verifier by CAS: a loser revalidates the authoritative row and
 // refuses when another boot established a different root.
 async fn persist_verifier(db: &Db, key: &[u8; 32]) -> Result<(), String> {
@@ -3550,19 +3560,22 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
             if verified.as_slice() != k { return Err("KMS root roundtrip returned a different key; refusing to persist it".into()); }
             // The candidate must decrypt the existing inventory before a new
             // kms_root is persisted, or a refusal would leave the write behind.
-            verify_master_full(db, &k).await?;
-            // The insert is atomic and portable across SQLite, PostgreSQL and
-            // MySQL. A losing concurrent first boot adopts the stored winner
-            // before writing anything encrypted by this process.
-            if db.insert_if_absent("kms_root", &wrapped).await? { k } else {
-                let row = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.ok_or("the concurrent KMS root is missing")?;
-                let raw = kms.unwrap(&db::s(&row, "v"), "master").await.map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
-                let winner: [u8; 32] = raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?;
-                if let Some(binding) = supplied { if binding != winner { return Err("OPENWARP_MASTER_KEY does not match the stored master root".into()); } }
-                // The winner is the root this boot adopts: prove it before any
-                // write from this process.
-                verify_master_full(db, &winner).await?;
-                winner
+            // A concurrent first boot can persist its root between the read
+            // above and this preflight, so a failed candidate adopts that
+            // winner instead of rejecting this boot.
+            let candidate = verify_master_full(db, &k).await;
+            match candidate {
+                Ok(()) => {
+                    // The insert is atomic and portable across SQLite, PostgreSQL and
+                    // MySQL. A losing concurrent first boot adopts the stored winner
+                    // before writing anything encrypted by this process.
+                    if db.insert_if_absent("kms_root", &wrapped).await? { k } else { adopt_kms_root(db, kms, supplied).await? }
+                }
+                Err(candidate_error) => {
+                    if db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.is_some() {
+                        adopt_kms_root(db, kms, supplied).await?
+                    } else { return Err(candidate_error); }
+                }
             }
         };
         // A plaintext master that differs from the effective wrapped root is a
@@ -3699,6 +3712,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     for (sql, updates) in [("UPDATE compat_transit_keys SET wrapping_key=? WHERE id=?", transit_updates), ("UPDATE users SET auth_key_enc=? WHERE id=?", auth_updates), ("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?", ldap_updates)] { for (id, value) in updates { statements.push((sql.into(), vec![json!(value),json!(id)], Some(1))); } }
     statements.push(("DELETE FROM email_codes".into(), vec![], None));
     if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
+    // The verifier proves the configured key on the next boot, so it must move
+    // with the records in the same transaction.
+    statements.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))], Some(1)));
 
     // Block new encryptions with the old key while the database is updated.
     // The write guard lives inside a blocking task so it never crosses an
