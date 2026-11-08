@@ -706,16 +706,20 @@ async fn org_sso_requires_an_invite_when_signups_are_closed() {
     let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 403, "org SSO must not join an uninvited account while signups are closed, got {} {}", r.status, r.text);
 
-    let r = s
+    let invited = s
         .call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "sso-invite@test.invalid", "role": "developer"})))
         .await;
-    assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    assert_eq!(invited.status, 200, "invite failed: {}", invited.text);
+    let invite_token = invited.body["invite_token"].as_str().expect("invite token").to_string();
     let r = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
     set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 307, "an invited SSO user must be admitted, got {} {}", r.status, r.text);
     let token = r.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    // The invitation is a pending grant: the user joins by redeeming it.
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(&token), Some(json!({"token": invite_token}))).await;
+    assert_eq!(accepted.status, 200, "the invited SSO user must be able to redeem the invitation: {}", accepted.text);
     let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
     assert!(orgs.text.contains(org), "the invited SSO user must join the org: {}", orgs.text);
     assert!(orgs.text.contains("developer"), "the invite role must apply: {}", orgs.text);
