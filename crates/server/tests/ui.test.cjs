@@ -140,7 +140,8 @@ function parse(markup, root) {
     for (const [, name, , quoted, bare] of rest.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+)))?/g)) attrs[name] = decode(quoted ?? bare ?? '');
     const el = new Element(tag, root.ownerDocument, attrs);
     stack.at(-1).appendChild(el);
-    if (!/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
+    const selfClosing = /\/\s*>$/.test(token);
+    if (!selfClosing && !/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
   }
 }
 

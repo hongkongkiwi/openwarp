@@ -93,6 +93,16 @@ Members & access also contains three workspace tools:
 
 Review screens and transit decrypt responses display plaintext in the browser. Use these controls only on a trusted device; do not paste real credentials into recordings or shared screens.
 
+## Managing apps, environments and teams
+
+App settings (from an app's environment toolbar) rename or delete the app and toggle its reuse warning. The delete action requires confirmation and removes the app's environments, secrets and grants; revoke dynamic leases first.
+
+Env settings rename the environment, set how many versions history keeps (`0` keeps every version), restrict access to explicit grants, require an approved proposal for non-admin writes, or delete the environment. Policy changes apply immediately.
+
+Teams group members for environment grants. Manage a team from Members & access to add or remove workspace members; roles are unchanged by team membership.
+
+The audit log includes a client-side filter over the loaded events and a Load older events control. Large workspaces should also use log streams for durable forwarding.
+
 ## Integrations and sharing
 
 Select the source environment and destination before creating an integration. Sync sends shared, non-sealed SSE values to the provider. Test is implemented for Trigger.dev, Instabox, Boat, and Daytona; other kinds require a sync to exercise their connection, which can write remote data.
