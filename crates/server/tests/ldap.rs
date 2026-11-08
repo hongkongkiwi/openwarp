@@ -689,6 +689,9 @@ async fn ldap_provisioning_respects_invites_and_allowed_domains() {
     let r = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(r.status, 200, "invited user refused: {}", r.text);
     let token = r.body["token"].as_str().expect("token").to_string();
+    // The invitation is pending until the invited user redeems it.
+    let invite_token = invite.body["invite_token"].as_str().expect("invite token").to_string();
+    assert_eq!(s.call(reqwest::Method::POST, "/api/auth/accept-invite", Some(&token), Some(json!({"token": invite_token}))).await.status, 200, "invited user could not redeem the invitation");
     let orgs = s.call(reqwest::Method::GET, "/api/orgs", Some(&token), None).await;
     let role = orgs.body.as_array().and_then(|a| a.iter().find(|o| o["id"] == json!(org))).and_then(|o| o["role"].as_str()).unwrap_or("");
     assert_eq!(role, "developer", "invite role not applied: {}", orgs.text);
