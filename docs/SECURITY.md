@@ -219,6 +219,14 @@ Provider integrations receive plaintext SSE values. Their credentials, destinati
 
 Log streams, email relays, OIDC endpoints, and generic webhooks are outbound connections. Apply network egress controls as well as application validation. Allowing private egress intentionally broadens the destinations the server can contact. See [configuration](CONFIGURATION.md).
 
+## AI disclosure and actions
+
+BYOK does not keep inference local. An explicitly configured model endpoint can receive questions and permitted managed-environment metadata. Stored secret values, comments, provider configurations, and arbitrary audit detail are excluded from model context. Credentials pasted into a question are user-supplied disclosure, not protected retrieval. Local value matching returns authorised non-sealed record references without calling a model. E2E and delegated keys remain outside server-side AI processing.
+
+AI endpoints initially require account sessions and refuse service, machine, and OAuth tokens. Retrieval and plan execution recheck workspace and environment access. Model text and retrieved metadata are untrusted input. Only typed folder and integration-draft plans can execute, after a separate confirmation bound to the stored operations and author. Plans cannot run provider tests, syncs, permission grants, or arbitrary code.
+
+Security findings use bounded deterministic evidence and report history limits. AI explanations are interpretation, not additional evidence. Read the [AI guide](AI.md) before enabling disclosure or private model endpoints.
+
 ## Secret handling on clients
 
 The CLI attempts to store access and refresh tokens in the operating system credential store. If that is unavailable, it can fall back to its configuration file. Unix file permissions are restricted; other platforms need their own access controls. `OPENWARP_NO_KEYRING=1` explicitly selects file storage.

@@ -69,6 +69,7 @@ pub const MIGRATIONS: &[Migration] = &[
     // Tolerant because a database that already ran PR7's former inline
     // migration 18 carries these columns and meta rows.
     Migration { version: 29, name: "workspace_policy", sql: include_str!("../migrations/0029_workspace_policy.sql"), tolerant: true },
+    Migration { version: 30, name: "ai_assistant", sql: include_str!("../migrations/0030_ai_assistant.sql"), tolerant: false },
 ];
 
 /// SQL profile used when splitting migration statements.
