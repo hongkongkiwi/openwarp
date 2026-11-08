@@ -96,6 +96,8 @@ Worktrees created before this rule may still live in `/Volumes/Storage/Developme
 
 `main` history uses plain imperative subjects ("Add …", "Fix …", "Guard …"), with no Conventional Commit prefixes. Commit only the files the task touched, by path.
 
+When a task is complete, merge it into `main` after the required checks and reviews pass. Preserve other work in shared checkouts; if a gate fails or a merge is blocked, leave the work intact and report the blocker instead of merging unverified changes.
+
 ## Documentation
 
 [docs/README.md](docs/README.md) is the index: [GETTING_STARTED](docs/GETTING_STARTED.md), [CONFIGURATION](docs/CONFIGURATION.md), [CLI](docs/CLI.md), [CONSOLE](docs/CONSOLE.md), [DEPLOY](docs/DEPLOY.md), [INTEGRATIONS](docs/INTEGRATIONS.md), [KUBERNETES](docs/KUBERNETES.md), [BACKUP](docs/BACKUP.md), [FEATURES](docs/FEATURES.md).

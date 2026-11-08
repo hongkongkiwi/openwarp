@@ -63,6 +63,84 @@ The console checks a value before staging a new secret, an edit, or an import. I
 
 Both `orgs.reuse_check` and `apps.reuse_check` default to on, and the warning requires both. Turning a switch off suppresses the warning but does not delete existing fingerprints. Existing rows are indexed by a one-time backfill at startup; new writes are indexed inline. The check is advisory, so an authorised caller can save the value anyway. Do not treat a missing warning as proof that a value is unique.
 
+## Optional secret health disclosure
+
+The console's explicit password advice runs bundled zxcvbn locally. An optional
+Pwned Passwords action sends only a five-character SHA-1 prefix directly from
+the browser to HIBP, with padding and without credentials or referrer. SHA-1
+is used for the range protocol only, not as a password KDF. Checks are bounded
+and advisory; a missing match is not evidence of safety.
+
+Email exposure checking is a separate, explicitly consented disclosure of the
+full address to OpenWarp and HIBP, even for an E2E value. Nothing extracts
+addresses or decrypts E2E values on the backend automatically. Each user must
+configure their own paid HIBP key, encrypted with the instance master key.
+Only active, verified account sessions may manage it or spend its quota.
+A nonempty Bearer credential takes precedence over the cookie, with the same
+expiry and revocation checks as normal authenticated requests. Responses contain
+minimal breach names, not provider detail; results and addresses are not
+persisted in audit records. Operators must also avoid logging request bodies
+and outbound URLs. Native requests refuse redirects; Workers email checks
+fail closed with 501. See [the API contract](API.md).
+
+Enzoic password-only screening is a separate per-request opt-in. The browser
+hashes the exact UTF-8 value with SHA-256 without normalization and sends only
+the first ten lowercase hexadecimal characters to the authenticated session
+relay. The relay uses the user's encrypted key and secret with a fixed Enzoic
+target and returns bounded hash candidates, exposure flags and counts only.
+The browser validates the entire candidate set and compares the full hash
+locally. A candidate marked unexposed is not found, not safe. Credentials are
+stored as encrypted JSON in `enzoic_credentials:<user id>` and rewrapped by
+master-key rotation. OAuth and service tokens cannot manage or spend them.
+One attempt per user per minute includes provider failures. Native transport
+refuses redirects and bounds request/body time to ten seconds; Workers fails
+closed with 501. No raw breach records or results are persisted.
+
+Native personal-credential saves, clears and read/decrypt snapshots are
+serialized with master-key rotation within one process, including its preflight
+snapshots. This is not a distributed lock or an atomic rewrite of all encrypted
+records. Before rotating a replicated deployment, quiesce the other replicas,
+then restart them with the new key before accepting requests again. An expiring
+background-work lease does not keep another replica's in-memory master current.
+
+Operators must hold an applicable Enzoic subscription and meet privacy and
+https://enzoic.com/terms-of-service obligations. Application/account access
+in those terms does not explicitly settle distribution specifics; vendor
+approval and resale rights are not claimed.
+
+Credential-pair screening is a separate explicit action with its own email
+field. It discloses a stable full SHA-256 hash of the lowercased exact email
+and ten-character password-derived prefixes through OpenWarp to Enzoic.
+These identifiers allow guessing and correlation. The browser computes all
+legacy hashes and outer Argon2d locally with bundled hash-wasm and compares
+full 40-character candidates locally. Plain email, password, legacy hashes
+and full derived hashes never enter these backend requests. The two relays
+use the current user's encrypted credentials, fixed v1 targets, redirect-safe
+ten-second native transport and separate atomic per-stage one-per-minute
+slots. Workers fails closed with 501. Both routes join the emergency guard.
+
+Only legacy types 1, 2, 3, 13, 14, 19, 25, 27, 32, 35, 37 and 40 with plain
+salts are supported. Unsupported types or encoded salts invalidate the entire
+lookup before password derivation, rather than skip a possible match. Any
+malformed candidate invalidates the entire result. Unavailable is not a clean
+result; a missing dataset match is not evidence of safety. Bounds and formula
+sources are in [the pair protocol](API.md#enzoic-credential-pairs). No live
+provider request has been used to validate these extensions.
+
+LeakCheck Public is free and keyless. Its separately consented email action
+trims and lowercases the address locally, then sends only the first 24 hex
+characters of SHA-256 via the same-origin session relay. No full email reaches
+the backend in this flow, but the stable identifier is not anonymous and
+permits guessing attacks. The fixed provider URL contains that identifier;
+operators must avoid logging bodies and outbound query strings. Only bounded
+source names are returned; provider failure or contradictory data is never a
+clean result. The relay uses native redirect-safe ten-second transport and
+fails closed with 501 on Workers. Atomic user and instance-wide quota slots
+limit shared egress to at most one attempt per second (conservatively two
+whole-second clock ticks), with one per user per minute. Results and raw
+provider records are not persisted. First-24-character live compatibility is
+unverified; see [the protocol evidence limits](API.md).
+
 ## Identity and authentication
 
 - Password sign-in uses an account session. Browser sessions use the HttpOnly `ow_session` cookie; HTTPS public URLs or `OPENWARP_SECURE_COOKIES=1` enable its Secure flag. Cookie authentication accepts session records only. Service, OAuth and workload credentials use the Authorization header so their scopes, environment ceilings and credential class remain enforced.
@@ -121,6 +199,8 @@ A workspace lockdown applies to every project. A direct project lockdown applies
 The console permits authorised metadata reads, but no mutations or secret reads, including exports, history and E2E key/ciphertext access. SDK and other automation credentials are denied both reads and writes targeting the halted scope. A Bearer session is an automation credential for this boundary. A service or OAuth token in a cookie does not become a console session. Cookie session authentication identifies the console access class; it cannot prove a human is operating the client.
 
 Activation revokes non-owner workspace members' existing sessions and OAuth credentials, including for a project-only halt. Account sessions are global and unrestricted environments admit workspace members, so revocation cannot be limited to one project. Members must reauthenticate for console inspection or access to an unaffected scope. Owners retain sessions, not secret access. Restoration never resurrects revoked credentials. Sync dispatch and runnable runner payloads remain paused for the effective locked scope.
+
+The account-level email, Enzoic password and LeakCheck secret-health disclosure relays return 423 before payload validation if any workspace membership has a workspace or project lockdown. These unscoped requests cannot establish which workspace supplied the value. Unrelated users remain unaffected, and personal credential settings and status remain available. The console also blocks direct Pwned Passwords requests during its active lockdown and discards stale editor actions and results.
 
 Lockdown does not rotate credentials or erase remote data. A client may retain plaintext or keys it already received. An operation already past its final access check may finish, and a provider request or runner payload already delivered may still execute. Existing Lockbox shares are not workspace-linked and are outside this control. Revoke external credentials and rotate affected secrets separately.
 
