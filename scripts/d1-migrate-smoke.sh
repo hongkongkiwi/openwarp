@@ -66,7 +66,7 @@ second="$(request_migration)"
 echo "first:  $first"
 echo "second: $second"
 case "$first" in
-  *"applied=[1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]"*|*"applied=[1,18,19,20,21,22,23,24,25,26,27,28]"*) ;;
+  *"applied=[1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]"*|*"applied=[1,18,19,20,21,22,23,24,25,26,27,28,29,30]"*) ;;
   *) echo "d1 smoke: unexpected first apply result: $first" >&2; tail -60 "$persist/dev.log" >&2; exit 1 ;;
 esac
 case "$second" in
@@ -85,8 +85,8 @@ echo "tables:   $tables"
 echo "version:  $version"
 echo "squashed: $squashed"
 case "$version" in
-  *'"v":28'*|*'"v": 28'*) ;;
-  *) echo "d1 smoke: D1 did not reach version 28" >&2; exit 1 ;;
+  *'"v":30'*|*'"v": 30'*) ;;
+  *) echo "d1 smoke: D1 did not reach version 30" >&2; exit 1 ;;
 esac
 case "$squashed" in
   *'"n":16'*|*'"n": 16'*) ;;

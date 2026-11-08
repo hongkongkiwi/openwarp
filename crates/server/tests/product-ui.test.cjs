@@ -151,6 +151,7 @@ async function consoleUI(opts = {}) {
       [`/api/orgs/${org}/members`]: [{ id: uid, email: 'fixture@test.invalid', role }],
       [`/api/orgs/${org}/roles`]: [{ name: role, managed: true, permissions: role === 'admin' || role === 'owner' ? ['*'] : [] }],
       [`/api/orgs/${org}/teams`]: [],
+      [`/api/orgs/${org}/invites`]: [],
       [`/api/orgs/${org}/identities`]: [{ id: 'identity-a', org_id: org, name: opts.identityName || 'CI identity', role: 'developer' }],
       [`/api/orgs/${org}/emergency`]: { locked: false },
       [`/api/orgs/${org}/identities/identity-a/workload-trust`]: [clone(trust)],

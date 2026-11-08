@@ -839,12 +839,18 @@ async fn social_login_requires_an_invite_when_signups_are_closed() {
         .call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "closed-google@test.invalid", "role": "developer"})))
         .await;
     assert_eq!(r.status, 200, "{}", r.text);
+    let invite = r.body["invite_token"].as_str().expect("social signup invitation").to_string();
     let r = s.get("/api/auth/social/google/start").await;
     set_expected_nonce(&idp, &r.header("location"));
     let state = query_param(&r.header("location"), "state");
     let r = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
     assert_eq!(r.status, 307, "a pending invite must admit the social user, got {} {}", r.status, r.text);
     let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let pending_orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
+    assert_eq!(pending_orgs.status, 200, "social account session must work before consent: {}", pending_orgs.text);
+    assert!(!pending_orgs.text.contains(org), "social sign-in must not accept a workspace invitation: {}", pending_orgs.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(&token), Some(json!({"token": invite}))).await;
+    assert_eq!(accepted.status, 200, "explicit social invitation consent failed: {}", accepted.text);
     let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
     assert!(orgs.text.contains(org), "the invited social user must join the inviting org: {}", orgs.text);
     assert!(orgs.text.contains("developer"), "the invite role must apply: {}", orgs.text);
