@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use mysql_async::prelude::Queryable;
@@ -178,6 +178,29 @@ impl Db {
         }
     }
     pub async fn one(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query(sql, params).await?.into_iter().next()) }
+    /// Insert a meta row unless the key exists; true when this call created it.
+    /// MySQL has no ON CONFLICT, so a duplicate key there is the expected losing
+    /// branch while every other driver error still fails the caller.
+    pub async fn insert_if_absent(&self, k: &str, v: &str) -> Result<bool, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Db::Mysql(pool) = self {
+            let mut client = pool.get_conn().await.map_err(|e| e.to_string())?;
+            return match client.exec_drop("INSERT INTO meta(k,v) VALUES(?,?)", mysql_params(&[json!(k), json!(v)])).await {
+                Ok(()) => Ok(true),
+                Err(mysql_async::Error::Server(e)) if e.code == 1062 => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Db::DoSqlite(s, _) = self;
+            s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
+            let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
+            Ok(changes["n"].as_u64() == Some(1))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        { Ok(self.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(k), json!(v)]).await? == 1) }
+    }
     /// Execute several statements atomically, optionally requiring one affected row.
     pub async fn batch(&self, statements: &[(String, Vec<Value>)]) -> Result<(), String> {
         self.batch_checked(statements, &[]).await
@@ -342,6 +365,11 @@ impl Db {
             }
             self.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())]).await?;
         }
+        // Migration 19 seeds the lifecycle barrier row. A resumed run may have
+        // inserted it before the ledger entry landed, so this insert is idempotent.
+        if self.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await?.is_none() {
+            self.insert_if_absent("rotation_lifecycle", "").await?;
+        }
         // One-time backfill: environments that already had an allowlist keep it.
         if self.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await?.is_none() {
             let _ = self.exec("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]).await;
@@ -382,6 +410,15 @@ impl Db {
         }
     }
     fn one_now(&self, sql: &str, params: &[Value]) -> Result<Option<Row>, String> { Ok(self.query_now(sql, params)?.into_iter().next()) }
+    fn insert_if_absent_now(&self, k: &str, v: &str) -> Result<bool, String> {
+        match self {
+            Db::DoSqlite(s, _) => {
+                s.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", do_binds(&[json!(k), json!(v)])).map_err(|e| e.to_string())?;
+                let changes: Value = s.exec("SELECT changes() AS n", None).map_err(|e| e.to_string())?.one().map_err(|e| e.to_string())?;
+                Ok(changes["n"].as_u64() == Some(1))
+            }
+        }
+    }
     fn migrate_now(&self) -> Result<(), String> {
         for stmt in SCHEMA { self.exec_now(stmt, &[])?; }
         for alter in [
@@ -414,6 +451,9 @@ impl Db {
                 }
             }
             self.exec_now("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", &[serde_json::json!(version), serde_json::json!(crate::clock::now())])?;
+        }
+        if self.one_now("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[])?.is_none() {
+            self.insert_if_absent_now("rotation_lifecycle", "")?;
         }
         if self.one_now("SELECT v FROM meta WHERE k='migration:env_restricted'", &[])?.is_none() {
             let _ = self.exec_now("UPDATE envs SET restricted=1 WHERE id IN (SELECT env_id FROM env_members)", &[]);
@@ -773,7 +813,6 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE rotation_schedules ADD COLUMN static_target TEXT DEFAULT NULL",
         "ALTER TABLE rotation_schedules ADD COLUMN execution_token TEXT DEFAULT ''",
         "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
-        "INSERT INTO meta(k,v) VALUES('rotation_lifecycle','')",
     ]),
 ];
 

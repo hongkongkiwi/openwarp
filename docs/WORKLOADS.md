@@ -24,7 +24,7 @@ Exchange an assertion with `POST /api/v1/machine/auth/workload/login`:
 {"identity_id":"IDENTITY_ID","jwt":"SIGNED_ASSERTION"}
 ```
 
-The response has `accessToken`, `expiresIn`, `identity_id` and `tokenType: "Bearer"`. Use the access token in the Authorization header. Its authority is the machine identity's workspace role, narrowed by normal access checks. The token lifetime is at most 300 seconds, the binding's `max_ttl_secs` (1-300), and the assertion's remaining lifetime.
+The response has `accessToken`, `expiresIn`, `identity_id` and `tokenType: "Bearer"`. Use the access token in the Authorization header. Its authority is the machine identity's workspace role, narrowed by normal access checks. The issued lifetime is the minimum of 300 seconds, the binding's `max_ttl_secs` (1-300) and the assertion's remaining lifetime.
 
 The assertion must have a `kid`, an asymmetric signature, exact `iss` and `sub`, and exactly one configured audience (a string or single-element array). Integer `exp` and `iat` are required. Assertions can span at most one hour, future `iat` is limited to 30 seconds, and `nbf` and expiration are enforced without an expiry grace period. Supported algorithms are RS256/384/512, PS256/384/512, ES256/384 and EdDSA with a matching public signing JWK. Symmetric keys, private JWK material and ambiguous key IDs are rejected.
 
@@ -54,6 +54,6 @@ Restricted principals retain only the explicitly allowed secret and discovery AP
 
 [Static PostgreSQL rotation](INTEGRATIONS.md#static-postgresql-password-rotation) changes an existing remote role and stores its password in an SSE secret on the native server. Workers reject this configuration. Pending passwords survive uncertain outcomes so retries reuse the same candidate. An uncertain execution retains a non-expiring claim; stop all workers and verify the remote operation has ended before following the documented manual claim recovery. [Transit](API.md#transit) encrypts application payloads under workspace keys with separate permissions. Neither feature provides client-held E2E encryption.
 
-Online instance master-key rotation is limited to single-process SQLite. PostgreSQL returns a conflict because the process-local lifecycle and transit gates cannot coordinate replicas. Keep its existing root until a coordinated offline procedure is available. Rotation also returns a conflict while KMS is configured or a persisted KMS root exists. Do not replace the startup master key or remove KMS state to bypass this guard. Follow the key-custody and recovery requirements in [encryption](ENCRYPTION.md).
+Online instance master-key rotation is limited to single-process SQLite. PostgreSQL and MySQL/MariaDB return a conflict because the process-local lifecycle and transit gates cannot coordinate replicas. Keep the existing root until a coordinated offline procedure is available. Rotation also returns a conflict while KMS is configured or a persisted KMS root exists. Do not replace the startup master key or remove KMS state to bypass this guard. Follow the key-custody and recovery requirements in [encryption](ENCRYPTION.md).
 
 The examples here describe request contracts inspected in source. They are not evidence that a particular external JWT issuer or Kubernetes deployment was exercised.

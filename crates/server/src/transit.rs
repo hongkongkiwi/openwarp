@@ -4,7 +4,8 @@ fn wrapping_aad(org: &str, kid: &str) -> Vec<u8> { json!(["openwarp-transit-wrap
 fn aad(org: &str, kid: &str, version: i64, context: &str) -> Vec<u8> { json!(["openwarp-transit-v1",org,kid,version,context]).to_string().into_bytes() }
 async fn authorize(st: &S, h: &HeaderMap, oid: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
-    if !env_scope_of(st, h).await.is_empty() { return Err(err(StatusCode::FORBIDDEN,"environment credentials cannot access transit")); }
+    let scoped = env_scope_of(st, h).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "credential scope unavailable"))?;
+    if !scoped.is_empty() { return Err(err(StatusCode::FORBIDDEN,"environment credentials cannot access transit")); }
     st.check_perm(oid,&uid,action).await?; Ok(uid)
 }
 async fn row(st: &S, oid: &str, kid: &str) -> Result<Row, (StatusCode, Json<Value>)> {
@@ -36,10 +37,15 @@ pub(super) async fn create(State(st): State<S>, h: HeaderMap, Path(oid): Path<St
     let name = body["name"].as_str().unwrap_or(""); if name.is_empty() || name.len()>128 || name.chars().any(char::is_control) { return Err(bad("name must contain 1-128 printable bytes")); }
     let kid = id(); let wrap = oc::random_key();
     let enc = oc::encrypt_symmetric_aad(&st.master(),&wrapping_aad(&oid,&kid),&wrap);
-    st.db.exec("INSERT INTO transit_keys(id,org_id,name,wrapping_key,created_at) VALUES(?,?,?,?,?)", &[json!(kid),json!(oid),json!(name),json!(enc),json!(now())]).await.map_err(|_| bad("transit key name already exists or storage unavailable"))?;
-    let v = add_version(&st,&oid,&kid,&wrap).await?;
+    let initial = oc::encrypt_symmetric_aad(&wrap,&aad(&oid,&kid,1,"key"),&oc::random_key());
+    // The key and its first version are one atomic write: a failed version
+    // insert must not reserve the name or leave an unusable key behind.
+    st.db.batch(&[
+        ("INSERT INTO transit_keys(id,org_id,name,wrapping_key,created_at) VALUES(?,?,?,?,?)".into(), vec![json!(&kid),json!(&oid),json!(&name),json!(&enc),json!(now())]),
+        ("INSERT INTO transit_versions(key_id,version,key_enc,created_at) VALUES(?,?,?,?)".into(), vec![json!(&kid),json!(1),json!(&initial),json!(now())]),
+    ]).await.map_err(|_| bad("transit key name already exists or storage unavailable"))?;
     st.audit(&oid,"","",&uid,"transit.create",&kid).await;
-    Ok(j(json!({"id":kid,"name":name,"key_version":v})))
+    Ok(j(json!({"id":kid,"name":name,"key_version":1})))
 }
 pub(super) async fn list(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     authorize(&st,&h,&oid,"transit:manage").await?;

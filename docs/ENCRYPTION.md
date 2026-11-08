@@ -100,6 +100,13 @@ authenticated data (GCP KMS), or the equivalent. `OPENWARP_KMS_KEY_ID` is stored
 with each wrapped value so a key rotation can still unwrap old data; run
 `POST /api/instance/rewrap` as the instance owner after switching key IDs.
 
+The bridge URL may be `http://` as well as `https://`. With plain HTTP, the
+unwrapped root and environment keys travel in request bodies over that network
+without transport encryption, and the bridge has no egress allowlist of its
+own. Use HTTPS, a loopback listener, or a protected private network; treat
+`OPENWARP_KMS_TOKEN` as a deployment secret with only the access the adapter
+needs.
+
 A fresh KMS deployment stores only `meta.kms_root`; the database then has no
 usable root key. An existing deployment that already has `meta.master` adopts
 that key under the KMS on first boot, stores the same root as `kms_root` and
@@ -116,8 +123,14 @@ existing development root. Later boots unwrap that same persisted root. A failed
 unwrap, an invalid root length or a missing bridge for a KMS-wrapped database
 stops startup; none is a reason to create a replacement root.
 
-If `OPENWARP_MASTER_KEY` is also supplied, it takes precedence. Adoption of a
-plaintext development root runs only when the master-key variable is absent.
+Precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise the persisted
+KMS-wrapped `meta.kms_root`; otherwise a plaintext `meta.master` adopted under
+the KMS; otherwise a newly generated root. Adoption of a plaintext development
+root runs only when the master-key variable is absent. If `meta.master` and the
+unwrapped `meta.kms_root` hold different roots, startup stops and neither row is
+deleted: the database is not safe to serve and an operator must restore the
+matching root or a backup. A KMS-wrapped database without `OPENWARP_KMS_URL` is
+also fatal.
 Test a restart with the configured bridge before removing any recovery copy.
 The bridge credential is itself a deployment secret and must have access to the
 stored key identifiers. This is not Shamir unseal or a recovery-share protocol.
@@ -129,8 +142,9 @@ KMS root is persisted. Changing the external KMS key identifier and rewrapping
 keys is a separate operation. The native SQLite root-rotation path also rewraps
 transit wrapping keys and version-2 authentication keys in the same transaction.
 A lifecycle lock prevents HTTP and maintenance work from persisting old-root
-records during that operation. PostgreSQL online rotation is refused: OpenWarp
-does not provide an offline multi-replica root-rotation command. Keep the existing
+records during that operation. PostgreSQL and MySQL/MariaDB online rotation are
+refused: OpenWarp does not provide an offline multi-replica root-rotation
+command. Keep the existing
 root until a coordinated migration has been designed and verified. Do not change
 a startup key value as a substitute for re-encrypting stored key material.
 

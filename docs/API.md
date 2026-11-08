@@ -9,7 +9,7 @@ This page covers the workload, path-policy, static-rotation and transit addition
 | Method | Endpoint | Contract |
 | --- | --- | --- |
 | `GET` | `/api/orgs/{org_id}/identities/{identity_id}/workload` | Workspace owner; binding or `null` |
-| `PUT` | Same path | Workspace owner; `{issuer,jwks_url,audience,subject,max_ttl_secs}`; TTL defaults to 300 and must be 1-300 seconds |
+| `PUT` | Same path | Workspace owner; `{issuer,jwks_url,audience,subject,max_ttl_secs}`; TTL defaults to 300 and must be 1-300 seconds; the issued lifetime is the minimum of 300 seconds, this bound and the assertion's remaining lifetime |
 | `DELETE` | Same path | Workspace owner; removes trust and revokes its issued tokens |
 | `POST` | `/api/v1/machine/auth/workload/login` | `{identity_id,jwt}`; returns `{accessToken,expiresIn,identity_id,tokenType}` |
 
@@ -34,7 +34,7 @@ Only explicit SSE environments and non-owner roles are supported. An empty rule 
 | `DELETE` | `/api/rotations/{id}` | `rotations:write`; removes schedule |
 | `POST` | `/api/rotations/{id}/run` | `rotations:write`; enables schedule and makes it due; returns `{scheduled:true,id}` |
 
-A run response acknowledges scheduling, not remote success. Active execution claims cannot be reset by Run. Deleting a schedule, its environment or its application returns 409 while a pending password or execution claim exists. Static rotation is native-only; Workers reject its configuration. For `config.kind: "postgres-static"`, configuration requires a PostgreSQL admin `connection` URL and existing login `username`. The target must already exist as an unsealed SSE secret. The configured driver host must match `OPENWARP_ALLOWED_DB_HOSTS`. See [static rotation](INTEGRATIONS.md#static-postgresql-password-rotation) for recovery and network constraints.
+A run response acknowledges scheduling, not remote success. Active execution claims cannot be reset by Run. Deleting a schedule, its environment or its application returns 409 while a pending password or execution claim exists. Static rotation is native-only; Workers reject its configuration. For `config.kind: "postgres-static"`, configuration requires a PostgreSQL admin `connection` URL and existing login `username`. The target must already exist as an unsealed string secret (`secret`, `config` or untyped) in an SSE environment; SSH keys and sealed values are rejected at creation and execution. The connection must parse as `sslmode=require`, except an explicit `sslmode=disable` to a literal loopback IP outside production, and the configured driver host must match `OPENWARP_ALLOWED_DB_HOSTS`. See [static rotation](INTEGRATIONS.md#static-postgresql-password-rotation) for recovery and network constraints.
 
 ## Transit
 

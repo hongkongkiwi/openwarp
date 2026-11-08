@@ -51,6 +51,18 @@ fn write_output(path: &Path, content: &[u8]) -> Result<(), String> {
     result
 }
 
+fn literal_loopback(host: &str) -> bool {
+    host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// Canonical identity even when the output does not exist yet.
+fn canonical_path(path: &Path) -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = fs::canonicalize(path) { return Ok(p); }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| "agent path has no file name".to_string())?;
+    Ok(fs::canonicalize(parent).map_err(|e| e.to_string())?.join(name))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(host: &str, token: &str, env: &str, template: &Path, output: &Path, interval: u64, cache_ttl: u64, once: bool) -> Result<(), String> {
     if interval == 0 || interval > 3600 || cache_ttl > 300 { return Err("interval must be 1-3600 seconds and cache TTL 0-300 seconds".into()); }
@@ -58,6 +70,17 @@ pub fn run(host: &str, token: &str, env: &str, template: &Path, output: &Path, i
     let mut url = reqwest::Url::parse(host).map_err(|_| "agent host is not a valid URL")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("agent host must be an HTTP(S) URL without credentials, query or fragment".into());
+    }
+    // A bearer credential must not cross remote plaintext. The exception is a
+    // literal loopback address, not a hostname such as localhost that DNS or
+    // hosts files could point elsewhere.
+    if url.scheme() == "http" && !literal_loopback(url.host_str().unwrap_or("")) {
+        return Err("agent requires HTTPS unless the host is a literal loopback address".into());
+    }
+    // Refuse a template aliased as its own output before any fetch or write, so
+    // an equivalent spelling or symlink cannot destroy the source file.
+    if canonical_path(template)? == canonical_path(output)? {
+        return Err("agent template and output must be different files".into());
     }
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "agent HTTP client could not be created")?;
     url.path_segments_mut().map_err(|_| "host cannot contain path segments")?.pop_if_empty().extend(["api", "envs", env, "export"]);

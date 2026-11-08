@@ -12,7 +12,7 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | `ADDR` | `0.0.0.0:8080` | Listen IP and port; use loopback for private local development |
 | `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key or a configured KMS bridge and activates production-specific checks |
 | `OPENWARP_MASTER_KEY` | Generated/stored in development without KMS | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
-| `OPENWARP_KMS_URL` | Unset | Native server HTTP(S) bridge for root/key wrapping; permits production auto-unseal without a plaintext master-key variable |
+| `OPENWARP_KMS_URL` | Unset | Native server HTTP(S) bridge for root/key wrapping; permits production auto-unseal without a plaintext master-key variable. `http://` is accepted, so use HTTPS, loopback or a protected private network |
 | `OPENWARP_KMS_TOKEN` | Unset | Optional bearer credential for the configured KMS bridge |
 | `OPENWARP_KMS_KEY_ID` | `primary` | Bridge key identifier stored in wrapped payloads; preserve access to previous identifiers |
 | `REDIS_URL` | Unset | Optional session cache with the default `redis-cache` build feature |
@@ -37,6 +37,10 @@ openssl rand -base64 32
 ```
 
 Store the result securely. A replacement value does not rotate existing ciphertext. Development promotion must preserve the database's existing generated key.
+
+Startup root precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise, with `OPENWARP_KMS_URL` set, the KMS-wrapped `meta.kms_root` (on first boot it wraps an existing plaintext `meta.master`, or mints a root when none exists); otherwise a stored plaintext `meta.master`; otherwise a generated development key stored in the database. If a plaintext `meta.master` and the unwrapped KMS root disagree, startup stops and neither row is deleted, because either deletion would lose key material. Online instance-root rotation is limited to single-process SQLite; PostgreSQL and MySQL/MariaDB return a conflict and need a coordinated offline procedure.
+
+The KMS bridge URL may be plain HTTP. In that case the unwrapped root and environment keys travel in request bodies over that unencrypted connection, and the bridge has no egress allowlist of its own. Use HTTPS, a loopback listener, or a protected private network, and give `OPENWARP_KMS_TOKEN` only to the adapter that terminates that trust boundary.
 
 ## Registration and email
 

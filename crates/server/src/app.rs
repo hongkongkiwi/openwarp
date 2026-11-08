@@ -736,7 +736,7 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r)
 
 async fn me(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?; let r = st.db.one("SELECT id,email,pubkey FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     // A caller can always learn the environment its own credential is confined to.
-    let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await); Ok(j(out)) }
+    let mut out = db::obj(&r); out["env_scope"] = json!(env_scope_of(&st, &h).await?); Ok(j(out)) }
 // Ownership grants and account deletion serialize on the same user rows.
 async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize]) -> Result<(), (StatusCode, Json<Value>)> {
     let mut users = users.to_vec(); users.sort_unstable(); users.dedup();
@@ -4262,7 +4262,7 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
         let scope = db::s(row, "scopes");
         if !scope.is_empty() && (!scope_has(&scope, need) || (rewrap && !scope_has(&scope,"transit:encrypt"))) { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("token lacks scope {}", need)}))).into_response(); }
     }
-    let scoped = env_scope_of(&st, req.headers()).await;
+    let scoped = match env_scope_of(&st, req.headers()).await { Ok(s)=>s, Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"credential scope unavailable").into_response() };
     if !scoped.is_empty() && !scope_path_ok(&st, &scoped, &path).await { return (StatusCode::FORBIDDEN, Json(json!({"error": "this token is scoped to a different environment"}))).into_response(); }
     next.run(req).await }
 fn scope_has(scope: &str, need: &str) -> bool { scope.split_whitespace().any(|s| s == "*" || s == need) }
@@ -4426,6 +4426,15 @@ async fn renew_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>,
     let (org, _) = st.require_env(&db::s(&row,"env_id"), &uid).await?; st.check_perm(&org, &uid, "leases:write").await?;
     let ttl = body.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(60, 30 * 86400);
     st.db.exec("UPDATE leases SET expires_at=? WHERE id=?", &[json!(now()+ttl), json!(lid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": lid, "expires_at": now()+ttl}))) }
+fn password_target(stype: &str) -> bool { matches!(stype, "" | "secret" | "config") }
+// Record the failure without claiming a candidate was retained when the schedule
+// never created one (for example, rejected target type or transport).
+pub(crate) async fn audit_rotation_failure(st: &S, eid: &str, rid: &str, key_name: &str) {
+    if let Ok((org, app)) = st.env_org_app(eid).await {
+        let pending = st.db.one("SELECT pending_enc FROM rotation_schedules WHERE id=?", &[json!(rid)]).await.ok().flatten().map(|r| db::s(&r, "pending_enc")).unwrap_or_default();
+        let action = if pending.is_empty() { "rotation.failed" } else { "rotation.failed_pending_retained" };
+        st.audit(&org, &app, eid, "rotation-scheduler", action, key_name).await; }
+}
 async fn create_rotation(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org,&uid,"rotations:write").await?;
     let key_name = body.get("key").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
     let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("/");
@@ -4442,7 +4451,7 @@ async fn create_rotation(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         if mode!="sse" { return Err(bad("postgres-static rotation requires SSE")); }
         let key=st.env_key(&eid).await?; let index=key_index(&key,path,&key_name); let legacy=oc::hash_token(&format!("{}:{}",path,key_name));
         let target=st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid),json!(index),json!(legacy)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("postgres-static requires an existing target secret"))?;
-        if db::s(&target,"secret_type")=="sealed" { return Err(bad("sealed secrets cannot be rotated")); }
+        if !password_target(&db::s(&target,"secret_type")) { return Err(bad("postgres-static target must be an unsealed secret or config value, not an SSH key or sealed value")); }
     }
     let static_target = if kind == "postgres-static" { json!(crate::pglease::static_target(config["connection"].as_str().unwrap_or(""),config["username"].as_str().unwrap_or("")).map_err(|e| bad(&e))?) } else { Value::Null };
     let rid = id(); st.db.exec("INSERT INTO rotation_schedules(id,env_id,key_name,path,interval_secs,next_run,config_enc,created_at,static_target) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(rid), json!(eid), json!(key_name), json!(path), json!(interval), json!(now()+interval), json!(&config_enc), json!(now()), static_target]).await.map_err(|e| bad(&e))?;
@@ -4547,7 +4556,7 @@ async fn process_rotations_inner(st: &S) {
                     continue;
                 };
                 if config["kind"] == "postgres-static" {
-                    if static_rotation::rotate(st,r,&config,&key,&org,&stype).await.is_err() { if let Ok((org,app))=st.env_org_app(&eid).await { st.audit(&org,&app,&eid,"rotation-scheduler","rotation.failed_pending_retained",&key_name).await; } }
+                    if static_rotation::rotate(st,r,&config,&key,&org,&stype).await.is_err() { audit_rotation_failure(st,&eid,&id,&key_name).await; }
                     continue;
                 }
                 match integrations::rotate_value(&config, &key_name, &path).await {
@@ -4901,9 +4910,9 @@ fn origin_matches(st: &S, h: &HeaderMap, origin: &str) -> bool {
     if origin == format!("http://{}", host) || origin == format!("https://{}", host) { return true; }
     let pub_url = st.pub_url.trim_end_matches('/');
     !pub_url.is_empty() && origin == pub_url }
-async fn env_scope_of(st: &S, h: &HeaderMap) -> String { st.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(oc::hash_token(&bearer_token(h)))]).await.ok().flatten().map(|r| db::s(&r, "env_id")).unwrap_or_default() }
+async fn env_scope_of(st: &S, h: &HeaderMap) -> Result<String,(StatusCode,Json<Value>)> { st.db.one("SELECT env_id FROM tokens WHERE token_hash=?", &[json!(oc::hash_token(&bearer_token(h)))]).await.map(|r| r.map(|r| db::s(&r, "env_id")).unwrap_or_default()).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"credential scope unavailable")) }
 async fn mcp_resources(st: &S, uid: &str, h: &HeaderMap) -> Result<Value, String> {
-    let scoped = env_scope_of(st, h).await;
+    let scoped = env_scope_of(st, h).await.map_err(|_| "credential scope unavailable".to_string())?;
     let rows = st.db.query("SELECT e.id AS id, e.name AS name, a.name AS app, a.org_id AS org FROM envs e JOIN apps a ON a.id=e.app_id JOIN org_members m ON m.org_id=a.org_id WHERE m.user_id=?", &[json!(uid)]).await?;
     let mut resources = Vec::new();
     for r in &rows {

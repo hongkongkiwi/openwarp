@@ -12,7 +12,7 @@ pub(super) async fn execute(st: &S, due: &Row) {
         if db::s(&mode,"mode")!="sse" { return Err(bad("static rotation requires SSE")); }
         let key=st.env_key(&eid).await?; let name=db::s(&r,"key_name"); let path=db::s(&r,"path");
         let target=st.db.one("SELECT secret_type FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid),json!(key_index(&key,&path,&name)),json!(oc::hash_token(&format!("{}:{}",path,name)))]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("rotation secret missing"))?;
-        let stype=db::s(&target,"secret_type"); if stype=="sealed" { return Err(bad("sealed target")); }
+        let stype=db::s(&target,"secret_type"); if !password_target(&stype) { return Err(bad("rotation target is not a password secret")); }
         let raw=oc::decrypt_symmetric(&key,&db::s(&r,"config_enc")).map_err(|_| bad("rotation config unavailable"))?;
         let config: Value=serde_json::from_slice(&raw).map_err(|_| bad("rotation config invalid"))?;
         let (org,_)=st.env_org_app(&eid).await?;
@@ -22,11 +22,12 @@ pub(super) async fn execute(st: &S, due: &Row) {
     if !matches!(&result,Err((StatusCode::GATEWAY_TIMEOUT,_))) {
         let _=st.db.exec("UPDATE rotation_schedules SET execution_token='' WHERE id=? AND execution_token=?", &[json!(rid),json!(token)]).await;
     }
-    if result.is_err() { if let Ok((org,app))=st.env_org_app(&db::s(due,"env_id")).await { st.audit(&org,&app,&db::s(due,"env_id"),"rotation-scheduler","rotation.failed_pending_retained",&rid).await; } }
+    if result.is_err() { audit_rotation_failure(st,&db::s(due,"env_id"),&rid,&db::s(due,"key_name")).await; }
 }
 
 pub(super) async fn rotate(st: &S, schedule: &Row, config: &Value, key: &[u8;32], org: &str, stype: &str) -> Result<(),(StatusCode,Json<Value>)> {
     let rid=db::s(schedule,"id"); let eid=db::s(schedule,"env_id"); let name=db::s(schedule,"key_name"); let path=db::s(schedule,"path");
+    if !password_target(stype) { return Err(bad("rotation target is not a password secret")); }
     let connection=config["connection"].as_str().unwrap_or(""); let username=config["username"].as_str().unwrap_or("");
     crate::pglease::validate_static(connection,username).map_err(|e| bad(&e))?;
     let a=json!(["postgres-static-pending-v1",eid,rid]).to_string();

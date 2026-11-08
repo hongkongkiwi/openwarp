@@ -29,7 +29,7 @@ fn config(connection: &str) -> Value {
 fn postgres_static_accepts_complete_config_without_connecting() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _hosts = AllowedHosts::set("db.example.invalid");
-    assert!(validate_rotation_config(&config("postgres://admin:pw@db.example.invalid/db")).is_ok(),
+    assert!(validate_rotation_config(&config("postgres://admin:pw@db.example.invalid/db?sslmode=require")).is_ok(),
         "a complete allowlisted postgres-static configuration must be supported");
 }
 
@@ -37,13 +37,13 @@ fn postgres_static_accepts_complete_config_without_connecting() {
 fn postgres_static_checks_the_driver_host_not_the_url_authority() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _hosts = AllowedHosts::set("db.example.invalid");
-    assert!(validate_rotation_config(&config("postgres://admin:pw@db.example.invalid/db")).is_ok(),
+    assert!(validate_rotation_config(&config("postgres://admin:pw@db.example.invalid/db?sslmode=require")).is_ok(),
         "positive control: the adapter must exist before rejection tests are meaningful");
     for connection in [
-        "postgres://admin:pw@forbidden.example.invalid/db",
-        "postgres://admin:pw@db.example.invalid/db?host=forbidden.example.invalid",
-        "postgres://admin:pw@db.example.invalid/db?host=127.0.0.1",
-        "postgres://admin:pw@db.example.invalid.evil.invalid/db",
+        "postgres://admin:pw@forbidden.example.invalid/db?sslmode=require",
+        "postgres://admin:pw@db.example.invalid/db?sslmode=require&host=forbidden.example.invalid",
+        "postgres://admin:pw@db.example.invalid/db?sslmode=require&host=127.0.0.1",
+        "postgres://admin:pw@db.example.invalid.evil.invalid/db?sslmode=require",
     ] {
         assert!(validate_rotation_config(&config(connection)).is_err(), "accepted non-allowlisted driver host: {connection}");
     }
@@ -53,7 +53,7 @@ fn postgres_static_checks_the_driver_host_not_the_url_authority() {
 fn postgres_static_requires_explicit_allowlist_and_complete_credentials() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _hosts = AllowedHosts::set("db.example.invalid");
-    let valid = config("postgres://admin:pw@db.example.invalid/db");
+    let valid = config("postgres://admin:pw@db.example.invalid/db?sslmode=require");
     assert!(validate_rotation_config(&valid).is_ok(), "positive control: postgres-static is supported");
     for field in ["username", "connection"] {
         let mut missing = valid.clone();
