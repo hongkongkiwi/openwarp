@@ -824,7 +824,7 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 32, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), crate::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
         assert_eq!(n(&row, "n"), 32, "each migration must be recorded exactly once");

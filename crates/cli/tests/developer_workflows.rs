@@ -236,7 +236,9 @@ impl Api {
             while !done.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() { Ok(v) => v, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(5)); continue; }, Err(_) => break };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap(); stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                // These bound a hung client, not a slow one: the CLI under test shares the
+                // host with the rest of the suite.
+                stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap(); stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
                 let mut bytes = Vec::new(); let mut buf = [0u8; 2048];
                 while bytes.len() < 16384 && !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
                     match stream.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => bytes.extend_from_slice(&buf[..n]) }

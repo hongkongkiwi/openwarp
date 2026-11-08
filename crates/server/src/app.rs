@@ -4804,7 +4804,15 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(feature = "pki")]
 #[cfg(feature = "pki")]
-async fn ocsp_respond(State(st): State<S>, Path(caid): Path<String>, body: Bytes) -> Response {
+async fn ocsp_respond(State(st): State<S>, PeerAddr(addr): PeerAddr, Path(caid): Path<String>, body: Bytes) -> Response {
+    // Unauthenticated by design and one signing operation per call, so it
+    // carries its own budget. The limit sits far above what a caching client
+    // needs; a caller that trips it is not a client checking its own
+    // certificates. A 429 is a soft-fail signal for revocation, which is why
+    // the budget is generous rather than tight.
+    let budget = oc::hash_token(&format!("ocsp:{}", addr));
+    if st.db.rate_increment(&budget, now(), 60).await.is_ok_and(|count| count > 600) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "too many certificate status requests; retry shortly").into_response(); }
     let ca = match st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await { Ok(Some(c)) => c, _ => return err(StatusCode::NOT_FOUND, "CA not found").into_response() };
     let cert_der = match keystore_ocsp::pem::decode("CERTIFICATE", &db::s(&ca,"cert_pem")) { Ok(d) => d, Err(e) => return bad(&e.to_string()).into_response() };
     let key_pem = match oc::decrypt_symmetric(&st.master(), &db::s(&ca,"key_enc")) { Ok(k) => k, Err(e) => return bad(&e).into_response() };
