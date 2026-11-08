@@ -131,7 +131,8 @@ async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
 #[cfg(target_arch = "wasm32")]
 async fn client(conn: &str) -> Result<tokio_postgres::Client, String> {
     let (host, port) = host_port(conn)?;
-    let config = conn.parse::<tokio_postgres::Config>().map_err(|e| e.to_string())?;
+    let mut config = conn.parse::<tokio_postgres::Config>().map_err(|e| e.to_string())?;
+    if config.get_ssl_mode() != tokio_postgres::config::SslMode::Disable { config.ssl_mode(tokio_postgres::config::SslMode::Require); }
     // StartTls covers the normal case (Hyperdrive or a TLS-enabled database).
     // A local database with TLS off needs the explicit opt-out, same as native.
     let transport = if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {

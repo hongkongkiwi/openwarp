@@ -10,7 +10,7 @@ async fn owner(st: &S, h: &HeaderMap, eid: &str) -> Result<String,(StatusCode,Js
 }
 pub(super) async fn put(State(st): State<S>, h: HeaderMap, Path((eid,role)): Path<(String,String)>, Json(b): Json<Value>) -> Res {
     owner(&st,&h,&eid).await?;
-    if role=="owner" || role.is_empty() || role.len()>128 { return Err(bad("owner cannot have a path policy")); }
+    if role=="owner" || role.is_empty() || role.len()>128 || role.trim()!=role { return Err(bad("role must be canonical and cannot be owner")); }
     let mode=st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("environment not found"))?;
     if db::s(&mode,"mode")!="sse" { return Err(bad("path policies require an explicit SSE environment")); }
     let rules: Vec<Rule>=serde_json::from_value(b["rules"].clone()).map_err(|_| bad("rules array required"))?;
@@ -45,8 +45,8 @@ impl AppState {
     }
     pub(super) async fn restricted_env(&self,eid: &str,uid: &str) -> Result<bool,(StatusCode,Json<Value>)> { Ok(self.path_rules(eid,uid).await?.is_some()) }
     pub(super) async fn restricted_principal(&self,uid: &str) -> Result<bool,(StatusCode,Json<Value>)> {
-        let rows=self.db.query("SELECT p.role AS policy_role,m.role AS principal_role FROM path_policies p JOIN envs e ON e.id=p.env_id JOIN apps a ON a.id=e.app_id JOIN org_members m ON m.org_id=a.org_id WHERE m.user_id=? UNION ALL SELECT p.role AS policy_role,i.role AS principal_role FROM path_policies p JOIN envs e ON e.id=p.env_id JOIN apps a ON a.id=e.app_id JOIN identities i ON i.org_id=a.org_id WHERE i.id=?", &[json!(uid),json!(uid)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"path policies unavailable"))?;
-        Ok(rows.iter().any(|r| db::s(r,"principal_role")!="owner" && db::s(r,"policy_role")==db::s(r,"principal_role")))
+        let rows=self.db.query("SELECT p.role AS policy_role,m.role AS principal_role FROM path_policies p JOIN envs e ON e.id=p.env_id JOIN apps a ON a.id=e.app_id JOIN org_members m ON m.org_id=a.org_id WHERE m.user_id=? AND p.role=m.role UNION ALL SELECT p.role AS policy_role,i.role AS principal_role FROM path_policies p JOIN envs e ON e.id=p.env_id JOIN apps a ON a.id=e.app_id JOIN identities i ON i.org_id=a.org_id WHERE i.id=? AND p.role=i.role", &[json!(uid),json!(uid)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"path policies unavailable"))?;
+        Ok(rows.iter().any(|r| db::s(r,"principal_role")!="owner"))
     }
     pub(super) fn stored_path(&self,key: &[u8;32],r: &Row) -> Result<String,(StatusCode,Json<Value>)> {
         if db::s(r,"path_enc").is_empty() { return Ok(db::s(r,"path")); }

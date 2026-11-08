@@ -1722,7 +1722,7 @@ async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
     let _ = st.db.exec("DELETE FROM sync_jobs WHERE integration_id=?", &[json!(&iid)]).await;
     st.db.exec("DELETE FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?;
     st.audit(&org,&app,&eid,&uid,"integration.delete",&iid).await; Ok(j(json!({"deleted": iid}))) }
-async fn trigger_sync(st: &S, eid: &str, uid: &str) -> Vec<String> { if st.restricted_env(eid, uid).await.unwrap_or(true) { return Vec::new(); } trigger_sync_with(st, eid, uid, true).await }
+async fn trigger_sync(st: &S, eid: &str, uid: &str) -> Vec<String> { if st.restricted_principal(uid).await.unwrap_or(true) { return Vec::new(); } trigger_sync_with(st, eid, uid, true).await }
 async fn trigger_sync_internal(st: &S, eid: &str) -> Vec<String> { trigger_sync_with(st, eid, "rotation-scheduler", false).await }
 async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<String> {
     let mut errors = Vec::new();
