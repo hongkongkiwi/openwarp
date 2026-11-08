@@ -63,7 +63,7 @@ pub struct AppState {
     instance_id: String,
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch="wasm32"))]
     pub(crate) ai_credentials: tokio::sync::Mutex<()>,
     #[cfg(not(target_arch="wasm32"))]
     transit_gate: Arc<tokio::sync::Mutex<()>>,
@@ -868,6 +868,9 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         format!("DELETE FROM rotation_schedules WHERE env_id IN ({})", envs),
         format!("DELETE FROM env_members WHERE env_id IN ({})", envs),
         format!("DELETE FROM team_env_grants WHERE env_id IN ({})", envs),
+        // AI folders are environment descendants; drop them before the envs
+        // they reference so teardown stays inside the guarded transaction.
+        format!("DELETE FROM folders WHERE env_id IN ({})", envs),
         format!("DELETE FROM secrets WHERE env_id IN ({})", envs),
         format!("DELETE FROM envs WHERE app_id IN ({})", apps),
         format!("DELETE FROM app_members WHERE app_id IN ({})", apps),
@@ -900,6 +903,15 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         "DELETE FROM identities WHERE org_id=?".to_string(),
         "DELETE FROM audit WHERE org_id=?".to_string(),
         "DELETE FROM live_events WHERE org_id=?".to_string(),
+        // AI records hold the wrapped BYOK provider key, plans, drafts and
+        // finding state for this org only; nothing may outlive the workspace.
+        "DELETE FROM ai_settings WHERE org_id=?".to_string(),
+        "DELETE FROM ai_plans WHERE org_id=?".to_string(),
+        "DELETE FROM ai_activity WHERE org_id=?".to_string(),
+        "DELETE FROM ai_finding_states WHERE org_id=?".to_string(),
+        "DELETE FROM ai_finding_history WHERE org_id=?".to_string(),
+        "DELETE FROM ai_usage WHERE org_id=?".to_string(),
+        "DELETE FROM integration_drafts WHERE org_id=?".to_string(),
         "DELETE FROM org_members WHERE org_id=?".to_string(),
         "DELETE FROM orgs WHERE id=?".to_string(),
     ];
@@ -915,6 +927,7 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     stmts.extend(statements.into_iter().map(|sql| (sql, vec![json!(&oid)])));
     for key in ["oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_redirect_uri", "oidc_auto_provision", "oidc_allowed_domains", "audit_webhook"] {
         stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("{}:{}", key, oid))])); }
+    stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("ai:background:{}", oid))]));
     let mut guarded = vec![workspaces::policy_lock()];
     let guard = if crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_ok() {
         if workspaces::creation_open(&st).await? { "UPDATE meta SET v=v WHERE k='workspace_policy_lock'" } else { "UPDATE meta SET v=v WHERE k='workspace_policy_lock' AND (SELECT COUNT(*) FROM orgs)>1" }
@@ -1074,6 +1087,7 @@ async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) 
         "DELETE FROM wrap_tokens WHERE env_id=?",
         "DELETE FROM tokens WHERE env_id=?",
         "DELETE FROM team_env_grants WHERE env_id=?",
+        "DELETE FROM folders WHERE env_id=?",
         "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
         "DELETE FROM secrets WHERE env_id=?",
@@ -1146,6 +1160,7 @@ async fn delete_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) 
         "DELETE FROM wrap_tokens WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM tokens WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM team_env_grants WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
+        "DELETE FROM folders WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
