@@ -178,6 +178,11 @@ impl Server {
     async fn invite(&self, token: &str, org: &str, email: &str, role: &str) {
         let r = self.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(token), Some(json!({"email": email, "role": role}))).await;
         assert_eq!(r.status, 200, "membership setup");
+        // An invitation is a pending grant; the recipient redeems it.
+        let invite = field(&r.body, "invite_token");
+        let invitee = self.login(email).await;
+        let accepted = self.call(Method::POST, "/api/auth/accept-invite", Some(&invitee), Some(json!({"token": invite}))).await;
+        assert_eq!(accepted.status, 200, "invitation redemption: {:?}", accepted.body);
     }
 
     async fn app(&self, token: &str, org: &str) -> (String, String) {
