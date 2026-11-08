@@ -477,7 +477,8 @@ async fn transit_permissions_are_independent_and_env_tokens_cannot_escape_scope(
             f.transit(&key, action, token, body, 403).await;
         }
     }
-    f.sql("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,expires_at,created_at) VALUES(?,'fixture-client','owner','secrets:read secrets:write','',?,?)",
+    // Main now binds OAuth tokens to the API audience; seed the instance URL.
+    f.sql("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,expires_at,created_at) VALUES(?,'fixture-client','owner','secrets:read secrets:write','https://openwarp.test.invalid',?,?)",
         &[json!(oc::hash_token("oauth-secret-scopes")), json!(now()+300), json!(now())]).await;
     f.expect(Method::GET, "/api/envs/dev/secrets", Some("oauth-secret-scopes"), None, 200).await;
     f.transit(&key, "decrypt", "oauth-secret-scopes", cipher, 403).await;

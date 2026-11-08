@@ -8,6 +8,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+// The merged console expects the i18n runtime to load before its inline script.
+const i18nSource = fs.readFileSync(path.join(__dirname, '../src/i18n.js'), 'utf8');
 const html = source.match(/r##"([\s\S]*)"##;/)?.[1];
 assert.ok(html, 'embedded console HTML is extractable');
 const script = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
@@ -150,6 +152,7 @@ async function consoleUI(opts = {}) {
       [`/api/orgs/${org}/roles`]: [{ name: role, managed: true, permissions: role === 'admin' || role === 'owner' ? ['*'] : [] }],
       [`/api/orgs/${org}/teams`]: [],
       [`/api/orgs/${org}/identities`]: [{ id: 'identity-a', org_id: org, name: opts.identityName || 'CI identity', role: 'developer' }],
+      [`/api/orgs/${org}/emergency`]: { locked: false },
       [`/api/orgs/${org}/identities/identity-a/workload-trust`]: [clone(trust)],
       [`/api/orgs/${org}/transit/keys`]: [clone(key)],
     });
@@ -160,10 +163,11 @@ async function consoleUI(opts = {}) {
     document, console, URL, TextDecoder, TextEncoder,
     localStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
     sessionStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
-    navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
+    navigator: { language: 'en', languages: ['en'], clipboard: { writeText: async text => clipboard.push(text) } },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState: (...args) => history.push(args), pushState: (...args) => history.push(args) },
     setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {},
+    setInterval: () => 1, clearInterval() {},
     requestAnimationFrame: fn => { timers.push(fn); return timers.length; }, confirm: () => true,
     fetch: async (url, options) => {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined }; calls.push(call);
@@ -219,7 +223,10 @@ async function consoleUI(opts = {}) {
     flushTimers() { for (const fn of timers.splice(0)) fn(); },
     async access() { await this.invoke("nav('access')"); },
   };
+  vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
+  // The merged console hides the shell until sign-in; these tests start inside it.
+  document.getElementById('shell').style.display = 'grid';
   await ui.settle();
   assert.equal(ui.run('ORG'), 'org-a', 'full inline console startup selected the fixture workspace');
   if (opts.requireProducts !== false) for (const name of functions) assert.equal(ui.run(`typeof ${name}`), 'function', `${name} must implement the product console contract`);

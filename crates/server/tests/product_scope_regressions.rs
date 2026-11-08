@@ -52,7 +52,8 @@ async fn regression_cookie_pat_and_oauth_transit_denied() {
     assert_eq!(session_decrypt.status, 200, "valid session cookie must retain transit decryption");
     assert_eq!(session_decrypt.body["plaintext"], plain);
     f.pat("cookie-env-pat", "dev", "secrets:read").await;
-    f.sql("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,expires_at,created_at) VALUES(?,'fixture-client','owner','secrets:read','',?,?)",
+    // OAuth tokens are audience-bound; seed the fixture instance URL.
+    f.sql("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,expires_at,created_at) VALUES(?,'fixture-client','owner','secrets:read','https://openwarp.test.invalid',?,?)",
         &[json!(oc::hash_token("cookie-oauth-secret-only")), json!(now()+300), json!(now())]).await;
     let mut outcomes = Vec::new();
     let mut denied = true;
@@ -78,7 +79,12 @@ async fn regression_encoded_transit_action_scope() {
     f.pat("manage-only-pat", "", "transit:manage").await;
     f.expect(Method::GET, KEYS, Some("manage-only-pat"), None, 200).await;
     assert_eq!(f.transit(&key, "decrypt", OWNER, cipher.clone(), 200).await["plaintext"], plain);
-    assert_eq!(f.transit(&key, "%64ecrypt", OWNER, cipher.clone(), 200).await["plaintext"], plain);
-    f.transit(&key, "decrypt", "manage-only-pat", cipher.clone(), 403).await;
-    f.transit(&key, "%64ecrypt", "manage-only-pat", cipher, 403).await;
+    // Main rejects percent-encoded API paths before routing, for every credential.
+    let encoded = format!("{}/{}/%64ecrypt", KEYS, key);
+    for token in [OWNER, "manage-only-pat"] {
+        let reply = f.call(Method::POST, &encoded, Some(token), Some(cipher.clone())).await;
+        assert_eq!(reply.status, 400, "encoded API paths must be rejected for {}", token);
+        assert!(reply.body["plaintext"].is_null(), "an encoded action cannot return plaintext");
+    }
+    f.transit(&key, "decrypt", "manage-only-pat", cipher, 403).await;
 }

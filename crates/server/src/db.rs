@@ -750,16 +750,22 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_audit_org_seq ON audit(org_id,seq)",
         "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
     ]),
+    // Main shipped 18 for emergency lockdown; product migrations follow it so a
+    // database that already applied main's 18 still receives them.
     (18, &[
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+    ]),
+    (19, &[
         "CREATE TABLE IF NOT EXISTS change_requests(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,title TEXT NOT NULL,author TEXT NOT NULL,revision BIGINT NOT NULL,status TEXT NOT NULL,approved_by TEXT DEFAULT '',created_at BIGINT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS change_request_envs(request_id TEXT NOT NULL,env_id TEXT NOT NULL,payload_enc TEXT NOT NULL,PRIMARY KEY(request_id,env_id))",
     ]),
-    (19, &[
+    (20, &[
         "CREATE TABLE IF NOT EXISTS workload_trusts(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,identity_id TEXT NOT NULL,env_id TEXT NOT NULL,issuer TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,jwks TEXT NOT NULL,scopes TEXT NOT NULL,ttl BIGINT NOT NULL,bound_claims TEXT NOT NULL,revoked BIGINT DEFAULT 0,created_at BIGINT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS workload_replay(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
         "ALTER TABLE tokens ADD COLUMN trust_id TEXT DEFAULT ''",
     ]),
-    (20, &[
+    (21, &[
         "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
         "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
     ]),
@@ -798,10 +804,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 20, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 21, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 20, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 21, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

@@ -36,6 +36,7 @@ fn validate_jwks(v: &Value) -> Result<(), String> {
 }
 async fn authority(st: &S, h: &HeaderMap, oid: &str, iid: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?; let role = st.require_org(oid, &uid).await?; st.check_admin(oid, &uid).await?;
+    st.require_org_running(oid).await?;
     let identity = st.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(iid), json!(oid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::FORBIDDEN, "identity does not belong to workspace"))?;
     if st.role_privileged(oid, &db::s(&identity, "role")).await && role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only owner may configure privileged identities")); }
     Ok(uid)
@@ -114,8 +115,12 @@ pub(super) async fn login(State(st): State<S>, h: HeaderMap, peer: PeerAddr, Jso
     let oid = db::s(&trust, "org_id"); let iid = db::s(&trust, "identity_id"); let eid = db::s(&trust, "env_id");
     let org = st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(oid)]).await.map_err(|_| denied())?.ok_or_else(denied)?;
     let list = db::s(&org, "ip_allowlist"); if !list.trim().is_empty() && !list.split(',').any(|c| ip_in_cidr(&ip, c)) { return Err(err(StatusCode::FORBIDDEN, "source IP not in organisation allowlist")); }
+    // Lockdown denials stay 403 and distinct from a generic proof failure; check
+    // them before spending work on the proof.
+    let (trust_org, app) = st.env_org_app(&eid).await.map_err(|_| denied())?; if trust_org != oid { return Err(denied()); }
+    st.require_org_running(&oid).await?; st.require_app_running(&app).await?;
     let c = verify(jwt, &trust).map_err(|_| denied())?;
-    let (org, app) = st.require_env(&eid, &iid).await.map_err(|_| denied())?; if org != oid { return Err(denied()); }
+    st.require_env(&eid, &iid).await.map_err(|_| denied())?;
     let ttl = db::n(&trust, "ttl").min(c["exp"].as_i64().ok_or_else(denied)? - now()); if ttl <= 0 { return Err(denied()); }
     let token = oc::random_token("oww");
     let replay = oc::hash_token(&json!([db::s(&trust,"issuer"),c["jti"]]).to_string());

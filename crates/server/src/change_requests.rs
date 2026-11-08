@@ -5,8 +5,10 @@ fn conflict() -> (StatusCode, Json<Value>) { err(StatusCode::CONFLICT,"change re
 fn tx_error(e: String) -> (StatusCode, Json<Value>) { if e.contains("unavailable on Workers") { err(StatusCode::NOT_IMPLEMENTED,"atomic change requests unavailable on Workers") } else { conflict() } }
 fn aad(pid: &str, eid: &str, revision: i64) -> Vec<u8> { json!(["openwarp:change-request:v1",pid,eid,revision]).to_string().into_bytes() }
 async fn environment(st: &S, h: &HeaderMap, uid: &str, org: &str, eid: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
-    st.check_scope(h,eid).await?; let (actual,_) = st.require_env(eid,uid).await?;
+    st.check_scope(h,eid).await?; let (actual,app) = st.require_env(eid,uid).await?;
     if actual!=org { return Err(err(StatusCode::FORBIDDEN,"environment outside workspace")); }
+    // Lockdown is enforced here too: these routes are outside the central mapper.
+    st.require_org_running(&actual).await?; st.require_app_running(&app).await?;
     let row = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(conflict)?;
     if db::s(&row,"mode")!="sse" { return Err(err(StatusCode::CONFLICT,"change requests require server-readable SSE environments")); }
     st.env_key(eid).await
