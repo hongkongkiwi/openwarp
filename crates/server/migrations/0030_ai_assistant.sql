@@ -1,5 +1,8 @@
--- Migration 30: ai assistant settings, plans, activity and finding schema.
--- Verbatim transfer of the feat/ai-assistant inline migration 19 statements.
+-- BYOK assistant settings, bounded plans and deterministic security findings.
+-- These tables arrived with the assistant feature after main's lineage
+-- convergence at version 28, so the version is appended rather than folded into
+-- a shipped migration. Every create is guarded and the runner tolerates
+-- duplicate objects, matching the reconciliation migrations.
 CREATE TABLE IF NOT EXISTS ai_settings(org_id TEXT PRIMARY KEY,settings TEXT NOT NULL,key_enc TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS ai_plans(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,actor TEXT NOT NULL,operations TEXT NOT NULL,status TEXT NOT NULL,expires_at BIGINT NOT NULL,results TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,env_id TEXT NOT NULL,path TEXT NOT NULL,created_at BIGINT NOT NULL);

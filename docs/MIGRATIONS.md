@@ -108,20 +108,19 @@ plus unique names, on every apply.
   columns on `invites`, the `idx_invites_id` unique index, and the guarded
   `workspace_policy_lock` and `workspace_creation_open` meta rows. It is
   tolerant: a database that already ran the inline original keeps its columns.
-- Version 30 restores the AI assistant schema the feat/ai-assistant branch's
-  former inline migration 19 carried before the engine merge: `ai_settings`,
-  `ai_plans`, `ai_finding_states`, `ai_usage`, `ai_activity`,
-  `ai_finding_history`, `folders`, `integration_drafts`, and their four indexes
-  including the unique `idx_folders_env_path`. It is tolerant: a database that
-  already ran the inline original keeps its tables.
+- Version 30 adds the assistant schema after the lineage convergence: `ai_settings`
+  (BYOK endpoint and model policy plus the wrapped provider credential),
+  `ai_plans`, `ai_finding_states`, `ai_finding_history`, `ai_usage` and
+  `ai_activity`, the `folders` tree, and `integration_drafts`. Every create is
+  guarded so a database that already carries the tables keeps them and their data.
 
 New migrations start at version 31. SQL files 1 through 29 remain unchanged.
 Legacy main version 17 through 27 ledger rows have no checksum and remain
 unverified. A legacy main version 22 database applies versions 23 through 30; a
 legacy main version 23 database applies versions 24 through 30; each later main
 version applies the remaining tail, so a main version 27 database executes
-versions 28 through 30. An engine version 20 database applies versions 21
-through 30. The
+versions 28 through 30. An engine version 20 database applies versions 21 through
+30. The
 runner records checksums only for the new reconciliation files it actually
 executes, without relabelling occupied legacy versions.
 

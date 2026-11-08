@@ -3512,15 +3512,23 @@ async fn master_updates(db: &Db, old: &[u8; 32], new: &[u8; 32]) -> Result<Vec<(
         ("saml_configs", "org_id", "sp_key_enc", "sp_key_enc<>''"),
         ("rotation_hooks", "org_id", "secret_enc", "secret_enc<>''"),
         ("ldap_configs", "org_id", "bind_password_enc", "bind_password_enc<>''"),
+        ("ai_settings", "org_id", "key_enc", "key_enc<>''"),
         ("users", "id", "auth_key_enc", "auth_key_enc<>''"),
     ] {
         let rows = db.query(&format!("SELECT {},{} FROM {} WHERE {}", id_col, col, table, predicate), &[]).await?;
         for row in rows {
             let id = db::s(&row, id_col); let value = db::s(&row, col);
             if value.is_empty() || (table == "envs" && value.starts_with("owkms:")) { continue; }
-            let plain = if table == "users" { oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value) } else { oc::decrypt_symmetric(old, &value) }
-                .map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
-            let encrypted = if table == "users" { oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain) } else { oc::encrypt_symmetric(new, &plain) };
+            let plain = match table {
+                "users" => oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value),
+                "ai_settings" => oc::decrypt_symmetric_aad(old, &crate::ai::key_aad(&id), &value),
+                _ => oc::decrypt_symmetric(old, &value),
+            }.map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
+            let encrypted = match table {
+                "users" => oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain),
+                "ai_settings" => oc::encrypt_symmetric_aad(new, &crate::ai::key_aad(&id), &plain),
+                _ => oc::encrypt_symmetric(new, &plain),
+            };
             updates.push((format!("UPDATE {} SET {}=? WHERE {}=?", table, col, id_col), vec![json!(encrypted), json!(id)]));
         }
     }
@@ -3729,6 +3737,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let transit_updates = transit_compat::rewrap_master(&st, &old, &new).await?;
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
     let mut statements = transit::rotation(&st, &old, &new, &transit_root).await?;
+    for (sql, params) in ai_updates { statements.push((sql, params, Some(1))); }
     for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped),json!(id)], Some(1))); }
     for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value),json!(k)], Some(1))); }
     for (id, key_enc) in &ca_updates { statements.push(("UPDATE pki_cas SET key_enc=? WHERE id=?".into(), vec![json!(key_enc),json!(id)], Some(1))); }
@@ -3736,7 +3745,6 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     for (org, key_enc) in &saml_updates { statements.push(("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?".into(), vec![json!(key_enc),json!(org)], Some(1))); }
     for (org, secret) in &hook_updates { statements.push(("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?".into(), vec![json!(secret),json!(org)], Some(1))); }
     for (sql, updates) in [("UPDATE compat_transit_keys SET wrapping_key=? WHERE id=?", transit_updates), ("UPDATE users SET auth_key_enc=? WHERE id=?", auth_updates), ("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?", ldap_updates)] { for (id, value) in updates { statements.push((sql.into(), vec![json!(value),json!(id)], Some(1))); } }
-    for (sql, params) in ai_updates { statements.push((sql, params, Some(1))); }
     statements.push(("DELETE FROM email_codes".into(), vec![], None));
     if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
 
