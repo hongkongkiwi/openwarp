@@ -259,6 +259,27 @@
               "open",
               "invite"
             ]
+          },
+          "region": {
+            "type": "string",
+            "description": "Jurisdiction this deployment serves, from its own configuration",
+            "example": "global"
+          },
+          "regions": {
+            "type": "array",
+            "description": "Jurisdictions the sign-in card may hand off to; empty when this deployment is the only one",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            }
           }
         }
       },
@@ -276,6 +297,10 @@
           },
           "role": {
             "type": "string"
+          },
+          "members": {
+            "type": "integer",
+            "description": "Number of members in the workspace"
           }
         }
       },

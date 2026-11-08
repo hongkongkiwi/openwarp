@@ -26,6 +26,10 @@ The interface is translated into English, Traditional Chinese, Simplified Chines
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
 
+Signing in is account-level, not workspace-level. One account can hold memberships in several workspaces; when it holds more than one, the console asks which workspace to open and remembers that choice for the account on this device. The switcher at the top of the sidebar lists the workspaces with the role held in each, keeps **Account settings** and **Sign out** apart from them, and closes on Escape or an outside click. Sign-in through a workspace's single sign-on needs the workspace ID, because an address alone cannot reveal which workspace is meant; the dialog offers SAML and OIDC.
+
+The sign-in card also names the data jurisdiction the instance serves, and offers **Change region** only when the operator lists another jurisdiction in `OPENWARP_REGIONS`. The hand-off is a link to that origin; a jurisdiction is never selected inside the current server, because it is where the account and its data live.
+
 Save the recovery kit shown during account creation. It is your private key, not an API token. If password reset asks for the kit, supplying it preserves the existing key. Choosing to discard a lost key prevents that account from decrypting existing E2E grants.
 
 Enable TOTP MFA from settings and keep the recovery codes somewhere other than your authenticator device. If verification email or reset delivery fails, contact your instance operator; a generic success message does not prove the relay sent the email.
