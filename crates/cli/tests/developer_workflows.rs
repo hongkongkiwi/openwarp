@@ -58,7 +58,9 @@ fn bounded(cmd: &mut Command) -> Output {
     // Drain both pipes while the child runs so a full pipe cannot mask its exit status.
     let stdout = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).expect("read CLI stdout"); bytes });
     let stderr = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).expect("read CLI stderr"); bytes });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // A hung CLI still fails, but keypair work and process startup can exceed a
+    // tight budget when the machine is busy, so this guards hangs, not speed.
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return Output { status, stdout: stdout.join().expect("stdout reader"), stderr: stderr.join().expect("stderr reader") };
