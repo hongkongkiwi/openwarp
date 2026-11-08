@@ -60,9 +60,14 @@ fn parse() -> Result<Option<Args>, String> {
             "--database-url" => url = arguments.next().ok_or("--database-url needs a value")?,
             "--to" => to = Some(arguments.next().ok_or("--to needs a version")?.parse::<i64>().map_err(|_| "--to needs an integer")?),
             "--version" => version = Some(arguments.next().ok_or("--version needs a version")?.parse::<i64>().map_err(|_| "--version needs an integer")?),
-            "--set-applied" => repair = Some("set-applied"),
-            "--remove" => repair = Some("remove"),
-            "--accept-checksum" => repair = Some("accept-checksum"),
+            "--set-applied" | "--remove" | "--accept-checksum" => {
+                if repair.is_some() { return Err("repair accepts exactly one action".to_string()); }
+                repair = Some(match argument.as_str() {
+                    "--set-applied" => "set-applied",
+                    "--remove" => "remove",
+                    _ => "accept-checksum",
+                });
+            },
             "--dry-run" => dry_run = true,
             "--expected-owner" => expected_owner = Some(arguments.next().ok_or("--expected-owner needs a value")?),
             "--quiesced" => quiesced = true,
@@ -130,7 +135,7 @@ async fn run(args: Args) -> Result<i32, String> {
         }
         "verify" => {
             let status = migrate::status(&db, MIGRATIONS).await?;
-            if !status.ledger_present { println!("no ledger yet (fresh database)"); }
+            if !status.ledger_present && !status.has_problems() { println!("no ledger yet (fresh database)"); }
             if status.problems.is_empty() {
                 println!("ok: current {} latest {} checksums and history agree", status.current, status.latest);
                 Ok(0)
@@ -140,11 +145,30 @@ async fn run(args: Args) -> Result<i32, String> {
             }
         }
         "apply" => {
-            if args.dry_run {
-                let status = migrate::status(&db, MIGRATIONS).await?;
-                for entry in status.pending() { println!("would apply {:04} {}", entry.version, entry.name); }
+            let status = migrate::status(&db, MIGRATIONS).await?;
+            if status.has_problems() {
                 print_problems(&status.problems);
-                return Ok(if status.has_problems() { 1 } else { 0 });
+                return Ok(1);
+            }
+            if args.dry_run {
+                let fresh = status.pending().len() == MIGRATIONS.len();
+                if fresh && db.has_application_schema().await? {
+                    eprintln!("database contains application tables but no migration history; refusing to apply the consolidated baseline");
+                    return Ok(1);
+                }
+                for entry in status.pending() {
+                    if fresh && entry.version == 2 {
+                        println!("would record versions 2-{} as squashed", migrate::SQUASHED_THROUGH);
+                    }
+                    if fresh && entry.version > 1 && entry.version <= migrate::SQUASHED_THROUGH { continue; }
+                    if status.interrupted_squash && entry.version <= migrate::SQUASHED_THROUGH {
+                        println!("would record {:04} {} as squashed", entry.version, entry.name);
+                        continue;
+                    }
+                    if entry.version > args.to.unwrap_or(i64::MAX) && !(fresh && entry.version == 1) { continue; }
+                    println!("would apply {:04} {}", entry.version, entry.name);
+                }
+                return Ok(0);
             }
             let report = migrate::apply(&db, MIGRATIONS, migrate::Options { to: args.to }).await?;
             if report.squashed { println!("applied the consolidated baseline (versions 2-{} recorded as squashed)", migrate::SQUASHED_THROUGH); }

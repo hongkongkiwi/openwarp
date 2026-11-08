@@ -194,7 +194,8 @@ impl Db {
                 for statement in statements {
                     if let Err(e) = conn.execute_batch(statement) { let _ = conn.execute_batch("ROLLBACK"); return Err(e.to_string()); }
                 }
-                conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+                if let Err(error) = conn.execute_batch("COMMIT") { let _ = conn.execute_batch("ROLLBACK"); return Err(error.to_string()); }
+                Ok(())
             }
             #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
@@ -229,13 +230,21 @@ impl Db {
     #[cfg(target_arch = "wasm32")]
     pub fn script_is_atomic(&self) -> bool { false }
     pub async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        self.query_inner(sql, params, true).await
+    }
+    pub(crate) async fn query_raw(&self, sql: &str) -> Result<Vec<Row>, String> {
+        self.query_inner(sql, &[], false).await
+    }
+    async fn query_inner(&self, sql: &str, params: &[Value], translate: bool) -> Result<Vec<Row>, String> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = translate;
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Db::Sqlite(c) => { let conn = c.lock().unwrap(); query_sqlite(&conn, sql, params) }
             #[cfg(not(target_arch = "wasm32"))]
             Db::Postgres(pool) => {
                 let client = pool.get().await.map_err(|e| e.to_string())?;
-                let sql2 = pg_sql(sql); let pg = PgParams::new(params); let refs = pg.refs();
+                let sql2 = if translate { pg_sql(sql) } else { sql.to_string() }; let pg = PgParams::new(params); let refs = pg.refs();
                 let rows = client.query(sql2.as_str(), &refs[..]).await.map_err(pg_err)?;
                 let mut out = Vec::new();
                 for r in &rows {

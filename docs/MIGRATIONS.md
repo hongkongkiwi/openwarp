@@ -195,7 +195,12 @@ file, so an inspection cannot create a database or change a ledger. `apply --dry
 is a preview too and opens read-only. A real `apply` may create a SQLite file.
 `repair` requires an existing ledger. `status` does not print the database URL,
 which may contain credentials. `--dry-run` is rejected on every command except
-`apply`.
+`apply`. A dry-run honors `--to` and identifies baseline-covered versions as
+squashed rather than executed; the baseline still covers versions 2 through 17
+on a fresh database even when the target is lower. The preview checks the current
+ledger without acquiring migration ownership. A real apply checks it again under
+ownership. If the ledger changes between those checks, an apply error exits 2.
+Repair requires exactly one of the three action flags.
 
 Use `--set-applied` after checking that an interrupted migration really did
 finish its work. It only completes a row whose `success` marker is `0`, and it
@@ -276,10 +281,10 @@ human has to reconcile.
 
 `crates/server/tests/migrations.rs` covers the fresh path, checksum drift,
 newer-database refusal, history gaps, interrupted migrations and repair, lock
-contention and stale takeover, a legacy ledger catching up, and a full apply on
+contention and refusal of stale takeover, a legacy ledger catching up, and a full apply on
 live PostgreSQL and MariaDB. It also builds the real version 9 schema from
 `tests/fixtures/schema_v9.sql`, seeds rows, and upgrades it through versions 10
-to 20 without losing data. The SQLite cases always run. The other two run when
+to 22 without losing data. The SQLite cases always run. The other two run when
 their environment variables are set, as shown above; each test creates and drops
 its own database.
 
@@ -292,7 +297,7 @@ WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 
 The script builds the Worker with the test-only `d1-smoke` feature, which adds
 an internal route that calls the same runner with the D1 binding. It applies the
-manifest, checks version 20 and the 16 squashed rows, and verifies that a second
+manifest, checks version 22 and the 16 squashed rows, and verifies that a second
 apply is a no-op. The production Worker build in `wrangler.toml` does not enable
 the feature, so that route is absent from deployed bundles. CI runs this after
 the Workerd smoke test.

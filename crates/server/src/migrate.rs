@@ -93,7 +93,7 @@ impl Target for Db {
     async fn apply(&self, migrations: &[Migration], options: Options) -> Result<Report, String> { self.migration_apply(migrations, options).await }
     async fn repair(&self, migrations: &[Migration], action: Repair) -> Result<String, String> { self.migration_repair(migrations, action).await }
     async fn exec(&self, sql: &str) -> Result<(), String> { Db::exec_raw(self, sql).await }
-    async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { Db::query(self, sql, &[]).await }
+    async fn query(&self, sql: &str) -> Result<Vec<Row>, String> { Db::query_raw(self, sql).await }
     async fn script(&self, statements: &[String]) -> Result<(), String> { Db::exec_script(self, statements).await }
     fn atomic_ddl(&self) -> bool { Db::script_is_atomic(self) }
     fn sql_dialect(&self) -> SqlDialect {
@@ -179,6 +179,10 @@ pub enum Problem {
     Unknown { version: i64 },
     /// A later version is applied while an earlier one is not.
     Gap { version: i64 },
+    /// Application tables exist without recorded migration history.
+    MissingHistory,
+    /// The ledger has only some of the migration metadata columns.
+    PartialMetadata,
 }
 
 impl Problem {
@@ -189,6 +193,8 @@ impl Problem {
             Problem::Newer { version, latest } => format!("database is newer than this binary (version {}, this binary knows {}); refusing to run an older schema", version, latest),
             Problem::Unknown { version } => format!("database recorded migration {} which this binary does not contain", version),
             Problem::Gap { version } => format!("migration {} is missing while a later version is applied", version),
+            Problem::MissingHistory => "database contains application tables but no migration history".to_string(),
+            Problem::PartialMetadata => "migration ledger has incomplete metadata columns; inspect its history before repair".to_string(),
         }
     }
 }
@@ -217,6 +223,8 @@ pub struct Status {
     pub problems: Vec<Problem>,
     /// False when the ledger table (or its metadata columns) is not readable.
     pub ledger_present: bool,
+    /// A proven baseline whose remaining squash markers will be recorded on apply.
+    pub interrupted_squash: bool,
 }
 
 impl Status {
@@ -309,6 +317,15 @@ async fn reject_persistent_owner<T: Target>(target: &T) -> Result<(), String> {
     Ok(())
 }
 
+fn interrupted_squash(rows: &[LedgerRow], migrations: &[Migration]) -> bool {
+    !rows.is_empty() && rows.len() < SQUASHED_THROUGH as usize
+        && rows[0].version == 1 && rows[0].name == "baseline" && rows[0].success
+        && rows[0].checksum == checksum(migrations[0].sql)
+        && rows.iter().skip(1).enumerate().all(|(index, row)| {
+            row.version == index as i64 + 2 && row.success && row.checksum == "squashed"
+        })
+}
+
 async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: Options, report: &mut Report) -> Result<(), String> {
     let rows = read_ledger(target).await?;
     let problems = check(&rows, migrations);
@@ -341,13 +358,7 @@ async fn apply_locked<T: Target>(target: &T, migrations: &[Migration], options: 
             done.insert(migration.version);
         }
         report.squashed = true;
-    } else if rows.len() < SQUASHED_THROUGH as usize
-        && rows[0].version == 1 && rows[0].name == "baseline" && rows[0].success
-        && rows[0].checksum == checksum(migrations[0].sql)
-        && rows.iter().skip(1).enumerate().all(|(index, row)| {
-            row.version == index as i64 + 2 && row.success && row.checksum == "squashed"
-        })
-    {
+    } else if interrupted_squash(&rows, migrations) {
         // Only a completed modern baseline followed by squash markers proves
         // that the missing prefix was covered before an interrupted write.
         for migration in migrations.iter().filter(|m| m.version > 1 && m.version <= SQUASHED_THROUGH && !done.contains(&m.version)) {
@@ -475,7 +486,9 @@ fn is_duplicate(error: &str) -> bool {
 
 fn is_missing_relation(error: &str) -> bool {
     let message = error.to_ascii_lowercase();
-    message.contains("no such table") || message.contains("does not exist") || message.contains("doesn't exist") || message.contains("unknown table")
+    message.contains("no such table") || message.contains("unknown table")
+        || ((message.contains("relation") || message.contains("table"))
+            && (message.contains("does not exist") || message.contains("doesn't exist")))
 }
 
 async fn insert_squashed<T: Target>(target: &T, migration: &Migration) -> Result<(), String> {
@@ -513,21 +526,43 @@ async fn backfill_legacy<T: Target>(target: &T, rows: &[LedgerRow], migrations: 
 /// ledger shape, and to an empty ledger when the table does not exist yet.
 pub async fn status<T: Target>(target: &T, migrations: &[Migration]) -> Result<Status, String> {
     validate(migrations)?;
-    let (rows, ledger_present) = match read_ledger(target).await {
-        Ok(rows) => (rows, true),
+    let (rows, ledger_present, partial_metadata) = match read_ledger(target).await {
+        Ok(rows) => (rows, true, false),
         // A ledger from an older binary lacks the metadata columns; fall back to
         // the version-only shape before deciding the table is absent.
-        Err(_) => match target.query("SELECT version FROM schema_migrations ORDER BY version").await {
-            Ok(rows) => (rows.iter().map(|row| LedgerRow {
-                version: n(row, "version"), name: String::new(), checksum: String::new(), success: true, execution_ms: 0,
-            }).collect(), true),
-            Err(error) if is_missing_relation(&error) => (Vec::new(), false),
-            // A permission or connection error is not a fresh database; report it
-            // instead of telling the operator there is nothing to verify.
-            Err(error) => return Err(error),
+        Err(error) => match target.query("SELECT version, applied_at FROM schema_migrations ORDER BY version").await {
+            Ok(rows) => {
+                let message = error.to_ascii_lowercase();
+                if !(message.contains("no such column") || message.contains("unknown column")
+                    || (message.contains("column") && message.contains("does not exist"))) { return Err(error); }
+                let catalog = match target.sql_dialect() {
+                    SqlDialect::Sqlite => "SELECT name FROM pragma_table_info('schema_migrations')",
+                    SqlDialect::Postgres => "SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='schema_migrations'",
+                    SqlDialect::Mysql => "SELECT column_name AS name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='schema_migrations'",
+                    SqlDialect::Legacy => return Err(error),
+                };
+                let columns: BTreeSet<String> = target.query(catalog).await?.iter().map(|row| s(row, "name")).collect();
+                let partial = columns != BTreeSet::from(["version".to_string(), "applied_at".to_string()]);
+                let rows = if partial {
+                    let select = |column: &str, default: &str| {
+                        if columns.contains(column) { column.to_string() } else { format!("{} AS {}", default, column) }
+                    };
+                    target.query(&format!("SELECT version, {}, {}, {}, {} FROM schema_migrations ORDER BY version",
+                        select("name", "''"), select("checksum", "''"), select("success", "0"), select("execution_ms", "0"))).await?
+                } else { rows };
+                (rows.iter().map(|row| LedgerRow {
+                    version: n(row, "version"), name: s(row, "name"), checksum: s(row, "checksum"),
+                    success: if partial { n(row, "success") != 0 } else { true }, execution_ms: n(row, "execution_ms"),
+                }).collect(), true, partial)
+            }
+            Err(probe_error) if is_missing_relation(&probe_error) => (Vec::new(), false, false),
+            Err(probe_error) => return Err(probe_error),
         },
     };
-    let problems = check(&rows, migrations);
+    let mut problems = check(&rows, migrations);
+    if partial_metadata { problems.push(Problem::PartialMetadata); }
+    if rows.is_empty() && target.has_application_schema().await? { problems.push(Problem::MissingHistory); }
+    let interrupted_squash = !partial_metadata && interrupted_squash(&rows, migrations);
     let current = rows.iter().filter(|r| r.success).map(|r| r.version).max().unwrap_or(0);
     let entries = migrations.iter().map(|migration| Entry {
         version: migration.version,
@@ -540,7 +575,7 @@ pub async fn status<T: Target>(target: &T, migrations: &[Migration]) -> Result<S
             Some(_) => State::Applied,
         },
     }).collect();
-    Ok(Status { current, latest: migrations.last().map(|m| m.version).unwrap_or(0), entries, problems, ledger_present })
+    Ok(Status { current, latest: migrations.last().map(|m| m.version).unwrap_or(0), entries, problems, ledger_present, interrupted_squash })
 }
 
 pub async fn repair<T: Target>(target: &T, migrations: &[Migration], action: Repair) -> Result<String, String> {
@@ -649,7 +684,9 @@ pub fn check(rows: &[LedgerRow], migrations: &[Migration]) -> Vec<Problem> {
         };
         if !row.success {
             problems.push(Problem::Incomplete { version: row.version });
-        } else if !row.checksum.is_empty() && row.checksum != "squashed" && row.checksum != checksum(migration.sql) {
+        } else if !row.checksum.is_empty() && (if row.checksum == "squashed" {
+            !(2..=SQUASHED_THROUGH).contains(&row.version)
+        } else { row.checksum != checksum(migration.sql) }) {
             problems.push(Problem::Checksum { version: row.version });
         }
     }
@@ -719,6 +756,7 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
     let mut has_code = false;
     let mut words = 0;
     let mut create = false;
+    let mut create_temp = false;
     let mut trigger = false;
     let mut trigger_depth = 0usize;
 
@@ -732,9 +770,9 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
             Mode::Normal => {
                 if continuation {
                     if byte == b'\n' || byte == b'\r' { continuation_newline = true; }
-                    else if !byte.is_ascii_whitespace() && byte != b'\''
-                        && !(byte == b'-' && bytes.get(index + 1) == Some(&b'-'))
-                        && !(byte == b'/' && bytes.get(index + 1) == Some(&b'*')) { continuation = false; }
+                    else if !(byte.is_ascii_whitespace() || byte == b'\''
+                        || (byte == b'-' && bytes.get(index + 1) == Some(&b'-'))
+                        || (byte == b'/' && bytes.get(index + 1) == Some(&b'*'))) { continuation = false; }
                 }
                 if byte == b'\'' {
                     single_backslash_escape = matches!(dialect, SqlDialect::Legacy | SqlDialect::Mysql)
@@ -761,7 +799,11 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
                     while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] == b'$') { index += 1; }
                     let word = &sql[word_start..index];
                     if words == 0 { create = word.eq_ignore_ascii_case("CREATE"); }
-                    if words == 1 && create { trigger = word.eq_ignore_ascii_case("TRIGGER"); }
+                    if words == 1 && create {
+                        trigger = word.eq_ignore_ascii_case("TRIGGER");
+                        create_temp = word.eq_ignore_ascii_case("TEMP") || word.eq_ignore_ascii_case("TEMPORARY");
+                    }
+                    if words == 2 && create && create_temp { trigger = word.eq_ignore_ascii_case("TRIGGER"); }
                     words += 1;
                     if trigger && (word_start == 0 || bytes[word_start - 1] != b'.') {
                         if word.eq_ignore_ascii_case("BEGIN") || (trigger_depth > 0 && word.eq_ignore_ascii_case("CASE")) {
@@ -778,6 +820,7 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
                     has_code = false;
                     words = 0;
                     create = false;
+                    create_temp = false;
                     trigger = false;
                     index += 1;
                 } else {
@@ -838,7 +881,9 @@ fn trim_leading_comments(text: &str, dialect: SqlDialect) -> &str {
     let mut rest = text.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
-            match after.find('\n') { Some(index) => rest = after[index + 1..].trim_start(), None => return "" }
+            match after.find(|c| c == '\n' || (dialect == SqlDialect::Postgres && c == '\r')) {
+                Some(index) => rest = after[index + 1..].trim_start(), None => return ""
+            }
         } else if let Some(after) = rest.strip_prefix('#').filter(|_| matches!(dialect, SqlDialect::Legacy | SqlDialect::Mysql)) {
             match after.find('\n') { Some(index) => rest = after[index + 1..].trim_start(), None => return "" }
         } else if let Some(after) = rest.strip_prefix("/*") {
