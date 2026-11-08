@@ -3967,6 +3967,7 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let lifecycle_guard=st.lifecycle.clone().write_owned().await;
     let uid = st.token_user(&h).await?;
@@ -4082,6 +4083,15 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     { let st2 = st.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} cas={} streams={} saml={} hooks={}", counts.0, counts.1, counts.2, counts.3, counts.4, counts.5)).await;
     Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
+
+// The Workers build has no blocking runtime, rusqlite, or OCSP/CRL signing;
+// these instance and PKI routes answer 501 there.
+#[cfg(target_arch = "wasm32")]
+async fn rotate_master(State(_): State<S>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
+#[cfg(target_arch = "wasm32")]
+async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
+#[cfg(target_arch = "wasm32")]
+async fn ca_crl() -> Response { err(StatusCode::NOT_IMPLEMENTED, "CRL generation requires the native server").into_response() }
 
 // ---------- SCIM groups + user lifecycle ----------
 #[cfg(feature = "scim")]

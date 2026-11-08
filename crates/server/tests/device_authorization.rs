@@ -268,11 +268,16 @@ async fn register(s: &Server, email: &str) -> Value {
     body
 }
 
-async fn invite(s: &Server, owner: &str, org: &str, email: &str, role: &str) {
+async fn invite(s: &Server, owner: &str, org: &str, email: &str, role: &str, invitee: &str) {
     let r = s
         .call(Method::POST, &format!("/api/orgs/{}/members", org), Some(owner), Some(json!({"email": email, "role": role})))
         .await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    // An invitation no longer grants membership; the invitee redeems it, as an
+    // invited person does in the console.
+    let token = r.body["invite_token"].as_str().expect("invite token").to_string();
+    let a = s.call(Method::POST, "/api/auth/accept-invite", Some(invitee), Some(json!({"token": token}))).await;
+    assert_eq!(a.status, 200, "invite acceptance failed: {}", a.text);
 }
 
 async fn app_with_envs(s: &Server, token: &str, org: &str) -> (String, Vec<String>) {
@@ -309,7 +314,7 @@ async fn org_with_viewer(s: &Server, suffix: &str) -> (String, String, String, S
         .call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&ot), Some(json!({"name": "viewer", "permissions": []})))
         .await;
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
-    invite(s, &ot, &org, &format!("viewer{}@test.invalid", suffix), "viewer").await;
+    invite(s, &ot, &org, &format!("viewer{}@test.invalid", suffix), "viewer", &mt).await;
     let (app, envs) = app_with_envs(s, &ot, &org).await;
     set_secret(s, &ot, &envs[0], "SECRET1", "v1").await;
     (ot, org, mt, mu, app, envs)
@@ -382,7 +387,7 @@ async fn device_management_requires_pki_write() {
     let op_token = operator["token"].as_str().unwrap().to_string();
     let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&owner), Some(json!({"name": "pki-ops", "permissions": ["pki:read", "pki:write"]}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
-    invite(&s, &owner, &org, "pki-operator@test.invalid", "pki-ops").await;
+    invite(&s, &owner, &org, "pki-operator@test.invalid", "pki-ops", &op_token).await;
     let r = s.call(Method::POST, &format!("/api/pki/cas/{}/devices", ca), Some(&op_token), Some(json!({"name": "sensor-2"}))).await;
     assert_eq!(r.status, 200, "pki:write may create devices: {}", r.text);
     let device = r.body["id"].as_str().unwrap().to_string();
