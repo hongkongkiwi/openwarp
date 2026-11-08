@@ -116,6 +116,16 @@ pub fn issue(ca_certificate_pem: &str, ca_private_key_pem: &str, cn: &str, sans:
     })
 }
 
+pub fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> {
+    let key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).map_err(err)?;
+    let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone());
+    let public = key.to_public_key().to_public_key_der().map_err(err)?;
+    let name = subject(cn)?;
+    let profile = Profile::Leaf { issuer: name.clone(), enable_key_agreement: false, enable_key_encipherment: false };
+    let builder = CertificateBuilder::new(profile, serial()?.0, ca_validity()?, name, SubjectPublicKeyInfoOwned::try_from(public.as_bytes()).map_err(err)?, &signer).map_err(err)?;
+    let cert = builder.build::<rsa::pkcs1v15::Signature>().map_err(err)?;
+    Ok((key.to_pkcs8_pem(LineEnding::LF).map_err(err)?.to_string(), cert.to_pem(LineEnding::LF).map_err(err)?.to_string()))
+}
 
 pub fn csr_public_key(pem: &str) -> Result<SubjectPublicKeyInfoOwned, String> {
     use x509_cert::der::Encode;
