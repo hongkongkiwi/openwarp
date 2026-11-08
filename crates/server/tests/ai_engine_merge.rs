@@ -86,7 +86,7 @@ async fn assert_contains_schema(db: &Db, canonical: &Db) {
         let actual = db.query(&format!("PRAGMA table_info({})", table), &[]).await.unwrap();
         assert!(!actual.is_empty(), "missing canonical table {}", table);
         for column in expected {
-            let name = s(column, "name");
+            let name = s(&column, "name");
             let found = actual.iter().find(|row| s(row, "name") == name)
                 .unwrap_or_else(|| panic!("missing canonical column {}.{}", table, name));
             for property in ["type", "notnull", "dflt_value", "pk"] {
@@ -95,7 +95,7 @@ async fn assert_contains_schema(db: &Db, canonical: &Db) {
         }
         let actual_indexes = db.query(&format!("PRAGMA index_list({})", table), &[]).await.unwrap();
         for index in canonical.query(&format!("PRAGMA index_list({})", table), &[]).await.unwrap() {
-            let name = s(index, "name");
+            let name = s(&index, "name");
             let expected_columns = canonical.query(&format!("PRAGMA index_info({})", name), &[]).await.unwrap()
                 .iter().map(|row| s(row, "name")).collect::<Vec<_>>();
             assert!(!expected_columns.is_empty());
