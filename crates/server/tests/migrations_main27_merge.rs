@@ -34,6 +34,13 @@ fn empty_db() -> Db {
     Db::Sqlite(std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))
 }
 
+// The canonical fixtures predate the engine's success column, so the installed
+// version has to come straight from the ledger they create.
+async fn installed_version(db: &Db) -> i64 {
+    db.one("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations", &[]).await.unwrap()
+        .map(|row| n(&row, "version")).unwrap_or(0)
+}
+
 async fn legacy_main(version: i64) -> Db {
     assert!((23..=27).contains(&version));
     let fixture = include_str!("fixtures/schema_main27.sql");
@@ -45,7 +52,7 @@ async fn legacy_main(version: i64) -> Db {
     };
     let db = empty_db();
     db.exec_script(&migrate::split_sql(&sql)).await.expect("install independently derived canonical main schema");
-    assert_eq!(db.version().await.unwrap(), version);
+    assert_eq!(installed_version(&db).await, version);
     assert_eq!(db.query("PRAGMA table_info(schema_migrations)", &[]).await.unwrap().iter().map(|row| s(row, "name")).collect::<Vec<_>>(), vec!["version", "applied_at"]);
     db
 }
@@ -150,9 +157,14 @@ async fn snapshot_except(db: &Db, except: &[&str]) -> Vec<(String, Vec<Row>)> {
 
 async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> { snapshot_except(db, &[]).await }
 
-async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)>) {
+// A migration may add rows (the rotation_lifecycle seed), so preservation means
+// every earlier row still exists unchanged, not that the table stopped growing.
+async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
-        assert_eq!(&db.query(sql, &[]).await.unwrap(), rows, "preserve rows for {}", sql);
+        let now = db.query(sql, &[]).await.unwrap();
+        for row in rows {
+            assert!(now.contains(row), "migration dropped or rewrote a row for {}: {:?}", sql, row);
+        }
     }
 }
 
@@ -228,7 +240,7 @@ async fn engine23_upgrade_preserves_checksums_and_product_data() {
 async fn historical_device20_restores_skipped_product_schema_and_keeps_ca_kinds() {
     let db = empty_db();
     db.exec_script(&migrate::split_sql(include_str!("fixtures/schema_device20.sql"))).await.unwrap();
-    assert_eq!(db.version().await.unwrap(), 20);
+    assert_eq!(installed_version(&db).await, 20);
     assert!(db.query("SELECT id FROM workload_trusts", &[]).await.is_err(), "fixture represents skipped canonical product history");
     let meta_before = db.query("SELECT k,v FROM meta ORDER BY k", &[]).await.unwrap()
         .iter().map(|row| (s(row, "k"), s(row, "v"))).collect::<Vec<_>>();

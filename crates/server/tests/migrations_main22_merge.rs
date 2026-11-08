@@ -150,9 +150,14 @@ async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> {
     result
 }
 
+// A migration may add rows (the rotation_lifecycle seed), so preservation means
+// every earlier row still exists unchanged, not that the table stopped growing.
 async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
-        assert_eq!(&db.query(sql, &[]).await.unwrap(), rows, "migration must preserve rows for {}", sql);
+        let now = db.query(sql, &[]).await.unwrap();
+        for row in rows {
+            assert!(now.contains(row), "migration dropped or rewrote a row for {}: {:?}", sql, row);
+        }
     }
 }
 
