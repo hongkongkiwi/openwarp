@@ -804,6 +804,10 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE INDEX IF NOT EXISTS idx_wrap_tokens_expiry ON wrap_tokens(expires_at)",
     ]),
     (18, &[
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+    ]),
+    (19, &[
         "CREATE TABLE IF NOT EXISTS pki_devices(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,ca_id TEXT NOT NULL,app_id TEXT DEFAULT '',env_id TEXT DEFAULT '',name TEXT NOT NULL,model TEXT DEFAULT '',hardware_serial TEXT DEFAULT '',tags TEXT DEFAULT '',sans TEXT DEFAULT '',cert_days BIGINT DEFAULT 90,active_cert_id TEXT DEFAULT '',enroll_epoch BIGINT DEFAULT 0,deleting BIGINT DEFAULT 0,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pki_devices_ca_name ON pki_devices(ca_id,name)",
         "CREATE INDEX IF NOT EXISTS idx_pki_devices_org ON pki_devices(org_id)",
@@ -815,7 +819,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_certs ADD COLUMN revoked_at BIGINT DEFAULT 0",
         "ALTER TABLE pki_certs ADD COLUMN issued_via TEXT DEFAULT ''",
     ]),
-    (19, &[
+    (20, &[
         "ALTER TABLE pki_cas ADD COLUMN parent_id TEXT DEFAULT ''",
         "ALTER TABLE pki_cas ADD COLUMN revoked BIGINT DEFAULT 0",
         "ALTER TABLE pki_cas ADD COLUMN revoked_at BIGINT DEFAULT 0",
@@ -837,7 +841,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "UPDATE pki_cas SET ca_kind='intermediate' WHERE parent_id<>''",
         "UPDATE pki_cas SET kind='x509' WHERE kind='root' OR kind='intermediate'",
     ]),
-    (20, &[
+    (21, &[
         "CREATE TABLE IF NOT EXISTS pki_renew_challenges(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,cert_id TEXT NOT NULL,csr TEXT NOT NULL,challenge TEXT NOT NULL,expires_at BIGINT NOT NULL,used_at BIGINT DEFAULT 0)",
         "CREATE INDEX IF NOT EXISTS idx_pki_renew_expiry ON pki_renew_challenges(expires_at)",
         "CREATE TABLE IF NOT EXISTS pki_expiry_deliveries(org_id TEXT NOT NULL,user_id TEXT NOT NULL,day BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(org_id,user_id,day))",
@@ -846,7 +850,9 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "ALTER TABLE pki_cas ADD COLUMN attest_mode TEXT DEFAULT 'jwt'",
     ]),
     // Feature-lineage databases recorded 17-20 before the canonical schema landed.
-    (21, &[
+    (22, &[
+        "ALTER TABLE orgs ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE apps ADD COLUMN emergency_locked BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE envs ADD COLUMN max_versions BIGINT DEFAULT 0",
         "ALTER TABLE leases ADD COLUMN attempted_at BIGINT DEFAULT 0",
         "ALTER TABLE audit ADD COLUMN seq BIGINT DEFAULT 0",
@@ -928,10 +934,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 21, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 21, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 22, "each migration must be recorded exactly once");
     }
     #[tokio::test] async fn device_migrations_converge_both_lineages() {
         for feature in [false, true] {
@@ -947,7 +953,7 @@ mod tests {
             conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind) VALUES('ssh','org','SSH','key','sealed',1,'ssh')", []).unwrap();
             if feature { conn.execute("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,created_at,kind,ca_kind,parent_id) VALUES('child','org','child','cert','sealed',1,'x509','intermediate','root')", []).unwrap(); }
             let db = Db::Sqlite(std::sync::Mutex::new(conn)); db.migrate().await.unwrap();
-            assert_eq!(db.version().await.unwrap(),21);
+            assert_eq!(db.version().await.unwrap(),22);
             assert_eq!(s(&db.one("SELECT kind FROM pki_cas WHERE id='ssh'", &[]).await.unwrap().unwrap(),"kind"),"ssh");
             if feature { assert_eq!(s(&db.one("SELECT ca_kind FROM pki_cas WHERE id='child'", &[]).await.unwrap().unwrap(),"ca_kind"),"intermediate"); }
             db.query("SELECT seq,prev_hash,hash FROM audit", &[]).await.unwrap();

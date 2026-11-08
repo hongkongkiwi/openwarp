@@ -82,6 +82,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
       <div class="searchbox" onclick="openPalette()"><span>⌕</span><span style="flex:1">Search secrets…</span><kbd>⌘K</kbd></div>
       <button class="primary" id="topaction" onclick="newApp()">+ New app</button>
     </div>
+    <div class="content" id="emergency-banner" role="status" hidden></div>
     <div class="content" id="view"></div>
   </main>
 </div>
@@ -92,6 +93,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
 <script>
+let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0;
 let T='', ORG='', APP=null, ENV=null, APPS=[], ENVS=[], SECRETS=[], DRAFTS={}, VIEW='apps', MFA=null, LASTFOCUS=null, PENDING_ORG=null, ME=null,
   E2E_KIT='', E2E_KEYS={}, E2E_DATA={}, E2E_DRAFTS={}, E2E_META={}, E2E_GRANTS={}, E2E_LOADING={}, E2E_LOCKED={}, E2E_ERR={}, MY_PUBKEY='', MY_UID='';
 function drafts(){return (ENV&&DRAFTS[ENV.id])||{}}
@@ -99,11 +101,34 @@ function draftList(){return Object.values(drafts())}
 function e2eDrafts(){return (ENV&&E2E_DRAFTS[ENV.id])||{}}
 function e2eDraftList(){return Object.values(e2eDrafts())}
 const $=id=>document.getElementById(id);
-const H=()=>({'Authorization':'Bearer '+T,'Content-Type':'application/json'});
-async function api(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+const H=()=>({'Content-Type':'application/json'});
+function emergencyAllowed(m,u){if(u===`/api/orgs/${ORG}/emergency`||u===`/api/apps/${APP?.id}/emergency`||u==='/api/auth/logout')return true;
+  return m==='GET'&&!/\/(secrets|export|e2e|leases|search)(\/|\?|$)/.test(u)}
+async function api(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
+  let active=AUTH_READY,org=ORG;let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+  if(active&&(!AUTH_READY||org!==ORG))throw new Error('Session or workspace changed');
+  if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');
+  if(r.status===401&&AUTH_READY)sessionEnded();
+  if(AUTH_READY&&(r.status===423||(r.status===403&&String(d.error||'').includes('emergency lockdown')))){clearSecretState();refreshEmergency()}
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status)); return d}
+function clearSecretState(){SECRET_EPOCH++;SECRETS=[];DRAFTS={};E2E_KIT='';E2E_KEYS={};E2E_DATA={};E2E_DRAFTS={};E2E_META={};E2E_GRANTS={};E2E_LOADING={};E2E_LOCKED={};E2E_ERR={};
+  closeModal();$('modal').innerHTML='';$('palette').style.display='none';$('paletteresults').innerHTML='';$('deploybar').classList.remove('show')}
+function sessionEnded(){AUTH_READY=false;EMERGENCY_REQUEST++;clearInterval(EMERGENCY_POLL);T='';clearSecretState();applyEmergency(false,false);PROJECT_DIRECT=false;EMERGENCY_OWNER=false;APP=null;ENV=null;APPS=[];ENVS=[];MY_PUBKEY='';MY_UID='';
+  $('view').innerHTML='';$('shell').style.display='none';$('auth').style.display='grid';$('pw').value='';toast('Your session ended. Sign in again.',true)}
+function emergencyCard(project=false){let locked=project?PROJECT_EMERGENCY:EMERGENCY,direct=project?PROJECT_DIRECT:EMERGENCY,scope=project?'project':'workspace';return `<div class="card" style="border-color:var(--bad)"><h3>${locked?'Emergency lockdown active':(project?'Project lockdown':'Emergency lockdown')}</h3>
+  <p>${locked?'The web console is read-only. Secrets are hidden, syncs are paused, and all automation reads and writes for this scope are rejected.':`Halt this ${scope}, sign out non-owner members, and block secret access, changes and automation requests.`}</p>
+  ${project&&EMERGENCY?'<p>The workspace lockdown also applies. Only restoring the workspace can lift that restriction.</p>':''}
+  <p class="small mut">Previously copied values and dispatched remote requests cannot be recalled. Revoked sessions stay revoked.</p>
+  ${EMERGENCY_OWNER?`<button class="${direct?'primary':'danger'}" onclick="confirmEmergency(${!direct},${project})">${direct?`Restore ${scope} access`:`Activate ${scope} lockdown`}</button>`:'<p>Only a workspace owner can restore access.</p>'}</div>`}
+function applyEmergency(locked,project=PROJECT_EMERGENCY){let changed=EMERGENCY!==locked||PROJECT_EMERGENCY!==project;EMERGENCY=locked;PROJECT_EMERGENCY=project;let halted=locked||project,banner=$('emergency-banner');banner.hidden=!halted;
+  banner.innerHTML=halted?`<div class="card" style="border-color:var(--bad)"><strong>Emergency lockdown active: ${locked?'workspace':'project'}</strong><p>The console is read-only. Secrets are hidden and automation requests are rejected.</p></div>`:'';
+  if(halted){if(changed)clearSecretState();$('topaction').style.display='none';if(changed)$('view').innerHTML=emergencyCard(!locked)}}
+async function refreshEmergency(){let org=ORG,app=APP?.id,request=++EMERGENCY_REQUEST;if(!org)return;try{let d=await api('GET',`/api/orgs/${org}/emergency`),p=app?await api('GET',`/api/apps/${app}/emergency`):null;
+  if(AUTH_READY&&org===ORG&&app===APP?.id&&request===EMERGENCY_REQUEST){PROJECT_DIRECT=!!p?.direct_locked;applyEmergency(!!d.locked,!!p?.locked)}}catch(e){if(AUTH_READY&&org===ORG&&request===EMERGENCY_REQUEST&&(EMERGENCY||PROJECT_EMERGENCY)){$('view').innerHTML=emergencyCard(!EMERGENCY)}}}
+function confirmEmergency(locked,project=false){let org=ORG,app=APP?.id,scope=project?'project':'workspace';modal(`<h3>${locked?`Activate ${scope} lockdown?`:`Restore ${scope} access?`}</h3><p>${locked?'Non-owner members will be signed out. The console will be read-only, secrets hidden and automation reads and writes rejected for this scope.':`The direct ${scope} lockdown will be lifted. Other lockdowns still apply. Revoked sessions stay revoked.`}</p><div class="row"><button class="${locked?'danger':'primary'}" id="emergency-confirm">${locked?'Activate lockdown':'Restore access'}</button><button class="ghost" onclick="closeModal()">Cancel</button></div>`,'Confirm emergency lockdown');
+  $('emergency-confirm').onclick=async()=>{if(ORG!==org||(project&&APP?.id!==app)){closeModal();return}try{EMERGENCY_REQUEST++;await api('PUT',project?`/api/apps/${app}/emergency`:`/api/orgs/${org}/emergency`,{locked});await refreshEmergency();closeModal();if(project){$('view').innerHTML=emergencyCard(true)}else await nav('settings')}catch(e){toast(e.message,true)}}}
 // Keep the error body for deletion's ownership and credential warnings.
-async function apiRaw(m,u,b){let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
+async function apiRaw(m,u,b){if((EMERGENCY||PROJECT_EMERGENCY)&&!emergencyAllowed(m,u))throw new Error('Selected scope is in emergency lockdown');let r=await fetch(u,{method:m,headers:H(),body:b!==undefined?JSON.stringify(b):undefined});let t=await r.text();let d;try{d=JSON.parse(t)}catch(e){d={error:t}}
   return {ok:r.ok,status:r.status,body:d}}
 function toast(msg,err){let el=document.createElement('div');el.className='toast'+(err?' err':'');el.textContent=msg;$('toasts').appendChild(el);el.style.transition='opacity .3s';setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),320)},3000)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -204,38 +229,42 @@ async function logout(){try{await api('POST','/api/auth/logout',{})}catch(e){} T
 async function enterApp(){$('auth').style.display='none';$('shell').style.display='grid';
   let me=await api('GET','/api/me');ME=me;$('whoami').textContent=me.email;MY_PUBKEY=me.pubkey||'';MY_UID=me.id||'';
   let orgs=await api('GET','/api/orgs');ORG=(PENDING_ORG&&orgs.some(o=>o.id===PENDING_ORG))?PENDING_ORG:(orgs[0]?.id||'');PENDING_ORG=null;
-  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
-  $('orgs').value=ORG;
-  await nav('apps')}
-async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG}
-async function switchOrg(){ORG=$('orgs').value;APP=null;ENV=null;await nav('apps')}
+  $('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');
+  $('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner';AUTH_READY=true;
+  await refreshEmergency();clearInterval(EMERGENCY_POLL);EMERGENCY_POLL=setInterval(refreshEmergency,5000);
+  await nav(EMERGENCY?'settings':'apps')}
+async function switchOrg(){SECRET_EPOCH++;SECRETS=[];ORG=$('orgs').value;APP=null;ENV=null;EMERGENCY_OWNER=$('orgs').selectedOptions?.[0]?.dataset.role==='owner';PROJECT_DIRECT=false;applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
+async function refreshOrgs(){let orgs=await api('GET','/api/orgs');$('orgs').innerHTML=orgs.map(o=>`<option value="${o.id}" data-role="${esc(o.role)}">${esc(o.name)} · ${esc(o.role)}</option>`).join('');$('orgs').value=ORG;EMERGENCY_OWNER=orgs.find(o=>o.id===ORG)?.role==='owner'}
 
 // ---------- navigation ----------
 function toggleNav(){let a=document.querySelector('aside');if(!a)return;let open=a.classList.toggle('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
 async function nav(v){VIEW=v;let a=document.querySelector('aside');if(a){a.classList.remove('open');let t=$('navtoggle');if(t)t.setAttribute('aria-expanded','false')}document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.nav===v));
-  $('topaction').style.display=(v==='apps')?'':'none';
+  $('topaction').style.display=(v==='apps'&&!EMERGENCY)?'':'none';
   updateDeployBar();
+  if((EMERGENCY||PROJECT_EMERGENCY)&&['access','integrations'].includes(v)){$('pagetitle').textContent='Read-only inspection';$('crumb').textContent='';$('view').innerHTML=emergencyCard(!EMERGENCY);return}
   await ({apps:renderApps,access:renderAccess,integrations:renderIntegrations,audit:renderAudit,settings:renderSettings}[v]||renderApps)();
   updateDeployBar()}
 
 // ---------- apps ----------
-async function renderApps(){$('topaction').style.display='';$('pagetitle').textContent='Apps';$('crumb').textContent='';
+async function renderApps(){$('topaction').style.display=EMERGENCY?'none':'';$('pagetitle').textContent='Apps';$('crumb').textContent='';
   $('view').innerHTML='<div class="empty"><div class="big">Loading…</div></div>';
   APPS=ORG?await api('GET',`/api/orgs/${ORG}/apps`):[];
   if(!APPS.length){$('view').innerHTML=`<div class="empty"><div class="big">▦</div>No apps yet<p>Create an app to start managing secrets for a project.</p><button class="primary" onclick="newApp()">Create your first app</button></div>`;return}
   let envCounts={};for(let a of APPS){try{let es=await api('GET',`/api/apps/${a.id}/envs`);envCounts[a.id]=es}catch(e){envCounts[a.id]=[]}}
   $('view').innerHTML=`<div class="row" style="margin-bottom:14px"><input id="appfilter" placeholder="Filter apps…" style="min-width:240px" oninput="filterApps(this.value)"><span class="mut small">${APPS.length} app${APPS.length!==1?'s':''}, unlimited environments</span></div>
   <div class="grid" id="appgrid">${APPS.map(a=>appCard(a,envCounts[a.id])).join('')}</div>`}
-function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}${a.reuse_check===false?' · reuse checks off':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div></div>`}
+function appCard(a,envs){return `<div class="appcard" onclick="openApp('${a.id}')"><h3>${esc(a.name)}</h3><div class="meta">${envs.length} environment${envs.length!==1?'s':''}${a.reuse_check===false?' · reuse checks off':''}${a.emergency_locked?' · lockdown':''}</div><div>${envs.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')}</div>${EMERGENCY_OWNER?`<button class="ghost" onclick="event.stopPropagation();projectLockSettings('${a.id}')">Project lockdown</button>`:''}</div>`}
+async function projectLockSettings(id){try{APP=APPS.find(a=>a.id===id)||{id};ENV=null;await refreshEmergency();$('pagetitle').textContent=APP.name||'Project';$('view').innerHTML=emergencyCard(true);$('topaction').style.display='none'}catch(e){toast(e.message,true)}}
 function filterApps(q){document.querySelectorAll('.appcard').forEach((c,i)=>{c.style.display=APPS[i].name.toLowerCase().includes(q.toLowerCase())?'':'none'})}
 async function newApp(){modal(`<h3>New app</h3><div class="field"><label for="na-name">App name</label><input id="na-name" placeholder="billing-api"></div><div class="field"><label for="na-readme">Readme (markdown, optional)</label><textarea id="na-readme" rows="4"></textarea></div><div class="row"><button class="primary" onclick="createApp()">Create app</button><button class="ghost" onclick="closeModal()">Cancel</button></div>
   <p class="small mut">Development, Staging and Production environments are created automatically. Add unlimited custom environments later.</p>`)}
 async function createApp(){try{await api('POST',`/api/orgs/${ORG}/apps`,{name:$('na-name').value,readme:$('na-readme').value});closeModal();toast('App created');renderApps()}catch(e){toast(e.message,true)}}
-async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};ENVS=await api('GET',`/api/apps/${id}/envs`);
+async function openApp(id){APP=APPS.find(a=>a.id===id)||{id};PROJECT_DIRECT=false;applyEmergency(EMERGENCY,false);await refreshEmergency();ENVS=await api('GET',`/api/apps/${id}/envs`);
   ENV=ENVS.find(e=>e.id===ENV?.id)||ENVS[0]||null;await renderEnv()}
 
 // ---------- environments and secrets ----------
 async function renderEnv(){VIEW='env';$('topaction').style.display='none';$('pagetitle').textContent=APP?.name||'App';$('crumb').textContent='/ environments';
+  if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard(true)+'<p class="mut">Environment names remain visible. Secret values are unavailable during lockdown.</p><div class="row">'+ENVS.map(e=>`<span class="chip">${esc(e.name)}</span>`).join('')+'</div>';updateDeployBar();return}
   if(!ENVS.length){$('view').innerHTML='<div class="empty"><div class="big">No environments</div><button class="primary" onclick="newEnv()">Create environment</button></div>';updateDeployBar();return}
   if(!ENV)ENV=ENVS[0];
   if(isDelegated(ENV)){await renderDelegatedEnv();return}
@@ -332,7 +361,7 @@ async function e2eHash(path,key,envKey){
   let k=await crypto.subtle.importKey('raw',envKey,{name:'HMAC',hash:'SHA-256'},false,['sign']);
   let sig=await crypto.subtle.sign('HMAC',k,enc('ow-key-index:v1|'+String(path||'/')+'|'+String(key||'').toUpperCase()));
   return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('')}
-async function e2eLoad(id,kit){E2E_LOADING[id]=true;delete E2E_ERR[id];
+async function e2eLoad(id,kit){let epoch=SECRET_EPOCH;E2E_LOADING[id]=true;delete E2E_ERR[id];
   try{
     let d=await api('GET',`/api/envs/${id}/e2e/secrets`);
     let key=await OW.decryptAsymmetric(kit,d.wrapped_key);
@@ -345,8 +374,9 @@ async function e2eLoad(id,kit){E2E_LOADING[id]=true;delete E2E_ERR[id];
       rows.push({id:s.id,key:name,value,path,key_hash:s.key_hash,version:s.version||1,updated_at:s.updated_at});
     }
     rows.sort((a,b)=>a.key.localeCompare(b.key));
-    E2E_KEYS[id]=key;E2E_DATA[id]=rows;E2E_DRAFTS[id]={};
     let [meta,grants]=await Promise.all([api('GET',`/api/envs/${id}/e2e/meta`).catch(()=>null),api('GET',`/api/envs/${id}/e2e/grants`).catch(()=>[])]);
+    if(epoch!==SECRET_EPOCH||EMERGENCY||PROJECT_EMERGENCY)throw new Error('Secret access ended');
+    E2E_KEYS[id]=key;E2E_DATA[id]=rows;E2E_DRAFTS[id]={};
     if(meta)E2E_META[id]=meta;E2E_GRANTS[id]=grants;
   }finally{delete E2E_LOADING[id]}}
 async function unlockE2EEnv(){let kit=($('e2e-kit')?.value||'').trim()||E2E_KIT;
@@ -586,7 +616,7 @@ async function delSecret(id,key){let d=drafts()[id];
   let s=SECRETS.find(x=>x.id===id);if(s&&s.type==='sealed'&&!confirm('Delete sealed secret '+key+'? Its value cannot be recovered.'))return;
   if(!confirm('Delete '+key+'? You can restore it from history.'))return;
   try{await api('DELETE',`/api/secrets/${id}`);delete drafts()[id];toast('Secret deleted');await renderEnv()}catch(e){toast(e.message,true)}}
-function updateDeployBar(){let n=isE2E(ENV)?e2eDraftList().length:draftList().length;let active=VIEW==='env'&&!!ENV&&n>0;
+function updateDeployBar(){let n=isE2E(ENV)?e2eDraftList().length:draftList().length;let active=VIEW==='env'&&!!ENV&&n>0&&!EMERGENCY&&!PROJECT_EMERGENCY;
   $('deploybar').classList.toggle('show',active);
   $('deploytext').innerHTML=active?`<b>${n}</b>&nbsp;staged change${n!==1?'s':''}`:''}
 function discardStage(){if(!ENV)return;delete DRAFTS[ENV.id];delete E2E_DRAFTS[ENV.id];
@@ -686,6 +716,7 @@ async function mkStream(){try{await api('POST',`/api/orgs/${ORG}/log-streams`,{n
 async function loadDeliveries(){try{let d=await api('GET',`/api/orgs/${ORG}/log-streams/deliveries`);$('delivs').textContent=JSON.stringify(d.slice(0,25),null,2)}catch(e){toast(e.message,true)}}
 
 async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb').textContent='';
+  if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
   let inst=await api('GET','/api/instance').catch(()=>null);
   let s=await api('GET',`/api/orgs/${ORG}/settings`).catch(()=>null);
   let saml=await api('GET',`/api/orgs/${ORG}/saml`).catch(()=>null);
@@ -717,7 +748,8 @@ async function renderSettings(){$('pagetitle').textContent='Settings';$('crumb')
     <button class="primary" onclick="saveSignups()" ${inst.signups_env_locked?'disabled':''}>Save signup policy</button>
     <div class="row" style="margin-top:12px"><label for="set-instance-owner">New instance owner email</label><input id="set-instance-owner" type="email" style="min-width:260px"><button onclick="transferInstance()">Transfer instance</button></div>
     <p class="small mut" style="margin-top:6px">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
-  $('view').innerHTML=`${instanceCard}
+  if(!AUTH_READY)return;if(EMERGENCY||PROJECT_EMERGENCY){$('view').innerHTML=emergencyCard()+(APP?emergencyCard(true):'');return}
+  $('view').innerHTML=`${EMERGENCY_OWNER?emergencyCard():''}${instanceCard}
   <div class="card"><h3>Organisation security</h3><p>IP allowlist is enforced on every API call. OIDC powers SSO and MCP OAuth discovery.</p>
   <div class="field"><label for="set-ip">IP allowlist (CIDR, comma separated, empty = allow all)</label><input id="set-ip" value="${esc(s?.ip_allowlist||'')}" placeholder="203.0.113.0/24"></div>
   <label class="row" style="gap:8px;margin:10px 0"><input type="checkbox" id="set-reuse" ${s?.reuse_check!==false?'checked':''}> Warn when a secret value is reused elsewhere in this workspace</label>
@@ -888,7 +920,7 @@ async function deleteAccount(){try{
 }catch(e){toast(e.message,true)}}
 
 // ---------- command palette ----------
-function openPalette(){$('palette').style.display='block';$('paletteinput').value='';$('paletteresults').innerHTML='';setTimeout(()=>$('paletteinput').focus(),30)}
+function openPalette(){if(EMERGENCY||PROJECT_EMERGENCY||!AUTH_READY)return;$('palette').style.display='block';$('paletteinput').value='';$('paletteresults').innerHTML='';setTimeout(()=>$('paletteinput').focus(),30)}
 async function paletteSearch(){let q=$('paletteinput').value;if(q.length<2){$('paletteresults').innerHTML='';return}
   try{let d=await api('GET','/api/search?q='+encodeURIComponent(q));$('paletteresults').innerHTML=d.results.map(r=>`<div class="pitem" onclick="paletteGo('${jsq(r.key)}')"><span class="mono">${esc(r.key)}</span><span class="mut small">${esc(r.app)} / ${esc(r.env)} ${esc(r.path||'')}</span></div>`).join('')||'<div class="pitem mut">No matches</div>'}catch(e){}}
 function paletteGo(key){$('palette').style.display='none';if(APP&&ENV){nav('apps');renderEnv().then(()=>{let f=$('sfilter');if(f){f.value=key;drawSecrets()}})}}
