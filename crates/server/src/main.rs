@@ -1,5 +1,5 @@
 use openwarp_crypto as oc;
-use openwarp_server::{backfill_value_fingerprints, install_kms, kms, load_master, new_state, process_maintenance, production, router, try_leader, validate_auth_env};
+use openwarp_server::{backfill_value_fingerprints, install_kms, kms, load_master, new_state, process_maintenance, production, router, try_leader, validate_auth_env, validate_region_env};
 use openwarp_server::db::{self, Db};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -20,6 +20,7 @@ async fn main() {
     let kms = match kms::Kms::from_env() { Ok(k) => k, Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
     let master = load_master(&db, kms.as_ref()).await.unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
     if let Err(e) = validate_auth_env() { eprintln!("{}", e); std::process::exit(1); }
+    if let Err(e) = validate_region_env() { eprintln!("{}", e); std::process::exit(1); }
     if !openwarp_server::mailer::MailConfig::from_env().enabled() {
         if production() {
             eprintln!("no email provider is configured: password signup is disabled until one is set; configured SSO sign-in still works");

@@ -25,7 +25,7 @@ function invitationConsole({ bearer = 'fixture-social-session', cookie = false, 
   const session = new Map();
   const elements = new Map();
   const document = { getElementById(id) {
-    if (!elements.has(id)) elements.set(id, { style: {}, innerHTML: '', textContent: '', value: '' });
+    if (!elements.has(id)) elements.set(id, { style: {}, innerHTML: '', textContent: '', value: '', dataset: {} });
     return elements.get(id);
   } };
   const context = vm.createContext({
@@ -36,6 +36,7 @@ function invitationConsole({ bearer = 'fixture-social-session', cookie = false, 
     // The shipped functions under test call the console's i18n and emergency
     // helpers; standalone evaluation only needs their side effects.
     owText: (el, text) => { el.textContent = text; },
+    owDataText: (el, text) => { el.textContent = text; },
     refreshEmergency: async () => {}, setInterval: () => 1, clearInterval() {},
     nav: async page => { navigations.push(page); },
     fetch: async (url, options) => {
@@ -57,9 +58,11 @@ function invitationConsole({ bearer = 'fixture-social-session', cookie = false, 
   });
   const headers = script.match(/^const H=.*$/m)?.[0];
   assert.ok(headers, 'evaluate the shipped request header builder');
-    vm.runInContext(`let T=${JSON.stringify(bearer)}, INVITE='', INVITE_META=null, PENDING_ORG=null, E2E_KIT='', ORG='', APP=null, ENV=null, ME=null, MY_PUBKEY='', MY_UID='', CREATION_OPEN=true, EMERGENCY=false, PROJECT_EMERGENCY=false, EMERGENCY_POLL=null, AUTH_READY=false;
+    vm.runInContext(`let T=${JSON.stringify(bearer)}, INVITE='', INVITE_META=null, PENDING_ORG=null, E2E_KIT='', ORG='', APP=null, ENV=null, ME=null, MY_PUBKEY='', MY_UID='', CREATION_OPEN=true, EMERGENCY=false, PROJECT_EMERGENCY=false, EMERGENCY_POLL=null, AUTH_READY=false, ORGS=[], EMERGENCY_OWNER=false,
+      PRODUCT_DIALOG=null, PRODUCT_SERIAL=0, SECRET_EPOCH=0, SECRETS=[], MODE='login', AUTH_FORM='',
+      PKI_RENDER=0, PKI_CAS=[], PKI_CA='', PKI_GROUPS=[], PKI_IMPORT_OUT='', PKI_SELECTED=new Set(), PKI_SELECTION_CA='', PKI_CODE_RESULTS=[], PKI_HOOK=null, PKI_ATT=null;
     const $=id=>document.getElementById(id);\n${headers}\n` +
-    ['api', 'esc', 'showInvite', 'acceptInvite', 'enterApp'].map(shippedFunction).join('\n'), context);
+    ['api', 'esc', 'showInvite', 'acceptInvite', 'enterApp', 'enterAppInner', 'orgMemoryKey', 'rememberedOrg', 'rememberOrg', 'memberLabel', 'showPicker', 'pickOrg', 'startWorkspace', 'renderOrgMenu', 'clearPkiState', 'applyEmergency', 'authMode', 'closeModal'].map(shippedFunction).join('\n'), context);
   return { calls, errors, navigations, session, elements, run: code => vm.runInContext(code, context) };
 }
 
@@ -78,7 +81,7 @@ for (const mode of ['bearer-only social session', 'HttpOnly cookie session']) {
     assert.deepEqual(acceptance.body, { token: 'fixture-invite' });
     assert.deepEqual(ui.errors, [], 'the authenticated application bootstrap must not lose its account session after consent');
     assert.deepEqual(ui.navigations, ['apps'], 'consent must finish entering the application');
-    assert.equal(ui.elements.get('orgs').value, 'joined-org', 'select the newly joined workspace instead of an earlier membership');
+    assert.equal(ui.run('ORG'), 'joined-org', 'select the newly joined workspace instead of an earlier membership');
     assert.equal(ui.session.has('ow_pending_invite'), false);
     if (mode.startsWith('bearer')) {
       const afterConsent = ui.calls.slice(ui.calls.indexOf(acceptance) + 1).filter(call => ['/api/me', '/api/orgs'].includes(call.url));
