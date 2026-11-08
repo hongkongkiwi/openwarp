@@ -227,6 +227,12 @@ approval workflows that inspect plaintext, and server-side search require the
 server to read or create the secret. They stay in `sse` mode. A zero-knowledge
 deployment gives those up or moves them into a client.
 
+## Offline encrypted files and transit
+
+The CLI's [encrypted-file commands](CLI.md#encrypted-files) use a separate file data key wrapped to explicit X25519 recipients. Files do not depend on an instance master key or environment grant. The JSON envelope authenticates the complete encrypted payload and recipient metadata. Rekey changes recipient wrappers without re-encrypting the payload; old saved envelopes remain readable to their old recipients.
+
+[Transit encryption](TRANSIT.md) is server-managed, workspace-scoped application encryption. Its versioned keys are wrapped by the instance master and are included in native master rotation. Permission to rewrap is separate from permission to decrypt, though the server decrypts internally during rewrap. Transit is not an E2E environment operation.
+
 ## Not yet implemented
 
 - OPAQUE, which would also prevent the server from impersonating an account.

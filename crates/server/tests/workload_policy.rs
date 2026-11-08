@@ -75,7 +75,7 @@ impl Fixture {
         body["secrets"].as_array().unwrap().iter().find(|s| s["key"] == key).unwrap()["id"].as_str().unwrap().into()
     }
     async fn key(&self, name: &str) -> String {
-        let body = self.call("POST", "/api/orgs/org/transit/keys", "owner", Some(json!({"name":name}))).await.ok();
+        let body = self.call("POST", "/api/orgs/org/transit-compat/keys", "owner", Some(json!({"name":name}))).await.ok();
         body["id"].as_str().expect("created transit key id").into()
     }
 }
@@ -188,8 +188,8 @@ async fn transit_roundtrip_rotation_old_decrypt_rewrap_and_authenticated_binding
     let f = Fixture::new().await;
     let kid = f.key("payload").await;
     let other = f.key("other").await;
-    let base = format!("/api/orgs/org/transit/keys/{}", kid);
-    let list = f.call("GET", "/api/orgs/org/transit/keys", "owner", None).await.ok();
+    let base = format!("/api/orgs/org/transit-compat/keys/{}", kid);
+    let list = f.call("GET", "/api/orgs/org/transit-compat/keys", "owner", None).await.ok();
     assert!(list.to_string().contains(&kid));
     let payload = oc::b64(b"binary\0payload\xff");
     let first = f.call("POST", &format!("{}/encrypt", base), "owner", Some(json!({"plaintext":payload,"context":"invoice:42"}))).await.ok();
@@ -205,8 +205,8 @@ async fn transit_roundtrip_rotation_old_decrypt_rewrap_and_authenticated_binding
     assert_eq!(f.call("POST", &format!("{}/decrypt", base), "owner", Some(json!({"ciphertext":updated["ciphertext"],"context":"invoice:42"}))).await.ok()["plaintext"], payload);
     for (path, user, input) in [
         (format!("{}/decrypt", base), "owner", json!({"ciphertext":ciphertext,"context":"invoice:43"})),
-        (format!("/api/orgs/org/transit/keys/{}/decrypt", other), "owner", decode.clone()),
-        (format!("/api/orgs/foreign/transit/keys/{}/decrypt", kid), "outsider", decode.clone()),
+        (format!("/api/orgs/org/transit-compat/keys/{}/decrypt", other), "owner", decode.clone()),
+        (format!("/api/orgs/foreign/transit-compat/keys/{}/decrypt", kid), "outsider", decode.clone()),
         (format!("{}/decrypt", base), "owner", json!({"ciphertext":"garbage","context":"invoice:42"}))
     ] { f.call("POST", &path, user, Some(input)).await.rejected(); }
 }
@@ -215,14 +215,14 @@ async fn transit_roundtrip_rotation_old_decrypt_rewrap_and_authenticated_binding
 async fn transit_manage_encrypt_and_decrypt_permissions_are_separate() {
     let f = Fixture::new().await;
     let kid = f.key("permissions").await;
-    let base = format!("/api/orgs/org/transit/keys/{}", kid);
+    let base = format!("/api/orgs/org/transit-compat/keys/{}", kid);
     let encrypted = f.call("POST", &format!("{}/encrypt", base), "encryptor", Some(json!({"plaintext":oc::b64(b"secret"),"context":"ctx"}))).await.ok();
     let input = json!({"ciphertext":encrypted["ciphertext"],"context":"ctx"});
     assert_eq!(f.call("POST", &format!("{}/decrypt", base), "decryptor", Some(input.clone())).await.ok()["plaintext"], oc::b64(b"secret"));
     f.call("POST", &format!("{}/decrypt", base), "encryptor", Some(input)).await.forbidden();
     f.call("POST", &format!("{}/encrypt", base), "decryptor", Some(json!({"plaintext":oc::b64(b"secret"),"context":"ctx"}))).await.forbidden();
     for user in ["encryptor", "decryptor", "outsider"] {
-        f.call("POST", "/api/orgs/org/transit/keys", user, Some(json!({"name":"denied"}))).await.forbidden();
+        f.call("POST", "/api/orgs/org/transit-compat/keys", user, Some(json!({"name":"denied"}))).await.forbidden();
         f.call("POST", &format!("{}/rotate", base), user, Some(json!({}))).await.forbidden();
     }
 }

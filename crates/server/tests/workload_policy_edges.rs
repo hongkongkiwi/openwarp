@@ -112,8 +112,8 @@ async fn concurrent_fresh_kms_boots_adopt_one_root_and_read_each_others_transit_
         assert!(calls.iter().any(|(op, body)| op == "unwrap" && body["wrapped"] == blob && body["context"] == "master"), "losing boot never adopted persisted winner: {:?}", calls);
     }
     for (writer, reader, name) in [(&a, &b, "from-a"), (&b, &a, "from-b")] {
-        let key = writer.ok("POST", "/api/orgs/org/transit/keys", json!({"name":name})).await;
-        let base = format!("/api/orgs/org/transit/keys/{}", key["id"].as_str().unwrap());
+        let key = writer.ok("POST", "/api/orgs/org/transit-compat/keys", json!({"name":name})).await;
+        let base = format!("/api/orgs/org/transit-compat/keys/{}", key["id"].as_str().unwrap());
         let encrypted = writer.ok("POST", &format!("{}/encrypt", base), json!({"plaintext":oc::b64(name.as_bytes()),"context":"race"})).await;
         let plain = reader.ok("POST", &format!("{}/decrypt", base), json!({"ciphertext":encrypted["ciphertext"],"context":"race"})).await;
         assert_eq!(plain["plaintext"], oc::b64(name.as_bytes()), "replicas disagree on the root");
@@ -125,8 +125,8 @@ async fn concurrent_fresh_kms_boots_adopt_one_root_and_read_each_others_transit_
 async fn transit_old_ciphertext_survives_native_root_rotation_and_restart() {
     let data = Database::new().await;
     let mut server = Server::start(&data, None); server.healthy().await;
-    let key = server.ok("POST", "/api/orgs/org/transit/keys", json!({"name":"persistent"})).await;
-    let base = format!("/api/orgs/org/transit/keys/{}", key["id"].as_str().unwrap());
+    let key = server.ok("POST", "/api/orgs/org/transit-compat/keys", json!({"name":"persistent"})).await;
+    let base = format!("/api/orgs/org/transit-compat/keys/{}", key["id"].as_str().unwrap());
     let payload = oc::b64(b"old-version\0root-rotation");
     let encrypted = server.ok("POST", &format!("{}/encrypt", base), json!({"plaintext":payload,"context":"persistent"})).await;
     server.ok("POST", &format!("{}/rotate", base), json!({})).await;

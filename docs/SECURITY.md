@@ -35,6 +35,12 @@ Do not replace the master key for an existing database with a newly generated on
 
 Password reset with a recovery kit re-wraps the same private key under the new password. The explicit `discard_e2e_key` alternative creates a different key pair; existing E2E grants to the old key become unreadable to that account. Reset revokes the account's sessions and OAuth credentials. An instance master key does not recover a lost client-held E2E private key.
 
+## Integrated schema and Transit boundaries
+
+Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts) and 21 (Transit) remain unchanged. Migration 22 adds external-JWKS workload bindings, path policies, static rotation state and the separate compatibility Transit tables. Databases from the unpublished feature branch's former migration 19 are not supported upgrades. Reset disposable fixtures; if that schema was used for persistent data, preserve a backup and reconcile it explicitly before starting this version. Do not delete migration ledger rows or reinterpret the old feature Transit tables as the shipped engine's schema.
+
+The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Online root rotation preflights and atomically updates both stores, v2 authentication keys, LDAP passwords and TOTP state, while retaining the main Transit root-generation fence. It is available only on native single-process SQLite without configured or persisted KMS root state.
+
 ## Cryptographic building blocks
 
 The [`openwarp-crypto` crate](../crates/crypto/src/lib.rs) implements X25519 key exchange, XChaCha20-Poly1305 authenticated encryption, Argon2id password-based key wrapping, and token hashing. GitHub secret sync uses a libsodium-compatible sealed-box format. Algorithm selection alone is not proof that the surrounding protocols or implementations are secure.
@@ -141,6 +147,12 @@ Log streams, email relays, OIDC endpoints, and generic webhooks are outbound con
 The CLI attempts to store access and refresh tokens in the operating system credential store. If that is unavailable, it can fall back to its configuration file. Unix file permissions are restricted; other platforms need their own access controls. `OPENWARP_NO_KEYRING=1` explicitly selects file storage.
 
 `get`, `secrets --show`, exports, and child-process injection expose plaintext to the local user and process. Avoid terminal recordings, shared CI logs, checked-in export files, and command-line arguments containing real secrets. Environment variables are not a protection from a compromised child process or privileged local account.
+
+`file encrypt` creates an authenticated whole-file envelope locally; its identity file contains a private key and must not be committed alongside encrypted data. Recipient rekeying does not revoke previously saved envelopes. `inject` and `run --refs-file` resolve explicit secret references at consumption time, but their output and child environment are plaintext. They do not sandbox the child or provide biometric approval. See [CLI reference](CLI.md).
+
+[Workload identity](WORKLOAD-IDENTITY.md) exchanges issuer-signed JWTs for short-lived, single-environment tokens. Trust is an administrator's decision about a public key and exact claims, not proof that every job at that issuer should be trusted. The server does not fetch keys automatically; revoke and replace trust when keys change.
+
+[Transit](TRANSIT.md) keeps versioned workspace keys on the server. A rewrap-only principal receives ciphertext rather than plaintext, but rewrapping decrypts internally. Transit therefore has the managed-encryption operator trust boundary, not the E2E boundary.
 
 Lockbox shares are intended for one-time viewing. Anyone with the complete link can attempt to consume it. Treat the URL fragment containing the decryption key as secret material; do not send the link through a system that rewrites or previews sensitive links without testing that behavior.
 

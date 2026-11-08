@@ -1,4 +1,7 @@
 mod agent;
+mod encrypted_file;
+mod references;
+
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -25,7 +28,9 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     /// base skips your personal overrides, which is what a deployment wants
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
-    Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
+    Run { #[arg(long, default_value = "")] env: String, #[arg(long)] refs_file: Option<String>, #[arg(long)] identity: Option<String>, #[arg(last = true)] command: Vec<String> },
+    Inject { #[arg(long)] input: String, #[arg(long)] out: Option<String>, #[arg(long)] identity: Option<String> },
+    File { #[command(subcommand)] cmd: encrypted_file::FileCmd },
     /// Render a local template from base secrets with an in-memory cache
     Agent { #[arg(long, default_value = "")] env: String, #[arg(long)] template: PathBuf, #[arg(long)] out: PathBuf, #[arg(long, default_value_t = 30)] interval_secs: u64, #[arg(long, default_value_t = 30)] cache_ttl_secs: u64, #[arg(long)] once: bool },
     /// SSH certificates: sign a public key, or mint one and run ssh with it
@@ -301,8 +306,16 @@ fn ssh_summary(signed: &Value, path: Option<&Path>) {
     println!("expires in:  {}m{}s", expires / 60, expires % 60);
     println!("ca:          {}", signed["ca_public_key"].as_str().unwrap_or("")); }
 
+fn reference_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client")
+}
+
 fn main() {
     let cli = Cli::parse();
+    if let Cmd::File { cmd } = &cli.cmd {
+        if let Err(e) = encrypted_file::execute(cmd) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
     let local = load_local_config();
     let mut cfg = load_config();
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
@@ -391,7 +404,24 @@ fn main() {
                 _ => { for s in &items { println!("{}={}", s["key"].as_str().unwrap_or(""), dotenv_value(s["value"].as_str().unwrap_or(""))); } } } }
         Cmd::Import { env, file } => { let env = pick(env, &local, "env_id", "--env"); let text = std::fs::read_to_string(file).expect("read file");
             let d: Value = client.post(format!("{}/api/envs/{}/import", host, env)).bearer_auth(&token).json(&json!({"text": text})).send().expect("request").json().expect("json"); println!("{}", d); }
-        Cmd::Run { env, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
+        Cmd::File { .. } => unreachable!(),
+        Cmd::Inject { input, out, identity } => {
+            let client = reference_client();
+            let mut resolver = references::Resolver::new(&client, &host, &token, identity.as_deref());
+            let result = references::inject(&mut resolver, Path::new(input)).and_then(|bytes| match out {
+                Some(path) => encrypted_file::write_new(Path::new(path), &bytes),
+                None => std::io::stdout().write_all(&bytes).map_err(|_| "could not write output".into()),
+            });
+            if let Err(e) = result { eprintln!("{}", e); std::process::exit(1); }
+        }
+        Cmd::Run { env, refs_file, identity, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
+            if let Some(file) = refs_file {
+                let client = reference_client();
+                let mut resolver = references::Resolver::new(&client, &host, &token, identity.as_deref());
+                let values = references::bindings(&mut resolver, Path::new(file)).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+                let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]).env_remove("OPENWARP_TOKEN").env_remove("OPENWARP_PRIVKEY").envs(values);
+                std::process::exit(cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+            }
             let d = get(&format!("{}/api/envs/{}/export", host, env));
             let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]);
             for s in d["secrets"].as_array().cloned().unwrap_or_default() {

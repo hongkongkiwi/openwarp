@@ -36,10 +36,10 @@ impl Fixture {
         Reply { status, body, text }
     }
     async fn create_key(&self, name: &str) -> Reply {
-        self.call("POST", "/api/orgs/org/transit/keys", "owner", Some(json!({"name": name}))).await
+        self.call("POST", "/api/orgs/org/transit-compat/keys", "owner", Some(json!({"name": name}))).await
     }
     async fn transit_key_count(&self, name: &str) -> usize {
-        self.state.db().query("SELECT id FROM transit_keys WHERE org_id='org' AND name=?", &[json!(name)]).await.unwrap().len()
+        self.state.db().query("SELECT id FROM compat_transit_keys WHERE org_id='org' AND name=?", &[json!(name)]).await.unwrap().len()
     }
 }
 
@@ -53,12 +53,12 @@ async fn transit_create_rolls_back_key_and_name_when_first_version_insert_fails(
     let duplicate = f.create_key("control").await;
     assert_eq!(duplicate.status, 400, "duplicate name should be rejected: {}", duplicate.text);
     assert_eq!(f.transit_key_count("control").await, 1, "duplicate create added a second row");
-    // Simulate a storage failure in the second insert: transit_keys commits first, then this aborts the first transit_versions row.
-    f.state.db().exec("CREATE TRIGGER block_transit_versions BEFORE INSERT ON transit_versions BEGIN SELECT RAISE(ABORT, 'forced transit version failure'); END", &[]).await.unwrap();
+    // Simulate a storage failure in the second insert: compat_transit_keys commits first, then this aborts the first compat_transit_versions row.
+    f.state.db().exec("CREATE TRIGGER block_compat_transit_versions BEFORE INSERT ON compat_transit_versions BEGIN SELECT RAISE(ABORT, 'forced transit version failure'); END", &[]).await.unwrap();
     let failed = f.create_key("rollback-me").await;
     assert_eq!(failed.status, 400, "blocked create should fail: {}", failed.text);
     assert_eq!(f.transit_key_count("rollback-me").await, 0, "failed create left an orphan transit key");
-    f.state.db().exec("DROP TRIGGER block_transit_versions", &[]).await.unwrap();
+    f.state.db().exec("DROP TRIGGER block_compat_transit_versions", &[]).await.unwrap();
     let retried = f.create_key("rollback-me").await;
     assert_eq!(retried.status, 200, "name still reserved after failed create: {}", retried.text);
     assert_eq!(f.transit_key_count("rollback-me").await, 1);
@@ -71,7 +71,7 @@ async fn transit_create_seeds_a_usable_first_version_and_enforces_name_uniquenes
     assert_eq!(created.status, 200, "{}", created.text);
     let kid = created.body["id"].as_str().expect("created key id").to_string();
     assert_eq!(created.body["key_version"].as_i64(), Some(1));
-    let base = format!("/api/orgs/org/transit/keys/{}", kid);
+    let base = format!("/api/orgs/org/transit-compat/keys/{}", kid);
     let plaintext = oc::b64(b"first version roundtrip");
     let sealed = f.call("POST", &format!("{}/encrypt", base), "owner", Some(json!({"plaintext": plaintext, "context": "ctx"}))).await;
     assert_eq!(sealed.status, 200, "{}", sealed.text);
@@ -81,7 +81,7 @@ async fn transit_create_seeds_a_usable_first_version_and_enforces_name_uniquenes
     let duplicate = f.create_key("payload").await;
     assert_eq!(duplicate.status, 400, "duplicate name should be rejected: {}", duplicate.text);
     assert_eq!(f.transit_key_count("payload").await, 1);
-    let list = f.call("GET", "/api/orgs/org/transit/keys", "owner", None).await;
+    let list = f.call("GET", "/api/orgs/org/transit-compat/keys", "owner", None).await;
     assert_eq!(list.status, 200, "{}", list.text);
     let names: Vec<&str> = list.body.as_array().unwrap().iter().map(|k| k["name"].as_str().unwrap()).collect();
     assert_eq!(names.iter().filter(|n| **n == "payload").count(), 1);
@@ -93,7 +93,7 @@ async fn environment_scoped_tokens_are_denied_transit_even_with_transit_scope() 
     // A credential scoped to an environment must never reach transit, even when
     // its scopes field would otherwise authorise transit:manage.
     f.state.db().exec("INSERT INTO tokens(id,org_id,env_id,name,token_hash,scopes,created_at,created_by) VALUES('scoped','org','env','scoped',?,'transit:manage',?,'owner')", &[json!(oc::hash_token("scoped")), json!(now())]).await.unwrap();
-    f.call("POST", "/api/orgs/org/transit/keys", "scoped", Some(json!({"name": "denied"}))).await.forbidden();
-    f.call("GET", "/api/orgs/org/transit/keys", "scoped", None).await.forbidden();
+    f.call("POST", "/api/orgs/org/transit-compat/keys", "scoped", Some(json!({"name": "denied"}))).await.forbidden();
+    f.call("GET", "/api/orgs/org/transit-compat/keys", "scoped", None).await.forbidden();
     assert_eq!(f.transit_key_count("denied").await, 0, "env-scoped credential created a transit key");
 }

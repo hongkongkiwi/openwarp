@@ -14,6 +14,12 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 
 Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority.
 
+## Appearance and languages
+
+The console ships a light and a dark theme. With nothing chosen it follows the system colour scheme and re-resolves when the system changes; a toggle in the top bar (and on the sign-in card) cycles system, light and dark, and the Settings page has an Appearance & language card with explicit picks. The theme preference and explicit language overrides are stored in the browser (`localStorage`), so they apply per device and before signing in; the sign-in screen, console and one-time lockbox page all honour the choice.
+
+The interface is translated into English, Traditional Chinese, Simplified Chinese, Japanese, Korean, Spanish, French, German and Brazilian Portuguese. The language defaults to the browser's own languages and can be overridden from the sign-in card, the top bar or Settings. Select System / browser to remove the override and detect the browser language again. Three limits are deliberate: text that comes from the server (error messages, audit details, provider hints with JSON examples) stays in English; a string a language has not yet translated falls back to English rather than vanishing; and values that come from your data (secret keys, app and environment names) are never rewritten even when they happen to match a UI label.
+
 ## Accounts and recovery
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
@@ -78,6 +84,14 @@ Invite people by email and choose the narrowest suitable role. Managed developer
 Teams organise members. Environment policy can restrict access or require approval for non-admin writes. Review proposals and access requests in context: the requester, target environment, permissions, and lifetime matter.
 
 Use app service tokens or machine identities for automation instead of a person's password. Record a newly issued credential securely, scope it, and revoke it when no longer needed. OAuth client scopes and workspace permissions both apply.
+
+Members & access also contains three workspace tools:
+
+- Batched change requests group managed-environment writes and deletions. Enter the environments and operations as JSON, then have a different admin review and approve the revision before applying it. An edit clears approval. See [batched change requests](CHANGE-REQUESTS.md).
+- Workload trust configures an existing machine identity with an explicit environment, issuer, audience, subject, public JWKS and optional bound claims. Revoking trust invalidates its issued tokens. See [workload identity](WORKLOAD-IDENTITY.md).
+- Transit encryption creates and rotates workspace keys and runs encrypt, decrypt or rewrap operations. Input plaintext is base64. The server processes plaintext, and rewrap permission is separate from decrypt permission. See [transit encryption](TRANSIT.md).
+
+Review screens and transit decrypt responses display plaintext in the browser. Use these controls only on a trusted device; do not paste real credentials into recordings or shared screens.
 
 ## Integrations and sharing
 

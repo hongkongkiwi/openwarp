@@ -13,6 +13,8 @@ This page covers the workload, path-policy, static-rotation and transit addition
 | `DELETE` | Same path | Workspace owner; removes trust and revokes its issued tokens |
 | `POST` | `/api/v1/machine/auth/workload/login` | `{identity_id,jwt}`; returns `{accessToken,expiresIn,identity_id,tokenType}` |
 
+The same login endpoint also accepts `{trust_id,jwt}` for the inline-JWKS trusts managed at `/api/orgs/{org_id}/identities/{identity_id}/workload-trust`. That engine issues environment-scoped workload tokens and checks the trust on every request. Supply exactly one of `identity_id` or `trust_id`; ambiguous or missing selectors are rejected without trying another verifier. The external-JWKS `identity_id` engine below retains its revision-bound machine tokens.
+
 Bindings require an existing workspace identity. Updating trust also revokes its issued tokens. Native exchange validates exact claims against configured public JWKS and consumes assertions once across the instance database. Kubernetes assertions use this same endpoint and must be fresh for each exchange. Workers exchange returns 501. See [workload access](WORKLOADS.md) for algorithms, claim bounds, network controls and Kubernetes refresh limitations.
 
 ## Path policy
@@ -38,17 +40,23 @@ A run response acknowledges scheduling, not remote success. Active execution cla
 
 ## Transit
 
+The established `/api/orgs/{org_id}/transit/keys` engine keeps its existing contract: `owt1:` ciphertext, required string `context`, `current_version` metadata, and an independent `transit:rewrap` permission and credential scope. Managing those keys also requires workspace administration. See [Transit](TRANSIT.md).
+
+### Compatibility engine
+
+The separate `/api/orgs/{org_id}/transit-compat/keys` engine below uses `compat_transit_keys` and `compat_transit_versions`. Keys and ciphertext are not interchangeable between engines. Its optional context, `key_version` responses and combined encrypt/decrypt rewrap permission remain distinct from the established engine.
+
 Transit is workspace-scoped server-side payload encryption, separate from environment secrets. It does not export keys or store application plaintext. Owners/admins have their normal broad authority; other roles need explicit `transit:manage`, `transit:encrypt` or `transit:decrypt` permissions. The managed developer role does not receive these permissions. Credential scopes, when present, must also permit the operation. Environment-scoped credentials are refused. Rewrap requires both encrypt and decrypt authority in the role and, when scoped, in the OAuth/service credential. Service-token creation accepts explicit `transit:manage`, `transit:encrypt` and `transit:decrypt` scopes in addition to the existing secret scopes and `*`; these scopes do not grant missing role permissions.
 
 | Method | Endpoint | Permission and JSON body |
 | --- | --- | --- |
-| `POST` | `/api/orgs/{org_id}/transit/keys` | `transit:manage`; `{name}`; returns `{id,name,key_version}` |
+| `POST` | `/api/orgs/{org_id}/transit-compat/keys` | `transit:manage`; `{name}`; returns `{id,name,key_version}` |
 | `GET` | Same path | `transit:manage`; list of `{id,name,created_at}` metadata |
-| `POST` | `/api/orgs/{org_id}/transit/keys/{key_id}/rotate` | `transit:manage`; returns `{id,key_version}` |
-| `POST` | `/api/orgs/{org_id}/transit/keys/{key_id}/encrypt` | `transit:encrypt`; `{plaintext,context}`; plaintext is base64; returns `{ciphertext,key_version}` |
-| `POST` | `/api/orgs/{org_id}/transit/keys/{key_id}/decrypt` | `transit:decrypt`; `{ciphertext,context}`; returns base64 `{plaintext}` |
-| `POST` | `/api/orgs/{org_id}/transit/keys/{key_id}/rewrap` | Both permissions; `{ciphertext,context}`; returns ciphertext under the latest version |
+| `POST` | `/api/orgs/{org_id}/transit-compat/keys/{key_id}/rotate` | `transit:manage`; returns `{id,key_version}` |
+| `POST` | `/api/orgs/{org_id}/transit-compat/keys/{key_id}/encrypt` | `transit:encrypt`; `{plaintext,context}`; plaintext is base64; returns `{ciphertext,key_version}` |
+| `POST` | `/api/orgs/{org_id}/transit-compat/keys/{key_id}/decrypt` | `transit:decrypt`; `{ciphertext,context}`; returns base64 `{plaintext}` |
+| `POST` | `/api/orgs/{org_id}/transit-compat/keys/{key_id}/rewrap` | Both permissions; `{ciphertext,context}`; returns ciphertext under the latest version |
 
 `context` is an optional string, defaulting to empty, limited to 1024 bytes. Plaintext is limited to 1 MiB. Ciphertext authenticates the workspace, key, version and exact context; changing any of them fails decryption. Ciphertext has an `owtransit:v1:` envelope and should be treated as opaque. Rotation retains old key versions for decryption; rewrap does not revoke the original ciphertext. There is no key-export, key-deletion or minimum-decryption-version endpoint in this implementation.
 
-A dedicated wrapping key protects each transit key's versions. Non-KMS instance master-key rotation rewraps those wrapping keys without changing transit ciphertext. Online root rotation waits for active HTTP and maintenance operations before taking its snapshot. It atomically rewraps environment keys, transit wrapping keys, v2 authentication keys, configured LDAP passwords and other stored root-encrypted state; outstanding emailed-code challenges are invalidated. Online root rotation is limited to single-process SQLite; PostgreSQL returns 409 because the process-local transit gate cannot coordinate other replicas. PostgreSQL deployments must keep the current root until a coordinated offline procedure is available. Master rotation is refused when KMS is configured or persisted KMS root state exists. Back up the database and preserve its matching root custody; see [encryption](ENCRYPTION.md).
+A dedicated wrapping key protects each transit key's versions. Non-KMS instance master-key rotation rewraps those wrapping keys without changing transit ciphertext. Online root rotation waits for active HTTP and maintenance operations before taking its snapshot. It atomically rewraps environment keys, transit wrapping keys, v2 authentication keys, configured LDAP passwords and other stored root-encrypted state; outstanding emailed-code challenges are invalidated. Online root rotation covers both Transit stores and retains the established engine's root-generation fence and checked transaction. It is limited to single-process SQLite; PostgreSQL and MySQL return 409 because process-local gates cannot coordinate other replicas. Those deployments must keep the current root until a coordinated offline procedure is available. Master rotation is refused when KMS is configured or persisted KMS root state exists. Back up the database and preserve its matching root custody; see [encryption](ENCRYPTION.md).

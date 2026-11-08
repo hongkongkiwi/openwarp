@@ -1,8 +1,11 @@
 use crate::{db, inference_leases, integrations, kms, mailer, mfa, ssh_ca, ssh_keys, ui};
-#[path = "transit.rs"] mod transit;
+#[path = "transit_compat.rs"] mod transit_compat;
 #[path = "workloads.rs"] mod workloads;
 #[path = "path_policy.rs"] mod path_policy;
 #[path = "static_rotation.rs"] mod static_rotation;
+#[path = "workload.rs"] mod workload;
+#[path = "transit.rs"] mod transit;
+#[path = "change_requests.rs"] mod change_requests;
 #[cfg(feature = "ldap")] use crate::ldap;
 #[cfg(not(target_arch = "wasm32"))]
 use axum::body::Bytes;
@@ -67,13 +70,14 @@ pub struct AppState {
     transit_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(not(target_arch="wasm32"))]
     lifecycle: Arc<tokio::sync::RwLock<()>>,
+    transit_lifecycle: transit::Lifecycle,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     #[cfg(feature = "redis-cache")] redis: std::sync::Mutex<Option<redis::Connection>>,
     live: LiveSender,
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db, db_url, instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// The root KMS is installed once at boot by the native entrypoint. The
 /// Workers build has no blocking HTTP client, so its slot stays empty.
@@ -318,7 +322,8 @@ impl AppState {
         let hash = oc::hash_token(&token);
         #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
         if self.cache_revoked(&hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
-        // Only account sessions are accepted from cookies; API credentials retain header scopes.
+        if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.is_none() {
+            return Err(err(StatusCode::UNAUTHORIZED, "ow_session requires an account session")); }
         if !cookie_only {
         // OAuth 2.1 access tokens (CLI / MCP clients)
         if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await.map_err(|e| bad(&e))? {
@@ -326,7 +331,8 @@ impl AppState {
             if !self.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
             return Ok(uid); }
         // service / personal access tokens
-        if let Some(row) = self.db.one("SELECT created_by,kind,created_at,expires_at,last_used_at,workload_revision FROM tokens WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))? {
+        if let Some(row) = self.db.one("SELECT * FROM tokens WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))? {
+            if db::s(&row, "kind") == "workload" && (db::n(&row, "expires_at") <= now() || !workload::live(self, &row).await) { return Err(err(StatusCode::UNAUTHORIZED, "invalid workload proof")); }
             let expires = db::n(&row, "expires_at");
             if expires > 0 && expires <= now() { return Err(err(StatusCode::UNAUTHORIZED, "token expired")); }
             if db::s(&row, "kind") == "machine" && db::n(&row, "created_at") + 3600 < now() { return Err(err(StatusCode::UNAUTHORIZED, "machine token expired (1h TTL); login again via Universal Auth")); }
@@ -871,6 +877,8 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         "DELETE FROM rotation_hooks WHERE org_id=?".to_string(),
         "DELETE FROM invites WHERE org_id=?".to_string(),
         "DELETE FROM workload_bindings WHERE org_id=?".to_string(),
+        "DELETE FROM compat_transit_versions WHERE key_id IN (SELECT id FROM compat_transit_keys WHERE org_id=?)".to_string(),
+        "DELETE FROM compat_transit_keys WHERE org_id=?".to_string(),
         "DELETE FROM transit_versions WHERE key_id IN (SELECT id FROM transit_keys WHERE org_id=?)".to_string(),
         "DELETE FROM transit_keys WHERE org_id=?".to_string(),
         format!("DELETE FROM path_policies WHERE env_id IN ({})", envs),
@@ -1506,7 +1514,7 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
     }
     let token = oc::random_token("owp"); let tid = id();
     let scopes: Vec<&str> = r.scopes.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-    for s in &scopes { if !matches!(*s, "secrets:read" | "secrets:write" | "org:admin" | "transit:manage" | "transit:encrypt" | "transit:decrypt" | "*") { return Err(bad("scopes may contain secrets:read, secrets:write, org:admin, transit:manage, transit:encrypt, transit:decrypt or *")); } }
+    for s in &scopes { if !matches!(*s, "secrets:read" | "secrets:write" | "org:admin" | "transit:manage" | "transit:encrypt" | "transit:decrypt" | "transit:rewrap" | "*") { return Err(bad("unsupported token scope")); } }
     let scopes = scopes.join(" ");
     let expires_at = if r.expires_in > 0 { now() + r.expires_in.clamp(60, 365 * 86400) } else { 0 };
     st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
@@ -3454,7 +3462,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if st.kms().is_some() || st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT,"master rotation is unavailable while KMS auto-unseal is configured")); }
     if !matches!(&st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
+    let _lifecycle = st.transit_lifecycle.write().await;
     let old = st.master();
+    let transit_root = transit::root(&st, &old).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     // Preflight every encrypted value before touching the database.
     let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
@@ -3511,8 +3521,18 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let ldap=st.db.query("SELECT org_id,bind_password_enc FROM ldap_configs WHERE bind_password_enc<>''",&[]).await.map_err(|e| bad(&e))?;
     let mut ldap_updates=Vec::new();
     for r in ldap { let plain=oc::decrypt_symmetric(&old,&db::s(&r,"bind_password_enc")).map_err(|_| bad("LDAP password unavailable; refusing root rotation"))?; ldap_updates.push((db::s(&r,"org_id"),oc::encrypt_symmetric(&new,&plain))); }
-    let transit_updates = transit::rewrap_master(&st, &old, &new).await?;
+    let transit_updates = transit_compat::rewrap_master(&st, &old, &new).await?;
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
+    let mut statements = transit::rotation(&st, &old, &new, &transit_root).await?;
+    for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped),json!(id)], Some(1))); }
+    for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value),json!(k)], Some(1))); }
+    for (id, key_enc) in &ca_updates { statements.push(("UPDATE pki_cas SET key_enc=? WHERE id=?".into(), vec![json!(key_enc),json!(id)], Some(1))); }
+    for (id, secret) in &stream_updates { statements.push(("UPDATE log_streams SET secret=? WHERE id=?".into(), vec![json!(secret),json!(id)], Some(1))); }
+    for (org, key_enc) in &saml_updates { statements.push(("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?".into(), vec![json!(key_enc),json!(org)], Some(1))); }
+    for (org, secret) in &hook_updates { statements.push(("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?".into(), vec![json!(secret),json!(org)], Some(1))); }
+    for (sql, updates) in [("UPDATE compat_transit_keys SET wrapping_key=? WHERE id=?", transit_updates), ("UPDATE users SET auth_key_enc=? WHERE id=?", auth_updates), ("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?", ldap_updates)] { for (id, value) in updates { statements.push((sql.into(), vec![json!(value),json!(id)], Some(1))); } }
+    statements.push(("DELETE FROM email_codes".into(), vec![], None));
+    if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
 
     // Block new encryptions with the old key while the database is updated.
     // The write guard lives inside a blocking task so it never crosses an
@@ -3524,11 +3544,8 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
         let _transit_guard=transit_guard;
         let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| bad(&e.to_string()))?;
-        let mut statements=Vec::new();
-        for (sql,updates) in [("UPDATE envs SET env_key_wrapped=? WHERE id=?",env_updates),("UPDATE meta SET v=? WHERE k=?",meta_updates),("UPDATE pki_cas SET key_enc=? WHERE id=?",ca_updates),("UPDATE log_streams SET secret=? WHERE id=?",stream_updates),("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?",saml_updates),("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?",hook_updates),("UPDATE transit_keys SET wrapping_key=? WHERE id=?",transit_updates),("UPDATE users SET auth_key_enc=? WHERE id=?",auth_updates),("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?",ldap_updates)] { for (id,value) in updates { statements.push((sql.to_string(),vec![json!(value),json!(id)])); } }
-        if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(),vec![json!(oc::b64(&new))])); }
-        statements.push(("DELETE FROM email_codes".into(),vec![]));
-        let result=runtime.block_on(st2.db.batch(&statements)).map_err(|e| bad(&e));
+        let result = runtime.block_on(st2.db.checked_batch(&statements, false))
+            .map_err(|_| err(StatusCode::CONFLICT, "master rotation conflicted with a key mutation; no changes applied"));
         if result.is_ok() { *guard = new; }
         result
     }).await.map_err(|e| bad(&e.to_string()))?;
@@ -4192,6 +4209,7 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
 
     let seg = |prefix: &str| path.strip_prefix(prefix).and_then(|r| r.split('/').next()).filter(|s| !s.is_empty()).map(|s| s.to_string());
     if let Some(oid) = seg("/api/orgs/") { return Some(oid); }
+    if let Some(pid) = seg("/api/change-requests/") { return st.db.one("SELECT org_id FROM change_requests WHERE id=?", &[json!(pid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
     if let Some(aid) = seg("/api/apps/") { return st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.ok().flatten().map(|r| db::s(&r, "org_id")); }
     if let Some(eid) = seg("/api/envs/") { return st.env_org_app(&eid).await.ok().map(|(o, _)| o); }
     for (prefix, table) in [("/api/secrets/", "secrets"), ("/api/leases/", "leases"), ("/api/integrations/", "integrations"), ("/api/rotations/", "rotation_schedules")] {
@@ -4242,6 +4260,18 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
 // API and MCP audiences are separate; administration needs org:admin, not
 // secret consent. Empty PAT scopes retain their legacy full-access meaning.
 async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    if let Err(e) = workload::restrict(&st, req.headers(), req.uri().path(), req.method().as_str()).await { return e.into_response(); }
+    match transit::scope(&st, req.headers(), req.uri().path(), req.method().as_str()).await {
+        Ok(true) => {
+            let hash = oc::hash_token(&bearer_token(req.headers()));
+            if let Ok(Some(row)) = st.db.one("SELECT resource FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await {
+                if db::s(&row,"resource") != issuer(&st, req.headers()) { return (StatusCode::FORBIDDEN, Json(json!({"error":"OAuth token audience does not match this API; sign in again"}))).into_response(); }
+            }
+            return next.run(req).await;
+        },
+        Err(e) => return e.into_response(),
+        Ok(false) => (),
+    }
     let path = req.uri().path().to_string();
     // SCIM is governed too: an environment-scoped credential must not be able to
     // deprovision users just because the route lives outside /api.
@@ -4252,8 +4282,8 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     let oauth = match st.db.one("SELECT scope,resource FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(&hash),json!(now())]).await { Ok(r)=>r,Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"credential scopes unavailable").into_response() };
     let service = match st.db.one("SELECT scopes,env_id FROM tokens WHERE token_hash=?", &[json!(&hash)]).await { Ok(r)=>r,Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"credential scopes unavailable").into_response() };
     let read = matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS);
-    let need = if path.contains("/transit/keys") { match path.rsplit('/').next().unwrap_or("") { "encrypt" => "transit:encrypt", "decrypt" | "rewrap" => "transit:decrypt", _ => "transit:manage" } } else if admin_scope_path(req.method(), &path) { "org:admin" } else if read { "secrets:read" } else { "secrets:write" };
-    let rewrap = path.ends_with("/rewrap") && path.contains("/transit/keys/");
+    let need = if path.contains("/transit-compat/keys") { match path.rsplit('/').next().unwrap_or("") { "encrypt" => "transit:encrypt", "decrypt" | "rewrap" => "transit:decrypt", _ => "transit:manage" } } else if admin_scope_path(req.method(), &path) { "org:admin" } else if read { "secrets:read" } else { "secrets:write" };
+    let rewrap = path.ends_with("/rewrap") && path.contains("/transit-compat/keys/");
     if let Some(row) = oauth {
         if db::s(&row,"resource") != issuer(&st, req.headers()) { return (StatusCode::FORBIDDEN, Json(json!({"error":"OAuth token audience does not match this API; sign in again"}))).into_response(); }
         let scope = db::s(&row, "scope");
@@ -4984,8 +5014,11 @@ async fn health(State(st): State<S>) -> impl IntoResponse {
 const LOCKBOX_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 async fn lockbox_page() -> Response {
     let body = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenWarp lockbox</title><style>body{margin:0;background:#08080c;color:#eceaf8;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh}
-main{width:620px;max-width:92vw;background:#12121b;border:1px solid #23233a;border-radius:14px;padding:24px}pre{white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace}</style></head>
+<title>OpenWarp lockbox</title><script>(function(){try{var p;try{p=localStorage.getItem('ow_theme')}catch(e){}if(p!=='light'&&p!=='dark'&&p!=='system')p='system';var de=document.documentElement;if(!de)return;de.dataset.themePref=p;var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;var ap=function(){de.dataset.theme=p==='system'?((mq&&mq.matches)?'dark':'light'):p};ap();if(mq&&mq.addEventListener)mq.addEventListener('change',ap)}catch(e){}})();
+</script><style>:root{color-scheme:light;--bg:#f4f5f9;--panel:#ffffff;--line:#dcdee9;--text:#1d1c2e;--muted:#5f5d78}
+:root[data-theme=dark]{color-scheme:dark;--bg:#08080c;--panel:#12121b;--line:#23233a;--text:#eceaf8;--muted:#9a97b3}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center;min-height:100vh}
+main{width:620px;max-width:92vw;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px}pre{white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace}</style></head>
 <body><main><h2>OpenWarp lockbox</h2><p id="out">Loading…</p></main><script>
 (function(){var out=document.getElementById('out');var id=decodeURIComponent(location.pathname.split('/').pop());var key=location.hash.slice(1);
 if(!key){out.textContent='This link is missing its decryption key.';return}
@@ -5055,6 +5088,13 @@ async fn metrics(State(st): State<S>, h: HeaderMap) -> Response {
 
 
 
+async fn workload_login(State(st): State<S>, h: HeaderMap, peer: PeerAddr, Json(body): Json<Value>) -> Res {
+    match (body.get("identity_id"), body.get("trust_id")) {
+        (Some(_), None) => workloads::login(State(st), Json(body)).await,
+        (None, Some(_)) => workload::login(State(st), h, peer, Json(body)).await,
+        _ => Err(bad("exactly one of identity_id or trust_id is required")),
+    }
+}
 async fn lifecycle_middleware(State(_st): State<S>, req: axum::extract::Request, next: Next) -> Response {
     let rotation=req.method()==axum::http::Method::POST && req.extensions().get::<axum::extract::MatchedPath>().is_some_and(|p| p.as_str()=="/api/instance/rotate-master");
     if rotation { return next.run(req).await; }
@@ -5065,14 +5105,15 @@ pub fn router(state: S) -> Router {
     let app = Router::new()
         .route("/api/rotations/{rid}/run", post(static_rotation::run))
         .route("/api/orgs/{oid}/identities/{iid}/workload", get(workloads::manage).put(workloads::manage).delete(workloads::manage))
-        .route("/api/v1/machine/auth/workload/login", post(workloads::login).layer(axum::extract::DefaultBodyLimit::max(20*1024)))
+        .route("/api/v1/machine/auth/workload/login", post(workload_login).layer(axum::extract::DefaultBodyLimit::max(40*1024)))
         .route("/api/envs/{eid}/path-policy/{role}", get(path_policy::get).put(path_policy::put).delete(path_policy::delete))
-        .route("/api/orgs/{oid}/transit/keys", get(transit::list).post(transit::create))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/rotate", post(transit::rotate))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/encrypt", post(transit::encrypt))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/decrypt", post(transit::decrypt))
-        .route("/api/orgs/{oid}/transit/keys/{kid}/rewrap", post(transit::rewrap))
+        .route("/api/orgs/{oid}/transit-compat/keys", get(transit_compat::list).post(transit_compat::create))
+        .route("/api/orgs/{oid}/transit-compat/keys/{kid}/rotate", post(transit_compat::rotate))
+        .route("/api/orgs/{oid}/transit-compat/keys/{kid}/encrypt", post(transit_compat::encrypt))
+        .route("/api/orgs/{oid}/transit-compat/keys/{kid}/decrypt", post(transit_compat::decrypt))
+        .route("/api/orgs/{oid}/transit-compat/keys/{kid}/rewrap", post(transit_compat::rewrap))
         .route("/", get(index)).route("/e2e.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("e2e.js")) }))
+        .route("/i18n.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("i18n.js")) }))
         .route("/auth-v2.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("auth-v2.js")) }))
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
         .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
@@ -5090,6 +5131,14 @@ pub fn router(state: S) -> Router {
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
+        .route("/api/orgs/{oid}/identities/{iid}/workload-trust", get(workload::list).post(workload::create))
+        .route("/api/orgs/{oid}/identities/{iid}/workload-trust/{tid}", delete(workload::revoke))
+        .route("/api/orgs/{oid}/change-requests", get(change_requests::list).post(change_requests::create))
+        .route("/api/change-requests/{id}", get(change_requests::detail).put(change_requests::edit))
+        .route("/api/change-requests/{id}/{action}", post(change_requests::action))
+        .route("/api/orgs/{oid}/transit/keys", get(transit::list).post(transit::create))
+        .route("/api/orgs/{oid}/transit/keys/{kid}/rotate", post(transit::rotate))
+        .route("/api/orgs/{oid}/transit/keys/{kid}/{action}", post(transit::operate))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))
         .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/tags", get(list_tags)).route("/api/envs/{eid}/secrets/reuse-check", post(reuse_check)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/meta", get(e2e_meta)).route("/api/envs/{eid}/e2e/rekey", post(e2e_rekey)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets)).route("/api/envs/{eid}/scan", get(scan_env)).route("/api/envs/{eid}/meta", get(env_meta)).route("/api/envs/{eid}/wrap", post(create_wrap)).route("/api/unwrap", get(lookup_wrap).post(consume_wrap))

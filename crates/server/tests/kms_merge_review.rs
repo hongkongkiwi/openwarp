@@ -1,4 +1,4 @@
-//! PR8 review tests: F7 migration-19 restart resume, F10 mixed-root startup
+//! PR8 review tests: F7 migration-22 restart resume, F10 mixed-root startup
 //! safety, and F3 MySQL/MariaDB KMS adoption. MySQL/Postgres variants are
 //! opt-in via OPENWARP_TEST_MYSQL_URL / OPENWARP_TEST_POSTGRES_URL and skip when
 //! unset; SQLite cases run unconditionally.
@@ -137,26 +137,26 @@ impl Spawned {
 }
 
 #[tokio::test]
-async fn migration19_resumes_when_lifecycle_row_exists_but_ledger_absent() {
+async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
     let dir = tmp_dir("f7-sqlite");
     let url = format!("sqlite://{}", dir.join("test.db").display());
     {
         let db = Db::open(&url).await.expect("open fresh sqlite database");
-        assert_eq!(db.version().await.unwrap(), 19, "a fresh database lands on the current version");
-        // Simulate an interrupted first run of migration 19: the lifecycle meta
+        assert_eq!(db.version().await.unwrap(), 22, "a fresh database lands on the current version");
+        // Simulate an interrupted first run of migration 22: the lifecycle meta
         // row was inserted but the schema_migrations ledger entry never landed.
-        db.exec("DELETE FROM schema_migrations WHERE version=19", &[]).await.unwrap();
+        db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
         assert!(
             db.one("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().is_some(),
             "precondition: the lifecycle row must already exist"
         );
     }
-    // Reopening replays migration 19; the duplicate lifecycle row must not abort.
+    // Reopening replays migration 22; the duplicate lifecycle row must not abort.
     {
         let reopened = Db::open(&url).await;
-        assert!(reopened.is_ok(), "migration 19 resume failed: {:?}", reopened.err());
+        assert!(reopened.is_ok(), "migration 22 resume failed: {:?}", reopened.err());
         let reopened = reopened.unwrap();
-        assert_eq!(reopened.version().await.unwrap(), 19, "the ledger must record version 19");
+        assert_eq!(reopened.version().await.unwrap(), 22, "the ledger must record version 22");
         let rows = reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap();
         assert_eq!(rows.len(), 1, "the lifecycle row must remain a single row");
     }
@@ -347,7 +347,7 @@ async fn mysql_kms_adoption_wraps_the_existing_master_and_removes_the_plaintext_
 }
 
 #[tokio::test]
-async fn migration19_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absent() {
+async fn migration22_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absent() {
     let admin = match std::env::var("OPENWARP_TEST_MYSQL_URL") {
         Ok(url) if !url.trim().is_empty() => url,
         _ => return,
@@ -360,13 +360,13 @@ async fn migration19_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absen
     let db_url = derive_db_url(&admin, &name);
     {
         let db = Db::open(&db_url).await.expect("open mysql test database");
-        assert_eq!(db.version().await.unwrap(), 19);
-        db.exec("DELETE FROM schema_migrations WHERE version=19", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 22);
+        db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
     }
     let reopened = Db::open(&db_url).await;
-    assert!(reopened.is_ok(), "migration 19 resume failed on MySQL: {:?}", reopened.err());
+    assert!(reopened.is_ok(), "migration 22 resume failed on MySQL: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 19);
+    assert_eq!(reopened.version().await.unwrap(), 22);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1
@@ -374,7 +374,7 @@ async fn migration19_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absen
 }
 
 #[tokio::test]
-async fn migration19_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_absent() {
+async fn migration22_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_absent() {
     let admin = match std::env::var("OPENWARP_TEST_POSTGRES_URL") {
         Ok(url) if !url.trim().is_empty() => url,
         _ => return,
@@ -385,13 +385,13 @@ async fn migration19_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_ab
     let db_url = derive_db_url(&admin, &name);
     {
         let db = Db::open(&db_url).await.expect("open postgres test database");
-        assert_eq!(db.version().await.unwrap(), 19);
-        db.exec("DELETE FROM schema_migrations WHERE version=19", &[]).await.unwrap();
+        assert_eq!(db.version().await.unwrap(), 22);
+        db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
     }
     let reopened = Db::open(&db_url).await;
-    assert!(reopened.is_ok(), "migration 19 resume failed on Postgres: {:?}", reopened.err());
+    assert!(reopened.is_ok(), "migration 22 resume failed on Postgres: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), 19);
+    assert_eq!(reopened.version().await.unwrap(), 22);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1

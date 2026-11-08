@@ -60,7 +60,7 @@ async fn cookie_credentials_cannot_escape_bearer_scope_or_mint_permanent_machine
     let write = json!({"secrets":[{"key":"ESCAPE","value":"denied"}]});
     for (method, path, body) in [
         ("PUT", "/api/envs/env-b/secrets", Some(write.clone())),
-        ("GET", "/api/orgs/org/transit/keys", None),
+        ("GET", "/api/orgs/org/transit-compat/keys", None),
     ] {
         let bearer = f.call(method, path, "scoped", body.clone()).await;
         assert!(bearer.denied(), "bearer negative control {}: {} {}", path, bearer.status, bearer.body);
@@ -91,8 +91,8 @@ async fn cookie_credentials_cannot_escape_bearer_scope_or_mint_permanent_machine
 #[tokio::test]
 async fn transit_rewrap_requires_encrypt_and_decrypt_scopes_for_service_and_oauth_tokens() {
     let f = Fixture::new().await;
-    let key = f.call("POST", "/api/orgs/org/transit/keys", "owner", Some(json!({"name":"scope-controls"}))).await.ok();
-    let base = format!("/api/orgs/org/transit/keys/{}", key["id"].as_str().unwrap());
+    let key = f.call("POST", "/api/orgs/org/transit-compat/keys", "owner", Some(json!({"name":"scope-controls"}))).await.ok();
+    let base = format!("/api/orgs/org/transit-compat/keys/{}", key["id"].as_str().unwrap());
     let plain = json!({"plaintext":oc::b64(b"local transit control"),"context":"regression"});
     let encrypted = f.call("POST", &format!("{}/encrypt", base), "owner", Some(plain.clone())).await.ok();
     f.call("POST", &format!("{}/rotate", base), "owner", Some(json!({}))).await.ok();
