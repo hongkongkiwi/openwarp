@@ -44,7 +44,7 @@ pub(super) async fn rotation(st: &S, old: &[u8;32], new: &[u8;32], expected: &st
 async fn authorize(st: &S, h: &HeaderMap, org: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
     st.require_org_running(org).await?;
-    if !env_scope_of(st,h).await.is_empty() { return Err(err(StatusCode::FORBIDDEN,"environment credentials cannot use transit")); }
+    if !env_scope_of(st,h).await?.is_empty() { return Err(err(StatusCode::FORBIDDEN,"environment credentials cannot use transit")); }
     credential_scope(st,h,org,action).await?;
     st.check_perm(org,&uid,action).await?;
     if action=="transit:manage" { st.check_admin(org,&uid).await?; }

@@ -10,8 +10,11 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite://openwarp.db` | SQLite file, PostgreSQL connection URL, or MySQL/MariaDB URL (`mysql://`, `mariadb://`) |
 | `ADDR` | `0.0.0.0:8080` | Listen IP and port; use loopback for private local development |
-| `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key and activates production-specific checks |
-| `OPENWARP_MASTER_KEY` | Generated/stored in development | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
+| `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key or a configured KMS bridge and activates production-specific checks |
+| `OPENWARP_MASTER_KEY` | Generated/stored in development without KMS | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
+| `OPENWARP_KMS_URL` | Unset | Native server HTTP(S) bridge for root/key wrapping; permits production auto-unseal without a plaintext master-key variable. `http://` is accepted, so use HTTPS, loopback or a protected private network |
+| `OPENWARP_KMS_TOKEN` | Unset | Optional bearer credential for the configured KMS bridge |
+| `OPENWARP_KMS_KEY_ID` | `primary` | Bridge key identifier stored in wrapped payloads; preserve access to previous identifiers |
 | `REDIS_URL` | Unset | Optional session cache with the default `redis-cache` build feature |
 | `OPENWARP_PUBLIC_URL` | Derived from request context where needed | Canonical public origin for issuer metadata, redirects, and links; configure explicitly in deployed instances |
 | `OPENWARP_PG_POOL_SIZE` | `8` | Postgres connections per process, clamped to 1..64. Multiply by the replica count before sizing the database |
@@ -36,6 +39,10 @@ openssl rand -base64 32
 ```
 
 Store the result securely. A replacement value does not rotate existing ciphertext. Development promotion must preserve the database's existing generated key.
+
+Startup root precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise, with `OPENWARP_KMS_URL` set, the KMS-wrapped `meta.kms_root` (on first boot it wraps an existing plaintext `meta.master`, or mints a root when none exists); outside production, a stored plaintext `meta.master` or a generated development key stored in the database. Production without an external master key or configured KMS bridge aborts before either development fallback. If a plaintext `meta.master` and the unwrapped KMS root disagree, startup stops and neither row is deleted, because either deletion would lose key material. Online instance-root rotation is limited to single-process SQLite; PostgreSQL and MySQL/MariaDB return a conflict and need a coordinated offline procedure.
+
+The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap responses carry plaintext root or environment keys over that unencrypted connection, and the bridge has no egress allowlist of its own. Use HTTPS, a loopback listener, or a protected private network, and give `OPENWARP_KMS_TOKEN` only to the adapter that terminates that trust boundary.
 
 ## Registration and email
 

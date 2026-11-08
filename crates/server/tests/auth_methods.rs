@@ -54,9 +54,12 @@ fn free_port() -> u16 {
 impl Server {
     async fn start() -> Server { Server::start_env(&[]).await }
     async fn start_env(extra: &[(&str, String)]) -> Server {
-        let server = Server::spawn_env(extra).await;
+        // The lock spans startup on purpose: free_port only proves the port was
+        // free when it was checked, so a second test must not spawn until this
+        // child has bound it.
+        let _start = START_LOCK.lock().await;
+        let mut server = Server::spawn_env(extra).await;
         let deadline = Instant::now() + Duration::from_secs(20);
-        let mut server = server;
         while Instant::now() < deadline {
             if server.child_exited().is_some() { panic!("server exited during startup; see {}", server.log.display()); }
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
@@ -67,10 +70,12 @@ impl Server {
         panic!("server did not become healthy at {}", server.base);
     }
     // For a configuration that must refuse to start: no health wait, so the
-    // caller can observe the exit instead of a startup timeout.
-    async fn start_env_unchecked(extra: &[(&str, String)]) -> Server { Server::spawn_env(extra).await }
-    async fn spawn_env(extra: &[(&str, String)]) -> Server {
+    // caller can observe the exit instead of a startup timeout. This child
+    // fails validation before binding, so the lock only has to cover the spawn.
+    async fn start_env_unchecked(extra: &[(&str, String)]) -> Server {
         let _start = START_LOCK.lock().await;
+        Server::spawn_env(extra).await }
+    async fn spawn_env(extra: &[(&str, String)]) -> Server {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-authmethods-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).expect("temp dir");
