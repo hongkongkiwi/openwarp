@@ -1,5 +1,5 @@
 use openwarp_crypto as oc;
-use openwarp_server::{backfill_value_fingerprints, install_kms, kms, new_state, process_maintenance, production, router, try_leader, validate_auth_env, validate_region_env};
+use openwarp_server::{backfill_value_fingerprints, install_kms, kms, load_master, new_state, process_maintenance, production, router, try_leader, validate_auth_env, validate_region_env};
 use openwarp_server::db::{self, Db};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -71,62 +71,6 @@ async fn shutdown_signal() {
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     eprintln!("shutdown signal received; draining connections"); }
-
-async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8;32], String> {
-    if let Ok(v) = std::env::var("OPENWARP_MASTER_KEY") {
-        let bytes = oc::unb64(&v).map_err(|_| "OPENWARP_MASTER_KEY is not valid base64".to_string())?;
-        return bytes.try_into().map_err(|_| "OPENWARP_MASTER_KEY must decode to exactly 32 bytes".to_string());
-    }
-    if let Some(kms) = kms {
-        // A present-but-unreadable master row must stop the boot. Minting a new
-        // root here would make every record under the old key undecryptable and
-        // delete the only copy of the old root.
-        let local: Option<[u8; 32]> = if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
-            let raw = oc::unb64(&db::s(&r, "v")).map_err(|_| "the stored master root is not valid base64; refusing to generate a replacement".to_string())?;
-            Some(raw.try_into().map_err(|_| "the stored master root is not 32 bytes; refusing to generate a replacement".to_string())?)
-        } else { None };
-        let stored = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| e.to_string())?;
-        let master = if let Some(r) = stored {
-            let raw = kms.unwrap(&db::s(&r, "v"), "master").map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
-            raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?
-        } else {
-            let k = local.unwrap_or_else(oc::random_key);
-            let wrapped = kms.wrap(&k, "master")?;
-            let verified = kms.unwrap(&wrapped, "master").map_err(|e| format!("KMS root roundtrip failed: {}", e))?;
-            if verified.as_slice() != k { return Err("KMS root roundtrip returned a different key; refusing to persist it".into()); }
-            // The insert is atomic and portable across SQLite, PostgreSQL and
-            // MySQL. A losing concurrent first boot adopts the stored winner
-            // before writing anything encrypted by this process.
-            if db.insert_if_absent("kms_root", &wrapped).await.map_err(|e| e.to_string())? { k } else {
-                let row = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| e.to_string())?.ok_or("the concurrent KMS root is missing")?;
-                let raw = kms.unwrap(&db::s(&row, "v"), "master").map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
-                raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?
-            }
-        };
-        // A plaintext master that differs from the effective wrapped root is a
-        // mixed-root database. Deleting either copy would lose key material, so
-        // startup stops and both rows stay for operator recovery.
-        if let Some(local) = local { if local != master { return Err("meta.master and meta.kms_root hold different roots; refusing to delete either. Restore the matching root or database backup.".into()); } }
-        db.exec("DELETE FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())?;
-        return Ok(master);
-    }
-    if std::env::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) {
-        return Err("OPENWARP_MASTER_KEY or OPENWARP_KMS_URL is required in production. Preserve the original root for an existing database; a generated development key must be supplied externally or adopted by a KMS.".into());
-    }
-    if let Some(r) = db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| e.to_string())? {
-        let raw = oc::unb64(&db::s(&r, "v")).map_err(|_| "the stored master root is not valid base64; refusing to generate a replacement".to_string())?;
-        return raw.try_into().map_err(|_| "the stored master root is not 32 bytes; refusing to generate a replacement".to_string());
-    }
-    // A database booted with a KMS has no plaintext master row: the root lives
-    // in meta.kms_root. Generating one here would silently make every owkms:
-    // environment key and every account key unreadable.
-    if db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| e.to_string())?.is_some() {
-        return Err("this database's master root is wrapped by a KMS, but OPENWARP_KMS_URL is not configured. Restore the KMS bridge, or set OPENWARP_MASTER_KEY to the original root.".into());
-    }
-    let k = oc::random_key(); let _ = db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&k))]).await;
-    eprintln!("warning: OPENWARP_MASTER_KEY is not set; a generated key was stored in the database. Set OPENWARP_MASTER_KEY before production use.");
-    Ok(k)
-}
 
 #[cfg(test)]
 mod tests {

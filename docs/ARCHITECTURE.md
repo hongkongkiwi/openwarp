@@ -6,7 +6,9 @@ OpenWarp is a Rust workspace with a server, CLI, and cryptographic library. The 
 
 | Path | Responsibility |
 | --- | --- |
-| [`crates/server/src/main.rs`](../crates/server/src/main.rs) | HTTP routing, authentication, authorisation, secret operations, and background work |
+| [`crates/server/src/main.rs`](../crates/server/src/main.rs) | Native startup, listener and background tasks |
+| [`crates/server/src/app.rs`](../crates/server/src/app.rs) | Shared routing, authentication, authorisation and secret operations |
+| [`crates/server/src/worker.rs`](../crates/server/src/worker.rs) | Workers fetch/scheduled entrypoints and Durable Object |
 | [`crates/server/src/db.rs`](../crates/server/src/db.rs) | SQLite, PostgreSQL, MariaDB and Durable Object storage adapter; MySQL DDL rewriting |
 | [`crates/server/src/migrate.rs`](../crates/server/src/migrate.rs) | Versioned migration runner and ledger checks |
 | [`crates/server/src/bin/migrate.rs`](../crates/server/src/bin/migrate.rs) | `openwarp-migrate` operator CLI |
@@ -29,7 +31,7 @@ flowchart TD
     HTTP --> Auth[Identity, scope, role, and environment checks]
     Auth --> Operations[Secret and workspace operations]
     Operations --> Storage[(SQLite, PostgreSQL, MariaDB, or DO SQLite)]
-    Auth -. optional session cache .-> Redis[(Redis)]
+    Auth -. optional revocation cache .-> Redis[(Redis)]
     Operations --> Sync[Provider sync]
     Sync --> Remote[External destinations]
 ```
@@ -58,9 +60,11 @@ A jurisdiction is a deployment: the instance, its database and its master key. T
 
 The database abstraction uses SQLite, PostgreSQL or MySQL/MariaDB behind a common row representation. SQLite enables WAL and foreign keys. PostgreSQL queries translate positional `?` placeholders into numbered parameters. MySQL keeps `?` and rewrites the canonical DDL where its rules differ: keyed or indexed `TEXT` columns become `VARCHAR(255)`, defaults on `TEXT` become expressions, `CREATE INDEX` loses `IF NOT EXISTS`, and tables use a binary collation. Startup applies the numbered migrations from `crates/server/migrations` through that adapter; the ledger records a checksum and completion state for each version, and boot refuses on drift, gaps, an interrupted run, or a database newer than the binary. See [schema migrations](MIGRATIONS.md).
 
-SQLite uses a synchronous connection behind a mutex; PostgreSQL and MySQL/MariaDB use async pools (`deadpool-postgres`, `mysql_async`). This is not a claim of throughput characteristics. The PostgreSQL client does not enable TLS, and the MySQL/MariaDB client enables it only when the URL requests `require_ssl=true`, so transport security must be addressed in deployment.
+Native SQLite uses a synchronous connection behind a mutex; PostgreSQL and MySQL/MariaDB use async pools (`deadpool-postgres`, `mysql_async`). This is not a claim of throughput characteristics. The PostgreSQL client does not enable TLS, and the MySQL/MariaDB client enables it only when the URL requests `require_ssl=true`, so transport security must be addressed in deployment.
 
-Redis is an optional session cache. The database remains authoritative for persistent application state. Rate-limit state is stored in the database rather than solely in process memory.
+On Workers, the same API executes queries against the synchronous SQLite handle in one Durable Object. It does not use a local database file or D1. Both deployments apply the shared schema and numbered migrations through the adapter. Native batches use database transactions; Workers batches use `transactionSync`, with exact affected-row guards for conditional writes.
+
+Redis is an optional native revocation cache, not an authority for accepting a session. The database holds account state and rate limits. Workers excludes Redis.
 
 Several server processes share one Postgres database and one master key. `instance_leases` keeps background work on a single replica. `live_events` carries audit-shaped change notices, and `GET /api/live` forwards the ones the caller may already read. The socket itself stays on the replica that accepted it; the table is what crosses process boundaries. A reconnect passes `since` and receives the matching rows still inside the hour-long retention before the live stream resumes. Each replica sends its own pings, so the socket survives an idle timeout at a proxy such as Cloudflare. SQLite remains a single-process database.
 
@@ -92,9 +96,9 @@ The CLI uses HTTP APIs rather than direct database access. User credentials and 
 
 ## Boundaries
 
-- The server needs operating-system networking and a database driver; it is not a drop-in Workers/WASM service.
+- Native and Workers deployments share handlers but use different runtime adapters. Workers has explicit capability gaps listed in [deployment](DEPLOY.md#cloudflare-workers); native-only routes do not become portable merely by disabling default features.
 - Database persistence does not imply that every background task has distributed leader election or a delivery guarantee.
 - Protocol endpoints do not establish full compatibility with every external client or provider version.
 - Cryptographic primitives and automated tests do not substitute for an independent audit.
 
-[Development](DEVELOPMENT.md) · [API reference](API.md) · [Security model](SECURITY.md) · [Documentation index](README.md)
+[Development](DEVELOPMENT.md) · [Authentication protocol](AUTH-PROTOCOL.md) · [Security model](SECURITY.md) · [Documentation index](README.md)

@@ -2577,8 +2577,6 @@ dependencies = [
 [[package]]
 name = "keystore-ocsp"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64777eb8bb151399e77c067139eda189af00cb63295992b6727ad0557d33227c"
 dependencies = [
  "der 0.7.10",
  "hex",
@@ -3299,6 +3297,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tower",
  "tracing",
+ "uuid",
  "wasm-bindgen-futures",
  "webauthn-rs",
  "webpki-roots",
@@ -4431,11 +4430,10 @@ dependencies = [
 [[package]]
 name = "risaml"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb9b1e44e15991eee5926e290e0c025463220ce81b8ee47330e74a3c96d7e321"
 dependencies = [
  "base64 0.23.1",
  "flate2",
+ "js-sys",
  "quick-xml",
  "ribergshamra",
  "thiserror 2.0.21",
@@ -6051,13 +6049,12 @@ dependencies = [
 [[package]]
 name = "webauthn-rs-core"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d13e555c106095051abd70415b88546a0d3757a7990e05b4659b4fba19e46ac"
 dependencies = [
  "base64 0.21.7",
  "crypto-glue",
  "der-parser 10.0.0",
  "hex",
+ "js-sys",
  "nom 7.1.3",
  "rand 0.10.3",
  "rand_chacha 0.10.0",

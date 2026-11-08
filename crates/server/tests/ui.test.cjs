@@ -207,6 +207,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-d/secrets': { secrets: [] },
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/ssh/cas': [],
+    '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/emergency': { locked: false },
     '/api/orgs/org-b/emergency': { locked: false },
     '/api/apps/app-a/emergency': { locked: false, direct_locked: false, workspace_locked: false },
@@ -217,6 +218,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
     ...opts.responses,
   };
+  const session = new Map();
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
     localStorage: {
@@ -224,6 +226,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       setItem: (key, value) => { store[key] = String(value); },
       removeItem: key => { delete store[key]; },
     },
+    sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
