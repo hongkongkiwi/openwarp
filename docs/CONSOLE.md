@@ -9,6 +9,8 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Apps | Create applications, select environments, manage secrets |
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
+| Assistant | Search permitted metadata, ask contextual questions, preview folders and integration drafts |
+| Security insights | Inspect rule-based findings, evidence, acknowledgments, and expiring exceptions |
 | Audit log | Inspect workspace activity |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
@@ -115,6 +117,13 @@ E2E environments show a dedicated decrypt panel rather than the ordinary SSE edi
 
 Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, read, and grant wrapped keys. Removing a grant prevents future access to that wrapped key through the server; it cannot erase plaintext or keys that a recipient already copied.
 
+## Assistant and insights
+
+The assistant starts disabled for each workspace. Administrators select an operator-approved endpoint and separately enable metadata disclosure, confirmed actions, and local value matching. Metadata search stays on the instance. Model questions go to the selected endpoint with authorised managed-environment metadata; do not type credentials into a question. Stored values, comments, and provider configuration are excluded. Use the separate import input for local parsing rather than pasting dotenv into a question.
+
+Setup suggestions first become a preview with an expiry. Only "Confirm these changes" executes its stored operations. Folder previews create real empty paths; integration previews create drafts without credentials. Complete an integration draft through its configuration form, then test or sync it separately. Future normal deployments can sync configured integrations.
+
+Security insights are administrator-only and work without a model. Inspect the coverage report before interpreting an empty findings list. Acknowledgments and expiring exceptions record investigation state; AI explanations do not change evidence or revoke credentials. See [assistant and security insights](AI.md) for API boundaries, encryption limits, and endpoint policy.
 ## Emergency lockdown
 
 Workspace owners can halt a whole workspace from Settings, or choose **Project lockdown** on an app card to halt that project. A project is an application in the API. Confirm the selected scope before activation.
