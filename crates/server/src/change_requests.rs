@@ -128,7 +128,7 @@ fn row_guard(raw: &Value) -> Result<Statement, (StatusCode, Json<Value>)> {
     }
     Ok((format!("UPDATE secrets SET version=version WHERE {}",conditions.join(" AND ")),params,Some(1)))
 }
-fn writes(st: &S, eid: &str, org: &str, uid: &str, key: &[u8;32], item: &Value) -> Result<Vec<Statement>, (StatusCode, Json<Value>)> {
+async fn writes(st: &S, eid: &str, org: &str, uid: &str, key: &[u8;32], limit: i64, item: &Value) -> Result<Vec<Statement>, (StatusCode, Json<Value>)> {
     let before = &item["before"]; let after = &item["after"]; let mut result = Vec::new();
     if after.is_null() {
         if !before.is_null() { result.push(("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=?,updated_by=? WHERE id=? AND env_id=?".into(),vec![json!(now()),json!(now()),json!(uid),before["id"].clone(),json!(eid)],Some(1))); }
@@ -150,6 +150,9 @@ fn writes(st: &S, eid: &str, org: &str, uid: &str, key: &[u8;32], item: &Value) 
         result.push(("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,path='',path_enc=?,tags='',tags_enc=?,key_hash=?,key_index=?,secret_type=?,version=?,updated_at=?,updated_by=? WHERE id=? AND env_id=?".into(),vec![json!(value_enc),json!(fp),json!(comment_enc),json!(path_enc),json!(tags_enc),json!(index),json!(index),json!(s.secret_type),json!(version),json!(now()),json!(uid),json!(sid),json!(eid)],Some(1)));
     }
     result.push(("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)".into(),vec![json!(id()),json!(sid),json!(version),json!(key_enc),json!(value_enc),json!(comment_enc),json!(s.secret_type),json!(s.path),json!(s.tags),json!(now()),json!(uid)],Some(1)));
+    // The limit is read once per environment and guarded by the apply transaction,
+    // so every item in one apply prunes under the same committed policy.
+    if limit > 0 && version > limit { result.push(("DELETE FROM secret_versions WHERE secret_id=? AND version<=?".into(),vec![json!(sid),json!(version-limit)],None)); }
     Ok(result)
 }
 pub(super) async fn action(State(st): State<S>, h: HeaderMap, Path((pid,action)): Path<(String,String)>, Json(body): Json<Value>) -> Res {
@@ -165,16 +168,19 @@ pub(super) async fn action(State(st): State<S>, h: HeaderMap, Path((pid,action))
     let mut mutations = Vec::new();
     if action=="apply" {
         for (eid,key,items) in &payloads {
-            let wrapped = st.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"env_key_wrapped")).ok_or_else(conflict)?;
+            let env = st.db.one("SELECT env_key_wrapped,max_versions FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(conflict)?;
+            let wrapped = db::s(&env,"env_key_wrapped"); let limit = db::n(&env,"max_versions");
             if st.env_key(eid).await? != *key { return Err(conflict()); }
-            statements.push(("UPDATE envs SET mode=mode WHERE id=? AND mode='sse' AND env_key_wrapped=?".into(),vec![json!(eid),json!(wrapped)],Some(1)));
+            // Retention is part of the guarded snapshot: a policy edited after this read
+            // makes the apply conflict instead of pruning under a stale limit.
+            statements.push(("UPDATE envs SET mode=mode WHERE id=? AND mode='sse' AND env_key_wrapped=? AND max_versions=?".into(),vec![json!(eid),json!(wrapped),json!(limit)],Some(1)));
             for item in items {
                 st.check_perm(&org,&uid,if item["after"].is_null() { "secrets:delete" } else { "secrets:write" }).await?;
                 let rows = item["rows"].as_array().ok_or_else(conflict)?;
                 // The table lock makes both cardinality and raw-row guards stable until commit.
                 statements.push(("UPDATE change_requests SET revision=revision WHERE id=? AND revision=? AND (SELECT COUNT(*) FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?))=?".into(),vec![json!(pid),json!(revision),json!(eid),item["index"].clone(),item["legacy"].clone(),json!(rows.len() as i64)],Some(1)));
                 for raw in rows { statements.push(row_guard(raw)?); }
-                mutations.extend(writes(&st,eid,&org,&uid,key,item)?);
+                mutations.extend(writes(&st,eid,&org,&uid,key,limit,item).await?);
             }
         }
         statements.extend(mutations);

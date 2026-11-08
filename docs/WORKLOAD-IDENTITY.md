@@ -43,8 +43,8 @@ Workload tokens cannot administer workspaces, create credentials, change grants,
 
 ## Deployment and verification limits
 
-Exchange uses a checked transaction to consume replay state and mint the token together. Native SQLite and PostgreSQL implement this transaction. The Workers backend currently returns 501 before minting because checked transactions are unavailable there. Rate-limit bookkeeping may still be updated for the failed attempt. Do not configure a workload that depends on Workers exchange until that support exists.
+Exchange uses a checked transaction to consume replay state and mint the token together. Native SQLite, PostgreSQL and the Workers Durable Object backend implement this transaction. Rate-limit bookkeeping may be updated for failed attempts.
 
-The in-process SQLite regression suite exercises claim validation, replay, token scoping, revocation and peer allowlists. It does not prove compatibility with a particular live issuer or PostgreSQL/Workers runtime behavior. Test a real issuer's JWT shape and its key-rotation procedure before deployment.
+The regression suite exercises claim validation, replay, token scoping, revocation and peer allowlists. PostgreSQL concurrency and the local Workers runtime also exercise exchange and replay. These checks do not prove compatibility with a particular live issuer. Test a real issuer's JWT shape and its key-rotation procedure before deployment.
 
 [Security model](SECURITY.md) | [CLI](CLI.md)

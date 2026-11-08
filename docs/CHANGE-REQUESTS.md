@@ -45,12 +45,14 @@ Send a JSON body containing the expected `revision` to these routes:
 
 The author cannot approve or apply their own request. Each action checks current access to every environment. Application also checks write/delete permissions for the requested operations.
 
+Application also honors each environment's `max_versions` retention policy. The limit is snapshotted once per environment and guarded in the same transaction, so an apply conflicts if policy changes after preparation instead of pruning under a stale limit.
+
 Application verifies that every captured target is unchanged, including deletions, recreations and previously absent logical keys. Any conflict returns 409 and leaves the batch unapplied. Rebase by editing, review the new diff, then approve that revision. A request that has already been applied cannot be applied again.
 
 Local changes and version history commit together in a checked database transaction. Native PostgreSQL briefly locks the secrets table against other writers during guarded application; this favors atomicity over concurrent write throughput. Native SQLite uses an immediate transaction. Provider sync runs after commit and reports errors per environment in `sync_errors`. A provider failure does not undo the committed local batch.
 
 ## Deployment limits
 
-The Workers backend currently returns 501 without creating or applying a change request because checked transactions are unavailable there. The new API does not provide client-side encrypted review, multi-workspace batches, multiple required reviewers or scheduled application. Existing proposals are a distinct workflow and do not acquire these guarantees automatically.
+The Workers Durable Object backend uses a synchronous checked transaction. Local runtime tests exercise stale-batch rollback and successful rebase. The API does not provide client-side encrypted review, multi-workspace batches, multiple required reviewers or scheduled application. Existing proposals are a distinct workflow and do not acquire these guarantees automatically.
 
 [Security model](SECURITY.md) | [Console](CONSOLE.md)

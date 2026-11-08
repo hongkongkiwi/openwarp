@@ -16,7 +16,10 @@ fn generation(key: &[u8;32]) -> String { format!("{}:{}", fingerprint(key), id()
 fn wrap_aad(org: &str, kid: &str, version: i64) -> Vec<u8> { json!(["openwarp:transit:wrap:v1",org,kid,version]).to_string().into_bytes() }
 fn content_aad(org: &str, kid: &str, version: i64, context: &str) -> Vec<u8> { json!(["openwarp:transit:content:v1",org,kid,version,context]).to_string().into_bytes() }
 pub(super) async fn root(st: &S, master: &[u8;32]) -> Result<String, (StatusCode, Json<Value>)> {
-    st.db.exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", &[json!(ROOT),json!(generation(master))]).await.map_err(|e| bad(&e))?;
+    let sql = "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING";
+    #[cfg(not(target_arch = "wasm32"))]
+    let sql = if st.db.backend()==db::Backend::Mysql { "INSERT INTO meta(k,v) VALUES(?,?) ON DUPLICATE KEY UPDATE k=k" } else { sql };
+    st.db.exec(sql, &[json!(ROOT),json!(generation(master))]).await.map_err(|e| bad(&e))?;
     let r = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(ROOT)]).await.map_err(|e| bad(&e))?.ok_or_else(conflict)?;
     let value = db::s(&r,"v");
     if value.split(':').next() != Some(fingerprint(master).as_str()) { return Err(conflict()); }

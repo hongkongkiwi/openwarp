@@ -104,8 +104,7 @@ fn client_ip(h: &HeaderMap, peer: PeerAddr) -> String {
     peer
 }
 async fn rate(st: &S, key: &str, max: i64) -> bool {
-    let t = now();
-    st.db.one("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN rate_limits.window_start<=? THEN 1 ELSE rate_limits.count+1 END,window_start=CASE WHEN rate_limits.window_start<=? THEN ? ELSE rate_limits.window_start END RETURNING count", &[json!(key),json!(t),json!(t-60),json!(t-60),json!(t)]).await.ok().flatten().is_some_and(|r| db::n(&r,"count") <= max)
+    st.db.rate_increment(key, now(), 60).await.is_ok_and(|count| count > 0 && count <= max)
 }
 pub(super) async fn login(State(st): State<S>, h: HeaderMap, peer: PeerAddr, Json(body): Json<Value>) -> Res {
     let tid = text(&body, "trust_id"); let jwt = text(&body, "jwt"); let ip = client_ip(&h, peer);

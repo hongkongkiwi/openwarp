@@ -38,6 +38,6 @@ Coordinate master-key changes across replicas and update `OPENWARP_MASTER_KEY` b
 
 ## Verification limits
 
-In-process SQLite tests cover permission separation, tenant/context binding, version rotation, rewrap and master rotation. Restart recovery and concurrent PostgreSQL/replica rotation have not been demonstrated by those tests. The Workers backend currently refuses key creation/rotation with 501 because checked transactions are unavailable. It may initialize generation bookkeeping before returning that error, but does not create a key version. It is not a fully supported transit deployment target.
+SQLite and PostgreSQL tests cover permission separation, tenant/context binding, concurrent version rotation and fresh-state recovery after master rotation. The local Workers smoke test exercises key creation, rotation, decryption and rewrap. The recovery test recreates database connections and application state, not an operating-system process; production replica coordination still needs a deployment-specific rehearsal.
 
 [Encryption and key custody](ENCRYPTION.md) | [Security model](SECURITY.md)
