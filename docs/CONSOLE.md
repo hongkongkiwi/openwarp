@@ -106,3 +106,15 @@ Register hosts here too: a host certificate is only issued for a hostname and pu
 Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
 
 [Getting started](GETTING_STARTED.md) · [Security model](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+
+## Device certificates without a TPM
+
+The PKI card creates root and intermediate CAs, selects the active CA, lists the device inventory and mints one-time enrollment or renewal codes. It also shows expiring-certificate counts, imports and exports CSV, manages groups, and configures the enrollment hook and hardware attestation. Select the CA, add a device name and optional environment or group, then use **Enroll** to copy the single-use code and nonce to the device. **Renew** mints a code that revokes the previous certificate when the replacement enrolls. The CA certificate shown below the table is the trust anchor for the MQTT broker. **Revoke** retires the device's active certificate. The console never displays a device private key, because enrollment only accepts a CSR.
+
+Select device checkboxes, or use Select all, then Mint selected codes to provision
+up to 500 existing devices. The result lists successful codes and per-device
+errors. Download codes CSV includes each device id, code, nonce and expiry;
+protect this file as a credential and remove it after provisioning. Switching
+workspace or CA clears selected devices and downloadable code results. Expiry
+summaries are also emailed through the configured mailer to verified, active
+workspace owners and admins.

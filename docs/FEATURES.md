@@ -454,12 +454,115 @@ without returning the encrypted config. The OpenAI/OpenRouter/Resend adapters
 are covered by mock-provider tests; the schedule endpoint has an HTTP
 integration test.
 
-### PKI, AWS leases and HA
+### Device certificates
 
 `GET /api/pki/cas/:id/crl` returns a signed PEM CRL containing every revoked
-certificate, with the issuer reconstructed from the stored serial.
+certificate, with the issuer reconstructed from the stored serial. The CRL is
+public: a broker fetches it without a workspace token, and the CA signature is
+what proves integrity. `POST /api/pki/cas/:id/ocsp` answers OCSP requests the
+same way and is also public.
 
-#### SSH certificate authority
+Certificates are issued from a workspace-owned CA. Two issuance paths share it:
+
+- `POST /api/pki/cas/:id/issue` generates the keypair on the server and returns
+  `private_key` once. It requires workspace admin and serves services and devices
+  that cannot generate a CSR. With `device_id` the certificate is bound to a
+  device record and becomes its active certificate.
+- `POST /api/pki/enroll` takes a PKCS#10 CSR and returns only the certificate, so
+  the private key never leaves the device. It needs no workspace token and is
+  authorised by a single-use enrollment code.
+
+Device records live under a CA: `POST/GET /api/pki/cas/:id/devices`,
+`GET/PATCH/DELETE /api/pki/devices/:id`, `POST /api/pki/devices/:id/revoke` and
+`POST /api/pki/devices/:id/enrollment`. A record carries the CN, optional DNS and
+IP SANs, the model, hardware serial, tags and an app/environment binding. Device
+certificates are client-auth only, default to 90 days (`cert_days`, clamped to 1
+to 365), and their SANs come from the record, never from the CSR.
+
+Enrollment codes are 256-bit random values stored only as a SHA-256 hash, valid
+from five minutes to seven days, and consumed atomically on the first successful
+request. Revoking or deleting a device invalidates its outstanding codes, and an
+enrollment that races a revocation fails rather than attaching a certificate.
+`pki:write` grants device administration without full admin; owner and admin hold
+it through `*`, the managed developer role has `pki:read` but not `pki:write`,
+and custom roles can be granted either. Read endpoints require `pki:read`.
+OAuth access tokens and service tokens can request the `pki:read` and `pki:write`
+scopes. An
+environment-scoped token can create, list, enroll and revoke only devices whose
+`env_id` matches its own environment; the CA-wide issuance and certificate-list
+endpoints stay closed to it.
+
+`GET /api/orgs/:id/pki/expiring?days=30` lists unrevoked device certificates in
+the window with 7/14/30 day counts. A daily background job records a `pki.expiry`
+audit event for each workspace with certificates in that window. The configured
+mailer also sends one daily summary to each verified, active workspace owner and
+admin. Failed delivery stays retryable. An owner or admin can trigger pending
+mail with `POST /api/orgs/:id/pki/expiry-notify`; it returns sent and failed counts.
+`POST /api/pki/devices/:id/renew` mints a replacement enrollment code.
+
+Devices can renew without an administrator or an application mTLS listener:
+`POST /api/pki/renew/challenge` takes a device id and a new PEM CSR. It returns an
+exact challenge text and id, valid for five minutes. The device signs that text
+with its current active certificate's private key and submits the padded base64
+signature to `POST /api/pki/renew`. Supported proofs are P-256 ECDSA SHA-256,
+P-384 ECDSA SHA-384 (ASN.1 DER), Ed25519 and RSA PKCS1 SHA-256. The new CSR signature proves possession of the
+replacement key. Current hook and attestation policy still apply; use the
+challenge id as the attestation nonce. Challenge consumption, replacement
+issuance and old-certificate revocation share one transaction. Expired, revoked
+or superseded credentials cannot renew.
+
+Bulk operations: `POST /api/pki/cas/:id/devices/import` accepts up to 1000
+device objects and can mint one code per device, `POST
+/api/pki/cas/:id/devices/codes` mints codes for up to 500 existing devices, and
+`GET /api/pki/cas/:id/devices/export` returns CSV.
+
+Groups hold defaults for a set of devices: `POST/GET
+/api/pki/cas/:id/groups`, `PATCH/DELETE /api/pki/groups/:id` and `POST
+/api/pki/groups/:id/revoke`. A device created with `group_id` inherits the
+group's environment, SANs, `cert_days` and tags unless the request overrides
+them; a device cannot join a group in another environment. Group revoke clears
+the active pointer, invalidates codes and revokes every unrevoked certificate for
+the group.
+
+The optional pre-issuance hook (`PUT /api/pki/cas/:id/hook`) posts a signed JSON
+event to an operator URL before a code is consumed. A response of
+`{"allow":true}` proceeds; a deny, a non-2xx response, a timeout or an egress
+policy rejection blocks enrollment and leaves the code usable.
+
+A CA can be a root or an intermediate: `POST /api/orgs/:id/pki/cas` accepts
+`parent_id` for a root in the same workspace, and the leaf responses carry
+`ca_chain` from the issuing CA to the root. `POST /api/pki/cas/:id/revoke` marks
+the CA, its immediate children, their devices and their certificates revoked, and
+the parent's CRL lists a revoked child's serial.
+
+Hardware attestation is an optional per-CA JWT requirement (`PUT
+/api/pki/cas/:id/attestation`). The enrollment response includes a nonce; the
+device returns a compact JWS from the configured issuer with `aud: openwarp-pki`,
+`sub` equal to the device id, the nonce, `csr_sha256` over the submitted CSR and
+`hardware_backed: true`. ES256 and RS256 are supported. A required but missing or
+invalid assertion blocks enrollment without consuming the code, and an accepted
+assertion marks the device as hardware attested.
+
+For built-in TPM verification, set the CA attestation `mode` to `tpm2`. A managed
+workspace owner or admin provisions each device through
+`PUT /api/pki/devices/:id/tpm` with `ak_public` (padded base64 TPM2B_PUBLIC) and
+`pcr_digest` (hex SHA-256 of concatenated SHA-256 PCR values 0 through 7).
+The AK pin must come from an authenticated provisioning process; an AK supplied
+in evidence cannot establish its own trust. Enrollment or renewal then accepts
+`tpm_evidence` containing Certify and Quote attestations. The verifier supports
+RSA 2048/3072/4096, RSASSA SHA-256, SHA-256 object Names and precisely PCRs 0
+through 7. It checks that the certified TPM public key matches the CSR and that
+both signed attestations bind the enrollment nonce and CSR SPKI hash. See the
+[TPM protocol](SECURITY.md#built-in-tpm-profile) for byte encodings and limitations.
+
+A broker that trusts the CA validates the certificate directly. Register the CA
+certificate returned by `GET /api/orgs/:id/pki/cas` as its trust anchor (EMQX,
+HiveMQ and Mosquitto read a CA file; AWS IoT Core and Azure Device Provisioning
+accept a registered CA). Revocation reaches the broker through the public CRL or,
+more practically for fleets, through the short certificate lifetime.
+
+
+### SSH certificate authority
 
 A separate CA type mints OpenSSH *user* certificates, which is not the same
 thing as syncing an `ssh_key` secret. A synced key is a permanent public key; a
@@ -503,6 +606,8 @@ returns 428 until the caller completes an emailed second factor (plus TOTP when
 configured) and retries with `X-OpenWarp-Step-Up`. A machine identity has no
 second factor, so it cannot request a privileged principal at all; an admin
 signs those from a signed-in session.
+
+### AWS leases and HA
 
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores

@@ -116,6 +116,57 @@ pub fn issue(ca_certificate_pem: &str, ca_private_key_pem: &str, cn: &str, sans:
     })
 }
 
+
+pub fn csr_public_key(pem: &str) -> Result<SubjectPublicKeyInfoOwned, String> {
+    use x509_cert::der::Encode;
+    let csr = x509_cert::request::CertReq::from_pem(pem).map_err(err)?;
+    let der = csr.to_der().map_err(err)?;
+    let request = keystore_pki::pkcs10::parse(&der).map_err(err)?;
+    request.verify().map_err(err)?;
+    Ok(csr.info.public_key)
+}
+pub fn certificate_live(pem: &str) -> bool {
+    Certificate::from_pem(pem).map(|c| {
+        let t = crate::clock::now().max(0) as u64;
+        c.tbs_certificate.validity.not_before.to_unix_duration().as_secs() <= t && c.tbs_certificate.validity.not_after.to_unix_duration().as_secs() > t
+    }).unwrap_or(false)
+}
+pub fn create_intermediate(name: &str, parent_pem: &str, parent_key: &str) -> Result<Issued, String> {
+    let parent = Certificate::from_pem(parent_pem).map_err(err)?;
+    let parent_key = SecretKey::from_pkcs8_pem(parent_key).map_err(err)?;
+    let key = SecretKey::random(&mut OsRng); let signer = SigningKey::from(&parent_key);
+    let (serial, serial_hex) = serial()?;
+    let profile = Profile::SubCA { issuer: parent.tbs_certificate.subject.clone(), path_len_constraint: Some(0) };
+    let builder = CertificateBuilder::new(profile, serial, parent.tbs_certificate.validity, subject(name)?, public_key(&key)?, &signer).map_err(err)?;
+    let cert = builder.build::<DerSignature>().map_err(err)?;
+    Ok(Issued { certificate_pem: cert.to_pem(LineEnding::LF).map_err(err)?, private_key_pem: key.to_pkcs8_pem(LineEnding::LF).map_err(err)?.to_string(), serial_hex })
+}
+/// Signs the verified CSR key using registry identity and policy, never CSR extensions.
+pub fn issue_device(ca_pem: &str, ca_key: &str, cn: &str, sans: &[String], days: i64, csr: Option<&str>) -> Result<Issued, String> {
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    use x509_cert::der::asn1::{ObjectIdentifier, OctetString};
+    let ca = Certificate::from_pem(ca_pem).map_err(err)?;
+    let ca_key = SecretKey::from_pkcs8_pem(ca_key).map_err(err)?; let signer = SigningKey::from(&ca_key);
+    let key = if csr.is_none() { Some(SecretKey::random(&mut OsRng)) } else { None };
+    let spki = match csr { Some(csr) => csr_public_key(csr)?, None => public_key(key.as_ref().ok_or("missing generated key")?)? };
+    let (serial, serial_hex) = serial()?; let now = crate::clock::now();
+    let validity = Validity { not_before: time_at(now - 60)?, not_after: time_at(now + days.clamp(1,365)*86400)? };
+    let profile = Profile::Leaf { issuer: ca.tbs_certificate.subject.clone(), enable_key_agreement: false, enable_key_encipherment: false };
+    let mut builder = CertificateBuilder::new(profile, serial, validity, subject(cn)?, spki, &signer).map_err(err)?;
+    builder.add_extension(&ExtendedKeyUsage(vec![ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2")])).map_err(err)?;
+    if !sans.is_empty() {
+        let names = sans.iter().map(|name| match name.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => OctetString::new(ip.octets()).map(GeneralName::IpAddress).map_err(err),
+            Ok(std::net::IpAddr::V6(ip)) => OctetString::new(ip.octets()).map(GeneralName::IpAddress).map_err(err),
+            Err(_) => Ia5String::new(name.as_str()).map(GeneralName::DnsName).map_err(err),
+        }).collect::<Result<Vec<_>,_>>()?;
+        builder.add_extension(&SubjectAltName(names)).map_err(err)?;
+    }
+    let cert = builder.build::<DerSignature>().map_err(err)?;
+    let private_key_pem = match key { Some(key) => key.to_pkcs8_pem(LineEnding::LF).map_err(err)?.to_string(), None => String::new() };
+    Ok(Issued { certificate_pem: cert.to_pem(LineEnding::LF).map_err(err)?, private_key_pem, serial_hex })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
