@@ -2200,8 +2200,16 @@ pub(crate) fn issuer_url_ok(issuer: &str) -> bool {
     if !url_ok(&u) { return false; }
     if u.contains("169.254.169.254") || u.contains("metadata.google.internal") { return false; }
     if u.starts_with("https://") { return true; }
-    let host = u.trim_start_matches("http://").split(['/', ':']).next().unwrap_or("");
+    let host = url_host(&u);
     host == "127.0.0.1" || host == "localhost" || host == "[::1]" }
+// A bracketed IPv6 literal contains colons, so it has to be read as a unit
+// before the port is stripped.
+fn url_host(u: &str) -> &str {
+    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).unwrap_or(u);
+    let rest = rest.split('/').next().unwrap_or("");
+    match (rest.starts_with('['), rest.find(']')) {
+        (true, Some(end)) => &rest[..=end],
+        _ => rest.split(':').next().unwrap_or("") } }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::new()) }
 #[cfg(target_arch = "wasm32")]
@@ -2778,8 +2786,8 @@ fn region_choices() -> Vec<Value> {
 /// A jurisdiction list that omits this deployment would send a user to a host
 /// that cannot authenticate them, so refuse to start rather than mislabel it.
 fn validate_regions(here_raw: Option<&str>, list_raw: Option<&str>) -> Result<(), String> {
-    let here = match here_raw {
-        Some(v) => { let v = v.trim().to_ascii_lowercase();
+    let here = match here_raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => { let v = v.to_ascii_lowercase();
             if !region_label_ok(&v) { return Err(format!("OPENWARP_REGION {:?} must be 1-32 characters of a-z, 0-9 or '-'", v)); }
             v }
         None => REGION_DEFAULT.to_string() };
@@ -5574,6 +5582,23 @@ mod tests {
     fn region_choices_are_ordered_and_normalised() {
         let parsed = parse_regions(" eu = https://eu.example.test/ , us=https://us.example.test").expect("valid list");
         assert_eq!(parsed, vec![("eu".to_string(), "https://eu.example.test".to_string()), ("us".to_string(), "https://us.example.test".to_string())]);
+    }
+    #[test]
+    fn an_empty_jurisdiction_setting_means_unset() {
+        // Compose and similar templating turn an unset substitution into an
+        // empty string; that must not stop a single-deployment instance.
+        assert!(validate_regions(Some(""), None).is_ok());
+        assert!(validate_regions(Some("   "), Some("global=https://global.example.test")).is_ok());
+    }
+    #[test]
+    fn loopback_origins_are_recognised_in_both_address_families() {
+        for ok in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", "https://eu.example.test"] {
+            assert!(issuer_url_ok(ok), "{} should be accepted", ok); }
+        for bad in ["http://10.0.0.1:8080", "http://169.254.169.254", "ftp://eu.example.test", "http://[fe80::1]:8080"] {
+            assert!(!issuer_url_ok(bad), "{} should be refused", bad); }
+        assert_eq!(url_host("http://[::1]:8080/x"), "[::1]");
+        assert_eq!(url_host("http://127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(url_host("https://eu.example.test"), "eu.example.test");
     }
     // Run environment-sensitive assertions in an isolated copy of this test binary.
     #[cfg(not(target_arch = "wasm32"))]

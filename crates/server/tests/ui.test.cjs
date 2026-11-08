@@ -957,7 +957,9 @@ test('a member of several workspaces chooses one, and the choice survives the ne
 });
 
 test('the login screen names its jurisdiction and offers another only when one exists', async () => {
-  const local = await consoleUI([saved], [], { manualBoot: true });
+  const local = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'global', regions: [], google: false, signups: 'open' },
+  } });
   await local.invoke('loadProviders()');
   assert.match(local.el('regionline').textContent, /global/, 'a single deployment still states its jurisdiction');
   assert.doesNotMatch(local.el('regionline').textContent, /Change region/, 'no switch is offered when there is nowhere to go');
