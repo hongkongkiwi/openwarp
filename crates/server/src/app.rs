@@ -320,14 +320,16 @@ impl AppState {
         let token=bearer.map(str::to_string).unwrap_or_else(|| cookie_val(headers,"ow_session"));
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
         let hash = oc::hash_token(&token);
-        if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.is_none() {
-            return Err(err(StatusCode::UNAUTHORIZED, "ow_session requires an account session")); }
-        self.token_user_by_hash(&hash).await
+        self.token_user_by_hash(&hash, cookie_only).await
     }
-    // Credential check by hash alone: the live socket retains only the hash, never the raw header.
-    pub(crate) async fn token_user_by_hash(&self, hash: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    // The live-event socket keeps the credential hash, not the token, so the
+    // identity checks must run from the hash without a header.
+    async fn token_user_by_hash(&self, hash: &str, cookie_only: bool) -> Result<String, (StatusCode, Json<Value>)> {
         #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
         if self.cache_revoked(hash) { return Err(err(StatusCode::UNAUTHORIZED, "session revoked")); }
+        if cookie_only && self.db.one("SELECT user_id FROM sessions WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?.is_none() {
+            return Err(err(StatusCode::UNAUTHORIZED, "ow_session requires an account session")); }
+        if !cookie_only {
         // OAuth 2.1 access tokens (CLI / MCP clients)
         if let Some(row) = self.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(hash), json!(now())]).await.map_err(|e| bad(&e))? {
             let uid = db::s(&row, "user_id");
@@ -344,8 +346,9 @@ impl AppState {
             if !revision.is_empty() && self.db.one("SELECT w.revision FROM workload_bindings w JOIN identities i ON i.id=w.identity_id AND i.org_id=w.org_id WHERE w.identity_id=? AND w.revision=?", &[json!(&uid),json!(revision)]).await.map_err(|_| err(StatusCode::UNAUTHORIZED,"workload trust unavailable"))?.is_none() { return Err(err(StatusCode::UNAUTHORIZED,"workload trust revoked")); }
             if !uid.is_empty() {
                 if !self.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "token owner is deactivated")); }
-                if db::n(&row, "last_used_at") + 60 < now() { let _ = self.db.exec("UPDATE tokens SET last_used_at=? WHERE token_hash=?", &[json!(now()), json!(hash)]).await; }
+                if db::n(&row, "last_used_at") + 60 < now() { let _ = self.db.exec("UPDATE tokens SET last_used_at=? WHERE token_hash=?", &[json!(now()), json!(&hash)]).await; }
                 return Ok(uid); }
+        }
         }
         let row = self.db.one("SELECT user_id,created_at FROM sessions WHERE token_hash=?", &[json!(hash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid token"))?;
         if db::n(&row, "created_at") + 7 * 86400 < now() { let _ = self.db.exec("DELETE FROM sessions WHERE token_hash=?", &[json!(hash)]).await; return Err(err(StatusCode::UNAUTHORIZED, "session expired (7d); login again")); }
@@ -2283,7 +2286,7 @@ pub(crate) fn issuer_url_ok(issuer: &str) -> bool {
     if u.scheme() == "https" { return true; }
     host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]" }
 // A bracketed IPv6 literal contains colons, so it has to be read as a unit
-// before the port is stripped.
+// before the port is stripped. Only the host-parsing tests call this.
 #[cfg(test)]
 fn url_host(u: &str) -> &str {
     let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).unwrap_or(u);
@@ -3628,6 +3631,16 @@ async fn verify_master_full(db: &Db, key: &[u8; 32]) -> Result<(), String> {
     master_updates(db, key, key).await?;
     Ok(())
 }
+/// Adopt the root another boot persisted first. The candidate this boot minted
+/// is discarded only after the winner proves itself against the inventory.
+async fn adopt_kms_root(db: &Db, kms: &kms::Kms, supplied: Option<[u8; 32]>) -> Result<[u8; 32], String> {
+    let row = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.ok_or("the concurrent KMS root is missing")?;
+    let raw = kms.unwrap(&db::s(&row, "v"), "master").await.map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
+    let winner: [u8; 32] = raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?;
+    if let Some(binding) = supplied { if binding != winner { return Err("OPENWARP_MASTER_KEY does not match the stored master root".into()); } }
+    verify_master_full(db, &winner).await?;
+    Ok(winner)
+}
 // Mint the boot verifier by CAS: a loser revalidates the authoritative row and
 // refuses when another boot established a different root.
 async fn persist_verifier(db: &Db, key: &[u8; 32]) -> Result<(), String> {
@@ -3671,19 +3684,22 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
             if verified.as_slice() != k { return Err("KMS root roundtrip returned a different key; refusing to persist it".into()); }
             // The candidate must decrypt the existing inventory before a new
             // kms_root is persisted, or a refusal would leave the write behind.
-            verify_master_full(db, &k).await?;
-            // The insert is atomic and portable across SQLite, PostgreSQL and
-            // MySQL. A losing concurrent first boot adopts the stored winner
-            // before writing anything encrypted by this process.
-            if db.insert_if_absent("kms_root", &wrapped).await? { k } else {
-                let row = db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.ok_or("the concurrent KMS root is missing")?;
-                let raw = kms.unwrap(&db::s(&row, "v"), "master").await.map_err(|e| format!("KMS could not unwrap the master root: {}", e))?;
-                let winner: [u8; 32] = raw.try_into().map_err(|_| "KMS master root is not 32 bytes".to_string())?;
-                if let Some(binding) = supplied { if binding != winner { return Err("OPENWARP_MASTER_KEY does not match the stored master root".into()); } }
-                // The winner is the root this boot adopts: prove it before any
-                // write from this process.
-                verify_master_full(db, &winner).await?;
-                winner
+            // A concurrent first boot can persist its root between the read
+            // above and this preflight, so a failed candidate adopts that
+            // winner instead of rejecting this boot.
+            let candidate = verify_master_full(db, &k).await;
+            match candidate {
+                Ok(()) => {
+                    // The insert is atomic and portable across SQLite, PostgreSQL and
+                    // MySQL. A losing concurrent first boot adopts the stored winner
+                    // before writing anything encrypted by this process.
+                    if db.insert_if_absent("kms_root", &wrapped).await? { k } else { adopt_kms_root(db, kms, supplied).await? }
+                }
+                Err(candidate_error) => {
+                    if db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await?.is_some() {
+                        adopt_kms_root(db, kms, supplied).await?
+                    } else { return Err(candidate_error); }
+                }
             }
         };
         // A plaintext master that differs from the effective wrapped root is a
@@ -3824,6 +3840,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     for (sql, updates) in [("UPDATE compat_transit_keys SET wrapping_key=? WHERE id=?", transit_updates), ("UPDATE users SET auth_key_enc=? WHERE id=?", auth_updates), ("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?", ldap_updates)] { for (id, value) in updates { statements.push((sql.into(), vec![json!(value),json!(id)], Some(1))); } }
     statements.push(("DELETE FROM email_codes".into(), vec![], None));
     if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
+    // The verifier proves the configured key on the next boot, so it must move
+    // with the records in the same transaction.
+    statements.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))], Some(1)));
 
     // Block new encryptions with the old key while the database is updated.
     // The write guard lives inside a blocking task so it never crosses an
@@ -4182,6 +4201,33 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), creds.to_string().as_bytes()), "", &config_enc).await?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
+    if typ == "planetscale" {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+        let issued = integrations::planetscale_create_password(&config, &name, ttl).await.map_err(|e| bad(&e))?;
+        let password = issued["password"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
+        let stored = json!({"type": "planetscale", "base_url": issued["base"], "remote_id": remote_id, "engine": issued["engine"],
+            "organization": config.get("organization").and_then(|v| v.as_str()).unwrap_or(""),
+            "db": config.get("database").and_then(|v| v.as_str()).unwrap_or(""),
+            "branch": config.get("branch").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent": config.get("service_token").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent_id": config.get("service_token_id").and_then(|v| v.as_str()).unwrap_or("")});
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), stored.to_string().as_bytes());
+        complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes()), issued["username"].as_str().unwrap_or(""), &config_enc).await?;
+        return Ok(j(json!({"id": lid, "username": issued["username"], "password": password, "host": issued["host"], "database": issued["database"], "remote_id": remote_id, "expires_at": now()+ttl, "type": "planetscale"})));
+    }
+    if typ == "instabox" {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+        let issued = integrations::instabox_create_ssh_token(&config, &name, ttl).await.map_err(|e| bad(&e))?;
+        let token = issued["token"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
+        let stored = json!({"type": "instabox", "base_url": issued["base"], "remote_id": remote_id,
+            "machine_id": config.get("machine_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent": config.get("api_key").and_then(|v| v.as_str()).unwrap_or("")});
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), stored.to_string().as_bytes());
+        complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), token.as_bytes()), "", &config_enc).await?;
+        return Ok(j(json!({"id": lid, "value": token, "host": issued["host"], "port": issued["port"], "command": issued["command"], "remote_id": remote_id, "expires_at": now()+ttl, "type": "instabox"})));
+    }
 	    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") {
         let config = body.get("config").cloned().unwrap_or(json!({}));
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
@@ -4249,6 +4295,11 @@ async fn revoke_lease_remote(st: &S, lid: &str) -> Result<(), (StatusCode, Json<
                 crate::pglease::drop_role(&conn, &username).await.map_err(|_| bad("Postgres lease revocation failed"))?; }
             Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 crate::mysqllease::drop_account(&conn, &username).await.map_err(|_| bad("MySQL lease revocation failed"))?; }
+            Some("planetscale") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
+                integrations::planetscale_revoke_password(&cfg, remote).await.map_err(|e| bad(&e))?; }
+            Some("instabox") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
+                let machine = cfg.get("machine_id").and_then(|v| v.as_str()).unwrap_or("");
+                integrations::instabox_revoke_ssh_token(&cfg, machine, remote).await.map_err(|e| bad(&e))?; }
             Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -5973,12 +6024,15 @@ async fn mcp_get() -> impl IntoResponse { (StatusCode::METHOD_NOT_ALLOWED, Json(
 pub(crate) struct LiveAdmission {
     pub uid: String,
     pub credential_hash: String,
+    /// The credential arrived in the session cookie, so the per-event identity
+    /// check must keep requiring an account session.
+    pub via_cookie: bool,
     pub cursor: i64,
     pub peer: String,
 }
 impl AppState {
     pub(crate) async fn live_identity(&self, admission: &LiveAdmission) -> Result<String, (StatusCode, Json<Value>)> {
-        let uid = self.token_user_by_hash(&admission.credential_hash).await?;
+        let uid = self.token_user_by_hash(&admission.credential_hash, admission.via_cookie).await?;
         if uid != admission.uid { return Err(err(StatusCode::UNAUTHORIZED, "live credential changed")); }
         if let Some(row) = self.db.one("SELECT scope FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(admission.credential_hash), json!(now())]).await.map_err(|e| bad(&e))? {
             if !db::s(&row, "scope").split_whitespace().any(|s| s == "*" || s == "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "OAuth token lacks secrets:read")); }
@@ -6007,8 +6061,9 @@ impl AppState {
 async fn live_admission(st: &S, h: &HeaderMap, q: &HashMap<String,String>, peer: PeerAddr) -> Result<LiveAdmission, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
     st.check_scope(h, "").await?;
-    let token = bearer_token(h);
-    let token = if token.is_empty() { cookie_val(h, "ow_session") } else { token };
+    let bearer = bearer_token(h);
+    let via_cookie = bearer.is_empty();
+    let token = if via_cookie { cookie_val(h, "ow_session") } else { bearer };
     let cursor = match q.get("since").and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0) {
         Some(since) => since,
         None => st.db.one("SELECT COALESCE(MAX(id),0) AS cursor FROM live_events", &[]).await.map_err(|e| bad(&e))?.map(|r| db::n(&r,"cursor")).unwrap_or(0),
@@ -6019,7 +6074,7 @@ async fn live_admission(st: &S, h: &HeaderMap, q: &HashMap<String,String>, peer:
     let client_ip = if trust_proxy && proxy_ok {
         h.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| peer.0.to_string())
     } else { peer.0.to_string() };
-    let admission = LiveAdmission { uid, credential_hash: oc::hash_token(&token), cursor, peer: client_ip };
+    let admission = LiveAdmission { uid, credential_hash: oc::hash_token(&token), via_cookie, cursor, peer: client_ip };
     st.live_identity(&admission).await?;
     Ok(admission)
 }
@@ -6040,6 +6095,7 @@ async fn live_ws(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<Stri
 #[cfg(not(target_arch = "wasm32"))]
 async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receiver<Arc<str>>, mut socket: WebSocket) {
     if socket.send(Message::Text(json!({"type":"hello","instance": st.instance_id}).to_string().into())).await.is_err() { return; }
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut sent = admission.cursor;
     loop {
         let Ok(missed) = st.live_replay(sent).await else { return };
@@ -6051,8 +6107,6 @@ async fn live_socket(st: S, admission: LiveAdmission, mut rx: broadcast::Receive
         }
         if !full { break; }
     }
-    // Revalidate by hash on a timer too: a revoked token must close the socket even while the stream is quiet.
-    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
             _ = auth_tick.tick() => { if st.live_identity(&admission).await.is_err() { let _ = socket.send(Message::Close(None)).await; break; } }

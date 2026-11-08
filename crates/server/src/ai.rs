@@ -297,6 +297,12 @@ updates.push(("UPDATE ai_settings SET key_enc=? WHERE org_id=? AND key_enc=? AND
 #[cfg(all(test,not(target_arch="wasm32")))]
 mod tests {
     use super::*;
+    /// The database handle is not shareable across threads, so a spawned
+    /// assertion runs on a LocalSet instead of tokio::spawn.
+    async fn join_local<F>(future: F) -> Result<F::Output, tokio::task::JoinError>
+    where F: std::future::Future + 'static, F::Output: 'static {
+        tokio::task::LocalSet::new().run_until(async move { tokio::task::spawn_local(future).await }).await
+    }
     #[tokio::test] async fn master_inventory_proves_ai_provider_credentials() {
         let db=db::Db::open_memory().await.unwrap();
         let root=[7u8;32]; let other=[8u8;32];
@@ -386,7 +392,7 @@ mod tests {
         let driver=tokio::spawn(async move { driver.await.unwrap(); });
         conn.batch_execute(&format!("CREATE DATABASE \"{}\"",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
-        // Db::open's migration future is not Send (the SQLite variant borrows a rusqlite connection); open on this task, then spawn the assertions like the MySQL test.
+        // Db::open's migration future is not Send (the SQLite variant borrows a rusqlite connection); open on this task, then run the assertions on a LocalSet.
         let db=match db::Db::open(url.as_str()).await {
             Ok(db)=>db,
             Err(e)=>{
@@ -398,7 +404,7 @@ mod tests {
         let latest=db.version().await.unwrap();
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
-        let outcome=tokio::spawn(assert_database_ai(st)).await;
+        let outcome=join_local(assert_database_ai(st)).await;
         conn.batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)",name)).await.unwrap();
         drop(conn); driver.await.unwrap();
         // Asserted after the drop so a stale manifest leaves no test database behind.
