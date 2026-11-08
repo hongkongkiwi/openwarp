@@ -1,5 +1,5 @@
-//! Main22 (b3eea91) and the checksummed engine history must converge on
-//! version 28 without ledger repair, data loss or false checksum stamps.
+//! Main22 (b3eea91) and the checksummed engine history must converge on the
+//! current manifest without ledger repair, data loss or false checksum stamps.
 
 use openwarp_server::db::{n, s, Db, Row};
 use openwarp_server::migrate::{self, Options, State, MIGRATIONS};
@@ -150,6 +150,19 @@ async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> {
     result
 }
 
+// Only these absent bootstrap pairs may be added on the first upgrade.
+async fn upgrade_snapshot(db: &Db) -> Vec<(String, Vec<Row>)> {
+    let mut before = snapshot(db).await;
+    let (_, rows) = before.iter_mut().find(|(sql, _)| sql.contains(" FROM meta ORDER BY ")).expect("snapshot includes meta");
+    for (key, value) in [("rotation_lifecycle", ""), ("workspace_policy_lock", "1"), ("workspace_creation_open", "1")] {
+        if !rows.iter().any(|row| s(row, "k") == key) {
+            rows.push(Row::from([("k".to_string(), serde_json::json!(key)), ("v".to_string(), serde_json::json!(value))]));
+        }
+    }
+    rows.sort_by_key(|row| s(row, "k"));
+    before
+}
+
 async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
         if sql.contains(" FROM meta ") {
@@ -168,11 +181,12 @@ async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     }
 }
 
-async fn assert_final28_and_second_boot(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 30);
+async fn assert_latest_and_second_boot(db: &Db) {
+    let latest = MIGRATIONS.last().unwrap().version;
+    assert_eq!(db.version().await.unwrap(), latest);
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 30);
-    assert_eq!(status.latest, 30);
+    assert_eq!(status.current, latest);
+    assert_eq!(status.latest, latest);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let before = snapshot(db).await;
@@ -180,7 +194,7 @@ async fn assert_final28_and_second_boot(db: &Db) {
     let report = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
     assert!(report.applied.is_empty(), "a second boot must not replay reconciliation");
     assert!(!report.squashed);
-    assert_preserved(db, &before).await;
+    assert_eq!(snapshot(db).await, before, "second boot must preserve the exact post-upgrade snapshot");
     assert_eq!(db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap(), ledger);
     assert_main22_schema(db).await;
     assert_engine_schema(db).await;
@@ -201,7 +215,7 @@ async fn fresh_engine_database_contains_all_shipped_main22_schema() {
     assert_main22_schema(&db).await;
     seed_common(&db).await;
     seed_product(&db).await;
-    assert_final28_and_second_boot(&db).await;
+    assert_latest_and_second_boot(&db).await;
 }
 
 #[tokio::test]
@@ -210,16 +224,16 @@ async fn engine22_upgrade_adds_main22_schema_without_rewriting_history_or_data()
     migrate::apply(&db, &MIGRATIONS[..22], Options::default()).await.unwrap();
     assert_eq!(db.version().await.unwrap(), 22);
     seed_common(&db).await;
-    let before = snapshot(&db).await;
+    let before = upgrade_snapshot(&db).await;
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade engine22 without checksum repair");
     assert!(!report.squashed);
-    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29, 30], "a pre-merge engine database applies the appended reconciliation suffix");
+    assert_eq!(report.applied, (23..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>(), "a pre-merge engine database applies the appended reconciliation suffix");
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=22 ORDER BY version", &[]).await.unwrap(), ledger);
     assert_main22_schema(&db).await;
     seed_product(&db).await;
-    assert_final28_and_second_boot(&db).await;
+    assert_latest_and_second_boot(&db).await;
 }
 
 #[tokio::test]
@@ -227,11 +241,11 @@ async fn shipped_main22_legacy_upgrade_preserves_product_data_and_unverified_his
     let db = legacy_main22().await;
     seed_common(&db).await;
     seed_product(&db).await;
-    let before = snapshot(&db).await;
+    let before = upgrade_snapshot(&db).await;
     let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("recognise real main22 history without newer-schema rejection or checksum repair");
     assert!(!report.squashed);
-    assert_eq!(report.applied, vec![23, 24, 25, 26, 27, 28, 29, 30], "occupied legacy versions must not be replayed as engine SQL");
+    assert_eq!(report.applied, (23..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>(), "occupied legacy versions must not be replayed as engine SQL");
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT version,applied_at FROM schema_migrations WHERE version<=22 ORDER BY version", &[]).await.unwrap(), ledger);
     let status = migrate::status(&db, MIGRATIONS).await.unwrap();
@@ -243,7 +257,7 @@ async fn shipped_main22_legacy_upgrade_preserves_product_data_and_unverified_his
     let env = db.one("SELECT restricted FROM envs WHERE id='main22-env'", &[]).await.unwrap().unwrap();
     assert_eq!(n(&env, "restricted"), 0, "a shipped sentinel preserves intentionally unrestricted environments even with members");
     assert_eq!(db.one("SELECT v FROM meta WHERE k='migration:env_restricted'", &[]).await.unwrap().unwrap().get("v"), Some(&serde_json::json!("122")));
-    assert_final28_and_second_boot(&db).await;
+    assert_latest_and_second_boot(&db).await;
     assert_preserved(&db, &before).await;
 }
 

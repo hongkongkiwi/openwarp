@@ -817,7 +817,7 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
     Ok(j(json!({"deleted":true, "revoked_api_keys":api_keys, "revoked_oauth_sessions":oauth_sessions}))) }
 async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.token_user(&h).await?;
     let human = emergency_session(&st, &h).await.is_ok();
-    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=? AND (?=1 OR o.emergency_locked=0)", &[json!(uid), json!(if human { 1 } else { 0 })]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role,(SELECT COUNT(*) FROM org_members om WHERE om.org_id=o.id) AS members FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=? AND (?=1 OR o.emergency_locked=0)", &[json!(uid), json!(if human { 1 } else { 0 })]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = workspaces::human(&st,&h).await?; let oid = id();
     if r.name.trim().is_empty() { return Err(bad("workspace name required")); }
@@ -2274,14 +2274,25 @@ pub(crate) fn egress_allowed(u: &str) -> bool {
     }
     true }
 // Outbound OIDC/SAML metadata may only use TLS, except for a loopback IdP used in
-// development or tests. Link-local metadata addresses are always refused.
+// development or tests. The URL is parsed so credentials cannot disguise the
+// host: string slicing reads `http://[::1]@host` as loopback while the request
+// actually goes to `host` over plain HTTP. Metadata-service hosts are refused.
 pub(crate) fn issuer_url_ok(issuer: &str) -> bool {
-    let u = issuer.trim().to_ascii_lowercase();
-    if !url_ok(&u) { return false; }
-    if u.contains("169.254.169.254") || u.contains("metadata.google.internal") { return false; }
-    if u.starts_with("https://") { return true; }
-    let host = u.trim_start_matches("http://").split(['/', ':']).next().unwrap_or("");
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]" }
+    let Ok(u) = reqwest::Url::parse(issuer.trim()) else { return false };
+    if u.scheme() != "https" && u.scheme() != "http" { return false; }
+    if !u.username().is_empty() || u.password().is_some() { return false; }
+    let Some(host) = u.host_str() else { return false };
+    if host.contains("169.254.169.254") || host.eq_ignore_ascii_case("metadata.google.internal") { return false; }
+    if u.scheme() == "https" { return true; }
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]" }
+// A bracketed IPv6 literal contains colons, so it has to be read as a unit
+// before the port is stripped.
+fn url_host(u: &str) -> &str {
+    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).unwrap_or(u);
+    let rest = rest.split('/').next().unwrap_or("");
+    match (rest.starts_with('['), rest.find(']')) {
+        (true, Some(end)) => &rest[..=end],
+        _ => rest.split(':').next().unwrap_or("") } }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::new()) }
 #[cfg(target_arch = "wasm32")]
@@ -2822,6 +2833,66 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
     let pubkey = st.db.one("SELECT pubkey FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "pubkey")).unwrap_or_default();
     Ok((hdr, j(json!({"token": token, "user_id": uid, "public_key": pubkey})))) }
 
+// ---------- deployment jurisdiction ----------
+// A jurisdiction is a deployment boundary: its own database and its own master
+// key. The label comes from deployment configuration, never from a tenant row,
+// so it cannot disagree with where the data actually lives.
+const REGION_DEFAULT: &str = "global";
+fn region_label_ok(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 32 && v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') }
+pub fn region() -> String {
+    crate::envcfg::var("OPENWARP_REGION").ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| region_label_ok(v)).unwrap_or_else(|| REGION_DEFAULT.to_string()) }
+// `label=origin` entries for the jurisdictions a sign-in can be elected into.
+// Empty means this deployment is the only one, so the console states the
+// jurisdiction but offers no switch.
+// A hand-off target is an origin the browser navigates to, so it is parsed
+// rather than pattern-matched: a string test lets `http://localhost:80@host`
+// read as loopback while the browser goes to `host` over plain HTTP. The
+// published value is the parsed origin, so a spelling like `https:eu.example`
+// still reaches the console as a real origin instead of the raw string.
+fn canonical_region_origin(origin: &str) -> Result<String, String> {
+    let invalid = || format!("OPENWARP_REGIONS origin {:?} must be an origin with no credentials, query or path: https, or http on a loopback host", origin);
+    let u = reqwest::Url::parse(origin).map_err(|_| invalid())?;
+    if !u.username().is_empty() || u.password().is_some() { return Err(invalid()); }
+    if u.query().is_some() || u.fragment().is_some() { return Err(invalid()); }
+    if u.path() != "/" && !u.path().is_empty() { return Err(invalid()); }
+    let Some(host) = u.host_str() else { return Err(invalid()) };
+    let loopback = host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]" || host == "::1";
+    match u.scheme() { "https" => (), "http" if loopback => (), _ => return Err(invalid()) }
+    Ok(u.origin().ascii_serialization()) }
+fn parse_regions(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() { continue; }
+        let (label, origin) = entry.split_once('=').ok_or_else(|| format!("OPENWARP_REGIONS entry {:?} must be label=origin", entry))?;
+        let label = label.trim().to_ascii_lowercase();
+        let origin = canonical_region_origin(origin.trim())?;
+        if !region_label_ok(&label) { return Err(format!("OPENWARP_REGIONS label {:?} must be 1-32 characters of a-z, 0-9 or '-'", label)); }
+        if out.iter().any(|(l, _)| l == &label) { return Err(format!("OPENWARP_REGIONS lists the jurisdiction {:?} twice", label)); }
+        out.push((label, origin)); }
+    Ok(out) }
+fn region_choices() -> Vec<Value> {
+    crate::envcfg::var("OPENWARP_REGIONS").ok().and_then(|raw| parse_regions(&raw).ok()).unwrap_or_default()
+        .into_iter().map(|(label, origin)| json!({"label": label, "origin": origin})).collect() }
+/// A jurisdiction list that omits this deployment would send a user to a host
+/// that cannot authenticate them, so refuse to start rather than mislabel it.
+fn validate_regions(here_raw: Option<&str>, list_raw: Option<&str>) -> Result<(), String> {
+    let here = match here_raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => { let v = v.to_ascii_lowercase();
+            if !region_label_ok(&v) { return Err(format!("OPENWARP_REGION {:?} must be 1-32 characters of a-z, 0-9 or '-'", v)); }
+            v }
+        None => REGION_DEFAULT.to_string() };
+    let choices = match list_raw { Some(raw) => parse_regions(raw)?, None => return Ok(()) };
+    if choices.is_empty() { return Ok(()); }
+    if !choices.iter().any(|(l, _)| l == &here) {
+        return Err(format!("OPENWARP_REGIONS does not list this deployment's region {:?}", here)); }
+    Ok(()) }
+pub fn validate_region_env() -> Result<(), String> {
+    let here = crate::envcfg::var("OPENWARP_REGION").ok();
+    let list = crate::envcfg::var("OPENWARP_REGIONS").ok();
+    validate_regions(here.as_deref(), list.as_deref()) }
+
 // ---------- email, verification and password reset ----------
 pub fn production() -> bool {
     crate::envcfg::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false) }
@@ -3287,6 +3358,8 @@ async fn auth_providers(State(st): State<S>) -> Res {
     out["ldap"] = json!(cfg!(feature = "ldap"));
     out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
     out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
+    out["region"] = json!(region());
+    out["regions"] = json!(region_choices());
     out["workspace_creation_open"] = json!(workspaces::creation_open(&st).await?);
     Ok(j(out)) }
 // Composed from discovery plus optional explicit endpoints, for IdPs that do not
@@ -6702,6 +6775,64 @@ mod tests {
     fn test_state(db: Db) -> S {
         let (live, _) = broadcast::channel(16);
         new_state(db, String::new(), "test".into(), String::new(), [7u8; 32], live, #[cfg(feature = "redis-cache")] None)
+    }
+    #[test]
+    fn region_labels_are_a_closed_vocabulary() {
+        assert!(region_label_ok("eu"));
+        assert!(region_label_ok("us-east-1"));
+        assert!(region_label_ok("global"));
+        assert!(!region_label_ok(""));
+        assert!(!region_label_ok("EU East"));
+        assert!(!region_label_ok("eu/east"));
+        assert!(!region_label_ok(&"a".repeat(33)));
+    }
+    #[test]
+    fn a_region_list_must_name_the_deployment_and_stay_well_formed() {
+        let ok = "global=https://global.example.test,eu=https://eu.example.test";
+        assert!(validate_regions(Some("eu"), Some(ok)).is_ok(), "the deployment's own label is listed");
+        assert!(validate_regions(None, Some(ok)).is_ok(), "unset region means global, which the list names");
+        assert!(validate_regions(None, None).is_ok(), "a single deployment needs no list");
+        let missing = validate_regions(Some("ap"), Some(ok)).expect_err("an unlisted deployment must not start");
+        assert!(missing.contains("does not list this deployment"), "{}", missing);
+        let dup = validate_regions(Some("eu"), Some("eu=https://a.example.test,eu=https://b.example.test"));
+        assert!(dup.expect_err("duplicate labels are ambiguous").contains("twice"));
+        let shape = validate_regions(Some("eu"), Some("eu"));
+        assert!(shape.expect_err("a bare label has no origin").contains("label=origin"));
+        let origin = validate_regions(Some("eu"), Some("eu=ftp://eu.example.test"));
+        assert!(origin.expect_err("the origin must be a web URL").contains("origin"));
+        let label = validate_regions(Some("EU East"), None);
+        assert!(label.expect_err("spaces cannot label a jurisdiction").contains("OPENWARP_REGION"));
+    }
+    #[test]
+    fn region_choices_are_ordered_and_normalised() {
+        let parsed = parse_regions(" eu = https://eu.example.test/ , us=https://us.example.test").expect("valid list");
+        assert_eq!(parsed, vec![("eu".to_string(), "https://eu.example.test".to_string()), ("us".to_string(), "https://us.example.test".to_string())]);
+    }
+    #[test]
+    fn a_hand_off_origin_cannot_smuggle_a_different_host_or_a_path() {
+        for bad in ["eu=http://localhost:80@outside.example", "eu=http://127.0.0.1@outside.example",
+            "eu=https://eu.example.test/path", "eu=https://eu.example.test?x=1", "eu=https://eu.example.test#frag",
+            "eu=https://:443", "eu=https://?x", "eu=http://10.0.0.1", "eu=ftp://eu.example.test"] {
+            assert!(parse_regions(bad).is_err(), "{} must be refused", bad); }
+        for ok in ["eu=https://eu.example.test", "eu=http://localhost:8080", "eu=http://[::1]:8080", "eu=https://eu.example.test:8443"] {
+            assert!(parse_regions(ok).is_ok(), "{} should be accepted", ok); }
+    }
+    #[test]
+    fn an_empty_jurisdiction_setting_means_unset() {
+        // Compose and similar templating turn an unset substitution into an
+        // empty string; that must not stop a single-deployment instance.
+        assert!(validate_regions(Some(""), None).is_ok());
+        assert!(validate_regions(Some("   "), Some("global=https://global.example.test")).is_ok());
+    }
+    #[test]
+    fn loopback_origins_are_recognised_in_both_address_families() {
+        for ok in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", "https://eu.example.test"] {
+            assert!(issuer_url_ok(ok), "{} should be accepted", ok); }
+        for bad in ["http://10.0.0.1:8080", "http://169.254.169.254", "ftp://eu.example.test", "http://[fe80::1]:8080"] {
+            assert!(!issuer_url_ok(bad), "{} should be refused", bad); }
+        assert_eq!(url_host("http://[::1]:8080/x"), "[::1]");
+        assert_eq!(url_host("http://127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(url_host("https://eu.example.test"), "eu.example.test");
     }
     // Run environment-sensitive assertions in an isolated copy of this test binary.
     #[cfg(not(target_arch = "wasm32"))]
