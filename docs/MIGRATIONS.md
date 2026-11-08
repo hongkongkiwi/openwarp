@@ -257,7 +257,11 @@ Object SQLite, and D1 recognise bracket-quoted identifiers; PostgreSQL and
 MySQL do not, so brackets in PostgreSQL array expressions remain SQL syntax.
 Existing custom `Target` implementations default to `SqlDialect::Legacy`, as do
 `split_sql` and `all_statements`. Custom targets for other engines should
-implement `sql_dialect` or use `split_sql_with_dialect` explicitly.
+implement `sql_dialect` or use `split_sql_with_dialect` explicitly. SQLite and
+ordinary PostgreSQL strings treat backslashes literally; PostgreSQL `E` strings
+retain backslash escapes. This PostgreSQL profile assumes
+`standard_conforming_strings=on`. MySQL and Legacy retain backslash escapes and
+recognise `#` line comments; PostgreSQL and SQLite do not.
 
 The splitter is not a full procedural SQL parser. It tracks `CREATE TRIGGER`
 `BEGIN`/`END` bodies and nested `CASE` expressions, but does not support every

@@ -712,6 +712,9 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
     let mut start = 0usize;
     let mut index = 0usize;
     let mut mode = Mode::Normal;
+    let mut single_backslash_escape = false;
+    let mut continuation = false;
+    let mut continuation_newline = false;
     let mut dollar: Option<&[u8]> = None;
     let mut has_code = false;
     let mut words = 0;
@@ -727,12 +730,25 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
         let byte = bytes[index];
         match mode {
             Mode::Normal => {
-                if byte == b'\'' { mode = Mode::Single; has_code = true; index += 1; }
+                if continuation {
+                    if byte == b'\n' || byte == b'\r' { continuation_newline = true; }
+                    else if !byte.is_ascii_whitespace() && byte != b'\''
+                        && !(byte == b'-' && bytes.get(index + 1) == Some(&b'-'))
+                        && !(byte == b'/' && bytes.get(index + 1) == Some(&b'*')) { continuation = false; }
+                }
+                if byte == b'\'' {
+                    single_backslash_escape = matches!(dialect, SqlDialect::Legacy | SqlDialect::Mysql)
+                        || (dialect == SqlDialect::Postgres && ((continuation && continuation_newline && single_backslash_escape)
+                            || (index > 0 && matches!(bytes[index - 1], b'E' | b'e')
+                                && (index < 2 || !(bytes[index - 2].is_ascii_alphanumeric() || bytes[index - 2] == b'_' || bytes[index - 2] == b'$' || !bytes[index - 2].is_ascii())))));
+                    continuation = false;
+                    mode = Mode::Single; has_code = true; index += 1;
+                }
                 else if byte == b'"' { mode = Mode::Double; has_code = true; index += 1; }
                 else if byte == b'`' { mode = Mode::Backtick; has_code = true; index += 1; }
                 else if byte == b'[' && matches!(dialect, SqlDialect::Legacy | SqlDialect::Sqlite) { mode = Mode::Bracket; has_code = true; index += 1; }
                 else if byte == b'-' && bytes.get(index + 1) == Some(&b'-') { mode = Mode::Line; index += 2; }
-                else if byte == b'#' { mode = Mode::Line; index += 1; }
+                else if byte == b'#' && matches!(dialect, SqlDialect::Legacy | SqlDialect::Mysql) { mode = Mode::Line; index += 1; }
                 else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') { mode = Mode::Block; index += 2; }
                 else if byte == b'$' {
                     match dollar_tag(bytes, index) {
@@ -757,7 +773,7 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
                     has_code = true;
                 } else if byte == b';' {
                     if trigger_depth > 0 { index += 1; continue; }
-                    push_statement(&mut out, &sql[start..index], has_code);
+                    push_statement(&mut out, &sql[start..index], has_code, dialect);
                     start = index + 1;
                     has_code = false;
                     words = 0;
@@ -770,9 +786,13 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
                 }
             }
             Mode::Single => {
-                if byte == b'\\' && index + 1 < bytes.len() { index += 2; }
+                if single_backslash_escape && byte == b'\\' && index + 1 < bytes.len() { index += 2; }
                 else if byte == b'\'' {
-                    if bytes.get(index + 1) == Some(&b'\'') { index += 2; } else { mode = Mode::Normal; index += 1; }
+                    if bytes.get(index + 1) == Some(&b'\'') { index += 2; } else {
+                        mode = Mode::Normal; index += 1;
+                        continuation = dialect == SqlDialect::Postgres;
+                        continuation_newline = false;
+                    }
                 } else { index += 1; }
             }
             Mode::Double => {
@@ -789,35 +809,37 @@ pub fn split_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Vec<String> {
                 index += 1;
             }
             Mode::Line => {
-                if byte == b'\n' { mode = Mode::Normal; }
+                if byte == b'\n' || (dialect == SqlDialect::Postgres && byte == b'\r') {
+                    if continuation { continuation_newline = true; }
+                    mode = Mode::Normal;
+                }
                 index += 1;
             }
             Mode::Block => {
+                if continuation && (byte == b'\n' || byte == b'\r') { continuation_newline = true; }
                 if byte == b'*' && bytes.get(index + 1) == Some(&b'/') { mode = Mode::Normal; index += 2; } else { index += 1; }
             }
         }
     }
-    push_statement(&mut out, &sql[start..], has_code);
+    push_statement(&mut out, &sql[start..], has_code, dialect);
     out
 }
 
-fn push_statement(out: &mut Vec<String>, text: &str, has_code: bool) {
+fn push_statement(out: &mut Vec<String>, text: &str, has_code: bool, dialect: SqlDialect) {
     if !has_code { return; }
-    let statement = trim_leading_comments(text).trim_end();
+    let statement = trim_leading_comments(text, dialect).trim_end();
     if statement.is_empty() { return; }
-    // A trailing chunk that is only comments must not be executed.
-    if strip_comments(statement).trim().is_empty() { return; }
     out.push(statement.to_string());
 }
 
 /// Drop leading line and block comments so a statement starts with its first
 /// keyword. Backend rewriting (for example MySQL DDL) keys off that word.
-fn trim_leading_comments(text: &str) -> &str {
+fn trim_leading_comments(text: &str, dialect: SqlDialect) -> &str {
     let mut rest = text.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
             match after.find('\n') { Some(index) => rest = after[index + 1..].trim_start(), None => return "" }
-        } else if let Some(after) = rest.strip_prefix('#') {
+        } else if let Some(after) = rest.strip_prefix('#').filter(|_| matches!(dialect, SqlDialect::Legacy | SqlDialect::Mysql)) {
             match after.find('\n') { Some(index) => rest = after[index + 1..].trim_start(), None => return "" }
         } else if let Some(after) = rest.strip_prefix("/*") {
             match after.find("*/") { Some(index) => rest = after[index + 2..].trim_start(), None => return "" }
@@ -837,33 +859,6 @@ fn dollar_tag(bytes: &[u8], at: usize) -> Option<&[u8]> {
     // Tags are short; refuse absurd runs so a stray '$' cannot scan the file.
     if end - at > 64 { return None; }
     Some(&bytes[at..=end])
-}
-
-fn strip_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    let mut single = false;
-    let mut line = false;
-    let mut block = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if line {
-            if byte == b'\n' { line = false; out.push('\n'); }
-            index += 1;
-        } else if block {
-            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') { block = false; index += 2; } else { index += 1; }
-        } else if single {
-            out.push(byte as char);
-            if byte == b'\'' { single = false; }
-            index += 1;
-        } else if byte == b'\'' { single = true; out.push('\''); index += 1; }
-        else if byte == b'-' && bytes.get(index + 1) == Some(&b'-') { line = true; index += 2; }
-        else if byte == b'#' { line = true; index += 1; }
-        else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') { block = true; index += 2; }
-        else { out.push(byte as char); index += 1; }
-    }
-    out
 }
 
 struct Lock<'a, T: Target> { target: &'a T, owner: String }

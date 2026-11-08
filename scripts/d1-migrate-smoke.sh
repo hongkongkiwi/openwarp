@@ -47,7 +47,7 @@ fi
 request_migration() {
   local body status
   body="$(mktemp "$persist/response.XXXXXX")"
-  if ! status="$(curl -sS -o "$body" -w '%{http_code}' "http://127.0.0.1:${port}/__internal/migrate-d1")"; then
+  if ! status="$(curl -sS --max-time 120 -o "$body" -w '%{http_code}' "http://127.0.0.1:${port}/__internal/migrate-d1")"; then
     echo "d1 smoke: migration request failed" >&2
     tail -60 "$persist/dev.log" >&2
     return 1

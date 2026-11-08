@@ -5,10 +5,7 @@ use crate::migrate::{SqlDialect, Target};
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ready<F: std::future::Future>(future: F) -> Result<F::Output, String> {
-    struct NoWake;
-    impl std::task::Wake for NoWake { fn wake(self: std::sync::Arc<Self>) {} }
-    let waker = std::task::Waker::from(std::sync::Arc::new(NoWake));
-    let mut context = std::task::Context::from_waker(&waker);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     let mut future = std::pin::pin!(future);
     match future.as_mut().poll(&mut context) {
         std::task::Poll::Ready(value) => Ok(value),
