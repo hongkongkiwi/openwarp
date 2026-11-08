@@ -103,13 +103,25 @@ plus unique names, on every apply.
   trusts, transit, the audit chain, wrap tokens, emergency lockdown, and the
   main 22 objects), the complete device schema, and the lifecycle meta guard. A
   database that already carries an object keeps it and its data.
+- Version 29 restores the workspace-policy schema PR7's former inline migration
+  18 carried before the engine merge: the invitation management id and inviter
+  columns on `invites`, the `idx_invites_id` unique index, and the guarded
+  `workspace_policy_lock` and `workspace_creation_open` meta rows. It is
+  tolerant: a database that already ran the inline original keeps its columns.
+- Version 30 restores the AI assistant schema the feat/ai-assistant branch's
+  former inline migration 19 carried before the engine merge: `ai_settings`,
+  `ai_plans`, `ai_finding_states`, `ai_usage`, `ai_activity`,
+  `ai_finding_history`, `folders`, `integration_drafts`, and their four indexes
+  including the unique `idx_folders_env_path`. It is tolerant: a database that
+  already ran the inline original keeps its tables.
 
-New migrations start at version 29. SQL files 1 through 23 remain unchanged.
+New migrations start at version 31. SQL files 1 through 29 remain unchanged.
 Legacy main version 17 through 27 ledger rows have no checksum and remain
-unverified. A legacy main version 22 database applies versions 23 through 28; a
-legacy main version 23 database applies versions 24 through 28; each later main
-version applies the remaining tail, so a main version 27 database executes only
-version 28. An engine version 20 database applies versions 21 through 28. The
+unverified. A legacy main version 22 database applies versions 23 through 30; a
+legacy main version 23 database applies versions 24 through 30; each later main
+version applies the remaining tail, so a main version 27 database executes
+versions 28 through 30. An engine version 20 database applies versions 21
+through 30. The
 runner records checksums only for the new reconciliation files it actually
 executes, without relabelling occupied legacy versions.
 
@@ -266,7 +278,7 @@ based on age or heartbeat absence.
 
 ## Adding a migration
 
-1. Add `crates/server/migrations/0029_your_change.sql`.
+1. Add `crates/server/migrations/0031_your_change.sql`.
 2. Add the matching entry to `MIGRATIONS` in `crates/server/src/migrate.rs` with
    the next version, a short name, and `tolerant: false`.
 3. Write canonical SQL:
@@ -330,7 +342,7 @@ WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 
 The script builds the Worker with the test-only `d1-smoke` feature, which adds
 an internal route that calls the same runner with the D1 binding. It applies the
-manifest, checks version 28 and the 16 squashed rows, and verifies that a second
+manifest, checks version 30 and the 16 squashed rows, and verifies that a second
 apply is a no-op. The production Worker build in `wrangler.toml` does not enable
 the feature, so that route is absent from deployed bundles. CI runs this after
 the Workerd smoke test.

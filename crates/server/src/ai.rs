@@ -292,7 +292,8 @@ pub(crate) async fn maintenance(st:&S) {
     for (sql,p) in [("DELETE FROM ai_finding_history WHERE last_seen<?",now()-30*86400),("DELETE FROM ai_plans WHERE expires_at<?",now()-86400),("DELETE FROM ai_activity WHERE created_at<?",now()-30*86400),("DELETE FROM ai_usage WHERE day<?",now()/86400-30)] { if st.db.exec(sql,&[json!(p)]).await.is_err() { crate::log::warn("AI maintenance cleanup failed"); } }
 }
 #[cfg(not(target_arch="wasm32"))]
-pub(crate) async fn rewrap(st:&S,old:&[u8;32],new:&[u8;32]) -> Result<Vec<(String,Vec<Value>)>,(StatusCode,Json<Value>)> { let rows=st.db.query("SELECT org_id,key_enc FROM ai_settings WHERE key_enc<>''",&[]).await.map_err(|_| bad("cannot preflight AI credential rotation"))?; let mut updates=Vec::new(); for r in rows { let org=db::s(&r,"org_id"); let plain=oc::decrypt_symmetric_aad(old,&key_aad(&org),&db::s(&r,"key_enc")).map_err(|_| bad("AI provider key cannot be decrypted; refusing master rotation"))?; updates.push(("UPDATE ai_settings SET key_enc=? WHERE org_id=?".into(),vec![json!(oc::encrypt_symmetric_aad(new,&key_aad(&org),&plain)),json!(org)])); } Ok(updates) }
+pub(crate) async fn rewrap(st:&S,old:&[u8;32],new:&[u8;32]) -> Result<Vec<(String,Vec<Value>)>,(StatusCode,Json<Value>)> { let rows=st.db.query("SELECT org_id,key_enc,settings FROM ai_settings WHERE key_enc<>''",&[]).await.map_err(|_| bad("cannot preflight AI credential rotation"))?; let mut updates=Vec::new(); for r in rows { let org=db::s(&r,"org_id"); let stale_key=db::s(&r,"key_enc"); let stale_settings=db::s(&r,"settings"); let plain=oc::decrypt_symmetric_aad(old,&key_aad(&org),&stale_key).map_err(|_| bad("AI provider key cannot be decrypted; refusing master rotation"))?; // CAS on the exact ciphertext and raw settings seen at preflight: a concurrent settings save makes the checked-batch row count miss and aborts rotation instead of mixing endpoint and key.
+updates.push(("UPDATE ai_settings SET key_enc=? WHERE org_id=? AND key_enc=? AND settings=?".into(),vec![json!(oc::encrypt_symmetric_aad(new,&key_aad(&org),&plain)),json!(org),json!(stale_key),json!(stale_settings)])); } Ok(updates) }
 #[cfg(all(test,not(target_arch="wasm32")))]
 mod tests {
     use super::*;
@@ -360,12 +361,14 @@ mod tests {
         conn.query_drop(format!("CREATE DATABASE `{}`",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on MySQL");
-        assert_eq!(db.version().await.unwrap(),19);
+        let latest=db.version().await.unwrap();
         let (live,_)=tokio::sync::broadcast::channel(4);
-        let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+        let st=app::new_state(db,url.to_string(),"mysql-ai".into(),String::new(),[9;32],live,#[cfg(feature = "redis-cache")] None);
         let outcome=tokio::spawn(assert_database_ai(st)).await;
         conn.query_drop(format!("DROP DATABASE `{}`",name)).await.unwrap();
         drop(conn); pool.disconnect().await.unwrap();
+        // Asserted after the drop so a stale manifest leaves no test database behind.
+        assert_eq!(latest,crate::migrate::MIGRATIONS.last().unwrap().version);
         outcome.expect("MySQL AI integration assertions must pass");
     }
     #[tokio::test] async fn postgres_ai_schema_upserts_and_lease_claims() {
@@ -377,7 +380,7 @@ mod tests {
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
         let outcome=tokio::spawn(async move {
             let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
-            assert_eq!(db.version().await.unwrap(),19);
+            assert_eq!(db.version().await.unwrap(),crate::migrate::MIGRATIONS.last().unwrap().version);
             let (live,_)=tokio::sync::broadcast::channel(4);
             let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
             assert_database_ai(st).await;
