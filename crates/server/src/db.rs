@@ -620,6 +620,20 @@ impl Db {
         crate::migrate::wait(db.migrate())?;
         Ok(db)
     }
+    /// Workers entrypoint variant of from_do_sql_now; both apply the numbered
+    /// migrations synchronously through the shared engine.
+    pub fn from_do_storage_now(storage: worker::Storage) -> Result<Self, String> {
+        let db = Db::DoSqlite(std::rc::Rc::new(storage.sql()), std::rc::Rc::new(storage));
+        crate::migrate::wait(db.migrate())?;
+        Ok(db)
+    }
+    /// Synchronous exec for callers that cannot hold a future across a borrow,
+    /// such as the risaml replay cache. Mirrors the async DoSqlite exec arm.
+    pub(crate) fn exec_sync(&self, sql: &str, params: &[Value]) -> Result<u64, String> {
+        let Db::DoSqlite(s, _) = self;
+        let cursor = s.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
+        Ok(cursor.rows_written() as u64)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -2504,7 +2504,7 @@ pub async fn keeper_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- OCI Vault ----------
-fn unix_now() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+fn unix_now() -> i64 { crate::clock::now() }
 fn http_date() -> String {
     let secs = unix_now(); let days = secs.div_euclid(86400); let rem = secs.rem_euclid(86400);
     let (y, mo, d) = civil(days);
@@ -2512,12 +2512,10 @@ fn http_date() -> String {
     let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT", day_names[((days + 4).rem_euclid(7)) as usize], d, month_names[(mo - 1) as usize], y, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn iso_after(days: i64) -> String {
     let secs = unix_now() + days * 86400; let d = secs.div_euclid(86400); let rem = secs.rem_euclid(86400); let (y, mo, day) = civil(d);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, day, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_endpoint(config: &Value) -> Result<String, String> {
     let endpoint = cfg(config, "endpoint").trim_end_matches('/');
     if !endpoint.is_empty() { return Ok(endpoint.to_string()); }
@@ -2525,14 +2523,11 @@ fn oci_endpoint(config: &Value) -> Result<String, String> {
     if region.is_empty() { return Err("OCI Vault requires region or endpoint".into()); }
     Ok(format!("https://vaults.{}.oraclecloud.com", region))
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_key_id(config: &Value) -> Result<String, String> {
     let (tenancy, user, fingerprint) = (cfg(config, "tenancy_ocid"), cfg(config, "user_ocid"), cfg(config, "fingerprint"));
     if tenancy.is_empty() || user.is_empty() || fingerprint.is_empty() { return Err("OCI Vault requires tenancy_ocid, user_ocid and fingerprint".into()); }
     Ok(format!("{}/{}/{}", tenancy, user, fingerprint))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -2545,8 +2540,6 @@ fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     let signature = signing_key.sign(canonical.as_bytes());
     Ok(openwarp_crypto::b64(&signature.to_bytes()))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_request(client: &crate::http::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
     let base = oci_endpoint(config)?; let url = format!("{}{}", base, path_query);
     let parsed = reqwest::Url::parse(&url).map_err(|e| format!("OCI endpoint is invalid: {}", e))?;
@@ -2564,37 +2557,28 @@ async fn oci_request(client: &crate::http::Client, config: &Value, method: &str,
         .header("date", &date).header("host", &host).header("authorization", auth);
     if let (Some(text), Some(sha)) = (&body_text, &content_sha) { request = request.header("content-type", "application/json").header("x-content-sha256", sha).header("content-length", text.len()).body(text.clone()); }
     let response = request.send().await.map_err(|e| format!("OCI Vault request failed: {}", e))?;
-    let status = response.status(); let text = response.text().await.unwrap_or_default();
+    let status = response.status(); let text = response.text().await.map_err(|e| format!("OCI Vault response body failed: {}", e))?;
     if !status.is_success() { return Err(format!("OCI Vault request failed: HTTP {}: {}", status, text.chars().take(400).collect::<String>())); }
     if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("OCI Vault invalid response: {}", e)) }
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_config_ready(config: &Value) -> Result<(String, String), String> {
     let compartment = cfg(config, "compartment_id"); let vault = cfg(config, "vault_id");
     if compartment.is_empty() || vault.is_empty() { return Err("OCI Vault requires compartment_id and vault_id".into()); }
     Ok((compartment.to_string(), vault.to_string()))
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_name_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (compartment, vault) = oci_config_ready(config)?;
     let value = oci_request(client, config, "GET", &format!("/20180608/secrets?compartmentId={}&vaultId={}&lifecycleState=ACTIVE&limit=1000", enc(&compartment), enc(&vault)), None).await?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_bundle(client: &crate::http::Client, config: &Value, id: &str) -> Result<String, String> {
     let value = oci_request(client, config, "GET", &format!("/20180608/secretBundles/{}", enc(id)), None).await?;
     let content = value.get("secretBundleContent").and_then(|c| c.get("content")).and_then(Value::as_str).unwrap_or("");
     let bytes = openwarp_crypto::unb64(content).map_err(|e| format!("OCI secret content is invalid: {}", e))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_content(value: &str) -> Value { json!({"content": openwarp_crypto::b64(value.as_bytes()), "contentType": "BASE64"}) }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let (compartment, vault) = oci_config_ready(config)?; let key_id = cfg(config, "key_id");
     let mode = sync_mode(config, "oci_vault")?; let dry = is_dry(config);
@@ -2623,8 +2607,6 @@ pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previo
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
     Ok((format!("OCI Vault sync{}: created={} updated={} deleted={} (deletions are scheduled 7 days out)", if dry { " (dry-run)" } else { "" }, created, updated, deleted), managed))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_test(config: &Value) -> Result<String, String> {
     let list = oci_list(&http_client(), config).await?;
     Ok(format!("OCI Vault connection OK: {} active secret(s) visible", list.len()))
@@ -3314,7 +3296,6 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             let list = huggingface_space_list(&http_client(), &base_url, &token, &path).await?;
             Ok(list.into_iter().filter_map(|(k, v)| Some((strip_remote_prefix(config, &k, ""), v?))).collect())
         }
-        #[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => {
             let client = http_client(); let list = oci_list(&client, config).await?;
             let mut out = Vec::new();
@@ -3392,10 +3373,7 @@ pub async fn sync_managed_with_tags(kind: &str, config: &Value, secrets: &[(Stri
         "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_sync(config, pairs, previous_managed).await,
         "keeper" => keeper_sync(config, pairs, previous_managed).await,
-#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_sync(config, pairs, previous_managed).await,
-        #[cfg(target_arch = "wasm32")]
-        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_sync(config, pairs, previous_managed).await,
         _ => return None,
     };
@@ -3451,10 +3429,7 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_test(config).await,
         "keeper" => keeper_test(config).await,
-#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_test(config).await,
-        #[cfg(target_arch = "wasm32")]
-        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_test(config).await,
         _ => Err(format!("connection test is not implemented for kind {}", kind)),
     }
@@ -5478,14 +5453,6 @@ mod tests {
     }
 
 }
-#[cfg(target_arch = "wasm32")]
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn oci_vault_sync(_config: &Value, _secrets: &[(String, String)], _previous: &[String]) -> Result<(String, Vec<String>), String> { Err("OCI Vault sync needs RSA request signing, which requires the native server".into()) }
-#[cfg(target_arch = "wasm32")]
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn oci_vault_test(_config: &Value) -> Result<String, String> { Err("OCI Vault needs RSA request signing, which requires the native server".into()) }
 #[cfg(target_arch = "wasm32")]
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
