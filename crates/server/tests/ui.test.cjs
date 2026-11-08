@@ -188,7 +188,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
-    '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
     '/api/instance': { instance_owner: false },
     '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },
@@ -196,6 +196,9 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
+    // Fixture workspaces hold every grant; a test that wants an ungranted
+    // surface overrides this entry.
+    '/api/orgs/org-a/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -644,6 +647,33 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+test('the SAML sign-in button follows the build, not the workspace grant', async () => {
+  // A build that carries SAML keeps the button even when a workspace has not
+  // enabled it; the attempt explains why. A build without it has no route, so
+  // the button would be dead and is hidden.
+  const withSaml = await consoleUI();
+  await withSaml.invoke('loadProviders()');
+  assert.ok(withSaml.document.getElementById('saml-signin'),
+    'the sign-in view always carries the SAML button node');
+  assert.notEqual(withSaml.el('saml-signin').style.display, 'none',
+    'a build with SAML shows the button regardless of workspace grants');
+
+  const withoutSaml = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { google: false, github: false, saml: false, signups: 'open' },
+  } });
+  await withoutSaml.invoke('loadProviders()');
+  assert.equal(withoutSaml.el('saml-signin').style.display, 'none',
+    'a build without SAML hides the button because the route does not exist');
+});
+
+test('a workspace-disabled sign-in method reports a readable reason, not JSON', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  assert.match(source, /saml_not_enabled:'SAML sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the saml_not_enabled code into a sentence');
+  assert.match(source, /ldap_not_enabled:'Directory sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the ldap_not_enabled code into a sentence');
 });
 
 const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };

@@ -23,13 +23,17 @@ Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before your first change, [docs/
 
 ## Gates
 
-Run from the repository root, serially. Never run two builds or suites at once. CI runs clippy, the Rust tests, the console test, and a container build that polls `/health` and runs `openwarp --help` inside the image.
+Run from the repository root, serially. Never run two builds or suites at once. CI runs clippy and the Rust tests twice, once core-only and once with `--all-features`, then the console test, and a container build that polls `/health` and runs `openwarp --help` inside the image.
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace -- --test-threads=2
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=2
 node --test crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs
 ```
+
+The enterprise surfaces (SAML, SCIM, PKI, SSH certificates, transit, workload identity, change requests, LDAP) are Cargo features the default build compiles out; `enterprise` enables all of them. A compiled surface also needs a per-workspace grant before its routes answer, so a test that exercises one grants it first through `PUT /api/instance/features`. Changing a gated path without the all-features run leaves it unchecked.
 
 Local-only: `cargo check --workspace`, `cargo build --workspace`.
 

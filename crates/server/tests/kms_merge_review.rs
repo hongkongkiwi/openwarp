@@ -142,7 +142,7 @@ async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
     let url = format!("sqlite://{}", dir.join("test.db").display());
     {
         let db = Db::open(&url).await.expect("open fresh sqlite database");
-        assert_eq!(db.version().await.unwrap(), 23, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 24, "a fresh database lands on the current version");
         // Simulate an interrupted first run of migration 22: the lifecycle meta
         // row was inserted but the schema_migrations ledger entry never landed.
         db.exec("DELETE FROM schema_migrations WHERE version=22", &[]).await.unwrap();
@@ -156,7 +156,7 @@ async fn migration22_resumes_when_lifecycle_row_exists_but_ledger_absent() {
         let reopened = Db::open(&url).await;
         assert!(reopened.is_ok(), "migration 22 resume failed: {:?}", reopened.err());
         let reopened = reopened.unwrap();
-        assert_eq!(reopened.version().await.unwrap(), 23, "the ledger must record the current version");
+        assert_eq!(reopened.version().await.unwrap(), 24, "the ledger must record the current version");
         let replayed = reopened.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE version=22", &[]).await.unwrap().unwrap();
         assert_eq!(replayed["n"].as_i64(), Some(1), "the replayed migration 22 is recorded exactly once");
         let rows = reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap();

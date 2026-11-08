@@ -222,6 +222,20 @@ Build the server:
 cargo build --release -p openwarp-server
 ```
 
+That command produces a core-only binary. SAML, SCIM, X.509 PKI, SSH
+certificates, transit, workload identity, change requests and LDAP are Cargo
+features that the default set omits, so add them to the build and then grant
+them per workspace before they answer:
+
+```bash
+cargo build --release -p openwarp-server --features enterprise,redis-cache
+```
+
+See [enterprise surfaces](FEATURES.md#enterprise-surfaces-build-features-and-workspace-grants)
+for the individual feature names, the grant API and the container build argument.
+Enabling a feature and forgetting the grant is the usual cause of a 403 that
+names the surface.
+
 Run it under your service manager with an existing data directory and securely provisioned environment:
 
 ```bash

@@ -858,7 +858,13 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE TABLE IF NOT EXISTS transit_keys(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,current_version BIGINT NOT NULL,UNIQUE(org_id,name))",
         "CREATE TABLE IF NOT EXISTS transit_versions(key_id TEXT NOT NULL,org_id TEXT NOT NULL,version BIGINT NOT NULL,key_enc TEXT NOT NULL,PRIMARY KEY(key_id,version))",
     ]),
+    // Per-workspace grants for the enterprise add-ons. Rows survive a build
+    // that omits a feature, so rebuilding with it restores the workspace's
+    // choice instead of silently dropping it.
     (22, &[
+        "CREATE TABLE IF NOT EXISTS feature_grants(org_id TEXT PRIMARY KEY,features TEXT NOT NULL DEFAULT '',updated_by TEXT NOT NULL DEFAULT '',updated_at BIGINT NOT NULL DEFAULT 0)",
+    ]),
+    (23, &[
         "CREATE TABLE workload_bindings(identity_id TEXT PRIMARY KEY,org_id TEXT NOT NULL,revision TEXT NOT NULL,issuer TEXT NOT NULL,jwks_url TEXT NOT NULL,audience TEXT NOT NULL,subject TEXT NOT NULL,max_ttl_secs BIGINT NOT NULL)",
         "CREATE TABLE workload_assertions(digest TEXT PRIMARY KEY,expires_at BIGINT NOT NULL)",
         "ALTER TABLE tokens ADD COLUMN workload_revision TEXT DEFAULT ''",
@@ -872,7 +878,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
         "CREATE UNIQUE INDEX idx_static_rotation_target ON rotation_schedules(static_target)",
     ]),
     // Account session management: stable ids for listing and revocation.
-    (23, &[
+    (24, &[
         "ALTER TABLE sessions ADD COLUMN id TEXT DEFAULT ''",
         "CREATE INDEX idx_sessions_id ON sessions(id)",
     ]),
@@ -911,10 +917,10 @@ mod tests {
     }
     #[tokio::test] async fn migrations_are_recorded_once() {
         let db = Db::open_memory().await.unwrap();
-        assert_eq!(db.version().await.unwrap(), 23, "a fresh database lands on the current version");
+        assert_eq!(db.version().await.unwrap(), 24, "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 23, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 24, "each migration must be recorded exactly once");
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_rewrites_only_what_mysql_rejects() {

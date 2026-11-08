@@ -182,10 +182,22 @@ async fn self_hosted_keeps_core_and_locks_every_enterprise_route() {
     let core = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&token), None).await;
     assert_eq!(core.status, 200, "core features do not consult the license: {}", core.text);
 
-    let saml = s.call(Method::GET, &format!("/api/orgs/{}/saml", org), Some(&token), None).await;
-    assert_eq!(saml.status, 403, "SAML is enterprise: {} {}", saml.status, saml.text);
-    assert_eq!(saml.body["code"], json!("enterprise_feature"));
-    assert_eq!(saml.body["feature"], json!("org_sso"));
+    for (compiled, feature, path, license_feature) in [
+        (cfg!(feature = "saml"), "saml", format!("/api/orgs/{}/saml", org), "org_sso"),
+        (cfg!(feature = "ldap"), "ldap", format!("/api/orgs/{}/ldap", org), "directory_sync"),
+        (cfg!(feature = "scim"), "scim", format!("/scim/v2/Users?org_id={}", org), "directory_sync"),
+    ] {
+        if compiled {
+            let grant = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": [feature]}))).await;
+            assert_eq!(grant.status, 200, "grant failed: {}", grant.text);
+        }
+        let response = s.call(Method::GET, &path, Some(&token), None).await;
+        assert_eq!(response.status, if compiled { 403 } else { 404 }, "{}: {}", feature, response.text);
+        if compiled {
+            assert_eq!(response.body["code"], json!("enterprise_feature"));
+            assert_eq!(response.body["feature"], json!(license_feature));
+        }
+    }
 
     let oidc = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&token), Some(json!({"oidc_issuer": "https://idp.example"}))).await;
     assert_eq!(oidc.status, 403, "workspace OIDC is enterprise: {} {}", oidc.status, oidc.text);
@@ -194,10 +206,6 @@ async fn self_hosted_keeps_core_and_locks_every_enterprise_route() {
     let stream = s.call(Method::POST, &format!("/api/orgs/{}/log-streams", org), Some(&token), Some(json!({"name": "SIEM", "url": "https://example.com/hook"}))).await;
     assert_eq!(stream.status, 403, "log streams are enterprise: {} {}", stream.status, stream.text);
     assert_eq!(stream.body["feature"], json!("audit_streaming"));
-
-    let scim = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}", org), Some(&token), None).await;
-    assert_eq!(scim.status, 403, "SCIM is enterprise: {} {}", scim.status, scim.text);
-    assert_eq!(scim.body["feature"], json!("directory_sync"));
 
     let core_settings = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&token), Some(json!({"ip_allowlist": "203.0.113.0/24"}))).await;
     assert_eq!(core_settings.status, 200, "core settings still save: {}", core_settings.text);
@@ -215,18 +223,27 @@ async fn enterprise_license_unlocks_the_same_routes() {
     assert_eq!(edition.body["tier"], json!("enterprise"));
     assert_eq!(edition.body["development"], json!(true));
 
-    let saml = s.call(Method::GET, &format!("/api/orgs/{}/saml", org), Some(&token), None).await;
-    assert_eq!(saml.status, 200, "SAML config is readable with a license: {}", saml.text);
-    assert_eq!(saml.body["configured"], json!(false));
+    for (compiled, feature, path) in [
+        (cfg!(feature = "saml"), "saml", format!("/api/orgs/{}/saml", org)),
+        (cfg!(feature = "ldap"), "ldap", format!("/api/orgs/{}/ldap", org)),
+        (cfg!(feature = "scim"), "scim", format!("/scim/v2/Users?org_id={}", org)),
+    ] {
+        if compiled {
+            let denied = s.call(Method::GET, &path, Some(&token), None).await;
+            assert_eq!(denied.status, 403, "a license alone cannot grant {}: {}", feature, denied.text);
+            let grant = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": [feature]}))).await;
+            assert_eq!(grant.status, 200, "grant failed: {}", grant.text);
+        }
+        let response = s.call(Method::GET, &path, Some(&token), None).await;
+        assert_eq!(response.status, if compiled { 200 } else { 404 }, "a license cannot conjure an uncompiled {} route: {}", feature, response.text);
+        if compiled && feature != "scim" { assert_eq!(response.body["configured"], json!(false)); }
+    }
 
     let oidc = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&token), Some(json!({"oidc_issuer": "https://idp.example"}))).await;
     assert_eq!(oidc.status, 200, "workspace OIDC saves with a license: {}", oidc.text);
 
     let stream = s.call(Method::POST, &format!("/api/orgs/{}/log-streams", org), Some(&token), Some(json!({"name": "SIEM", "url": "https://example.com/hook"}))).await;
     assert_eq!(stream.status, 200, "log streams unlock with a license: {}", stream.text);
-
-    let scim = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}", org), Some(&token), None).await;
-    assert_eq!(scim.status, 200, "SCIM unlocks with a license: {} {}", scim.status, scim.text);
 
     let member = register(&s, "enterprise-member@test.invalid").await;
     let member_token = member.body["token"].as_str().expect("member token").to_string();
@@ -247,7 +264,11 @@ async fn an_invalid_license_falls_back_to_self_hosted() {
     assert_eq!(edition.body["tier"], json!("self-hosted"));
     assert!(edition.body["warning"].as_str().unwrap_or("").contains("license"), "the rejection reason is reported: {}", edition.text);
     let saml = s.call(Method::GET, &format!("/api/orgs/{}/saml", org), Some(&token), None).await;
-    assert_eq!(saml.status, 403);
+    assert_eq!(saml.status, if cfg!(feature = "saml") { 403 } else { 404 });
+    if cfg!(feature = "saml") {
+        assert_eq!(saml.body["code"], json!("enterprise_feature"));
+        assert_eq!(saml.body["feature"], json!("org_sso"));
+    }
 }
 
 #[tokio::test]
