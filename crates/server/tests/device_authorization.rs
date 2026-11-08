@@ -519,9 +519,9 @@ async fn device_records_are_workspace_scoped() {
     let (ca, _) = pki_ca(&s, at, aorg, "scope-ca").await;
     let device = pki_device(&s, at, &ca, "sensor-1").await;
     let r = s.call(Method::GET, &format!("/api/pki/cas/{}/devices", ca), Some(bt), None).await;
-    assert_ne!(r.status, 200, "another workspace must not list the inventory: {}", r.text);
+    assert!(matches!(r.status,403|404), "another workspace must not list the inventory: {}", r.text);
     let r = s.call(Method::POST, &format!("/api/pki/devices/{}/enrollment", device), Some(bt), Some(json!({}))).await;
-    assert_ne!(r.status, 200, "another workspace must not mint an enrollment code: {}", r.text);
+    assert!(matches!(r.status,403|404), "another workspace must not mint an enrollment code: {}", r.text);
 }
 
 #[tokio::test]

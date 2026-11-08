@@ -68,9 +68,9 @@ HTTP suites start real server processes against private databases. The Node suit
 Ordinary device enrollment and renewal need no TPM. Run the focused regression:
 
 ```bash
-cargo test -p openwarp-server --test device_delivery default_device_lifecycle_does_not_require_a_tpm
-cargo test -p openwarp-server --test device_remaining
-cargo test -p openwarp-server --test tpm_interoperability
+cargo test -p openwarp-server --test device_delivery default_device_lifecycle_does_not_require_a_tpm -- --test-threads=2
+cargo test -p openwarp-server --test device_remaining -- --test-threads=2
+cargo test -p openwarp-server --test tpm_interoperability -- --test-threads=2
 ```
 
 `device_postgres` creates private databases when `OPENWARP_TEST_POSTGRES_URL`
@@ -78,7 +78,7 @@ points to a local test administrator database. It exercises transaction
 cancellation, expiry after row-lock waits and concurrent policy changes. Without
 that variable, the live database checks do not run. TPM interoperability uses
 swtpm evidence, not a physical TPM; its public fixtures and generation recipe are
-in `tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
+in `crates/server/tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
 
 Device schema migrations append after canonical main's existing migrations.
 The protocol discriminator `pki_cas.kind` remains `x509` or `ssh`; X.509 hierarchy

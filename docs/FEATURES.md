@@ -524,8 +524,8 @@ them; a device cannot join a group in another environment. Group revoke clears
 the active pointer, invalidates codes and revokes every unrevoked certificate for
 the group.
 
-The optional pre-issuance hook (`PUT /api/pki/cas/:id/hook`) posts a signed JSON
-event to an operator URL before a code is consumed. A response of
+The optional pre-issuance hook (`PUT /api/pki/cas/:id/hook`) posts a JSON
+event, signed when a hook secret is configured, to an operator URL before a code is consumed. A response of
 `{"allow":true}` proceeds; a deny, a non-2xx response, a timeout or an egress
 policy rejection blocks enrollment and leaves the code usable.
 

@@ -122,6 +122,12 @@ pub fn csr_public_key(pem: &str) -> Result<SubjectPublicKeyInfoOwned, String> {
     let csr = x509_cert::request::CertReq::from_pem(pem).map_err(err)?;
     let der = csr.to_der().map_err(err)?;
     let request = keystore_pki::pkcs10::parse(&der).map_err(err)?;
+    let key=keystore_pki::parse_public_key(&request.spki).map_err(err)?;
+    match key {
+        keystore_pki::PublicKey::Rsa(ref key) => { use rsa::traits::PublicKeyParts; if ![2048,3072,4096].contains(&key.n().bits()) { return Err("CSR RSA key must be 2048, 3072 or 4096 bits".into()); } }
+        keystore_pki::PublicKey::EcP256(_) | keystore_pki::PublicKey::EcP384(_) | keystore_pki::PublicKey::Ed25519(_) => {}
+        _ => return Err("unsupported CSR key algorithm".into()),
+    }
     request.verify().map_err(err)?;
     Ok(csr.info.public_key)
 }

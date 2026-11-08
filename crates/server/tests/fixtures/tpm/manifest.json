@@ -2,7 +2,7 @@
   "origin": "swtpm software TPM, not physical hardware",
   "nonce": "openwarp-swtpm-interoperability-fixture-v1",
   "qualifying_data_hex": "8dbe5d2301dcf5de80ef39cfb7b35dfd4c19f3eec7859fd08c2fd3fca97e45e9",
-  "binding": "SHA256(OpenWarp/TPM2/enroll/v1\\0 || nonce UTF8 || SHA256(spki.der))",
+  "binding": "SHA256(UTF8(OpenWarp/TPM2/enroll/v1) || NUL byte || nonce UTF8 || SHA256(spki.der))",
   "expected_pcr_digest": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
   "pcr_bank": "sha256",
   "pcr_indices": [
@@ -31,7 +31,7 @@
       "firmware_version": 14451207940499494521
     }
   },
-  "trust": "Test-only operator pin is ak-public.b64, provisioned separately from evidence. Production requires an out-of-band authenticated AK public pin. No EK or hardware provenance proof.",
+  "trust": "Test-only AK pin is included in this fixture bundle. Production requires an out-of-band authenticated AK public pin, separate from submitted evidence. No EK or hardware provenance proof.",
   "checks": {
     "tpm2_checkquote": 0,
     "tpm2_verifysignature_certify": 0

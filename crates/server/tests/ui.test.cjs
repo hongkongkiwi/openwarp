@@ -828,6 +828,68 @@ test('PKI bulk codes use explicit selection and show partial failures', async ()
   assert.equal(ui.el('pki-download-codes').disabled, true);
 });
 
+test('PKI device import accepts exported headers, quoted cells and the legacy headerless rows', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => call.method === 'POST' && call.url === '/api/pki/cas/ca-a/devices/import'
+    ? { created: 2, failed: 0, results: [] } : undefined };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  const rows = JSON.parse(ui.run(`JSON.stringify(parseCsvRows(${JSON.stringify('name,model\r\n"a,b","say ""hi"""\r\n')}))`));
+  assert.deepEqual(rows, [['name', 'model'], ['a,b', 'say "hi"']],
+    'quoted cells keep commas, newlines and doubled quotes');
+  ui.el('pki-import').value = [
+    'name,model,hardware_serial,tags,env_id,group_id,sans,cert_days,serial,expires_at,revoked,attested',
+    'sensor-1,model-a,S123,"site=a,b",env-9,group-9,"gw.local;192.0.2.10",45,ABC,1900000000,false,false',
+    'sensor-2,model-b,S456,site=c,env-9,,"gw2.local,192.0.2.11",30,DEF,1900000000,false,false',
+  ].join('\r\n');
+  await ui.click(ui.button(ui.el('pki-body'), /Import and mint codes/));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/import');
+  assert.deepEqual(call.body.devices, [
+    { name: 'sensor-1', model: 'model-a', hardware_serial: 'S123', tags: 'site=a,b', env_id: 'env-9', group_id: 'group-9', sans: ['gw.local', '192.0.2.10'], cert_days: 45 },
+    { name: 'sensor-2', model: 'model-b', hardware_serial: 'S456', tags: 'site=c', env_id: 'env-9', sans: ['gw2.local', '192.0.2.11'], cert_days: 30 },
+  ], 'exported columns map by header and status columns are ignored');
+  const legacy = JSON.parse(ui.run(`JSON.stringify(deviceImportRows(${JSON.stringify('sensor-3,model-c,S789,site=d,env-9,gw.local;192.0.2.12,60')}))`));
+  assert.deepEqual(legacy, [{ name: 'sensor-3', model: 'model-c', hardware_serial: 'S789', tags: 'site=d', env_id: 'env-9', sans: ['gw.local', '192.0.2.12'], cert_days: 60 }],
+    'the previous headerless line format keeps working');
+  assert.throws(() => ui.run(`parseCsvRows(${JSON.stringify('"open')})`), /Unterminated quoted CSV cell/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('model,tags\nsensor,site=a')})`), /must include a name column/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('name,cert_days\nsensor,soon')})`), /invalid cert_days/);
+  assert.ok(!JSON.stringify(call.body.devices).includes('private'), 'imports never carry private key material');
+});
+
+test('minted PKI codes are repopulated after a render', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  const minted = ui.el('pki-codes-out').textContent;
+  assert.match(minted, /sensor-a: test-code/);
+  await ui.invoke('renderPki()');
+  assert.equal(ui.el('pki-codes-out').textContent, minted, 'the issued codes stay visible after a full render');
+  assert.equal(ui.el('pki-download-codes').disabled, false, 'a render keeps the download control usable');
+});
+
+test('device CSV download checks the response status', async () => {
+  const ui = await consoleUI();
+  ui.run("fetch=async()=>({ok:false,status:403,text:async()=>JSON.stringify({error:'pki:read denied'})})");
+  await ui.invoke('downloadDevices()');
+  assert.match(ui.el('toasts').textContent, /pki:read denied/, 'a rejected export must report the server error');
+});
+
 test('the theme resolves from the system by default and the toggle persists an override', async () => {
   const ui = await consoleUI();
   const html = ui.document.documentElement;

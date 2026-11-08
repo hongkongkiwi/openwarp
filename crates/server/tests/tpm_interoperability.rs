@@ -8,7 +8,7 @@ fn simulator_certify_and_quote_match_the_verifier() {
     let spki = include_bytes!("fixtures/tpm/spki.der");
     let nonce = manifest["nonce"].as_str().unwrap();
     let policy = manifest["expected_pcr_digest"].as_str().unwrap();
-    assert!(tpm_attestation::validate_ak(pin).unwrap().contains("BEGIN PUBLIC KEY"));
+    assert_eq!(tpm_attestation::validate_ak(pin).unwrap().trim(),include_str!("fixtures/tpm/ak-public.pem").trim());
     let result = tpm_attestation::verify(&evidence, pin, spki, nonce, policy).expect("unmodified swtpm evidence must verify");
     assert_eq!(result["pcr_digest"], policy);
     assert!(tpm_attestation::verify(&evidence, pin, spki, "replayed-into-another-enrollment", policy).is_err());
