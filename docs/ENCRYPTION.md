@@ -99,8 +99,11 @@ POST {OPENWARP_KMS_URL}/unwrap
 authenticated data (GCP KMS), or the equivalent. `OPENWARP_KMS_KEY_ID` is stored
 with each wrapped value so a key rotation can still unwrap old data; run
 `POST /api/instance/rewrap` as the instance owner after switching key IDs. It
-rewraps the persisted root and available environment keys, verifies their unwrap
-roundtrips, then commits the updates together without changing the root itself.
+rewraps the persisted root and every nonempty environment key, including legacy
+root-wrapped keys, and verifies their unwrap roundtrips before writing anything.
+The updates commit together with old-value checks. An unreadable key, failed
+verification or concurrent key change aborts the batch without changing the root
+or any environment key. Empty client-managed keys are excluded.
 
 The bridge URL may be `http://` as well as `https://`. With plain HTTP, the
 wrap requests and unwrap responses carry plaintext root or environment keys

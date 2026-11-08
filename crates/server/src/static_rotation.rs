@@ -4,8 +4,8 @@ pub(super) async fn execute(st: &S, due: &Row) {
     if cfg!(target_arch="wasm32") { return; }
     let rid=db::s(due,"id"); let token=id(); let current=now();
     let eid=db::s(due,"env_id"); let name=db::s(due,"key_name"); let path=db::s(due,"path");
-    let Ok(key)=st.env_key(&eid).await else { return; };
-    let Ok(Some(target))=st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0 AND secret_type IN ('','secret','config')", &[json!(eid),json!(key_index(&key,&path,&name)),json!(oc::hash_token(&format!("{}:{}",path,name)))]).await else { return; };
+    let Ok(key)=st.env_key(&eid).await else { record_unclaimed_failure(st,due,current).await; return; };
+    let Ok(Some(target))=st.db.one("SELECT id,version FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0 AND secret_type IN ('','secret','config')", &[json!(eid),json!(key_index(&key,&path,&name)),json!(oc::hash_token(&format!("{}:{}",path,name)))]).await else { record_unclaimed_failure(st,due,current).await; return; };
     let claimed=st.db.rotation_batch("SELECT 1 AS blocked WHERE NOT EXISTS (SELECT id FROM rotation_schedules WHERE id=? AND enabled=1 AND next_run<=? AND execution_token='') OR NOT EXISTS (SELECT id FROM secrets WHERE id=? AND version=? AND deleted=0 AND secret_type IN ('','secret','config'))", &[json!(rid),json!(current),json!(db::s(&target,"id")),json!(db::n(&target,"version"))], &[("UPDATE rotation_schedules SET execution_token=?,next_run=? WHERE id=?".into(),vec![json!(token),json!(current+db::n(due,"interval_secs").max(60)),json!(rid)])]).await;
     if !matches!(claimed,Ok(true)) { return; }
     let result=async {
@@ -26,6 +26,12 @@ pub(super) async fn execute(st: &S, due: &Row) {
         let _=st.db.exec("UPDATE rotation_schedules SET execution_token='' WHERE id=? AND execution_token=?", &[json!(rid),json!(token)]).await;
     }
     if result.is_err() { audit_rotation_failure(st,&db::s(due,"env_id"),&rid,&db::s(due,"key_name")).await; }
+}
+
+async fn record_unclaimed_failure(st: &S, due: &Row, current: i64) {
+    let rid=db::s(due,"id");
+    let won=st.db.exec("UPDATE rotation_schedules SET next_run=? WHERE id=? AND enabled=1 AND next_run=? AND next_run<=? AND execution_token=''", &[json!(current+db::n(due,"interval_secs").max(60)),json!(rid),json!(db::n(due,"next_run")),json!(current)]).await;
+    if matches!(won,Ok(1)) { audit_rotation_failure(st,&db::s(due,"env_id"),&rid,&db::s(due,"key_name")).await; }
 }
 
 pub(super) async fn rotate(st: &S, schedule: &Row, config: &Value, key: &[u8;32], org: &str, stype: &str) -> Result<(),(StatusCode,Json<Value>)> {

@@ -1822,6 +1822,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
     // must disappear, and a secret deleted before ts must stay deleted.
     let rows = st.db.query("SELECT id,version,deleted_at,path FROM secrets WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
     let mut restored = 0; let mut removed = 0;
+    let mut statements=Vec::new(); let mut checked=Vec::new();
     for r in &rows {
         let sid = db::s(r,"id"); let cur = db::n(r,"version"); let del_at = db::n(r,"deleted_at");
         let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND created_at<=? ORDER BY created_at DESC, version DESC LIMIT 1", &[json!(&sid), json!(ts)]).await.map_err(|e| bad(&e))?;
@@ -1845,18 +1846,21 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
                     None => (db::s(&v,"value_enc"), db::s(&v,"comment_enc"), String::new(), db::s(&v,"tags"), String::new()),
                 };
                 let vpath = { let p = db::s(r,"path"); if p.is_empty() { let p = db::s(&v,"path"); if p.is_empty() { "/".to_string() } else { p } } else { p } };
-                rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,tags=?,tags_enc=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=?".into(),
-                    vec![json!(db::s(&v,"key_enc")), json!(value_enc), json!(&fp), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid)])]).await?;
-                st.db.exec("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    &[json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(&uid)]).await.map_err(|e| bad(&e))?;
+                checked.push(statements.len());
+                statements.push(("UPDATE secrets SET key_enc=?,value_enc=?,value_fp=?,comment_enc=?,secret_type=?,tags=?,tags_enc=?,version=?,deleted=?,deleted_at=?,updated_at=?,updated_by=? WHERE id=? AND version=?".into(),
+                    vec![json!(db::s(&v,"key_enc")), json!(value_enc), json!(&fp), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(tomb), json!(tomb_at), json!(now()), json!(&uid), json!(&sid), json!(cur)]));
+                statements.push(("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)".into(),
+                    vec![json!(id()), json!(&sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(&uid)]));
                 if was_deleted { removed += 1 } else { restored += 1 }
             }
             None => {
-                rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?".into(),vec![json!(now()), json!(now()), json!(&sid)])]).await?;
+                checked.push(statements.len());
+                statements.push(("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=? AND version=?".into(),vec![json!(now()), json!(now()), json!(&sid), json!(cur)]));
                 removed += 1;
             }
         }
     }
+    if !st.db.rotation_batch_checked("SELECT id FROM rotation_schedules WHERE env_id=? AND (pending_enc<>'' OR execution_token<>'')", &[json!(&eid)], &statements, &checked).await.map_err(secret_batch_error)? { return Err(err(StatusCode::CONFLICT,"rotation pending or executing; reconcile before restoring the environment")); }
     st.audit(&org,&app,&eid,&uid,"env.pitr",&format!("ts={} restored={} removed={}",ts,restored,removed)).await;
     let _ = trigger_sync(&st, &eid, &uid).await;
     Ok(j(json!({"restored": restored, "removed": removed}))) }
@@ -3427,7 +3431,7 @@ async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rewrap environment keys")); }
     let kms = st.kms().ok_or_else(|| bad("no KMS is configured; environment keys are wrapped by the instance master"))?;
-    let rows = st.db.query("SELECT id FROM envs WHERE env_key_wrapped<>''", &[]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,env_key_wrapped FROM envs WHERE env_key_wrapped<>''", &[]).await.map_err(|e| bad(&e))?;
     let mut rewrapped = 0;
     let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
     let mut checked=Vec::new();
@@ -3442,14 +3446,16 @@ async fn rewrap_env_keys(State(st): State<S>, h: HeaderMap) -> Res {
     }
     for r in &rows {
         let eid = db::s(r, "id");
-        // env_key unwraps both legacy and KMS rows, so this also migrates a
-        // deployment that enabled KMS after its data was created.
-        if let Ok(key) = st.env_key(&eid).await {
-            let wrapped = kms.wrap(&key, &format!("env:{}", eid)).map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
-            if kms.unwrap(&wrapped,&format!("env:{}",eid)).map_err(|e| bad(&e))?.as_slice()!=key { return Err(bad("KMS environment key roundtrip returned a different key")); }
-            stmts.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(&eid)]));
-            rewrapped += 1;
-        }
+        let previous=db::s(r,"env_key_wrapped"); let context=format!("env:{}",eid);
+        // Decode without env_key's lazy migration so a failed preparation writes nothing.
+        let raw=if previous.starts_with("owkms:") { kms.unwrap(&previous,&context).map_err(|e| bad(&e))? }
+            else { oc::decrypt_symmetric(&st.master(),&previous).map_err(|e| bad(&e))? };
+        let key: [u8;32]=raw.try_into().map_err(|_| bad("bad env key"))?;
+        let wrapped = kms.wrap(&key, &context).map_err(|e| bad(&format!("KMS could not wrap {}: {}", eid, e)))?;
+        if kms.unwrap(&wrapped,&context).map_err(|e| bad(&e))?.as_slice()!=key { return Err(bad("KMS environment key roundtrip returned a different key")); }
+        checked.push(stmts.len());
+        stmts.push(("UPDATE envs SET env_key_wrapped=? WHERE id=? AND env_key_wrapped=?".into(), vec![json!(wrapped), json!(&eid), json!(previous)]));
+        rewrapped += 1;
     }
     st.db.batch_checked(&stmts,&checked).await.map_err(secret_batch_error)?;
     st.audit("", "", "", &uid, "instance.rewrap_keys", &format!("{} environments, key {}", rewrapped, kms.key_id())).await;
