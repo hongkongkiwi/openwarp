@@ -392,15 +392,23 @@ mod tests {
         let driver=tokio::spawn(async move { driver.await.unwrap(); });
         conn.batch_execute(&format!("CREATE DATABASE \"{}\"",name)).await.unwrap();
         let mut url=crate::http::Url::parse(&admin).unwrap(); url.set_path(&format!("/{}",name));
-        let outcome=join_local(async move {
-            let db=db::Db::open(url.as_str()).await.expect("AI migration must apply on PostgreSQL");
-            assert_eq!(db.version().await.unwrap(),crate::migrate::MIGRATIONS.last().unwrap().version);
-            let (live,_)=tokio::sync::broadcast::channel(4);
-            let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
-            assert_database_ai(st).await;
-        }).await;
+        // Db::open's migration future is not Send (the SQLite variant borrows a rusqlite connection); open on this task, then run the assertions on a LocalSet.
+        let db=match db::Db::open(url.as_str()).await {
+            Ok(db)=>db,
+            Err(e)=>{
+                let _=conn.batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)",name)).await;
+                drop(conn); driver.await.unwrap();
+                panic!("AI migration must apply on PostgreSQL: {}",e);
+            }
+        };
+        let latest=db.version().await.unwrap();
+        let (live,_)=tokio::sync::broadcast::channel(4);
+        let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
+        let outcome=join_local(assert_database_ai(st)).await;
         conn.batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)",name)).await.unwrap();
         drop(conn); driver.await.unwrap();
+        // Asserted after the drop so a stale manifest leaves no test database behind.
+        assert_eq!(latest,crate::migrate::MIGRATIONS.last().unwrap().version);
         outcome.expect("PostgreSQL AI integration assertions must pass");
     }
     async fn assert_database_ai(st:S) {
