@@ -36,7 +36,7 @@ The top-level token option supplies a token for the current invocation. The sepa
 | Sign out | `openwarp logout` | Sign out and clear saved credentials |
 | SSH certificates | `openwarp ssh cert --ca CA_ID --principal NAME` | Sign a public key for a granted principal |
 
-Browser login uses PKCE and a temporary loopback callback port. Browser OAuth credentials can refresh automatically when saved refresh metadata is available. Service tokens and machine credentials do not become renewable OAuth sessions simply because you saved them; respect their expiry and reauthenticate as needed. Machine-issued tokens last one hour.
+Browser login uses PKCE and a temporary loopback callback port. Browser OAuth credentials can refresh automatically when saved refresh metadata is available. Service tokens and machine credentials do not become renewable OAuth sessions simply because you saved them; respect their expiry and reauthenticate as needed. Universal Auth machine tokens last one hour. Workload-login tokens last at most 300 seconds.
 
 Avoid literal credentials in shell history. Even variable expansion into a command argument can expose that argument to local process inspection. Use a suitably protected automation environment.
 
@@ -109,6 +109,64 @@ openwarp run -- sh -c 'printf "%s\n" "$EXAMPLE_GREETING"'
 ```
 
 The CLI sets fetched values in the child's environment and propagates its exit status. The `--` separates OpenWarp arguments from the child command. Shell operators require an explicit shell, as in the second example. Do not run untrusted programs with production secrets.
+
+## Template agent
+
+Render a local configuration file from shared SSE secrets:
+
+```bash
+openwarp agent --env ENV_ID --template app.conf.tmpl --out app.conf --once
+openwarp agent --env ENV_ID --template app.conf.tmpl --out app.conf --interval-secs 30 --cache-ttl-secs 30
+```
+
+A template expression such as `{{secret /database/PASSWORD}}` selects the exact folder and key. Use `{{secret /PASSWORD}}` for the root folder. Expressions insert literal values; they do not evaluate shell syntax or execute commands. Missing, ambiguous, sealed or unreadable values stop rendering without replacing the existing output.
+
+The agent accepts HTTP(S) hosts without URL credentials, query strings or fragments and never follows redirects. HTTPS is required for every host except a literal loopback address (`http://127.0.0.1:8080` or `http://[::1]:8080`); the check runs before the bearer token is sent, and `localhost` is not accepted as loopback proof. It uses an explicit token or a saved token only when the saved host exactly matches the selected host. It does not refresh saved OAuth credentials; reauthenticate separately or supply an automation token through `OPENWARP_TOKEN`.
+
+The agent fetches base exports, so personal overrides do not enter configuration files. It caches values only in process memory. Both interval and cache TTL default to 30 seconds; the interval accepts 1-3600 seconds and cache TTL accepts 0-300 seconds. A zero TTL fetches on every iteration. An expired cache is never used after a failed refresh. Authentication, authorization, network and rendering errors stop the agent with a nonzero exit status. A process supervisor can restart it after credentials or connectivity recover.
+
+On Unix, the agent writes a new file with mode 0600 and atomically renames it over the output. It refuses a symlink destination. The template and output must resolve to different files; equivalent spellings such as `template`, `./template` or `subdir/../template`, and symlinks to the same file, are refused before any fetch or write so the template cannot be overwritten. Use an output directory owned by the agent's operating-system account; file modes do not protect against another process running as that account. Windows needs its own directory ACLs. Rendered files contain plaintext and remain on disk when the agent exits or access is revoked. The cache lifetime bounds refresh delay, not retention of previously written files. E2E and delegated environments are not supported by this SSE export workflow.
+
+## Encrypted files
+
+File commands run offline and do not load saved credentials or contact an instance. They encrypt an entire file in an OpenWarp JSON envelope, not the SOPS file format. File names and sizes remain visible; JSON keys inside the input do not.
+
+```bash
+openwarp file keygen --out identity.json
+openwarp file encrypt settings.json --recipient PUBLIC_KEY --out settings.ow.json
+openwarp file decrypt settings.ow.json --identity identity.json --out settings.local.json
+openwarp file rekey settings.ow.json --identity identity.json --recipient NEW_PUBLIC_KEY --out settings.rekeyed.json
+```
+
+The identity file contains `public_key` and `private_key`. Keep it outside version control and back it up separately from encrypted files. Encryption accepts up to 16 MiB and 1-32 distinct X25519 recipients; repeat `--recipient` for additional recipients. Any listed recipient can decrypt. The envelope authenticates the payload and recipient metadata.
+
+Every output must be a new path. Existing files and symlinks are refused; Unix output permissions are 0600. Decrypt and rekey authenticate the source before creating output. Rekey replaces the recipients and preserves the encrypted payload. It does not revoke an old copy: anyone who saved the previous envelope or data key can still decrypt that copy.
+
+## Secret references
+
+Use a reference to select a secret by environment ID, path and key. A root reference is `ow://ENV_ID/KEY`; a nested reference is `ow://ENV_ID/team/db/KEY` for the path `/team/db/`. Percent-encode spaces and other special characters in individual path segments. References never select a different server; the host and token come from normal CLI configuration.
+
+A UTF-8 template can contain `{{ow://ENV_ID/KEY}}` placeholders:
+
+```bash
+openwarp inject --input app.template --out app.local.conf
+```
+
+Without `--out`, `inject` writes plaintext to standard output. All references resolve before any output is written. Returned values are inserted literally and are not expanded as further references. Output files follow the new-only and Unix 0600 rules above. Templates are literal substitution, not JSON, shell or YAML escaping; quote values for the destination format yourself.
+
+For process injection, put explicit environment-variable bindings in a JSON file:
+
+```json
+{"DATABASE_URL":"ow://ENV_ID/services/db/DATABASE_URL"}
+```
+
+```bash
+openwarp run --env ENV_ID --refs-file bindings.json -- ./your-app
+```
+
+With `--refs-file`, OpenWarp injects only the listed bindings rather than exporting the whole environment. All bindings must resolve before the child starts. Command arguments remain literal. The child still inherits the calling process's ordinary environment; this is not a sandbox. OpenWarp removes inherited `OPENWARP_TOKEN` and `OPENWARP_PRIVKEY` in this mode, unless an explicit binding supplies that name. Without `--refs-file`, `run` retains its whole-environment export behavior.
+
+References use current server authorization and resolve afresh on each CLI invocation. Sealed or unreadable targets fail. For an E2E or delegated environment, pass `--identity identity.json` containing the public/private key pair that holds a wrapped environment-key grant. Decryption happens in the CLI. An unrelated offline file identity does not grant access to an environment. These commands do not provide biometric authorization.
 
 ## End-to-end environments
 

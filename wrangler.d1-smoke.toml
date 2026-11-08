@@ -1,0 +1,23 @@
+# Test-only Worker configuration. It builds the server with the `d1-smoke`
+# feature, which adds an unauthenticated internal route that runs the migration
+# manifest against the D1 binding below. The production build in wrangler.toml
+# does not enable that feature, so the route does not exist there.
+name = "openwarp-d1-smoke"
+main = "crates/server/build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cd crates/server && worker-build --dev --no-default-features --features d1-smoke"
+
+[[durable_objects.bindings]]
+name = "APP"
+class_name = "OpenWarp"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OpenWarp"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "openwarp-d1-smoke"
+database_id = "00000000-0000-0000-0000-000000000001"
