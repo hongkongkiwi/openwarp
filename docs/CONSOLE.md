@@ -85,6 +85,14 @@ Teams organise members. Environment policy can restrict access or require approv
 
 Use app service tokens or machine identities for automation instead of a person's password. Record a newly issued credential securely, scope it, and revoke it when no longer needed. OAuth client scopes and workspace permissions both apply.
 
+Members & access also contains three workspace tools:
+
+- Batched change requests group managed-environment writes and deletions. Enter the environments and operations as JSON, then have a different admin review and approve the revision before applying it. An edit clears approval. See [batched change requests](CHANGE-REQUESTS.md).
+- Workload trust configures an existing machine identity with an explicit environment, issuer, audience, subject, public JWKS and optional bound claims. Revoking trust invalidates its issued tokens. See [workload identity](WORKLOAD-IDENTITY.md).
+- Transit encryption creates and rotates workspace keys and runs encrypt, decrypt or rewrap operations. Input plaintext is base64. The server processes plaintext, and rewrap permission is separate from decrypt permission. See [transit encryption](TRANSIT.md).
+
+Review screens and transit decrypt responses display plaintext in the browser. Use these controls only on a trusted device; do not paste real credentials into recordings or shared screens.
+
 ## Integrations and sharing
 
 Select the source environment and destination before creating an integration. Sync sends shared, non-sealed SSE values to the provider. Test is implemented for Trigger.dev, Instabox, Boat, and Daytona; other kinds require a sync to exercise their connection, which can write remote data.
