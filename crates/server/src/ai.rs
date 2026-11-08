@@ -395,12 +395,14 @@ mod tests {
                 panic!("AI migration must apply on PostgreSQL: {}",e);
             }
         };
-        assert_eq!(db.version().await.unwrap(),crate::migrate::MIGRATIONS.last().unwrap().version);
+        let latest=db.version().await.unwrap();
         let (live,_)=tokio::sync::broadcast::channel(4);
         let st=app::new_state(db,url.to_string(),"postgres-ai".into(),String::new(),[9;32],live,#[cfg(feature="redis-cache")] None);
         let outcome=tokio::spawn(assert_database_ai(st)).await;
         conn.batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)",name)).await.unwrap();
         drop(conn); driver.await.unwrap();
+        // Asserted after the drop so a stale manifest leaves no test database behind.
+        assert_eq!(latest,crate::migrate::MIGRATIONS.last().unwrap().version);
         outcome.expect("PostgreSQL AI integration assertions must pass");
     }
     async fn assert_database_ai(st:S) {

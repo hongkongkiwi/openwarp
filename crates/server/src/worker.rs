@@ -69,6 +69,7 @@ impl DurableObject for OpenWarp {
             if let Some(v) = value { cfg.insert((*key).to_string(), v); }
         }
         envcfg::init(cfg);
+        crate::validate_region_env().expect("region configuration");
         crate::validate_auth_env().expect("invalid sign-in configuration");
         let production = crate::production();
         let pub_url = match envcfg::var("OPENWARP_PUBLIC_URL") {

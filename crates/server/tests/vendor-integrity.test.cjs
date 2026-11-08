@@ -30,3 +30,17 @@ test('the console policy permits the libsodium WebAssembly build', () => {
   assert.match(app.slice(start, end), /wasm-unsafe-eval/,
     'the console CSP must allow the WASM build, or the browser E2E editor cannot load libsodium');
 });
+
+// A stale SRI attribute fails closed in a browser: the console script never
+// loads and the Node suite still passes, because it reads ui.rs directly.
+test('every pinned subresource digest matches the file it loads', () => {
+  const ui = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  const pins = [...ui.matchAll(/<script src="\/([^"]+)" integrity="sha384-([A-Za-z0-9+/=]+)"/g)];
+  assert.ok(pins.length >= 3, 'the console pins its script dependencies');
+  for (const [, src, digest] of pins) {
+    const file = ['../src', '../src/vendor'].map(dir => path.join(__dirname, dir, src)).find(candidate => fs.existsSync(candidate));
+    assert.ok(file, `pinned script has no file: ${src}`);
+    assert.equal(crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64'), digest,
+      `${src} changed; update its integrity attribute in ui.rs`);
+  }
+});

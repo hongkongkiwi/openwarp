@@ -1088,7 +1088,10 @@ mod tests {
         assert!(problems.contains(&Problem::Checksum { version: 2 }));
         assert!(problems.contains(&Problem::Gap { version: 3 }));
         let newer = vec![LedgerRow { version: 99, name: String::new(), checksum: String::new(), success: true, execution_ms: 0 }];
-        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest: 23 }]);
+        // Read the newest shipped version instead of pinning it, so appending a
+        // migration does not turn this assertion into a stale constant.
+        let latest = migrations.last().map(|m| m.version).unwrap_or(0);
+        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest }]);
     }
 
     #[test]
