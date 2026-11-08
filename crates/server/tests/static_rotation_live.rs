@@ -104,10 +104,9 @@ async fn live_static_rotation_changes_postgres_login_and_matches_sse_secret() {
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone();
-    let f = Fixture::new().await;
     let result = async move {
         assert!(worker.authenticates(OLD).await, "old credential positive control");
-        let rid = f.schedule(&url,&worker.name).await;
+        let f = Fixture::new().await; let rid = f.schedule(&url,&worker.name).await;
         f.run(&rid).await;
         let password = f.value().await; assert_ne!(password, OLD);
         assert!(worker.authenticates(&password).await, "stored SSE password cannot authenticate");
