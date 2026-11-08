@@ -660,6 +660,27 @@ as given, so the parent token's `API Tokens Write` permission is what bounds
 them. xAI defaults the child to every model and endpoint the team can use, and
 accepts `qps`, `qpm` and `tpm`. ElevenLabs defaults `permissions` to `"all"`.
 
+Two infrastructure providers issue a credential rather than an API key:
+
+- `type: "planetscale"` creates a branch password from a service token and
+  deletes it on revoke. It takes `service_token` (plus `service_token_id` when
+  the token authenticates only as the raw `id:token` pair), `organization`,
+  `database`, `branch`, optional `engine` (`mysql` by default, or `postgres`)
+  and `role` (`reader`, `writer`, `readwriter` by default, or `admin`). The
+  lease TTL is sent as PlanetScale's `ttl`, so the remote password expires even
+  if this server stops. The response carries `password`, `username`, `host` and
+  `database`. Postgres has no role flag, so the lease role maps to
+  `pg_read_all_data` or `pg_read_all_data` plus `pg_write_all_data`, and
+  `admin` adds `pg_monitor`. Branch names containing `/` are refused because the
+  branch is a URL path segment.
+- `type: "instabox"` mints a per-sandbox SSH token, the only Instabox
+  credential an API key can create and revoke. It takes `api_key`,
+  `machine_id`, and sends the lease TTL as `ttlSeconds`; the Instabox API allows
+  one second to 30 days, and the lease TTL floor of 60 seconds applies here.
+  The response carries the token, `host`, `port` and the ready `command`. The
+  token is used as the SSH user name. Instabox API keys cannot be minted from
+  another key and have a one-day minimum lifetime, so they are not a lease type.
+
 The parent credential is encrypted on the lease so revoke can authenticate; the
 response returns only the child secret. A failed remote delete leaves the lease
 active and retries after a minute. The background lease sweeper revokes expired

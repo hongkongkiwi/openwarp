@@ -3670,6 +3670,120 @@ pub async fn huggingface_revoke_token(base_url: &str, token: &str, org: &str, se
         .map_err(|e| format!("Hugging Face token revocation failed: {}", e))?;
     Ok(())
 }
+async fn req_allow_missing(r: crate::http::RequestBuilder) -> Result<(), String> {
+    let resp = r.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    // Repeating a revoke is success: a credential the provider already removed
+    // must not leave the local lease active.
+    if status.is_success() || status == 404 { return Ok(()); }
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>()))
+}
+fn path_segment(value: &str, what: &str) -> Result<(), String> {
+    // "." and ".." survive the charset check but URL parsers collapse them, so
+    // they would move the request to a different provider path.
+    if value.is_empty() || value == "." || value == ".." || value.len() > 128 || !value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        return Err(format!("{} must be 1 to 128 characters of letters, digits, hyphens, underscores or dots", what));
+    }
+    Ok(())
+}
+/// Issue a PlanetScale branch credential. Vitess/MySQL uses the passwords
+/// endpoint, Postgres the roles endpoint; both take a server-side `ttl` and
+/// return the plaintext once.
+/// `https://planetscale.com/docs/api/reference/create_password.md`
+pub async fn planetscale_create_password(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    let token = cfg(config, "service_token");
+    if token.is_empty() { return Err("planetscale lease requires config.service_token".into()); }
+    if name.is_empty() || name.len() > 255 { return Err("planetscale password name must be 1 to 255 characters".into()); }
+    let organization = cfg(config, "organization"); let database = cfg(config, "database"); let branch = cfg(config, "branch");
+    path_segment(organization, "planetscale organization")?;
+    path_segment(database, "planetscale database")?;
+    path_segment(branch, "planetscale branch")?;
+    let engine = { let e = cfg(config, "engine"); if e.is_empty() { "mysql" } else { e } };
+    if !matches!(engine, "mysql" | "postgres") { return Err("planetscale engine must be mysql or postgres".into()); }
+    let role = { let r = cfg(config, "role"); if r.is_empty() { "readwriter" } else { r } };
+    let ttl = ttl_secs.clamp(60, 30 * 86400);
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), json!(name));
+    body.insert("ttl".into(), json!(ttl));
+    if engine == "postgres" {
+        // Postgres roles have no reader/writer flag, so the lease role maps to
+        // PlanetScale's bundled data roles.
+        let inherited: Vec<&str> = match role {
+            "reader" => vec!["pg_read_all_data"],
+            "writer" | "readwriter" => vec!["pg_read_all_data", "pg_write_all_data"],
+            "admin" => vec!["pg_read_all_data", "pg_write_all_data", "pg_monitor"],
+            other => return Err(format!("planetscale role {} is not supported; use reader, writer, readwriter or admin", other)),
+        };
+        body.insert("inherited_roles".into(), json!(inherited));
+    } else {
+        if !matches!(role, "reader" | "writer" | "admin" | "readwriter") { return Err(format!("planetscale role {} is not supported; use reader, writer, readwriter or admin", role)); }
+        body.insert("role".into(), json!(role));
+    }
+    let base = lease_base(config, "https://api.planetscale.com/v1")?;
+    let url = format!("{}/organizations/{}/databases/{}/branches/{}/{}", base, organization, database, branch, if engine == "postgres" { "roles" } else { "passwords" });
+    let token_id = cfg(config, "service_token_id");
+    // Older service tokens authenticate only as the raw `id:token` pair; a bare
+    // token is a bearer credential.
+    let request = if token_id.is_empty() { http_client().post(url).bearer_auth(token) } else { http_client().post(url).header("Authorization", format!("{}:{}", token_id, token)) };
+    let text = req(request.json(&Value::Object(body))).await.map_err(|e| format!("PlanetScale password creation failed: {}", e))?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| format!("PlanetScale password response is not JSON: {}", e))?;
+    let secret = parsed.get(if engine == "postgres" { "password" } else { "plain_text" }).and_then(|v| v.as_str()).unwrap_or("");
+    let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let username = parsed.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    if secret.is_empty() || !key_ref_ok(id) || username.is_empty() { return Err("PlanetScale password response is missing the password, its id or the username".into()); }
+    Ok(json!({"password": secret, "id": id, "username": username, "base": base, "engine": engine,
+        "host": parsed.get("access_host_url").and_then(|v| v.as_str()).unwrap_or(""),
+        // Postgres roles connect to a database name of their own.
+        "database": parsed.get("database_name").and_then(|v| v.as_str()).unwrap_or(database)}))
+}
+pub async fn planetscale_revoke_password(config: &Value, password_id: &str) -> Result<(), String> {
+    let token = cfg(config, "parent");
+    let organization = cfg(config, "organization"); let database = cfg(config, "db"); let branch = cfg(config, "branch");
+    let engine = cfg(config, "engine");
+    if token.is_empty() || !key_ref_ok(password_id) { return Err("planetscale lease config or password id is missing".into()); }
+    path_segment(organization, "planetscale organization")?;
+    path_segment(database, "planetscale database")?;
+    path_segment(branch, "planetscale branch")?;
+    let base = lease_base(config, "https://api.planetscale.com/v1")?;
+    let url = format!("{}/organizations/{}/databases/{}/branches/{}/{}/{}", base, organization, database, branch, if engine == "postgres" { "roles" } else { "passwords" }, password_id);
+    let token_id = cfg(config, "parent_id");
+    let request = if token_id.is_empty() { http_client().delete(url).bearer_auth(token) } else { http_client().delete(url).header("Authorization", format!("{}:{}", token_id, token)) };
+    req_allow_missing(request).await.map_err(|e| format!("PlanetScale password revocation failed: {}", e))
+}
+/// Issue a per-sandbox Instabox SSH token, used as the SSH user name.
+/// `POST /v1/machines/{id}/ssh-tokens` in the published OpenAPI document.
+pub async fn instabox_create_ssh_token(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    let api_key = cfg(config, "api_key");
+    if api_key.is_empty() { return Err("instabox lease requires config.api_key".into()); }
+    if name.is_empty() || name.len() > 100 { return Err("instabox token name must be 1 to 100 characters".into()); }
+    let machine = cfg(config, "machine_id");
+    path_segment(machine, "instabox machine_id")?;
+    let base = lease_base(config, "https://api.instabox.sh/v1")?;
+    let body = json!({"name": name, "ttlSeconds": ttl_secs.clamp(1, 2_592_000)});
+    let text = req(http_client().post(format!("{}/machines/{}/ssh-tokens", base, machine)).header("X-API-Key", api_key).json(&body)).await
+        .map_err(|e| format!("Instabox SSH token creation failed: {}", e))?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| format!("Instabox SSH token response is not JSON: {}", e))?;
+    let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let host = parsed.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    if token.is_empty() || !key_ref_ok(id) || host.is_empty() { return Err("Instabox SSH token response is missing the token, its id or the host".into()); }
+    // A port is required to connect; the API always returns one, and a client
+    // must never be handed port 0.
+    let port = parsed.get("port").and_then(|v| v.as_u64()).filter(|p| (1..=65535).contains(p))
+        .ok_or("Instabox SSH token response is missing the SSH port")?;
+    let command = { let c = parsed.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if !c.is_empty() { c.to_string() } else if port == 22 { format!("ssh {}@{}", token, host) } else { format!("ssh -p {} {}@{}", port, token, host) } };
+    Ok(json!({"token": token, "id": id, "base": base, "host": host, "port": port, "command": command}))
+}
+pub async fn instabox_revoke_ssh_token(config: &Value, machine: &str, token_id: &str) -> Result<(), String> {
+    let api_key = cfg(config, "parent");
+    if api_key.is_empty() || !key_ref_ok(token_id) { return Err("instabox lease config or token id is missing".into()); }
+    path_segment(machine, "instabox machine_id")?;
+    let base = lease_base(config, "https://api.instabox.sh/v1")?;
+    req_allow_missing(http_client().delete(format!("{}/machines/{}/ssh-tokens/{}", base, machine, token_id)).header("X-API-Key", api_key)).await
+        .map_err(|e| format!("Instabox SSH token revocation failed: {}", e))
+}
 fn chrono_now() -> String { chrono_now_at(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64) }
 fn chrono_now_at(secs: i64) -> String {
     // YYYYMMDDTHHMMSSZ from unix time without chrono dep
@@ -5243,6 +5357,124 @@ mod tests {
         assert_eq!(body["key"], "CUSTOM_KEY");
         assert_eq!(body["path"], "/team");
         assert_eq!(body["provider"], "custom");
+    }
+
+    #[tokio::test]
+    async fn planetscale_lease_creates_and_revokes_a_vitess_password() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /organizations/acme/databases/app/branches/main/passwords", 201, r#"{"id":"pw_1","username":"user1","plain_text":"pscale_pw_child","access_host_url":"aws.connect.psdb.cloud","expires_at":"2030-01-01T00:00:00Z"}"#),
+            ("DELETE /organizations/acme/databases/app/branches/main/passwords/pw_1", 204, ""),
+        ]));
+        let config = json!({"service_token": "pscale_tkn", "organization": "acme", "database": "app", "branch": "main", "base_url": base});
+        let issued = planetscale_create_password(&config, "lease", 3600).await.expect("create");
+        assert_eq!(issued["password"], "pscale_pw_child");
+        assert_eq!(issued["id"], "pw_1");
+        assert_eq!(issued["username"], "user1");
+        assert_eq!(issued["host"], "aws.connect.psdb.cloud");
+        let stored = json!({"type": "planetscale", "base_url": base, "remote_id": "pw_1", "engine": "mysql",
+            "organization": "acme", "db": "app", "branch": "main", "parent": "pscale_tkn", "parent_id": ""});
+        planetscale_revoke_password(&stored, "pw_1").await.expect("revoke");
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/passwords")).expect("create call");
+        assert!(create.2.contains("Bearer pscale_tkn"), "service token must authenticate the create");
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["name"], "lease");
+        assert_eq!(body["role"], "readwriter");
+        assert_eq!(body["ttl"], 3600);
+        assert!(calls.iter().any(|(m, p, h, _)| m == "DELETE" && p.ends_with("/passwords/pw_1") && h.contains("Bearer pscale_tkn")));
+    }
+
+    #[tokio::test]
+    async fn planetscale_postgres_lease_maps_roles_and_accepts_a_gone_password() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /organizations/acme/databases/app/branches/main/roles", 201, r#"{"id":"role_1","username":"pscale_role_abc","password":"pg_child","access_host_url":"pg.psdb.cloud","database_name":"app_db"}"#),
+            ("DELETE /organizations/acme/databases/app/branches/main/roles/role_1", 404, r#"{"error":"not found"}"#),
+        ]));
+        let config = json!({"service_token": "pst_tok", "service_token_id": "svc_id", "organization": "acme", "database": "app",
+            "branch": "main", "engine": "postgres", "role": "reader", "base_url": base});
+        let issued = planetscale_create_password(&config, "lease", 60).await.expect("create");
+        assert_eq!(issued["password"], "pg_child");
+        assert_eq!(issued["database"], "app_db");
+        let stored = json!({"type": "planetscale", "base_url": base, "remote_id": "role_1", "engine": "postgres",
+            "organization": "acme", "db": "app", "branch": "main", "parent": "pst_tok", "parent_id": "svc_id"});
+        planetscale_revoke_password(&stored, "role_1").await.expect("a missing password is already revoked");
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/roles")).expect("create call");
+        assert!(create.2.contains("svc_id:pst_tok"), "older service tokens authenticate as id:token");
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["inherited_roles"][0], "pg_read_all_data");
+        assert_eq!(body["inherited_roles"].as_array().unwrap().len(), 1);
+        assert_eq!(body["ttl"], 60);
+        assert!(calls.iter().any(|(m, p, h, _)| m == "DELETE" && p.ends_with("/roles/role_1") && h.contains("svc_id:pst_tok")));
+    }
+
+    #[tokio::test]
+    async fn instabox_lease_creates_and_revokes_a_sandbox_ssh_token() {
+        let (base, calls) = start_mock_routes(mock_routes(&[
+            ("POST /machines/sb_1/ssh-tokens", 201, r#"{"id":"cn_1","token":"ibssh_abc","host":"box.instabox.sh","port":2222,"command":"ssh -p 2222 ibssh_abc@box.instabox.sh"}"#),
+            ("DELETE /machines/sb_1/ssh-tokens/cn_1", 204, ""),
+            ("DELETE /machines/sb_1/ssh-tokens/cn_2", 404, r#"{"error":"not found"}"#),
+        ]));
+        let config = json!({"api_key": "ibk_parent", "machine_id": "sb_1", "base_url": base});
+        let issued = instabox_create_ssh_token(&config, "lease", 3600).await.expect("create");
+        assert_eq!(issued["token"], "ibssh_abc");
+        assert_eq!(issued["id"], "cn_1");
+        assert_eq!(issued["host"], "box.instabox.sh");
+        assert_eq!(issued["port"], 2222);
+        assert_eq!(issued["command"], "ssh -p 2222 ibssh_abc@box.instabox.sh");
+        let stored = json!({"type": "instabox", "base_url": base, "remote_id": "cn_1", "machine_id": "sb_1", "parent": "ibk_parent"});
+        instabox_revoke_ssh_token(&stored, "sb_1", "cn_1").await.expect("revoke");
+        // A provider that already removed the token must not leave the lease active.
+        instabox_revoke_ssh_token(&stored, "sb_1", "cn_2").await.expect("a missing token is already revoked");
+        let calls = calls.lock().unwrap();
+        let create = calls.iter().find(|(m, p, _, _)| m == "POST" && p.ends_with("/ssh-tokens")).expect("create call");
+        assert!(create.2.to_lowercase().contains("x-api-key: ibk_parent"), "{}", create.2);
+        let body: Value = serde_json::from_str(&create.3).expect("json");
+        assert_eq!(body["name"], "lease");
+        assert_eq!(body["ttlSeconds"], 3600);
+        assert!(calls.iter().any(|(m, p, h, _)| m == "DELETE" && p.ends_with("/ssh-tokens/cn_1") && h.to_lowercase().contains("x-api-key: ibk_parent")));
+    }
+
+    #[tokio::test]
+    async fn instabox_requires_a_port_and_builds_a_missing_command() {
+        let (base, _) = start_mock_routes(mock_routes(&[
+            ("POST /machines/sb_1/ssh-tokens", 201, r#"{"id":"cn_9","token":"ibssh_abc","host":"box.instabox.sh"}"#),
+        ]));
+        let err = instabox_create_ssh_token(&json!({"api_key": "ibk", "machine_id": "sb_1", "base_url": base}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("SSH port"), "{}", err);
+        let (base, _) = start_mock_routes(mock_routes(&[
+            ("POST /machines/sb_1/ssh-tokens", 201, r#"{"id":"cn_9","token":"ibssh_abc","host":"box.instabox.sh","port":22}"#),
+        ]));
+        let issued = instabox_create_ssh_token(&json!({"api_key": "ibk", "machine_id": "sb_1", "base_url": base}), "lease", 60).await.expect("create");
+        assert_eq!(issued["command"], "ssh ibssh_abc@box.instabox.sh");
+    }
+
+    #[tokio::test]
+    async fn planetscale_and_instabox_leases_reject_incomplete_config() {
+        let err = planetscale_create_password(&json!({"organization": "acme"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("service_token"), "{}", err);
+        let err = planetscale_create_password(&json!({"service_token": "t", "organization": "acme", "database": "app", "branch": "feat/x"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("planetscale branch"), "{}", err);
+        let err = planetscale_create_password(&json!({"service_token": "t", "organization": "..", "database": "app", "branch": "main"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("planetscale organization"), "a dot segment would move the request: {}", err);
+        let err = planetscale_create_password(&json!({"service_token": "t", "organization": "acme", "database": "app", "branch": "main", "engine": "sqlite"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("engine must be mysql or postgres"), "{}", err);
+        let err = planetscale_create_password(&json!({"service_token": "t", "organization": "acme", "database": "app", "branch": "main", "role": "owner"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("role owner is not supported"), "{}", err);
+        let err = instabox_create_ssh_token(&json!({"machine_id": "sb_1"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("api_key"), "{}", err);
+        let err = instabox_create_ssh_token(&json!({"api_key": "ibk", "machine_id": "sb/1"}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("instabox machine_id"), "{}", err);
+        let err = instabox_revoke_ssh_token(&json!({"parent": ""}), "sb_1", "cn_1").await.unwrap_err();
+        assert!(err.contains("missing"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn planetscale_and_instabox_leases_refuse_a_loopback_base_url() {
+        let err = planetscale_create_password(&json!({"service_token": "t", "organization": "acme", "database": "app", "branch": "main", "base_url": "http://127.0.0.1:9", "require_public_host": true}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("public host"), "{}", err);
+        let err = instabox_create_ssh_token(&json!({"api_key": "ibk", "machine_id": "sb_1", "base_url": "http://localhost:9", "require_public_host": true}), "lease", 60).await.unwrap_err();
+        assert!(err.contains("public host"), "{}", err);
     }
 
 }

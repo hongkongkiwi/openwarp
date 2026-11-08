@@ -3900,6 +3900,33 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), creds.to_string().as_bytes()), "", &config_enc).await?;
         return Ok(j(json!({"id": lid, "credentials": creds, "expires_at": now()+ttl, "type":"aws_iam"})));
     }
+    if typ == "planetscale" {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+        let issued = integrations::planetscale_create_password(&config, &name, ttl).await.map_err(|e| bad(&e))?;
+        let password = issued["password"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
+        let stored = json!({"type": "planetscale", "base_url": issued["base"], "remote_id": remote_id, "engine": issued["engine"],
+            "organization": config.get("organization").and_then(|v| v.as_str()).unwrap_or(""),
+            "db": config.get("database").and_then(|v| v.as_str()).unwrap_or(""),
+            "branch": config.get("branch").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent": config.get("service_token").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent_id": config.get("service_token_id").and_then(|v| v.as_str()).unwrap_or("")});
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), stored.to_string().as_bytes());
+        complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes()), issued["username"].as_str().unwrap_or(""), &config_enc).await?;
+        return Ok(j(json!({"id": lid, "username": issued["username"], "password": password, "host": issued["host"], "database": issued["database"], "remote_id": remote_id, "expires_at": now()+ttl, "type": "planetscale"})));
+    }
+    if typ == "instabox" {
+        let config = body.get("config").cloned().unwrap_or(json!({}));
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+        let issued = integrations::instabox_create_ssh_token(&config, &name, ttl).await.map_err(|e| bad(&e))?;
+        let token = issued["token"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
+        let stored = json!({"type": "instabox", "base_url": issued["base"], "remote_id": remote_id,
+            "machine_id": config.get("machine_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "parent": config.get("api_key").and_then(|v| v.as_str()).unwrap_or("")});
+        let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), stored.to_string().as_bytes());
+        complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), token.as_bytes()), "", &config_enc).await?;
+        return Ok(j(json!({"id": lid, "value": token, "host": issued["host"], "port": issued["port"], "command": issued["command"], "remote_id": remote_id, "expires_at": now()+ttl, "type": "instabox"})));
+    }
 	    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") {
         let config = body.get("config").cloned().unwrap_or(json!({}));
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
@@ -3967,6 +3994,11 @@ async fn revoke_lease_remote(st: &S, lid: &str) -> Result<(), (StatusCode, Json<
                 crate::pglease::drop_role(&conn, &username).await.map_err(|_| bad("Postgres lease revocation failed"))?; }
             Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 crate::mysqllease::drop_account(&conn, &username).await.map_err(|_| bad("MySQL lease revocation failed"))?; }
+            Some("planetscale") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
+                integrations::planetscale_revoke_password(&cfg, remote).await.map_err(|e| bad(&e))?; }
+            Some("instabox") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
+                let machine = cfg.get("machine_id").and_then(|v| v.as_str()).unwrap_or("");
+                integrations::instabox_revoke_ssh_token(&cfg, machine, remote).await.map_err(|e| bad(&e))?; }
             Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
