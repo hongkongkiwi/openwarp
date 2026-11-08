@@ -162,7 +162,8 @@ async function consoleUI(opts = {}) {
   routes['/api/apps/app-b/envs'] = [{ id: 'env-other', name: 'Other environment', mode: 'sse' }];
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
-    localStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
+    // The workspace-memory key is console chrome state from the picker, not a product value.
+    localStorage: { getItem: key => key.startsWith('ow.org.') ? 'org-a' : '', setItem: (...args) => { if (!String(args[0]).startsWith('ow.org.')) storage.push(args); }, removeItem() {} },
     sessionStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
     navigator: { language: 'en', languages: ['en'], clipboard: { writeText: async text => clipboard.push(text) } },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },

@@ -10,6 +10,13 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const OLD: &str = "openwarp-isolated-old-password";
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
+// These cases run the request against an in-memory SQLite fixture, and a
+// rusqlite connection is not Send, so the panic isolation they rely on has to
+// come from a task local to this thread rather than tokio::spawn.
+async fn isolated<F>(f: F) -> Result<(), tokio::task::JoinError>
+where F: std::future::Future<Output = ()> + 'static {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async move { tokio::task::spawn_local(f).await }).await }
 struct Allow(Option<String>);
 impl Drop for Allow {
     fn drop(&mut self) { match &self.0 { Some(v) => std::env::set_var("OPENWARP_ALLOWED_DB_HOSTS", v), None => std::env::remove_var("OPENWARP_ALLOWED_DB_HOSTS") } }
@@ -108,7 +115,7 @@ async fn live_static_rotation_changes_postgres_login_and_matches_sse_secret() {
         assert!(f.pending(&rid).await.is_empty());
     };
     // Catch assertion panics so even a failing regression removes only its own role.
-    let outcome = tokio::spawn(result).await;
+    let outcome = isolated(result).await;
     role.cleanup().await; outcome.unwrap();
 }
 
@@ -118,9 +125,8 @@ async fn live_remote_success_local_failure_retains_same_pending_password_until_r
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone(); let connection = url.clone();
-    let f = Fixture::new().await;
-    let outcome = tokio::spawn(async move {
-        let rid = f.schedule(&connection,&worker.name).await;
+    let outcome = isolated(async move {
+        let f = Fixture::new().await; let rid = f.schedule(&connection,&worker.name).await;
         f.state.db().exec("CREATE TRIGGER reject_static_secret BEFORE UPDATE ON secrets BEGIN SELECT RAISE(ABORT,'injected local store failure'); END", &[]).await.unwrap();
         f.run(&rid).await;
         let pending = f.pending(&rid).await; assert!(!pending.is_empty(), "remote/local failure lost durable pending state");
@@ -147,8 +153,8 @@ async fn live_static_schedule_and_execution_reject_client_encrypted_sealed_and_d
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone();
-    let f = Fixture::new().await;
-    let outcome = tokio::spawn(async move {
+    let outcome = isolated(async move {
+        let f = Fixture::new().await;
         let rid = f.schedule(&url,&worker.name).await;
         let input = json!({"key":"DB_PASSWORD","interval_secs":3600,"config":{"kind":"postgres-static","connection":url,"username":worker.name}});
         for mode in ["e2e","delegated"] {

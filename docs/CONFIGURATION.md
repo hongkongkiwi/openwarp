@@ -20,6 +20,8 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | `OPENWARP_PG_POOL_SIZE` | `8` | Postgres connections per process, clamped to 1..64. Multiply by the replica count before sizing the database |
 | `OPENWARP_MYSQL_POOL_SIZE` | `8` | MySQL/MariaDB connections per process, clamped to 1..64 |
 | `OPENWARP_SECURE_COOKIES` | Unset | `1` forces Secure cookies; an HTTPS public URL also enables the flag |
+| `OPENWARP_REGION` | `global` | Jurisdiction label for this deployment, 1 to 32 characters of `a-z`, `0-9` or `-`. It describes the data in this deployment's own database and is not stored on tenant rows. An empty value is treated as unset |
+| `OPENWARP_REGIONS` | Unset | Optional `label=origin` list such as `global=https://global.example.com,eu=https://eu.example.com`. The sign-in card offers a hand-off to these origins. Origins must be HTTPS, or HTTP on a loopback host, carry no credentials, query or path, are published to the console in canonical `scheme://host[:port]` form, and startup fails unless the list names this deployment's own region |
 | `OPENWARP_METRICS_TOKEN` | Unset | Enables `/metrics`; callers must supply this bearer token |
 
 The SQLite path is relative to the process working directory unless absolute, for example `sqlite:///var/lib/openwarp/openwarp.db`. Create the parent directory and grant the service account access.
