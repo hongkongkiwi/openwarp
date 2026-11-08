@@ -54,6 +54,8 @@ class Element {
   set className(value) { this.setAttribute('class', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { value ? this.setAttribute('hidden', '') : this.removeAttribute('hidden'); }
+  get checked() { return this._checked ?? this.hasAttribute('checked'); }
+  set checked(value) { this._checked = Boolean(value); }
   get disabled() { return this.hasAttribute('disabled'); }
   set disabled(value) { value ? this.setAttribute('disabled', '') : this.removeAttribute('disabled'); }
   get value() {
@@ -203,8 +205,13 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-b/secrets': { secrets: [] },
     '/api/envs/env-c/secrets': { secrets: [] },
     '/api/envs/env-d/secrets': { secrets: [] },
+    '/api/envs/env-a/folders': { folders: [] },
+    '/api/envs/env-b/folders': { folders: [] },
+    '/api/envs/env-c/folders': { folders: [] },
+    '/api/envs/env-d/folders': { folders: [] },
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/ssh/cas': [],
+    '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/emergency': { locked: false },
     '/api/orgs/org-b/emergency': { locked: false },
     '/api/apps/app-a/emergency': { locked: false, direct_locked: false, workspace_locked: false },
@@ -215,6 +222,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
     ...opts.responses,
   };
+  const session = new Map();
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
     localStorage: {
@@ -222,6 +230,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       setItem: (key, value) => { store[key] = String(value); },
       removeItem: key => { delete store[key]; },
     },
+    sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
@@ -233,6 +242,13 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     fetch: async (url, options) => {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
+      const fixtureKey = call.method + ' ' + url;
+      if (Object.hasOwn(opts.responses || {}, fixtureKey)) {
+        const fixture = opts.responses[fixtureKey];
+        const response = typeof fixture === 'function' ? await fixture(call) : fixture;
+        const status = response.status ?? 200;
+        return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(response.body) };
+      }
       let body;
       if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
@@ -596,6 +612,20 @@ test('project lockdown leaves metadata readable and blocks secrets and changes',
   assert.match(ui.run('emergencyCard(true)'), /workspace lockdown also applies/);
 });
 
+test('a sibling project lockdown clears an open AI view without recursive polling', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/settings': { status: 403, body: { error: 'a project emergency lockdown is active' } },
+  } });
+  await ui.invoke("APP=null;ENV=null;VIEW='assistant';AI_REFS=[{key:'private-name'}];AI_PLAN={id:'pending'};$('view').innerHTML='<p>private-name</p>'");
+  ui.calls.length = 0;
+  await ui.invoke('refreshEmergency()');
+  assert.doesNotMatch(ui.el('view').textContent, /private-name/);
+  assert.match(ui.el('view').textContent, /Project emergency lockdown active/);
+  assert.equal(ui.run('AI_REFS.length'), 0);
+  assert.equal(ui.run('AI_PLAN'), null);
+  assert.equal(ui.calls.filter(c => c.url === '/api/orgs/org-a/ai/settings').length, 1, 'a single poll must not recursively trigger another probe');
+});
+
 test('an ended session removes plaintext and returns to sign-in', async () => {
   const ui = await consoleUI();
   await ui.invoke("E2E_KIT='private-kit';PKI_SELECTED.add('dev-a');PKI_CODE_RESULTS=[{code:'stale'}];PKI_HOOK={ca:'ca-a',render:PKI_RENDER};PKI_ATT={ca:'ca-a',render:PKI_RENDER};applyEmergency(true);sessionEnded()");
@@ -774,6 +804,188 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+const aiPolicy = {
+  enabled: true, allow_metadata: true, allow_actions: true, allow_local_search: false,
+  monitoring_enabled: false, can_admin: true, has_api_key: true,
+  endpoint: 'https://ai.test.invalid/v1/chat/completions', model: 'fixture-model',
+  allowed_endpoints: ['https://ai.test.invalid/v1/chat/completions'],
+  request_limit: 100, token_limit: 100000, max_output_tokens: 1024,
+};
+const folderOps = [{ kind: 'create_folder', env_id: 'env-a', path: '/reviewed-folder' }];
+const aiPlan = { id: 'plan-fixture', status: 'pending', operations: folderOps, expires_at: 2000000000 };
+function aiFixtures(policy = {}, extra = {}) {
+  return {
+    'GET /api/orgs/org-a/ai/settings': { body: { ...aiPolicy, ...policy } },
+    'GET /api/orgs/org-a/ai/context': { body: { envs: [{ id: 'env-a', app_id: 'app-a', app_name: 'First app', name: 'Development', mode: 'sse' }], integrations: [] } },
+    'GET /api/orgs/org-a/ai/drafts': { body: { drafts: [] } },
+    ...extra,
+  };
+}
+async function assistantUI(policy = {}, extra = {}) {
+  const ui = await consoleUI([saved], [], { responses: aiFixtures(policy, extra) });
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  return ui;
+}
+async function prepareFolder(ui) {
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-env').value = 'env-a';
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  await ui.click(ui.button(ui.el('modal'), /^Preview changes$/));
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test('assistant defaults off without context fetch, questions or inference', async () => {
+  const ui = await assistantUI({ enabled: false, allow_metadata: false, allow_actions: false });
+  assert.match(ui.el('view').textContent, /assistant is off/i);
+  assert.equal(ui.document.getElementById('ai-question'), null);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/settings']]);
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  for (const flag of ['enabled', 'allow_metadata', 'allow_actions']) assert.equal(ui.el('ai-set-' + flag).checked, false);
+  assert.deepEqual(ui.writes(), [], 'opening disabled assistant and policy must never infer or persist');
+});
+
+test('metadata search stays a GET without secret values or model requests', async () => {
+  const ui = await assistantUI({}, {
+    'GET /api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a': { body: { results: [{ id: saved.id, key: saved.key, path: saved.path, env_id: 'env-a', app_id: 'app-a' }] } },
+  });
+  ui.calls.length = 0;
+  ui.el('ai-search').value = 'DATABASE';
+  await ui.click(ui.el('ai-search-btn'));
+  assert.deepEqual(ui.calls, [{ method: 'GET', url: '/api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a', body: undefined }]);
+  assert.match(ui.el('ai-search-results').textContent, /DATABASE_URL/);
+  assert.ok(!ui.el('view').textContent.includes(saved.value));
+  assert.ok(!JSON.stringify(ui.calls).includes(saved.value), 'stored secret values must not be assembled into search requests');
+});
+
+test('assistant answers and source labels render hostile model text without HTML elements', async () => {
+  const hostile = '<img src=x onerror="alert(1)"><script>bad()</script>';
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: hostile, citations: [{ id: 'source-fixture', key: hostile, path: hostile, app_name: hostile, env_name: hostile, app_id: 'app-a', env_id: 'env-a' }], suggested_operations: [] } },
+  });
+  ui.el('ai-question').value = 'Where is the database key?';
+  await ui.click(ui.el('ai-ask'));
+  assert.ok(ui.el('ai-answer').textContent.includes(hostile), 'escaping must preserve the literal answer and citation text');
+  assert.equal(ui.el('ai-answer').querySelectorAll('img,script').length, 0, 'model and citation content must never create markup');
+  assert.ok(ui.el('ai-answer').querySelectorAll('button').every(b => /^aiOpenRef\(\d+\)$/.test(b.getAttribute('onclick'))), 'source actions use local references, not model-authored handlers');
+});
+
+test('import content uses its dedicated field and never becomes the model question', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: 'Use a service folder.', citations: [], suggested_operations: [] } },
+  });
+  ui.el('ai-task').value = 'import';
+  await ui.invoke('aiTaskChanged()');
+  assert.ok(!hidden(ui.el('ai-import-wrap')));
+  assert.match(ui.el('ai-disclosure').textContent, /do not type passwords, keys, or connection strings/i);
+  const importText = 'DATABASE_URL=fake-import-private-value\nAPI_KEY=fake-import-key';
+  ui.el('ai-question').value = 'Suggest folder names for this import';
+  ui.el('ai-import').value = importText;
+  await ui.click(ui.el('ai-ask'));
+  const request = ui.calls.find(c => c.method === 'POST' && c.url.endsWith('/ai/chat'));
+  assert.deepEqual(request.body, { message: 'Suggest folder names for this import', task: 'import', env_id: 'env-a', import_text: importText });
+  assert.ok(!request.body.message.includes('fake-import-'));
+  assert.ok(!request.body.message.includes(saved.value));
+  assert.equal(ui.el('ai-import').value, '', 'discard raw import input after a successful response');
+});
+
+test('folder setup previews exact operations and executes only after Confirm with a minimal body', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/plans/plan-fixture/execute': { body: { results: [{ kind: 'create_folder', status: 'created' }] } },
+  });
+  ui.calls.length = 0;
+  await prepareFolder(ui);
+  assert.deepEqual(ui.writes(), [{ method: 'POST', url: '/api/orgs/org-a/ai/plans', body: { operations: folderOps } }]);
+  assert.match(ui.el('ai-plan').textContent, /reviewed-folder/);
+  assert.equal(ui.el('ai-plan').querySelectorAll('input,textarea,select').length, 0, 'preview operations are not editable');
+  await ui.click(ui.el('ai-confirm'));
+  const execute = ui.calls.filter(c => c.url.endsWith('/execute'));
+  assert.deepEqual(execute, [{ method: 'POST', url: '/api/orgs/org-a/ai/plans/plan-fixture/execute', body: { confirm: true } }]);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 1, 'repeated activation cannot reuse the consumed preview');
+});
+
+test('workspace switches discard previews and stale chat responses cannot populate the new workspace', async () => {
+  const pending = deferred();
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/chat': () => pending.promise,
+    'GET /api/orgs/org-b/ai/settings': { body: { ...aiPolicy, enabled: false } },
+  });
+  await prepareFolder(ui);
+  ui.el('ai-question').value = 'Ask the old workspace';
+  const asking = ui.run('aiAsk()');
+  await ui.settle();
+  ui.el('orgs').value = 'org-b';
+  await ui.invoke('switchOrg()');
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  const newWorkspace = ui.el('view').textContent;
+  pending.resolve({ body: { answer: 'STALE_ORG_A_PRIVATE_RESPONSE', citations: [], suggested_operations: folderOps } });
+  await asking;
+  await ui.settle();
+  assert.equal(ui.el('view').textContent, newWorkspace);
+  assert.ok(!ui.el('view').textContent.includes('STALE_ORG_A_PRIVATE_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0, 'old workspace preview must no longer execute');
+});
+
+test('reset discards a preview and a pending plan response cannot restore it', async () => {
+  const pending = deferred();
+  let requests = 0;
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': () => ++requests === 1 ? { body: aiPlan } : pending.promise,
+  });
+  await prepareFolder(ui);
+  await ui.invoke('aiReset(); aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  const planning = ui.run("aiPreviewSetup('create_folder')");
+  await ui.settle();
+  await ui.invoke('aiReset(); closeModal()');
+  pending.resolve({ body: { ...aiPlan, id: 'stale-plan', operations: [{ ...folderOps[0], path: '/STALE_PLAN_RESPONSE' }] } });
+  await planning;
+  await ui.settle();
+  assert.ok(!ui.el('view').textContent.includes('STALE_PLAN_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+});
+
+test('settings preserve a saved provider key when blank and clear it only explicitly', async () => {
+  const ui = await assistantUI({}, { 'PUT /api/orgs/org-a/ai/settings': { body: { ok: true } } });
+  for (const clear of [false, true]) {
+    await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+    assert.equal(ui.el('ai-set-key').value, '', 'saved key must never populate the password field');
+    ui.el('ai-set-clear').checked = clear;
+    await ui.click(ui.el('ai-settings-save'));
+    const request = ui.calls.filter(c => c.method === 'PUT' && c.url.endsWith('/ai/settings')).at(-1);
+    assert.equal(Object.hasOwn(request.body, 'api_key'), false, 'blank replacement must be omitted rather than clearing the key');
+    assert.equal(request.body.clear_api_key, clear);
+  }
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  ui.el('ai-set-key').value = 'fake-new-provider-key';
+  await ui.click(ui.el('ai-settings-save'));
+  assert.equal(ui.calls.filter(c => c.method === 'PUT').at(-1).body.api_key, 'fake-new-provider-key');
+});
+
+test('security insights display admin authorization failures instead of an empty findings claim', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/findings': { status: 403, body: { error: 'Workspace administrator access required.' } },
+  } });
+  await ui.click(ui.document.querySelector('[data-nav="insights"]'));
+  assert.match(ui.el('view').textContent, /Workspace administrator access required/);
+  assert.equal(ui.el('view').getAttribute('role'), 'alert');
+  assert.doesNotMatch(ui.el('view').textContent, /No findings/);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/findings']]);
 });
 
 test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {

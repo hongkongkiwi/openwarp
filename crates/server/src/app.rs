@@ -11,6 +11,7 @@ use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, middlew
 #[cfg(not(target_arch = "wasm32"))]
 use axum::{extract::{WebSocketUpgrade, ws::{Message, WebSocket}}};
 use db::{Db, Row};
+#[path = "workspaces.rs"] mod workspaces;
 use openwarp_crypto as oc;
 use risaml::{
     AcsEndpoint, AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, FormField,
@@ -63,6 +64,8 @@ pub struct AppState {
     pub(crate) pub_url: String,
     master: std::sync::RwLock<[u8; 32]>,
     #[cfg(not(target_arch="wasm32"))]
+    pub(crate) ai_credentials: tokio::sync::Mutex<()>,
+    #[cfg(not(target_arch="wasm32"))]
     transit_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(not(target_arch="wasm32"))]
     lifecycle: Arc<tokio::sync::RwLock<()>>,
@@ -74,7 +77,7 @@ pub struct AppState {
 }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
+    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: transit::Lifecycle::default(), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), live })
 }
 /// Install the validated bridge before serving requests on either runtime.
 pub fn install_kms(st: &S, kms: Option<kms::Kms>) { assert!(st.kms.set(kms).is_ok(), "KMS already initialized"); }
@@ -279,12 +282,12 @@ impl AppState {
     async fn require_app_running(&self, app: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let (_, direct, workspace) = self.app_emergency(app).await?;
         if direct || workspace { return Err(err(StatusCode::FORBIDDEN, "project emergency lockdown is active")); } Ok(()) }
-    async fn require_org_running(&self, org: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) async fn require_org_running(&self, org: &str) -> Result<(), (StatusCode, Json<Value>)> {
         self.require_running(org).await?;
         if self.db.one("SELECT id FROM apps WHERE org_id=? AND emergency_locked<>0 LIMIT 1", &[json!(org)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::FORBIDDEN, "a project emergency lockdown is active")); } Ok(()) }
     async fn require_env_running(&self, env: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let (_, app) = self.env_org_app(env).await?; self.require_app_running(&app).await }
-    async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
+    pub(crate) async fn env_key(&self, env_id: &str) -> Result<[u8;32], (StatusCode, Json<Value>)> {
         self.require_env_running(env_id).await?;
         let row = self.db.one("SELECT env_key_wrapped FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         let wrapped = db::s(&row, "env_key_wrapped");
@@ -363,7 +366,7 @@ impl AppState {
     async fn org_role(&self, org: &str, user: &str) -> Option<String> {
         self.db.one("SELECT role FROM org_members WHERE org_id=? AND user_id=?", &[json!(org), json!(user)]).await.ok().flatten().map(|r| db::s(&r, "role"))
     }
-    async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) async fn check_scope(&self, headers: &HeaderMap, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""); let token = auth.strip_prefix("Bearer ").unwrap_or("");
         self.check_scope_by_hash(&oc::hash_token(token), env_id).await }
     async fn check_scope_by_hash(&self, hash: &str, env_id: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -380,11 +383,11 @@ impl AppState {
     // every owner-only grant has to test permissions, not the label.
     async fn role_privileged(&self, org: &str, role: &str) -> bool {
         self.role_perms(org, role).await.iter().any(|p| p == "*" || p == "org:admin") }
-    async fn check_perm(&self, org: &str, user: &str, action: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) async fn check_perm(&self, org: &str, user: &str, action: &str) -> Result<(), (StatusCode, Json<Value>)> {
         let role = self.require_org(org, user).await?;
         let perms = self.role_perms(org, &role).await;
         if perms.iter().any(|p| p == "*" || p == action) { Ok(()) } else { Err(err(StatusCode::FORBIDDEN, &format!("role {} lacks permission {}", role, action))) } }
-    async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
+    pub(crate) async fn check_admin(&self, org: &str, user: &str) -> Result<(), (StatusCode, Json<Value>)> { self.check_perm(org, user, "org:admin").await }
     // Counters live in the database so a restart, or a second replica behind a
     // load balancer, does not reset an attacker's budget.
     // MySQL keys rate_limits on a VARCHAR(255), and an email-length suffix can
@@ -429,7 +432,7 @@ impl AppState {
             Ok(None) => self.db.one("SELECT id FROM identities WHERE id=?", &[json!(uid)]).await.ok().flatten().is_some(),
             Err(_) => false,
         } }
-    async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    pub(crate) async fn require_org(&self, org: &str, user: &str) -> Result<String, (StatusCode, Json<Value>)> {
         if let Some(r) = self.org_role(org, user).await { return Ok(r); }
         // machine identities belong to an org directly
         if let Ok(Some(idn)) = self.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(user), json!(org)]).await { self.require_running(org).await?; return Ok(db::s(&idn, "role")); }
@@ -438,7 +441,7 @@ impl AppState {
         let row = self.db.one("SELECT a.org_id AS org_id, e.app_id AS app_id FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
         Ok((db::s(&row, "org_id"), db::s(&row, "app_id")))
     }
-    async fn require_env(&self, env_id: &str, user: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    pub(crate) async fn require_env(&self, env_id: &str, user: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
         let (org, app) = self.env_org_app(env_id).await?; self.require_app_running(&app).await?; let role = self.require_org(&org, user).await?;
         if role == "owner" || role == "admin" { return Ok((org, app)); }
         let env = self.db.one("SELECT restricted FROM envs WHERE id=?", &[json!(env_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
@@ -497,7 +500,7 @@ impl AppState {
 // included in the key/path/tags fields: restore and point-in-time recovery copy
 // those, and a version binding would make the copy unreadable. Value and
 // comment are bound to the version and re-encrypted when restored.
-fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
+pub(crate) fn secret_aad(env: &str, sid: &str, field: &str) -> Vec<u8> { format!("ow-secret:v2|{}|{}|{}", env, sid, field).into_bytes() }
 // A deterministic index is still needed to look a secret up. HMAC under the
 // environment key removes the offline dictionary attack a bare SHA-256 allows.
 fn key_index(env_key: &[u8;32], path: &str, key: &str) -> String { hmac_hex(env_key, format!("ow-key-index:v1|{}|{}", path, key).as_bytes()) }
@@ -507,7 +510,7 @@ fn lease_aad(env: &str, lid: &str, field: &str) -> Vec<u8> { format!("ow-lease:v
 fn proposal_aad(env: &str, pid: &str, field: &str) -> Vec<u8> { format!("ow-proposal:v1|{}|{}|{}", env, pid, field).into_bytes() }
 // Version rows are bound to their version, but value and comment ciphertext
 // written before that binding (or by an earlier release) must stay readable.
-fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decrypt_secret_value(key: &[u8;32], env: &str, sid: &str, field: &str, version: i64, payload: &str) -> Result<Vec<u8>, String> {
     if payload.starts_with("ow2:") {
         if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad_v(env, sid, field, version), payload) { return Ok(v); }
         if let Ok(v) = oc::decrypt_symmetric_aad(key, &secret_aad(env, sid, field), payload) { return Ok(v); }
@@ -536,13 +539,13 @@ async fn register(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, J
     // A password signup proves nothing about the address until the link is opened.
     // The instance-owner claim in particular waits for verification.
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,0)", &[json!(uid), json!(r.email.to_lowercase()), json!(hash), json!(kp.public), json!(wrapped), json!(now())]).await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
-    let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", r.email)), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let oid = workspaces::default_workspace(&st, &uid,  &r.email).await?;
     mfa::note_password_login(&st, &uid).await;
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&r.email, "verify", &[("link", &link), ("email", &r.email)]).await;
-    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": kp.public, "recovery_kit": kp.secret_b64(), "verification_required": true}))))
+    let mut out = json!({"user_id":uid,"public_key":kp.public,"recovery_kit":kp.secret_b64(),"verification_required":true});
+    if let Some(oid) = oid { out["org_id"] = json!(oid); } Ok((HeaderMap::new(),j(out)))
 }
 pub(crate) async fn make_session(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> { let t = oc::random_token("ow"); st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(&t)), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?; Ok(t) }
 async fn login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<AuthReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
@@ -625,8 +628,7 @@ async fn register_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,0,2,?,?,?,?)",
         &[json!(&uid), json!(&email), json!(hash), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)])
         .await.map_err(|_| err(StatusCode::CONFLICT, "an account with this email already exists"))?;
-    let oid = id(); st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(&oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    let oid = workspaces::default_workspace(&st, &uid, &email).await?;
     claim_instance_owner(&st, &uid).await;
     // A v2 account never proves a password, so factor management must not ask
     // for one; the session or auth-key proof is the credential.
@@ -634,7 +636,8 @@ async fn register_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap
     let link_token = issue_auth_token(&st, &uid, "verify", 86400).await;
     let link = format!("{}/api/auth/verify?token={}", issuer(&st, &h), link_token);
     send_template(&email, "verify", &[("link", &link), ("email", &email)]).await;
-    Ok((HeaderMap::new(), j(json!({"user_id": uid, "org_id": oid, "public_key": r.public_key, "verification_required": true})))) }
+    let mut out = json!({"user_id":uid,"public_key":r.public_key,"verification_required":true});
+    if let Some(oid) = oid { out["org_id"] = json!(oid); } Ok((HeaderMap::new(),j(out))) }
 #[derive(Deserialize, Default)] struct ChallengeReq { email: String }
 async fn auth_challenge(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<ChallengeReq>) -> Res {
     let key = format!("challenge:{}", addr);
@@ -717,8 +720,10 @@ async fn me_auth(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT auth_version,kdf_salt,kdf_iterations,kdf_algo,pubkey,wrapped_privkey FROM users WHERE id=?", &[json!(&uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("no user"))?;
     Ok(j(json!({"auth_version": db::n(&row,"auth_version"), "kdf_salt": db::s(&row,"kdf_salt"), "kdf_iterations": db::n(&row,"kdf_iterations"), "kdf_algo": db::s(&row,"kdf_algo"), "public_key": db::s(&row,"pubkey"), "wrapped_privkey": db::s(&row,"wrapped_privkey")}))) }
-#[derive(Deserialize, Default)] struct InviteV2Req { token: String, salt: String, iterations: i64, algo: String, auth_key: String, public_key: String, wrapped_privkey: String }
-async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+#[derive(Deserialize, Default)] struct InviteV2Req { token: String, #[serde(default)] salt: String, #[serde(default)] iterations: i64, #[serde(default)] algo: String, #[serde(default)] auth_key: String, #[serde(default)] public_key: String, #[serde(default)] wrapped_privkey: String }
+async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
+    if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
     let rl = format!("invite-accept:{}", addr);
     if !st.rate_ok(&rl, 10, 3600).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many invite attempts; try again later")); }
@@ -728,18 +733,21 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r)
     if auth_key.len() != 32 { return Err(bad("auth_key must decode to 32 bytes")); }
     if !valid_key32(&r.public_key) { return Err(bad("public_key must be 32-byte base64")); }
     if !valid_wrapped_key(&r.wrapped_privkey) { return Err(bad("wrapped_privkey must be an owv2 payload")); }
-    let hash = oc::hash_token(r.token.trim());
-    let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
-    let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
+    let email = db::s(&row,"email"); let org = db::s(&row,"org_id"); let role = db::s(&row,"role");
     st.require_running(&org).await?;
+    // The consent path above already handled an existing matching account; a
+    // row here means nobody matching is signed in, so refuse instead of
+    // colliding with the users.email unique index.
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
     let uid = id();
     let auth_key_enc = oc::encrypt_symmetric_aad(&st.master(), &auth_key_aad(&uid), &auth_key);
     let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)",
-        &[json!(&uid), json!(&email), json!(pass), json!(&r.public_key), json!(&r.wrapped_privkey), json!(now()), json!(&r.salt), json!(r.iterations), json!(&r.algo), json!(auth_key_enc)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    workspaces::invite_batch(&st,&row,&[],&[
+        workspaces::consume(&st,&row,&r.token).await?,
+        ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)".into(),
+            vec![json!(&uid),json!(&email),json!(pass),json!(&r.public_key),json!(&r.wrapped_privkey),json!(now()),json!(&r.salt),json!(r.iterations),json!(&r.algo),json!(auth_key_enc)]),
+        ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(),vec![json!(&org),json!(&uid),json!(&role)]),
+    ],&[0,1,2]).await?;
     claim_instance_owner(&st, &uid).await;
     st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
@@ -811,12 +819,18 @@ async fn list_orgs(State(st): State<S>, h: HeaderMap) -> Res { let uid = st.toke
     let human = emergency_session(&st, &h).await.is_ok();
     let rows = st.db.query("SELECT o.id,o.name,o.ip_allowlist,m.role FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=? AND (?=1 OR o.emergency_locked=0)", &[json!(uid), json!(if human { 1 } else { 0 })]).await.map_err(|e| bad(&e))?;
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
-async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; let oid = id();
-    user_guarded_batch(&st, &[&uid], &[
+async fn create_org(State(st): State<S>, h: HeaderMap, Json(r): Json<NameReq>) -> Res { let uid = workspaces::human(&st,&h).await?; let oid = id();
+    if r.name.trim().is_empty() { return Err(bad("workspace name required")); }
+    if !workspaces::creation_open(&st).await? { return Err(err(StatusCode::FORBIDDEN,"workspace creation is disabled; accept an invitation instead")); }
+    let mut stmts = vec![workspaces::policy_lock()];
+    if crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_err() { stmts.push(workspaces::creation_guard()); }
+    let mut checked: Vec<usize> = (0..stmts.len()).collect(); let offset = stmts.len();
+    stmts.extend([
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&uid)]),
         ("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)".into(), vec![json!(&oid), json!(r.name), json!(now())]),
         ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')".into(), vec![json!(&oid), json!(&uid)]),
-    ], &[0, 2]).await?; Ok(j(json!({"id": oid}))) }
+    ]); checked.extend([offset,offset+2]);
+    user_guarded_batch(&st, &[&uid], &stmts, &checked).await?; Ok(j(json!({"id": oid}))) }
 async fn update_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     if r.name.trim().is_empty() { return Err(bad("organisation name required")); }
@@ -857,6 +871,9 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         format!("DELETE FROM rotation_schedules WHERE env_id IN ({})", envs),
         format!("DELETE FROM env_members WHERE env_id IN ({})", envs),
         format!("DELETE FROM team_env_grants WHERE env_id IN ({})", envs),
+        // AI folders are environment descendants; drop them before the envs
+        // they reference so teardown stays inside the guarded transaction.
+        format!("DELETE FROM folders WHERE env_id IN ({})", envs),
         format!("DELETE FROM secrets WHERE env_id IN ({})", envs),
         format!("DELETE FROM envs WHERE app_id IN ({})", apps),
         format!("DELETE FROM app_members WHERE app_id IN ({})", apps),
@@ -889,6 +906,15 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         "DELETE FROM identities WHERE org_id=?".to_string(),
         "DELETE FROM audit WHERE org_id=?".to_string(),
         "DELETE FROM live_events WHERE org_id=?".to_string(),
+        // AI records hold the wrapped BYOK provider key, plans, drafts and
+        // finding state for this org only; nothing may outlive the workspace.
+        "DELETE FROM ai_settings WHERE org_id=?".to_string(),
+        "DELETE FROM ai_plans WHERE org_id=?".to_string(),
+        "DELETE FROM ai_activity WHERE org_id=?".to_string(),
+        "DELETE FROM ai_finding_states WHERE org_id=?".to_string(),
+        "DELETE FROM ai_finding_history WHERE org_id=?".to_string(),
+        "DELETE FROM ai_usage WHERE org_id=?".to_string(),
+        "DELETE FROM integration_drafts WHERE org_id=?".to_string(),
         "DELETE FROM org_members WHERE org_id=?".to_string(),
         "DELETE FROM orgs WHERE id=?".to_string(),
     ];
@@ -904,7 +930,13 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     stmts.extend(statements.into_iter().map(|sql| (sql, vec![json!(&oid)])));
     for key in ["oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_redirect_uri", "oidc_auto_provision", "oidc_allowed_domains", "audit_webhook"] {
         stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("{}:{}", key, oid))])); }
-    user_guarded_batch(&st, &[&uid], &stmts, &[0, 1, 2, 3]).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed or has unresolved leases or rotations; refresh and reconcile before deleting it") } else { e })?;
+    stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("ai:background:{}", oid))]));
+    let mut guarded = vec![workspaces::policy_lock()];
+    let guard = if crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_ok() {
+        if workspaces::creation_open(&st).await? { "UPDATE meta SET v=v WHERE k='workspace_policy_lock'" } else { "UPDATE meta SET v=v WHERE k='workspace_policy_lock' AND (SELECT COUNT(*) FROM orgs)>1" }
+    } else { "UPDATE meta SET v=v WHERE k='workspace_creation_open' AND (v<>'0' OR (SELECT COUNT(*) FROM orgs)>1)" };
+    guarded.push((guard.into(),vec![])); guarded.extend(stmts);
+    user_guarded_batch(&st, &[&uid], &guarded, &[0, 1, 2, 3, 4, 5]).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed, has unresolved leases or rotations, or is the last workspace while creation is disabled; refresh, reconcile, or enable creation first") } else { e })?;
     st.audit("", "", "", &uid, "org.delete", &format!("{} ({})", name, oid)).await;
     Ok(j(json!({"deleted":true, "workspace":name}))) }
 async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
@@ -962,41 +994,39 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     // privilege read cannot race a role being created between the two checks.
     if st.role_privileged(&oid, &new_role).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can grant a role with admin rights")); }
     if let Some(target) = st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))? {
-        let tid = db::s(&target, "id");
-        if st.org_role(&oid, &tid).await.is_some() { return Err(err(StatusCode::CONFLICT, "user is already a member")); }
-        if new_role == "owner" {
-            user_guarded_batch(&st, &[&uid, &tid], &[
-                ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&tid)]),
-                ("UPDATE org_members SET role=role WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
-                ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')".into(), vec![json!(&oid), json!(&tid)]),
-            ], &[0, 1, 2]).await?;
-        } else {
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(oid), json!(tid), json!(new_role)]).await.map_err(|e| bad(&e))?;
-        }
-        st.audit(&oid, "", "", &uid, "member.invite", &email).await; return Ok(j(json!({"ok": true, "added": true})));
+        if st.org_role(&oid,&db::s(&target,"id")).await.is_some() { return Err(err(StatusCode::CONFLICT,"user is already a member")); }
     }
-    // No account yet: issue a single-use invite the invitee redeems with a
-    // password, or with Google/GitHub when those providers are configured.
-    let token = oc::random_token("inv"); let expires = now() + 7 * 86400;
-    let _ = st.db.exec("DELETE FROM invites WHERE email=? AND org_id=? AND accepted=0", &[json!(&email), json!(&oid)]).await;
-    st.db.exec("INSERT INTO invites(token_hash,email,org_id,role,created_at,expires_at) VALUES(?,?,?,?,?,?)", &[json!(oc::hash_token(&token)), json!(&email), json!(&oid), json!(&new_role), json!(now()), json!(expires)]).await.map_err(|e| bad(&e))?;
-    st.audit(&oid, "", "", &uid, "member.invite", &email).await;
-    Ok(j(json!({"ok": true, "invite_token": token, "expires_at": expires, "note": "single use, valid 7 days; the invitee redeems it at POST /api/auth/accept-invite or by signing in with a configured social provider"}))) }
-#[derive(Deserialize)] struct InviteReq { token: String, password: String }
-async fn accept_invite(State(st): State<S>, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
-    if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
-    if r.password.len() < 8 { return Err(bad("password (>=8 chars) required")); }
-    let hash = oc::hash_token(r.token.trim());
-    let row = st.db.one("SELECT * FROM invites WHERE token_hash=? AND accepted=0 AND expires_at>?", &[json!(&hash), json!(now())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invite is invalid or expired"))?;
-    let email = db::s(&row, "email"); let org = db::s(&row, "org_id"); let role = db::s(&row, "role");
+    if !valid_email(&email) { return Err(bad("email required")); }
+    // The invitee redeems a single-use link with a password, a v2 key, or a
+    // configured provider; issuing it never adds membership by itself.
+    let token = oc::random_token("inv"); let expires = now()+7*86400; let iid = id();
+    st.db.batch(&[
+        ("DELETE FROM invites WHERE email=? AND org_id=? AND accepted=0".into(),vec![json!(&email),json!(&oid)]),
+        ("INSERT INTO invites(id,token_hash,email,org_id,role,invited_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)".into(),vec![json!(&iid),json!(oc::hash_token(&token)),json!(&email),json!(&oid),json!(&new_role),json!(&uid),json!(now()),json!(expires)]),
+    ]).await.map_err(|e| bad(&e))?;
+    st.audit(&oid,"","",&uid,"member.invite",&email).await;
+    Ok(j(workspaces::share(&st,&iid,&token,expires))) }
+
+#[derive(Deserialize)] struct InviteReq { token: String, #[serde(default)] password: String }
+async fn accept_invite(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
+    if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
+    if !auth_enabled(&st,"password").await { return Err(err(StatusCode::FORBIDDEN,"password sign-in is disabled; sign in with a configured provider to join")); }
+    if r.password.len()<8 { return Err(bad("password (>=8 chars) required")); }
+    let email = db::s(&row,"email"); let org = db::s(&row,"org_id"); let role = db::s(&row,"role");
     st.require_running(&org).await?;
+    // The consent path above already handled an existing matching account; a
+    // row here means nobody matching is signed in, so refuse instead of
+    // colliding with the users.email unique index.
     if st.db.one("SELECT id FROM users WHERE email=?", &[json!(&email)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "an account with this email already exists; sign in instead")); }
     let kp = oc::Keypair::generate(); let uid = id();
     // The invite token reached this address, which is the proof a password
     // signup would otherwise obtain by email.
-    st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(&email), json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&r.password, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|e| bad(&e))?;
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(&org), json!(&uid), json!(&role)]).await.map_err(|e| bad(&e))?;
-    st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    workspaces::invite_batch(&st,&row,&[],&[
+        workspaces::consume(&st,&row,&r.token).await?,
+        ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)".into(),vec![json!(&uid),json!(&email),json!(oc::hash_password(&r.password).map_err(|e| bad(&e))?),json!(kp.public),json!(oc::wrap_with_password(&r.password,kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?),json!(now())]),
+        ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(),vec![json!(&org),json!(&uid),json!(&role)]),
+    ],&[0,1,2]).await?;
     claim_instance_owner(&st, &uid).await;
     st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
     let token = make_session(&st, &uid).await?;
@@ -1060,6 +1090,7 @@ async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) 
         "DELETE FROM wrap_tokens WHERE env_id=?",
         "DELETE FROM tokens WHERE env_id=?",
         "DELETE FROM team_env_grants WHERE env_id=?",
+        "DELETE FROM folders WHERE env_id=?",
         "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id=?)",
         "DELETE FROM secrets WHERE env_id=?",
@@ -1132,6 +1163,7 @@ async fn delete_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) 
         "DELETE FROM wrap_tokens WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM tokens WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM team_env_grants WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
+        "DELETE FROM folders WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
         "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM overrides WHERE secret_id IN (SELECT id FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?))",
         "DELETE FROM secrets WHERE env_id IN (SELECT id FROM envs WHERE app_id=?)",
@@ -1204,6 +1236,7 @@ async fn list_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>
     let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(500).clamp(1, 1000);
     let offset = q.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let page: Vec<Value> = items.iter().skip(offset).take(limit).map(|x| x.2.clone()).collect();
+    crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"secret.list","",page.len()).await;
     Ok(j(json!({"secrets": page, "total": total, "limit": limit, "offset": offset}))) }
 async fn list_tags(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_scope(&h, &eid).await?;
     let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
@@ -1500,6 +1533,7 @@ async fn export_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, 
     let omitted = total - visible.len();
     let text = visible.iter().map(|(k,v,_)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n");
     st.audit(&org,&app,&eid,&uid,"secret.export",&format!("{} secrets, {} sealed omitted", visible.len(), omitted)).await;
+    crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"secret.export","",visible.len()).await;
     Ok(j(json!({"text": text, "secrets": visible.iter().map(|x| x.2.clone()).collect::<Vec<_>>(), "omitted_sealed": omitted}))) }
 // An environment-scoped token cannot list workspaces, so it needs a way to name
 // the one environment it is confined to. The path also passes scope_path_ok.
@@ -1544,6 +1578,7 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
     let scopes = scopes.join(" ");
     let expires_at = if r.expires_in > 0 { now() + r.expires_in.clamp(60, 365 * 86400) } else { 0 };
     st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+    crate::ai::activity(&st,(&org,&aid,&r.env_id),&uid,&h,"token.create",&tid,1).await;
     Ok(j(json!({"id": tid, "token": token, "expires_at": expires_at, "scopes": scopes}))) }
 async fn audit_list(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
     let limit = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
@@ -1688,13 +1723,16 @@ async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<S
     let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, &config).await? }
         else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
     st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).await.map_err(|e| bad(&e))?;
+    crate::ai::activity(&st,(&org,"",&eid),&uid,&h,"integration.create",&iid,1).await;
     Ok(j(json!({"id": iid}))) }
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let rows = st.db.query("SELECT id,env_id,kind,name,created_at FROM integrations WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn sync_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
-    let msg = sync_one(&st, &iid, &uid).await?; Ok(j(json!({"ok": true, "detail": msg}))) }
+    let result = sync_one(&st, &iid, &uid).await;
+    crate::ai::activity(&st,(&org,"",&db::s(&row,"env_id")),&uid,&h,if result.is_ok() { "integration.sync" } else { "integration.sync_failed" },&iid,1).await;
+    let msg = result?; Ok(j(json!({"ok": true, "detail": msg}))) }
 async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -1704,7 +1742,9 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let key = st.env_key(&eid).await?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, &iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
-    if integrations::has_test(&kind) { let msg = integrations::test(&kind, &config).await.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
+    if integrations::has_test(&kind) { let result = integrations::test(&kind, &config).await;
+        crate::ai::activity(&st,(&org,"",&eid),&uid,&h,if result.is_ok() { "integration.test" } else { "integration.test_failed" },&iid,1).await;
+        let msg = result.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
     Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
 async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
@@ -1718,7 +1758,8 @@ async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
         let enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, config).await? }
             else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
         st.db.exec("UPDATE integrations SET config_enc=? WHERE id=?", &[json!(enc), json!(&iid)]).await.map_err(|e| bad(&e))?; }
-    st.audit(&org,&app,&eid,&uid,"integration.update",&iid).await; Ok(j(json!({"ok": true}))) }
+    st.audit(&org,&app,&eid,&uid,"integration.update",&iid).await;
+    crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"integration.update",&iid,1).await; Ok(j(json!({"ok": true}))) }
 async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
@@ -2281,7 +2322,7 @@ async fn oidc_start(State(st): State<S>, Path(oid): Path<String>) -> Result<axum
     let url = format!("{}?client_id={}&redirect_uri={}&response_type=code&scope=openid%20email%20profile&state={}&nonce={}", auth_ep, urlencode(&client_id), urlencode(&redirect_uri), state, nonce);
     Ok(axum::response::Redirect::temporary(&url)) }
 fn urlencode(s: &str) -> String { s.chars().map(|c| match c { 'A'..='Z'|'a'..='z'|'0'..='9'|'-'|'_'|'.'|'~' => c.to_string(), _ => format!("%{:02X}", c as u32) }).collect() }
-async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Redirect, (StatusCode, Json<Value>)> {
+async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let code = q.get("code").cloned().unwrap_or_default(); let state = q.get("state").cloned().unwrap_or_default();
     let srow = st.db.one("SELECT org_id,created_at,nonce FROM oidc_states WHERE state=?", &[json!(state)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("invalid or expired state"))?;
     let oid = db::s(&srow, "org_id"); let expected_nonce = db::s(&srow, "nonce");
@@ -2293,10 +2334,8 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     let disc = oidc_discovery(&issuer).await?;
     let (subject, email) = oidc_identity_from_doc(&disc, &issuer, &client_id, &client_secret, &redirect_uri, &code, "", &expected_nonce, false, if issuer.contains("login.microsoftonline.com") { "microsoft" } else { "oidc" }).await.map_err(|e| bad(&e))?;
     let issuer_key = issuer.clone();
-    // An SSO login may attach an account to this organisation only through a
-    // pending invite, or when the org explicitly enables auto-provisioning for
-    // this email domain. Instance-wide signups are not enough.
-    let pending = st.db.one("SELECT role,token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&email), json!(&oid), json!(now())]).await.map_err(|e| bad(&e))?;
+    // A pending invite admits an account, but membership requires explicit token acceptance.
+    let pending = st.db.one("SELECT token_hash FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(&email), json!(&oid), json!(now())]).await.map_err(|e| bad(&e))?;
     let auto = meta_get(&st, &format!("oidc_auto_provision:{}", oid)).await == "1";
     let domains = meta_get(&st, &format!("oidc_allowed_domains:{}", oid)).await;
     let domain = email.split('@').nth(1).unwrap_or("");
@@ -2315,20 +2354,23 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     if let Some(u) = st.db.one("SELECT active FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))? { if db::n(&u, "active") == 0 { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); } }
     if st.org_role(&oid, &uid).await.is_none() {
         st.require_org_running(&oid).await?;
-        if let Some(inv) = &pending {
-            add_provisioned_member(&st, &oid, &uid, &db::s(inv, "role")).await?;
-            let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]).await;
-        } else if auto && domain_ok && signups_open(&st).await {
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
-        } else {
-            return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
+        // The invitee accepts the invitation token explicitly; login alone joins nobody.
+        if pending.is_none() {
+            if auto && domain_ok && signups_open(&st).await {
+                st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(&oid), json!(&uid)]).await.map_err(|e| bad(&e))?;
+            } else {
+                return Err(err(StatusCode::FORBIDDEN, "this organisation does not allow SSO self-provisioning; ask an administrator to invite you or enable it in organisation settings"));
+            }
         } }
     st.audit(&oid,"","",&uid,"auth.oidc_login",&format!("{} sub={}", email, subject)).await;
     if mfa::required(&st, &uid).await {
         let challenge = mfa::new_challenge(&st, &uid).await?;
-        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}&org={}", challenge, oid))); }
+        return Ok(axum::response::Redirect::temporary(&format!("/#mfa={}&org={}", challenge, oid)).into_response()); }
     let token = make_session(&st, &uid).await?;
-    Ok(axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))) }
+    // Every other login helper sets the account-session cookie; emergency
+    // endpoints require it and reject any Authorization header.
+    let mut hdr = HeaderMap::new(); hdr.insert(axum::http::header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    Ok((hdr, axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))).into_response()) }
 
 // ---------- SAML 2.0 service provider ----------
 struct SamlReplayCache { st: S }
@@ -2467,7 +2509,12 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).await.map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
         if !st.principal_active(&uid).await { return Err(err(StatusCode::UNAUTHORIZED, "account deactivated")); }
-        st.require_org(org, &uid).await?;
+        if st.org_role(org, &uid).await.is_none() {
+            st.require_org_running(org).await?;
+            // A pending invitation admits the account; membership still needs explicit token acceptance.
+            let pending = st.db.one("SELECT id FROM invites WHERE email=? AND org_id=? AND accepted=0 AND expires_at>? ORDER BY created_at DESC LIMIT 1", &[json!(email), json!(org), json!(now())]).await.map_err(|e| bad(&e))?;
+            if pending.is_none() { return Err(err(StatusCode::FORBIDDEN, "this account is no longer a member of this organisation; ask an administrator to invite you again")); }
+        }
         return Ok(uid);
     }
     st.require_org_running(org).await?;
@@ -2488,9 +2535,10 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
         &[json!(&uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO saml_subjects(org_id,idp_entity_id,name_id,user_id,created_at) VALUES(?,?,?,?,?)",
         &[json!(org), json!(idp_entity), json!(name_id), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?;
-    let role = pending.as_ref().map(|p| db::s(p, "role")).unwrap_or_else(|| "developer".to_string());
-    st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(org), json!(&uid), json!(role)]).await.map_err(|e| bad(&e))?;
-    if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv,"token_hash"))]).await; }
+    // Invitation-backed accounts join only through explicit token acceptance.
+    if pending.is_none() {
+        st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'developer')", &[json!(org), json!(&uid)]).await.map_err(|e| bad(&e))?;
+    }
     claim_instance_owner(st, &uid).await;
     st.audit(org, "", "", &uid, "auth.saml_provision", &format!("{} {}", email, name_id)).await;
     Ok(uid) }
@@ -2726,18 +2774,17 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
     let locked = match st.require_org_running(&org).await { Ok(()) => false, Err((StatusCode::FORBIDDEN, _)) => true, Err(e) => return Err(e) };
     if st.org_role(&org, &uid).await.is_none() {
         st.require_org_running(&org).await?;
-        // A bound directory user is re-admitted only through a fresh invite;
-        // otherwise removing a member would be undone by their next sign-in.
-        if bound.is_some() && pending.is_none() {
-            return Err(err(StatusCode::FORBIDDEN, "this account is no longer a member of this organisation; ask an administrator to invite you again"));
+        // Pending invitations admit an account, never a directory-derived membership.
+        if pending.is_none() {
+            if bound.is_some() {
+                return Err(err(StatusCode::FORBIDDEN, "this account is no longer a member of this organisation; ask an administrator to invite you again"));
+            }
+            let role = mapped.clone().unwrap_or_else(|| db::s(&row, "default_role"));
+            add_provisioned_member(&st, &org, &uid, &role).await?;
+            // Only group-mapped roles are directory-derived and subject to later revocation.
+            let mapped_role = if mapped.is_some() { role } else { String::new() };
+            let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]).await;
         }
-        let role = mapped.clone().or_else(|| pending.as_ref().map(|p| db::s(p, "role"))).unwrap_or_else(|| db::s(&row, "default_role"));
-        add_provisioned_member(&st, &org, &uid, &role).await?;
-        if let Some(inv) = &pending { let _ = st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(inv, "token_hash"))]).await; }
-        // Record a role that came from the group map, so leaving the group can
-        // revoke it later. Invite and default roles are not directory-derived.
-        let mapped_role = if mapped.is_some() { role } else { String::new() };
-        let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]).await;
     } else if !locked {
         let current = st.org_role(&org, &uid).await.unwrap_or_default();
         if let Some(role) = &mapped {
@@ -3232,15 +3279,7 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)", &[json!(uid), json!(email), json!(oc::hash_password(&pw).map_err(|e| bad(&e))?), json!(kp.public), json!(oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?), json!(now())]).await.map_err(|e| bad(&e))?;
     st.db.exec("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)", &[json!(provider), json!(subject), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid).await;
-    match invite {
-        Some(inv) => {
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(db::s(&inv, "org_id")), json!(uid), json!(db::s(&inv, "role"))]).await.map_err(|e| bad(&e))?;
-            st.db.exec("UPDATE invites SET accepted=1 WHERE token_hash=?", &[json!(db::s(&inv, "token_hash"))]).await.map_err(|e| bad(&e))?; }
-        None => {
-            let oid = id();
-            st.db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(oid), json!(format!("{}'s organisation", email)), json!(now())]).await.map_err(|e| bad(&e))?;
-            st.db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,'owner')", &[json!(oid), json!(uid)]).await.map_err(|e| bad(&e))?; }
-    }
+    if invite.is_none() { workspaces::default_workspace(st,&uid,email).await?; }
     st.audit("", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email)).await;
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
@@ -3248,6 +3287,7 @@ async fn auth_providers(State(st): State<S>) -> Res {
     out["ldap"] = json!(cfg!(feature = "ldap"));
     out["oidc_name"] = json!(if social_enabled("oidc") { oidc_custom_name() } else { String::new() });
     out["signups"] = json!(if signups_open(&st).await { "open" } else { "invite" });
+    out["workspace_creation_open"] = json!(workspaces::creation_open(&st).await?);
     Ok(j(out)) }
 // Composed from discovery plus optional explicit endpoints, for IdPs that do not
 // publish usable metadata.
@@ -3355,6 +3395,8 @@ async fn instance_info(State(st): State<S>, h: HeaderMap) -> Res {
     let uid = st.token_user(&h).await?;
     let mut out = auth_settings(&st).await;
     out["signups_open"] = json!(signups_open(&st).await);
+    out["workspace_creation_open"] = json!(workspaces::creation_open(&st).await?);
+    out["workspace_creation_env_locked"] = json!(crate::envcfg::var("OPENWARP_WORKSPACE_CREATION").is_ok());
     out["signups_env_locked"] = json!(crate::envcfg::var("OPENWARP_SIGNUPS").is_ok());
     out["instance_owner"] = json!(instance_owner(&st).await.as_deref() == Some(uid.as_str()));
     out["mfa_email"] = json!(mfa::email_available());
@@ -3475,15 +3517,23 @@ async fn master_updates(db: &Db, old: &[u8; 32], new: &[u8; 32]) -> Result<Vec<(
         ("saml_configs", "org_id", "sp_key_enc", "sp_key_enc<>''"),
         ("rotation_hooks", "org_id", "secret_enc", "secret_enc<>''"),
         ("ldap_configs", "org_id", "bind_password_enc", "bind_password_enc<>''"),
+        ("ai_settings", "org_id", "key_enc", "key_enc<>''"),
         ("users", "id", "auth_key_enc", "auth_key_enc<>''"),
     ] {
         let rows = db.query(&format!("SELECT {},{} FROM {} WHERE {}", id_col, col, table, predicate), &[]).await?;
         for row in rows {
             let id = db::s(&row, id_col); let value = db::s(&row, col);
             if value.is_empty() || (table == "envs" && value.starts_with("owkms:")) { continue; }
-            let plain = if table == "users" { oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value) } else { oc::decrypt_symmetric(old, &value) }
-                .map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
-            let encrypted = if table == "users" { oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain) } else { oc::encrypt_symmetric(new, &plain) };
+            let plain = match table {
+                "users" => oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value),
+                "ai_settings" => oc::decrypt_symmetric_aad(old, &crate::ai::key_aad(&id), &value),
+                _ => oc::decrypt_symmetric(old, &value),
+            }.map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
+            let encrypted = match table {
+                "users" => oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain),
+                "ai_settings" => oc::encrypt_symmetric_aad(new, &crate::ai::key_aad(&id), &plain),
+                _ => oc::encrypt_symmetric(new, &plain),
+            };
             updates.push((format!("UPDATE {} SET {}=? WHERE {}=?", table, col, id_col), vec![json!(encrypted), json!(id)]));
         }
     }
@@ -3641,7 +3691,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if !matches!(&*st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
     let _lifecycle = st.transit_lifecycle.write().await;
+    let _ai_guard = st.ai_credentials.lock().await;
     let old = st.master();
+    let ai_updates = crate::ai::rewrap(&st, &old, &new).await?;
     let transit_root = transit::root(&st, &old).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
@@ -3703,6 +3755,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let transit_updates = transit_compat::rewrap_master(&st, &old, &new).await?;
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
     let mut statements = transit::rotation(&st, &old, &new, &transit_root).await?;
+    for (sql, params) in ai_updates { statements.push((sql, params, Some(1))); }
     for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped),json!(id)], Some(1))); }
     for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value),json!(k)], Some(1))); }
     for (id, key_enc) in &ca_updates { statements.push(("UPDATE pki_cas SET key_enc=? WHERE id=?".into(), vec![json!(key_enc),json!(id)], Some(1))); }
@@ -5325,7 +5378,7 @@ fn admin_scope_path(method: &axum::http::Method, path: &str) -> bool {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
         if tail.is_empty() { return method != axum::http::Method::GET; }
         let sub = tail.split('/').next().unwrap_or("");
-        return matches!(sub, "members" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "ssh" | "identities" | "runners" | "audit" | "leave" | "transfer");
+        return matches!(sub, "members" | "invites" | "roles" | "teams" | "settings" | "saml" | "ldap" | "log-streams" | "rotation-hook" | "pki" | "ssh" | "identities" | "runners" | "audit" | "leave" | "transfer");
     }
     if let Some(rest) = path.strip_prefix("/api/apps/") {
         let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -5525,6 +5578,7 @@ pub async fn process_maintenance(st: &S) {
     process_rotations_inner(st).await;
     retry_stale_deliveries(st).await;
     reap_expired_leases(st).await;
+    crate::ai::maintenance(st).await;
 }
 
 async fn retry_stale_deliveries(st: &S) {
@@ -6191,16 +6245,17 @@ pub fn router(state: S) -> Router {
         .route("/libsodium.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium.js")) }))
         .route("/libsodium-wrappers.js", get(|| async { ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("vendor/libsodium-wrappers.js")) }))
         .route("/metrics", get(metrics)).route("/lockbox/{lid}", get(lockbox_page))
-        .route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
+        .route("/api/auth/invite", get(workspaces::metadata)).route("/api/auth/providers", get(auth_providers)).route("/api/auth/accept-invite", post(accept_invite))
         .route("/api/auth/kdf", get(auth_kdf)).route("/api/auth/register-v2", post(register_v2)).route("/api/auth/challenge", post(auth_challenge)).route("/api/auth/login-v2", post(login_v2)).route("/api/auth/reset-v2", post(reset_password_v2)).route("/api/auth/reset-info", post(reset_info)).route("/api/auth/accept-invite-v2", post(accept_invite_v2)).route("/api/me/auth", get(me_auth))
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
-        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
+        .route("/api/instance", get(instance_info)).route("/api/instance/signups", put(set_signups)).route("/api/instance/workspaces", put(workspaces::set_creation)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
         .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
         .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me))
         .route("/api/orgs", get(list_orgs).post(create_org)).route("/api/orgs/{oid}", axum::routing::patch(update_org).delete(delete_org)).route("/api/orgs/{oid}/leave", post(leave_org)).route("/api/orgs/{oid}/transfer", post(transfer_org))
+        .route("/api/orgs/{oid}/invites", get(workspaces::list)).route("/api/orgs/{oid}/invites/{iid}", delete(workspaces::revoke)).route("/api/orgs/{oid}/invites/{iid}/resend", post(workspaces::resend))
         .route("/api/orgs/{oid}/members", get(list_members).post(invite_member)).route("/api/orgs/{oid}/members/{uid}", axum::routing::patch(update_member_role).delete(remove_member)).route("/api/orgs/{oid}/apps", get(list_apps).post(create_app))
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/saml", get(get_saml_config).put(put_saml_config)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
@@ -6240,6 +6295,7 @@ pub fn router(state: S) -> Router {
         .route("/api/ssh/cas/{caid}/hosts/{hid}", delete(delete_ssh_host)).route("/api/ssh/cas/{caid}/sign-host", post(ssh_sign_host))
         .route("/api/ssh/certs/{cid}/revoke", post(revoke_ssh_cert));
     let app = app
+        .merge(crate::ai::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), path_policy::middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), emergency_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))

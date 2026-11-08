@@ -94,6 +94,14 @@ Review custom roles against the actions callers need. An approved access request
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 
+## Workspace creation and invitation consent
+
+Workspace creation is an instance-owner policy separate from self-signup. `OPENWARP_WORKSPACE_CREATION` pins it for native and Worker deployments. Disabling it prevents explicit creation and automatic personal workspaces, not invitation acceptance. Policy changes and last-workspace deletion share a database lock row; existing ownership and unresolved-lease checks still apply. An operator can pin creation closed on an empty database, but must reopen it to bootstrap a workspace.
+
+Inviting an existing account does not add membership. `GET /api/auth/invite?token=...` previews only the workspace, email, role, expiry and whether an account exists. It does not return token hashes, passwords or key material. Existing accounts must consent with a matching active, verified account session; a valid session for another account cannot create the invitee on either password protocol. New accounts may redeem a token through legacy or client-derived creation without a personal workspace. Social sign-in may admit an invited address while signup is closed but leaves the invitation unconsumed until explicit acceptance. Workspace-specific directory provisioning retains its separate admission rules.
+
+Invitations expire after seven days. Acceptance consumes the token and inserts membership in one checked database batch; failure rolls both back. Workspace admins list pending invitations by opaque management IDs, revoke them, or resend a rotated token. Resending invalidates the old token. Privileged role grants remain owner-only. Tracked invitations recheck the inviter's current grant authority in the token-consumption transaction, including admin and custom privileged roles. Human inviters must still be active and verified; machine inviters must still exist in the destination workspace. Legacy invitations without an inviter retain their unexpired token/email contract. Preview and acceptance enforce the destination workspace's IP allowlist even before membership exists, and acceptance is refused while the destination workspace is under emergency lockdown. Deliver links over trusted channels; possession authorises new-account creation for the named address. The consume-time check does not serialize all membership and role mutations; cross-backend concurrent role-change behavior still needs runtime validation. The policy guards avoid same-table UPDATE subqueries, but this repair has not been exercised against a live MySQL/MariaDB server.
+
 ## Emergency workspace and project lockdown
 
 A workspace owner can halt the workspace or one project (an application). The console uses `PUT /api/orgs/{org_id}/emergency` or `PUT /api/apps/{app_id}/emergency` with `{"locked":true}` to activate and `{"locked":false}` to restore the selected scope. Both require a cookie-backed database account session and the actual workspace `owner` role. Admins, custom administrative roles and owner-created automation credentials cannot restore access. Member console sessions can read status through `GET` on the same routes. Project status reports `locked` (effective state), `direct_locked` and `workspace_locked`.
@@ -210,6 +218,14 @@ The PostgreSQL driver connects without TLS, and the MySQL/MariaDB driver uses TL
 Provider integrations receive plaintext SSE values. Their credentials, destination URLs, permissions, and remote retention policy are part of your trust boundary. Integration sync excludes sealed values and user-specific overrides. Do not treat sealed secrets as a mechanism for delivering values to providers.
 
 Log streams, email relays, OIDC endpoints, and generic webhooks are outbound connections. Apply network egress controls as well as application validation. Allowing private egress intentionally broadens the destinations the server can contact. See [configuration](CONFIGURATION.md).
+
+## AI disclosure and actions
+
+BYOK does not keep inference local. An explicitly configured model endpoint can receive questions and permitted managed-environment metadata. Stored secret values, comments, provider configurations, and arbitrary audit detail are excluded from model context. Credentials pasted into a question are user-supplied disclosure, not protected retrieval. Local value matching returns authorised non-sealed record references without calling a model. E2E and delegated keys remain outside server-side AI processing.
+
+AI endpoints initially require account sessions and refuse service, machine, and OAuth tokens. Retrieval and plan execution recheck workspace and environment access. Model text and retrieved metadata are untrusted input. Only typed folder and integration-draft plans can execute, after a separate confirmation bound to the stored operations and author. Plans cannot run provider tests, syncs, permission grants, or arbitrary code.
+
+Security findings use bounded deterministic evidence and report history limits. AI explanations are interpretation, not additional evidence. Read the [AI guide](AI.md) before enabling disclosure or private model endpoints.
 
 ## Secret handling on clients
 
