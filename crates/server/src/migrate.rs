@@ -1084,7 +1084,7 @@ mod tests {
         assert!(problems.contains(&Problem::Checksum { version: 2 }));
         assert!(problems.contains(&Problem::Gap { version: 3 }));
         let newer = vec![LedgerRow { version: 99, name: String::new(), checksum: String::new(), success: true, execution_ms: 0 }];
-        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest: 23 }]);
+        assert_eq!(check(&newer, migrations), vec![Problem::Newer { version: 99, latest: migrations.last().expect("a shipped manifest").version }]);
     }
 
     #[test]

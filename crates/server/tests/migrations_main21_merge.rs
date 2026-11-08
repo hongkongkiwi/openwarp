@@ -127,6 +127,17 @@ async fn snapshot(db: &Db) -> Vec<(String, Vec<Row>)> {
 
 async fn assert_preserved(db: &Db, before: &[(String, Vec<Row>)]) {
     for (sql, rows) in before {
+        if sql.contains(" FROM meta ") {
+            // Migrations 0023 and 0028 seed the canonical bootstrap keys when
+            // absent; every other meta change or removal is data loss.
+            let mut expected = rows.clone();
+            for (k, v) in [("rotation_lifecycle", "")] {
+                if !expected.iter().any(|row| s(row, "k") == k) { expected.push([("k".to_string(), serde_json::json!(k)), ("v".to_string(), serde_json::json!(v))].into_iter().collect()); }
+            }
+            expected.sort_by_key(|row| (s(row, "k").to_string(), s(row, "v").to_string()));
+            assert_eq!(&db.query(sql, &[]).await.unwrap(), &expected, "migration must preserve rows for {}", sql);
+            continue;
+        }
         assert_eq!(&db.query(sql, &[]).await.unwrap(), rows, "migration must preserve rows for {}", sql);
     }
 }
