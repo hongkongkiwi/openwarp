@@ -27,7 +27,7 @@ async function call(method, path, token, body) {
 }
 async function expect(method, path, token, body, status = 200) {
   const result = await call(method, path, token, body);
-  assert.equal(result.status, status, `${method} ${path}: unexpected HTTP status`);
+  assert.equal(result.status, status, `${method} ${path}: unexpected HTTP status: ${result.status} ${JSON.stringify(result.json).slice(0, 200)}`);
   assert(result.json && typeof result.json === 'object', `${method} ${path}: expected JSON API response`);
   if (status >= 400) assert.equal(typeof result.json.error, 'string', 'denial must be an API error');
   checks += 1;
@@ -88,7 +88,7 @@ await put(prod, [{ key: 'TARGET', value: 'before-prod' }]);
 // Workload identity and transit are feature-gated per workspace; the smoke
 // seeds its own grants (the fixture account is the instance owner).
 const grants = await expect('PUT', '/api/instance/features', token, { org, features: ['workload-identity', 'transit', 'change-requests'] });
-assert.equal(grants.org, org, 'feature grants seeded');
+assert.equal(grants.org_id, org, `feature grants seeded: ${JSON.stringify(grants).slice(0, 160)}`);
 const identity = id(await expect('POST', `/api/orgs/${org}/identities`, token, { name: 'worker-product', role: 'developer' }));
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'product-test', alg: 'ES256', use: 'sig', key_ops: ['verify'] };

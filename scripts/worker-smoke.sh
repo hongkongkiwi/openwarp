@@ -56,6 +56,6 @@ if ! curl -fsS "${BASE}/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-OPENWARP_SMOKE_BASE="${BASE}" OPENWARP_SMOKE_ECHO="http://127.0.0.1:${ECHO_PORT}" node "${ROOT}/scripts/worker-smoke.mjs"
 OPENWARP_SMOKE_BASE="${BASE}" OPENWARP_SMOKE_ECHO="http://127.0.0.1:${ECHO_PORT}" node "${ROOT}/scripts/product-worker-smoke.mjs"
+OPENWARP_SMOKE_BASE="${BASE}" OPENWARP_SMOKE_ECHO="http://127.0.0.1:${ECHO_PORT}" node "${ROOT}/scripts/worker-smoke.mjs"
 SUCCESS=1

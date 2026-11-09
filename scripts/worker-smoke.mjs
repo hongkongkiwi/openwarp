@@ -225,7 +225,10 @@ if (!token) {
     await new Promise(resolve => setTimeout(resolve, 250));
     const seen = await (await fetch(`${process.env.OPENWARP_SMOKE_ECHO}/_requests`)).json();
     for (const message of seen) {
-      const match = String(message.body || '').match(/https?:\/\/[^\s"]+\/api\/auth\/verify\?token=[A-Za-z0-9_-]+/);
+      // The relay may hold other fixtures' mail; only this account's link counts.
+      const body = typeof message.body === 'string' ? message.body : JSON.stringify(message.body || '');
+      if (!body.includes(email)) continue;
+      const match = body.match(/https?:\/\/[^\s"]+\/api\/auth\/verify\?token=[A-Za-z0-9_-]+/);
       if (match) { link = match[0]; break; }
     }
   }
