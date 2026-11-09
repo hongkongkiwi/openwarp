@@ -173,9 +173,9 @@ async fn receipt_replay(State(st): State<S>,h: HeaderMap,Path((wid,rid)): Path<(
     let changed=st.db.webhook_atomic(move |tx| {
         let count=tx.one("SELECT COUNT(*) AS n FROM webhook_receipts WHERE webhook_id=? AND status IN ('pending','processing','failed')",&[json!(wid2)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
         if count>=1000 {return Err("incoming queue full".into());}
-        // A replay only runs under the current enabled subscription version;
+        // A replay only runs under the current enabled incoming-hook version;
         // an older or paused hook would cancel the receipt unread otherwise.
-        let version=tx.one("SELECT version FROM webhook_subscriptions WHERE id=? AND enabled=1",&[json!(wid2)])?.ok_or("incoming webhook is paused or removed")?.clone();
+        let version=tx.one("SELECT version FROM incoming_webhooks WHERE id=? AND enabled=1",&[json!(wid2)])?.ok_or("incoming webhook is paused or removed")?;
         tx.exec("UPDATE webhook_receipts SET status='pending',attempts=0,http_status=0,duration_ms=0,error_code='',outcome='',claim_id='',lease_until=0,version=?,next_attempt_at=?,updated_at=? WHERE id=? AND webhook_id=? AND status IN ('delivered','failed','dead_lettered')",&[json!(db::n(&version,"version")),json!(now()),json!(now()),json!(rid2),json!(wid2)])
     }).await.map_err(|e|err(StatusCode::CONFLICT,&e))?;
     if changed==0 { return Err(err(StatusCode::CONFLICT,"only delivered, failed or dead-lettered receipts can be replayed")); }
@@ -202,16 +202,10 @@ async fn accept_inner(st: &S,h: &HeaderMap,peer: PeerAddr,wid: &str,body: &[u8])
     let source=client_address(h,peer); let ratekey=format!("incoming_source:{}",source);
     // The pre-auth source budget runs outside webhook_atomic: an unauthenticated
     // request must never contend on the instance serialization row.
-    async fn source_budget(st: &S, ratekey: &str) -> Option<i64> {
-        // A first-ever source has no row yet: that is count 1, not an outage.
-        let prior=st.db.one("SELECT count,window_start FROM rate_limits WHERE key=?",&[json!(ratekey)]).await.ok().flatten();
-        let count=prior.as_ref().filter(|r|db::n(r,"window_start")>now()-60).map(|r|db::n(r,"count")+1).unwrap_or(1);
-        if st.db.exec("UPDATE rate_limits SET count=?,window_start=CASE WHEN window_start<=? THEN ? ELSE window_start END WHERE key=?",&[json!(count),json!(now()-60),json!(now()),json!(ratekey)]).await.is_ok() { return Some(count); }
-        if st.db.exec("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,?)",&[json!(ratekey),json!(now()),json!(count)]).await.is_ok() { return Some(count); }
-        None
-    }
-    let budget=source_budget(st,&ratekey).await;
-    let budget=match budget { Some(b)=>b, None=>return Err(err(StatusCode::SERVICE_UNAVAILABLE,"source limiter unavailable")) };
+    // The pre-auth source budget uses the shared atomic per-key upsert: an
+    // unauthenticated request never contends on the serialization row and a
+    // first-ever source still gets a persisted counter.
+    let budget=st.db.rate_increment(&ratekey,now(),60).await.unwrap_or(181);
     if budget>180 {return Err(err(StatusCode::TOO_MANY_REQUESTS,"source request budget exceeded"));} let r=st.db.one("SELECT * FROM incoming_webhooks WHERE id=?",&[json!(wid)]).await.map_err(|e|bad(&e))?.ok_or_else(||err(StatusCode::NOT_FOUND,"webhook not found"))?; if db::n(&r,"enabled")==0 { return Err(err(StatusCode::FORBIDDEN,"webhook disabled")); }
     let header=|k|h.get(k).and_then(|v|v.to_str().ok()).unwrap_or(""); let mid=header("webhook-id"); let ts=header("webhook-timestamp"); let timestamp=ts.parse::<i64>().map_err(|_|err(StatusCode::UNAUTHORIZED,"invalid signature"))?;
     if mid.is_empty() || mid.len()>128 || !mid.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'_' || b==b'-') || timestamp.abs_diff(now())>300 { return Err(err(StatusCode::UNAUTHORIZED,"invalid signature")); }

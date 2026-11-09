@@ -191,8 +191,17 @@ pub(super) async fn action(State(st): State<S>, h: HeaderMap, Path((pid,action))
         }
         statements.extend(mutations);
     }
-    let (pairs,checked)=crate::checked_pairs(statements,action=="apply");
-    st.audited_batch(&pairs,&checked,[&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)]).await.map_err(tx_error)?;
+    if action=="apply" {
+        // Apply keeps checked_batch's original semantics exactly: per-statement
+        // expected counts (retention pruning deletes many rows) plus the
+        // secret-table lock; its audit stays observational because audited_batch
+        // cannot express the lock. Known composition gap, disclosed in the PR.
+        st.db.checked_batch(&statements,true).await.map_err(tx_error)?;
+        st.audit(&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)).await;
+    } else {
+        let (pairs,checked)=crate::checked_pairs(statements,false);
+        st.audited_batch(&pairs,&checked,[&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)]).await.map_err(tx_error)?;
+    }
     let mut sync_errors = serde_json::Map::new();
     if action=="apply" { for (eid,_,_) in &payloads { sync_errors.insert(eid.clone(),json!(trigger_sync(&st,eid,&uid).await)); } }
     Ok(j(json!({"id":pid,"revision":revision,"status":next,"sync_errors":sync_errors})))

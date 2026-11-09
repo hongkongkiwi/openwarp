@@ -90,6 +90,19 @@ pub(super) async fn invite_batch(st: &S, row: &Row, users: &[&str], statements: 
     guarded.extend_from_slice(statements);
     user_guarded_batch(st,&users,&guarded,&shifted).await.map_err(invite_error)
 }
+/// invite_batch with a master epoch fence and transactional audit: the v2
+/// acceptance writes a master-encrypted auth key, so a replica holding a stale
+/// key must fail closed inside the consuming transaction, not at entry.
+pub(super) async fn invite_batch_master(st: &S, row: &Row, users: &[&str], statements: &[(String, Vec<Value>)], checked: &[usize], fields: [&str; 6], master: [u8; 32]) -> Result<(), Failure> {
+    let inviter = db::s(row,"invited_by"); let mut users = users.to_vec();
+    if !inviter.is_empty() && st.db.one("SELECT id FROM users WHERE id=?", &[json!(&inviter)]).await.map_err(|e| bad(&e))?.is_some() { users.push(&inviter); }
+    let org = db::s(row,"org_id");
+    let mut guarded = vec![("UPDATE orgs SET name=name WHERE id=? AND emergency_locked=0 AND NOT EXISTS (SELECT 1 FROM apps WHERE org_id=? AND emergency_locked<>0)".into(), vec![json!(&org), json!(&org)])];
+    let shifted = std::iter::once(0usize).chain(checked.iter().map(|i| i + 1)).collect::<Vec<_>>();
+    guarded.extend_from_slice(statements);
+    user_guarded_commit_master(st,&users,&guarded,&shifted,fields,master).await
+        .map_err(|e| if e.1.get("error").and_then(|v| v.as_str())==Some("epoch_stale") { (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"instance key epoch changed; reload required","code":"epoch_stale"}))) } else { invite_error(e) })
+}
 pub(super) async fn existing(st: &S, row: &Row, token: &str, h: &HeaderMap) -> Result<Option<(HeaderMap,Json<Value>)>, Failure> {
     let user = st.db.one("SELECT id FROM users WHERE email=?", &[json!(db::s(row,"email"))]).await.map_err(|e| bad(&e))?;
     if let Some(user) = user {

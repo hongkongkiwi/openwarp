@@ -764,13 +764,14 @@ async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: Head
     let uid = id(); let master = st.master();
     let auth_key_enc = oc::encrypt_symmetric_aad(&master, &auth_key_aad(&uid), &auth_key);
     let pass = oc::hash_password(&oc::random_token("v2")).map_err(|e| bad(&e))?;
-    workspaces::invite_batch(&st,&row,&[],&[
+    // The auth key is master-encrypted: the invitation is consumed inside an
+    // epoch-fenced transaction so a replica on a stale key fails closed.
+    workspaces::invite_batch_master(&st,&row,&[],&[
         workspaces::consume(&st,&row,&r.token).await?,
         ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified,auth_version,kdf_salt,kdf_iterations,kdf_algo,auth_key_enc) VALUES(?,?,?,?,?,?,1,2,?,?,?,?)".into(),
             vec![json!(&uid),json!(&email),json!(pass),json!(&r.public_key),json!(&r.wrapped_privkey),json!(now()),json!(&r.salt),json!(r.iterations),json!(&r.algo),json!(auth_key_enc)]),
         ("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(),vec![json!(&org),json!(&uid),json!(&role)]),
-    ],&[0,1,2]).await?;
-    st.audit(&org, "", "", &uid, "member.accept_invite", &email).await;
+    ],&[0,1,2],[&org,"","",&uid,"member.accept_invite",&email],master).await?;
     claim_instance_owner(&st, &uid).await;
     login_outcome(&st, &uid, &r.public_key, Some(&r.wrapped_privkey)).await }
 
@@ -808,6 +809,17 @@ async fn revoke_all_sessions(State(st): State<S>, h: HeaderMap) -> Result<(Heade
 // Ownership grants and account deletion serialize on the same user rows.
 async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize]) -> Result<(), (StatusCode, Json<Value>)> {
     user_guarded_commit(st, users, statements, require_one, None).await
+}
+/// Same guard shape as user_guarded_commit, but the batch runs inside the
+/// epoch-fenced webhook transaction: a replica holding a stale master key
+/// fails closed before its first statement commits.
+async fn user_guarded_commit_master(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize], fields: [&str;6], master: [u8;32]) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut users = users.to_vec(); users.sort_unstable(); users.dedup();
+    let mut batch: Vec<(String, Vec<Value>)> = users.iter().map(|uid| ("UPDATE users SET active=active WHERE id=?".into(), vec![json!(uid)])).collect();
+    let mut checked: Vec<usize> = (0..batch.len()).collect();
+    checked.extend(require_one.iter().map(|index| batch.len() + index));
+    batch.extend_from_slice(statements);
+    st.audited_batch_master(&batch,&checked,fields,master).await.map_err(|e| if e==webhooks::EPOCH_STALE {webhooks::epoch_stale()} else if e.contains("version conflict") { err(StatusCode::CONFLICT, "account or ownership changed; refresh and try again") } else { bad(&e) })
 }
 async fn user_guarded_commit(st: &S, users: &[&str], statements: &[(String, Vec<Value>)], require_one: &[usize], audit: Option<[&str;6]>) -> Result<(), (StatusCode, Json<Value>)> {
     let mut users = users.to_vec(); users.sort_unstable(); users.dedup();
