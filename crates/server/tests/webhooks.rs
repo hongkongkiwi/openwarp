@@ -6,6 +6,7 @@ use reqwest::{redirect::Policy, Client, Method};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -25,7 +26,8 @@ impl Drop for Server {
     }
 }
 impl Server {
-    async fn start() -> Self {
+    async fn start() -> Self { Self::start_with(&[]).await }
+    async fn start_with(extra: &[(&str,&str)]) -> Self {
         let _start = START_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("openwarp-webhooks-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).expect("private temp dir");
@@ -40,6 +42,7 @@ impl Server {
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS").env_remove("OPENWARP_ALLOWED_DB_HOSTS")
             .env_remove("OPENWARP_TRUST_PROXY")
+            .envs(extra.iter().map(|(k,v)| ((*k).to_string(), (*v).to_string())))
             .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(30)).build().unwrap();
         let s = Self { child, base, dir, client, inbox };
@@ -350,4 +353,134 @@ async fn incoming_receipts_capture_inspect_replay_and_master_rotation_clears_pay
     assert_eq!(r.body["body_available"],false,"rotation must erase captured payloads: {}",r.text);
     assert!(r.body["body"].is_null());
     assert!(!r.text.contains("captured-payload-marker"));
+}
+
+// A minimal HTTP receiver so outgoing deliveries can be captured and their
+// Standard Webhooks signatures verified byte for byte.
+struct Receiver { url: String, got: Arc<Mutex<Vec<(String, String, String)>>>, }
+impl Receiver {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("receiver port");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let got: Arc<Mutex<Vec<(String,String,String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock,_)) = listener.accept().await else { break };
+                let g = g.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new(); let mut buf = [0u8; 16384];
+                    loop {
+                        if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&data[..p]).to_lowercase();
+                            let clen: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0usize))).unwrap_or(0);
+                            if data.len() >= p + 4 + clen { break; }
+                        }
+                        match sock.read(&mut buf).await { Ok(0) => break, Ok(n) => data.extend_from_slice(&buf[..n]), Err(_) => break }
+                        if data.len() > 200_000 { break; }
+                    }
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
+                    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                    let method = head.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("").to_string();
+                    g.lock().unwrap().push((head, body, method));
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+                });
+            }
+        });
+        Receiver { url, got }
+    }
+}
+fn header_of(head: &str, name: &str) -> String {
+    head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string())).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn outgoing_asymmetric_signing_survives_master_rotation() {
+    let s = Server::start_with(&[("OPENWARP_ALLOW_PRIVATE_EGRESS","1")]).await;
+    let u = register(&s,"asym-signing@test.invalid").await;
+    let t = u["token"].as_str().unwrap(); let org = u["org_id"].as_str().unwrap();
+    let list = format!("/api/orgs/{}/webhooks",org);
+    let rx = Receiver::start().await;
+    let mut body = outgoing(); body["url"] = json!(rx.url); body["asymmetric"] = json!(true);
+    let hook_secret = secret(&s.call(Method::POST,&list,Some(t),Some(body)).await);
+    let r = s.call(Method::GET,&list,Some(t),None).await; ok(&r);
+    let row = r.body.as_array().expect("hooks").iter().find(|h| h["public_key"].as_str().is_some_and(|k| k.starts_with("whpk_"))).expect("asymmetric hook");
+    let pk_b64 = row["public_key"].as_str().unwrap().trim_start_matches("whpk_").to_string();
+    assert!(!r.text.contains("sign_key_enc"),"private signing key must never leave the server");
+    let hid = id(row); let path = format!("/api/webhooks/{}",hid);
+    let verify = |head: &str, payload: &str, secret: &str, pk_b64: &str| {
+        let mid = header_of(head,"webhook-id"); let ts = header_of(head,"webhook-timestamp"); let sigs = header_of(head,"webhook-signature");
+        let material = format!("{}.{}.{}", mid, ts, payload);
+        let key = Base64::decode_vec(secret.strip_prefix("whsec_").unwrap()).unwrap();
+        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(material.as_bytes());
+        let want_v1 = format!("v1,{}", Base64::encode_string(&mac.finalize().into_bytes()));
+        assert!(sigs.split_whitespace().any(|s| s == want_v1), "valid v1 HMAC expected, got {}", sigs);
+        let v1a = sigs.split_whitespace().find_map(|s| s.strip_prefix("v1a,")).expect("v1a signature present");
+        use ed25519_dalek::{Verifier, Signature as EdSig, VerifyingKey};
+        let pk: [u8;32] = Base64::decode_vec(pk_b64).expect("pk base64").try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&pk).unwrap();
+        let sig = EdSig::from_bytes(Base64::decode_vec(v1a).expect("sig base64").as_slice().try_into().expect("64 bytes"));
+        vk.verify(material.as_bytes(), &sig).expect("v1a signature must verify");
+    };
+    // The subscription matches its own audit events too, so select the test
+    // event by its returned id rather than by delivery order.
+    async fn wait_for(rx: &Receiver, ev: &str, secs: u64) -> (String, String, String) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let snap = rx.got.lock().unwrap().clone();
+            if let Some(hit) = snap.iter().find(|(head,_,_)| header_of(head,"webhook-id")==ev) { return hit.clone(); }
+            if Instant::now() >= deadline { panic!("event {} never delivered", ev); }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    let r = s.call(Method::POST,&format!("{}/test",path),Some(t),Some(json!({}))).await; ok(&r);
+    let ev = r.body["event_id"].as_str().expect("test event id").to_string();
+    let got = wait_for(&rx,&ev,30).await;
+    verify(&got.0, &got.1, &hook_secret, &pk_b64);
+    // Master rotation rewraps the encrypted seed and key rotation regenerates
+    // the pair; the next test event must verify under the new keys.
+    let new_key = Base64::encode_string(&Sha256::digest(b"asym-rotate-master"));
+    ok(&s.call(Method::POST,"/api/instance/rotate-master",Some(t),Some(json!({"new_key":new_key}))).await);
+    let rotated = secret(&s.call(Method::POST,&format!("{}/rotate",path),Some(t),Some(json!({}))).await);
+    let r = s.call(Method::GET,&path,Some(t),None).await; ok(&r);
+    let pk_b64 = r.body["public_key"].as_str().expect("rotated public key").trim_start_matches("whpk_").to_string();
+    let r = s.call(Method::POST,&format!("{}/test",path),Some(t),Some(json!({}))).await; ok(&r);
+    let ev = r.body["event_id"].as_str().expect("test event id").to_string();
+    let got = wait_for(&rx,&ev,30).await;
+    verify(&got.0, &got.1, &rotated, &pk_b64);
+}
+
+#[tokio::test]
+async fn outgoing_auto_pauses_after_consecutive_dead_letters_and_reenables() {
+    let s = Server::start_with(&[("OPENWARP_ALLOW_PRIVATE_EGRESS","1"),("OPENWARP_WEBHOOK_RETRY_BASE_SECS","0")]).await;
+    let u = register(&s,"auto-pause@test.invalid").await;
+    let t = u["token"].as_str().unwrap(); let org = u["org_id"].as_str().unwrap();
+    let list = format!("/api/orgs/{}/webhooks",org);
+    let mut body = outgoing(); body["url"] = json!("http://127.0.0.1:9/never");
+    let hook_secret = secret(&s.call(Method::POST,&list,Some(t),Some(body)).await);
+    let hid = { let r = s.call(Method::GET,&list,Some(t),None).await; ok(&r); id(&r.body.as_array().expect("hooks")[0]) };
+    let path = format!("/api/webhooks/{}",hid);
+    for _ in 0..5 { ok(&s.call(Method::POST,&format!("{}/test",path),Some(t),Some(json!({}))).await); }
+    // Fast retries drive the five events to eight failed attempts each; the
+    // fifth consecutive dead-letter pauses the subscription by itself.
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut disabled = false;
+    while Instant::now() < deadline {
+        let r = s.call(Method::GET,&path,Some(t),None).await; ok(&r);
+        if r.body["enabled"] == json!(false) && r.body["disabled_reason"] == json!("consecutive_dead_letters") { disabled = true; break; }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    assert!(disabled, "subscription never auto-paused");
+    let r = s.call(Method::GET,&format!("/api/orgs/{}/audit",org),Some(t),None).await; ok(&r);
+    assert!(r.body.as_array().expect("audit").iter().any(|e| e["action"] == json!("webhook.auto_disabled")), "auto-pause must be audited");
+    let r = s.call(Method::POST,&format!("{}/test",path),Some(t),Some(json!({}))).await;
+    assert_eq!(r.status, 400, "a paused subscription must reject test events: {}", r.text);
+    // A manager re-enable clears the reason and the flow resumes.
+    ok(&s.call(Method::PATCH,&path,Some(t),Some(json!({"enabled":true}))).await);
+    let r = s.call(Method::GET,&path,Some(t),None).await; ok(&r);
+    assert_eq!(r.body["enabled"],json!(true)); assert_eq!(r.body["disabled_reason"],json!(""));
+    ok(&s.call(Method::POST,&format!("{}/test",path),Some(t),Some(json!({}))).await);
+    redacted(&s.call(Method::GET,&list,Some(t),None).await,&[&hook_secret,"whsec_"]);
 }

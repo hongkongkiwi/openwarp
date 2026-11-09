@@ -25,6 +25,12 @@ pub(super) fn routes() -> Router<S> { Router::new()
 }
 fn supported() -> Result<(), (StatusCode, Json<Value>)> { if cfg!(target_arch="wasm32") { Err(err(StatusCode::NOT_IMPLEMENTED,"webhook dispatch requires the native runtime")) } else { Ok(()) } }
 fn generated(master: &[u8;32], wid: &str) -> (String,String) { let key=oc::random_key(); (format!("whsec_{}",Base64::encode_string(&key)),oc::encrypt_symmetric_aad(master,format!("webhook:{}",wid).as_bytes(),&key)) }
+// Asymmetric signing pair (Standard Webhooks v1a): the seed is encrypted with
+// the instance master and receipt-style AAD; the public key is not secret.
+fn signing_keypair(master: &[u8;32], wid: &str) -> (String,String) {
+    let seed=oc::random_key(); let sk=ed25519_dalek::SigningKey::from_bytes(&seed);
+    let enc=oc::encrypt_symmetric_aad(master,format!("webhook-sign:{}",wid).as_bytes(),&seed);
+    (format!("whpk_{}",Base64::encode_string(&sk.verifying_key().to_bytes())),enc) }
 pub(super) fn master_fence(tx: &db::WebhookTx<'_>, master: &[u8;32]) -> Result<(),String> {
     let hash=oc::hash_token(&Base64::encode_string(master)); let row=tx.one("SELECT master_hash FROM webhook_serialization WHERE id=1",&[])?.ok_or("missing webhook serialization row")?;
     let stored=db::s(&row,"master_hash"); if !stored.is_empty() && stored!=hash {return Err("instance master key changed; restart with the current key".into());}
@@ -72,7 +78,7 @@ async fn key_write(st: &S, master: [u8;32], wid: String, incoming: bool, sql: St
     st.db.webhook_atomic(move |tx| {master_fence(tx,&master)?; if tx.exec(&sql,&params)?!=1 {return Err("webhook changed during key operation".into());} cancel_tx(tx,&wid,incoming)}).await.map_err(|e|err(StatusCode::CONFLICT,&e))
 }
 fn key(st: &AppState, row: &Row) -> Result<Vec<u8>, (StatusCode, Json<Value>)> { oc::decrypt_symmetric_aad(&st.master(),format!("webhook:{}",db::s(row,"id")).as_bytes(),&db::s(row,"secret_enc")).map_err(|_|err(StatusCode::SERVICE_UNAVAILABLE,"signing key unavailable")) }
-fn visible(row: &Row) -> Value { let mut v=db::obj(row); if let Some(m)=v.as_object_mut() { for k in ["secret_enc","credential_hash","creator_id","source_ip"] { m.remove(k); } m.insert("enabled".into(),json!(db::n(row,"enabled")!=0)); if let Some(events)=m.get("events").and_then(Value::as_str).and_then(|s|serde_json::from_str::<Value>(s).ok()) { m.insert("events".into(),events); } } v }
+fn visible(row: &Row) -> Value { let mut v=db::obj(row); if let Some(m)=v.as_object_mut() { for k in ["secret_enc","sign_key_enc","credential_hash","creator_id","source_ip"] { m.remove(k); } m.insert("enabled".into(),json!(db::n(row,"enabled")!=0)); if let Some(events)=m.get("events").and_then(Value::as_str).and_then(|s|serde_json::from_str::<Value>(s).ok()) { m.insert("events".into(),events); } } v }
 fn page(q: &HashMap<String,String>) -> (i64,i64) { (q.get("limit").and_then(|v|v.parse().ok()).unwrap_or(25).clamp(1,100),q.get("offset").and_then(|v|v.parse().ok()).unwrap_or(0).clamp(0,100000)) }
 fn name(body: &Value) -> Result<&str,(StatusCode,Json<Value>)> { let n=body["name"].as_str().unwrap_or("webhook"); if n.is_empty() || n.len()>128 { Err(bad("name must contain 1-128 bytes")) } else { Ok(n) } }
 fn events(body: &Value) -> Result<String,(StatusCode,Json<Value>)> { let v=body.get("events").cloned().unwrap_or(json!(["*"])); let a=v.as_array().ok_or_else(||bad("events must be an array"))?; if a.is_empty() || a.len()>64 || a.iter().any(|x|x.as_str().map(|s|s.is_empty() || s.len()>128 || !s.bytes().all(|b|b.is_ascii_alphanumeric() || b"._*-".contains(&b))).unwrap_or(true)) { return Err(bad("invalid event filters")); } Ok(v.to_string()) }
@@ -88,17 +94,28 @@ async fn out(st: &S,h: &HeaderMap,wid: &str) -> Result<Row,(StatusCode,Json<Valu
 async fn list_outgoing(State(st): State<S>,h: HeaderMap,Path(oid): Path<String>) -> Res { outgoing_admin(&st,&h,&oid).await?; let rows=st.db.query("SELECT * FROM webhook_subscriptions WHERE org_id=? ORDER BY created_at,id LIMIT 100",&[json!(oid)]).await.map_err(|e|bad(&e))?; Ok(j(json!(rows.iter().map(visible).collect::<Vec<_>>()))) }
 async fn create_outgoing(State(st): State<S>,h: HeaderMap,Path(oid): Path<String>,Json(body): Json<Value>) -> Res { supported()?; let uid=outgoing_admin(&st,&h,&oid).await?; let url=body["url"].as_str().ok_or_else(||bad("url required"))?; destination(url)?; let app=body["app_id"].as_str().unwrap_or(""); if !app.is_empty() && st.db.one("SELECT id FROM apps WHERE id=? AND org_id=?",&[json!(app),json!(oid)]).await.map_err(|e|bad(&e))?.is_none() { return Err(bad("application does not belong to workspace")); }
     let count=st.db.one("SELECT COUNT(*) AS n FROM webhook_subscriptions WHERE org_id=?",&[json!(oid)]).await.map_err(|e|bad(&e))?.map(|r|db::n(&r,"n")).unwrap_or(0); if count>=100 { return Err(err(StatusCode::CONFLICT,"subscription limit reached")); }
-    let wid=id(); let master=st.master(); let (secret,enc)=generated(&master,&wid); let event=AuditEvent::new([&oid,app,"",&uid,"webhook.create",&wid]); key_write_audited(&st,master,wid.clone(),false,"INSERT INTO webhook_subscriptions(id,org_id,app_id,name,url,events,enabled,secret_enc,version,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,1,?,? WHERE (SELECT COUNT(*) FROM webhook_subscriptions WHERE org_id=?)<100".into(),vec![json!(wid),json!(oid),json!(app),json!(name(&body)?),json!(url),json!(events(&body)?),json!(i64::from(body["enabled"].as_bool().unwrap_or(true))),json!(enc),json!(now()),json!(now()),json!(oid)],event).await?;
-    let mut v=visible(&out(&st,&h,&wid).await?); v["secret"]=json!(secret); Ok(j(v)) }
+    let wid=id(); let master=st.master(); let (secret,enc)=generated(&master,&wid);
+    let (pk,sign_enc)=if body["asymmetric"].as_bool()==Some(true) { let (pk,e)=signing_keypair(&master,&wid); (pk,Some(e)) } else { (String::new(),None) };
+    let event=AuditEvent::new([&oid,app,"",&uid,"webhook.create",&wid]);
+    key_write_audited(&st,master,wid.clone(),false,"INSERT INTO webhook_subscriptions(id,org_id,app_id,name,url,events,enabled,secret_enc,sign_key_enc,public_key,version,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,?,1,?,? WHERE (SELECT COUNT(*) FROM webhook_subscriptions WHERE org_id=?)<100".into(),vec![json!(wid),json!(oid),json!(app),json!(name(&body)?),json!(url),json!(events(&body)?),json!(i64::from(body["enabled"].as_bool().unwrap_or(true))),json!(enc),json!(sign_enc.clone().unwrap_or_default()),json!(pk.clone()),json!(now()),json!(now()),json!(oid)],event).await?;
+    let mut v=visible(&out(&st,&h,&wid).await?); v["secret"]=json!(secret); if let Some(pk)=pk_non_empty(pk) { v["public_key"]=json!(pk); } Ok(j(v)) }
+fn pk_non_empty(pk: String) -> Option<String> { if pk.is_empty() { None } else { Some(pk) } }
 async fn get_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { Ok(j(visible(&out(&st,&h,&wid).await?))) }
 async fn update_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>,Json(body): Json<Value>) -> Res { let r=out(&st,&h,&wid).await?; let url=body["url"].as_str().map(str::to_string).unwrap_or_else(||db::s(&r,"url")); destination(&url)?; let n=if body.get("name").is_some() { name(&body)?.to_string() } else { db::s(&r,"name") }; let filters=if body.get("events").is_some() { events(&body)? } else { db::s(&r,"events") }; let app=body["app_id"].as_str().map(str::to_string).unwrap_or_else(||db::s(&r,"app_id")); if !app.is_empty() && st.db.one("SELECT id FROM apps WHERE id=? AND org_id=?",&[json!(app),json!(db::s(&r,"org_id"))]).await.map_err(|e|bad(&e))?.is_none() { return Err(bad("application does not belong to workspace")); }
-    let actor=st.token_user(&h).await?; let event=AuditEvent::new([&db::s(&r,"org_id"),"","",&actor,"webhook.update",&wid]); mutate(&st,wid.clone(),false,"UPDATE webhook_subscriptions SET name=?,url=?,events=?,app_id=?,enabled=?,version=version+1,updated_at=? WHERE id=?".into(),vec![json!(n),json!(url),json!(filters),json!(app),json!(i64::from(body["enabled"].as_bool().unwrap_or(db::n(&r,"enabled")!=0))),json!(now()),json!(wid)],event).await?; Ok(j(visible(&out(&st,&h,&wid).await?))) }
+    let actor=st.token_user(&h).await?; let event=AuditEvent::new([&db::s(&r,"org_id"),"","",&actor,"webhook.update",&wid]); mutate(&st,wid.clone(),false,"UPDATE webhook_subscriptions SET name=?,url=?,events=?,app_id=?,enabled=?,disabled_reason='',version=version+1,updated_at=? WHERE id=?".into(),vec![json!(n),json!(url),json!(filters),json!(app),json!(i64::from(body["enabled"].as_bool().unwrap_or(db::n(&r,"enabled")!=0))),json!(now()),json!(wid)],event).await?; Ok(j(visible(&out(&st,&h,&wid).await?))) }
 fn cancel_tx(tx: &db::WebhookTx<'_>,wid: &str,incoming: bool) -> Result<(),String> {let table=if incoming {"webhook_receipts"} else {"webhook_deliveries"}; tx.exec(&format!("UPDATE {} SET status='cancelled',claim_id='',updated_at=?,error_code='subscription_changed' WHERE webhook_id=? AND status IN ('pending','failed','processing')",table),&[json!(now()),json!(wid)])?;Ok(())}
 async fn mutate(st: &S,wid: String,incoming: bool,sql: String,params: Vec<Value>,event: AuditEvent) -> Result<(),(StatusCode,Json<Value>)> {
     st.db.webhook_atomic(move |tx| {if tx.exec(&sql,&params)?!=1 {return Err("webhook changed".into());} cancel_tx(tx,&wid,incoming)?; event.append(tx)}).await.map_err(|e|err(StatusCode::CONFLICT,&e))?; st.drain_outbox().await; Ok(())
 }
 async fn delete_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { let r=out(&st,&h,&wid).await?; let actor=st.token_user(&h).await?; let event=AuditEvent::new([&db::s(&r,"org_id"),"","",&actor,"webhook.delete",&wid]); mutate(&st,wid.clone(),false,"DELETE FROM webhook_subscriptions WHERE id=?".into(),vec![json!(wid)],event).await?; Ok(j(json!({"deleted":wid}))) }
-async fn rotate_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { let r=out(&st,&h,&wid).await?; let master=st.master(); let (secret,enc)=generated(&master,&wid); let actor=st.token_user(&h).await?; let event=AuditEvent::new([&db::s(&r,"org_id"),"","",&actor,"webhook.rotate",&wid]); key_write_audited(&st,master,wid.clone(),false,"UPDATE webhook_subscriptions SET secret_enc=?,version=version+1,updated_at=? WHERE id=?".into(),vec![json!(enc),json!(now()),json!(wid)],event).await?; Ok(j(json!({"id":wid,"secret":secret}))) }
+async fn rotate_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { let r=out(&st,&h,&wid).await?; let master=st.master(); let (secret,enc)=generated(&master,&wid); let actor=st.token_user(&h).await?;
+    // An asymmetric subscription rotates both keys; a HMAC-only one keeps its
+    // signing pair untouched.
+    let (pk,sign_enc)=if db::s(&r,"sign_key_enc").is_empty() { (String::new(),None) } else { let (p,e)=signing_keypair(&master,&wid); (p,Some(e)) };
+    let event=AuditEvent::new([&db::s(&r,"org_id"),"","",&actor,"webhook.rotate",&wid]);
+    let (sql,params)=if let Some((e,p))=sign_enc.map(|e| (e,pk.clone())) { ("UPDATE webhook_subscriptions SET secret_enc=?,sign_key_enc=?,public_key=?,version=version+1,updated_at=? WHERE id=?",vec![json!(enc),json!(e),json!(p),json!(now()),json!(wid)]) } else { ("UPDATE webhook_subscriptions SET secret_enc=?,version=version+1,updated_at=? WHERE id=?",vec![json!(enc),json!(now()),json!(wid)]) };
+    key_write_audited(&st,master,wid.clone(),false,sql.into(),params,event).await?;
+    let mut resp=json!({"id":wid,"secret":secret}); if !pk.is_empty() { resp["public_key"]=json!(pk); } Ok(j(resp)) }
 async fn deliveries(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>,Query(q): Query<HashMap<String,String>>) -> Res { out(&st,&h,&wid).await?; history(&st,"webhook_deliveries",&wid,&q).await }
 async fn history(st: &S,table: &str,wid: &str,q: &HashMap<String,String>) -> Res { let (limit,offset)=page(q); let rows=st.db.query(&format!("SELECT id,{} AS {},status,attempts,http_status,duration_ms,updated_at,next_attempt_at,error_code,created_at FROM {} WHERE webhook_id=? ORDER BY created_at DESC,id LIMIT ? OFFSET ?",if table=="webhook_receipts" {"message_id"} else {"event_id"},if table=="webhook_receipts" {"message_id"} else {"event_id"},table),&[json!(wid),json!(limit),json!(offset)]).await.map_err(|e|bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn test_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { supported()?; st.epoch_ok().await?; let r=out(&st,&h,&wid).await?; if db::n(&r,"enabled")==0 { return Err(bad("subscription disabled")); } let event=id(); enqueue(&st,&r,&event,&json!({"id":event,"type":"webhook.test","timestamp":now(),"workspace_id":db::s(&r,"org_id"),"app_id":db::s(&r,"app_id"),"env_id":"","actor_id":st.token_user(&h).await?}).to_string()).await?; Ok(j(json!({"event_id":event,"queued":true}))) }
@@ -214,13 +231,30 @@ async fn send(st: &S,sub: &Row,delivery: &Row) -> (bool,i64,String,i64) { let re
     if addresses.is_empty() || (!private_override() && addresses.iter().any(|v|!public_ip(v.ip()))) { return Err("destination_blocked"); }
     let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(10)).resolve_to_addrs(host,&addresses).build().map_err(|_|"transport_failed")?;
     let material=key(st,sub).map_err(|_|"signing_key_unavailable")?; let ts=now(); let event=db::s(delivery,"event_id"); let payload=db::s(delivery,"payload"); let mut mac=hmac::Hmac::<Sha256>::new_from_slice(&material).map_err(|_|"signing_key_unavailable")?; mac.update(format!("{}.{}.",event,ts).as_bytes()); mac.update(payload.as_bytes());
-    let response=client.post(url.clone()).header("content-type","application/json").header("webhook-id",event).header("webhook-timestamp",ts.to_string()).header("webhook-signature",format!("v1,{}",Base64::encode_string(&mac.finalize().into_bytes()))).body(payload).send().await.map_err(|_|"transport_failed")?;
+    // Standard Webhooks v1a: receivers with only the public key verify the
+    // Ed25519 signature; the HMAC stays in the same header for both checks.
+    let mut signature=format!("v1,{}",Base64::encode_string(&mac.finalize().into_bytes()));
+    let seed_enc=db::s(sub,"sign_key_enc");
+    if !seed_enc.is_empty() {
+        let seed=oc::decrypt_symmetric_aad(&st.master(),format!("webhook-sign:{}",db::s(sub,"id")).as_bytes(),&seed_enc).map_err(|_|"signing_key_unavailable")?;
+        let mut seed_bytes=[0u8;32]; seed_bytes.copy_from_slice(&seed);
+        use ed25519_dalek::Signer;
+        let sk=ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
+        let mut msg=Vec::with_capacity(96+payload.len());
+        msg.extend_from_slice(format!("{}.{}.",event,ts).as_bytes()); msg.extend_from_slice(payload.as_bytes());
+        let sigv=sk.sign(&msg);
+        signature.push_str(&format!(" v1a,{}",Base64::encode_string(&sigv.to_bytes())));
+    }
+    let response=client.post(url.clone()).header("content-type","application/json").header("webhook-id",event).header("webhook-timestamp",ts.to_string()).header("webhook-signature",signature).body(payload).send().await.map_err(|_|"transport_failed")?;
     let status=i64::from(response.status().as_u16()); let retry=if status==429 || status==503 { response.headers().get("retry-after").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<i64>().ok()).unwrap_or(0).clamp(0,3600) } else {0};
     Ok::<_,&str>((response.status().is_success(),status,if response.status().is_success(){""} else {"http_error"}.to_string(),retry))
     }; result.await.unwrap_or_else(|e|(false,0,e.into(),0)) }
 #[cfg(not(target_arch="wasm32"))]
 pub(super) async fn process(st: &S) {
     st.drain_outbox().await;
+    // Retry pacing is operator-tunable so self-hosted test instances can
+    // converge fast; production keeps the documented exponential schedule.
+    let retry_base=crate::envcfg::var("OPENWARP_WEBHOOK_RETRY_BASE_SECS").ok().and_then(|v|v.parse::<i64>().ok()).unwrap_or(5).clamp(0,3600);
     let _=st.db.exec("DELETE FROM webhook_attempts WHERE created_at<?",&[json!(now()-7*86400)]).await;
     let _=st.db.exec("UPDATE webhook_attempts SET status='lease_expired',error_code='lease_expired',updated_at=? WHERE status='processing' AND created_at<?",&[json!(now()),json!(now()-120)]).await;
     for incoming in [false,true] {
@@ -238,8 +272,28 @@ pub(super) async fn process(st: &S) {
                 Ok(Ok(msg))=>{outcome=msg.chars().take(200).collect();(true,0,String::new(),0)},
                 Ok(Err(_))=>(false,0,"integration_sync_failed".into(),0),Err(_)=>(false,0,"integration_sync_timeout".into(),0) } }
         } else { let app=db::s(&sub,"app_id"); let running=if app.is_empty() {st.require_org_running(&db::s(&sub,"org_id")).await} else {st.require_app_running(&app).await}; if running.is_err() {(false,0,"emergency_lockdown".into(),0)} else {send(st,&sub,&row).await} } } else {(false,0,"subscription_changed".into(),0)};
-        let terminal=attempts>=8 || ["authorization_revoked","subscription_changed","destination_blocked"].contains(&code.as_str()); let state=if ok {"delivered"} else if terminal {"dead_lettered"} else {"failed"}; let delay=(5_i64*2_i64.pow(attempts.min(10) as u32)).min(3600)+i64::from(oc::random_key()[0]%16); let next=now()+delay.max(retry);
+        let terminal=attempts>=8 || ["authorization_revoked","subscription_changed","destination_blocked"].contains(&code.as_str()); let state=if ok {"delivered"} else if terminal {"dead_lettered"} else {"failed"}; let delay=(retry_base*2_i64.pow(attempts.min(10) as u32)).min(3600)+i64::from(oc::random_key()[0]%16); let next=now()+delay.max(retry);
         if !incoming { let _=st.db.exec("UPDATE webhook_attempts SET status=?,http_status=?,duration_ms=?,error_code=?,updated_at=? WHERE id=? AND claim_id=?",&[json!(if ok {"delivered"} else {"failed"}),json!(status),json!(start.elapsed().as_millis() as i64),json!(code),json!(now()),json!(attempt_id),json!(claim)]).await; }
         let _=st.db.exec(&format!("UPDATE {} SET status=CASE WHEN EXISTS(SELECT 1 FROM {} s WHERE s.id={}.webhook_id AND s.version={}.version AND s.enabled=1) THEN ? ELSE 'cancelled' END,http_status=?,duration_ms=?,error_code=?,outcome=?,next_attempt_at=?,updated_at=?,claim_id='',lease_until=0 WHERE id=? AND claim_id=? AND lease_until>=?",table,subs,table,table),&[json!(state),json!(status),json!(start.elapsed().as_millis() as i64),json!(code),json!(if ok {outcome} else {String::new()}),json!(next),json!(now()),json!(did),json!(claim),json!(now())]).await;
+        // Svix-style endpoint disabling: a subscription whose deliveries keep
+        // dead-lettering without an intervening success stops consuming the
+        // queue until a workspace admin re-enables it. The streak counts
+        // dead-letters newer than the last successful delivery.
+        if !incoming && state=="dead_lettered" {
+            let wid0=db::s(&row,"webhook_id");
+            let streak=st.db.one("SELECT COUNT(*) AS n FROM webhook_deliveries d WHERE d.webhook_id=? AND d.status='dead_lettered' AND d.updated_at>COALESCE((SELECT MAX(x.updated_at) FROM webhook_deliveries x WHERE x.webhook_id=? AND x.status='delivered'),0)",&[json!(&wid0),json!(&wid0)]).await.unwrap_or(None);
+            let streak_n=streak.as_ref().map(|r|db::n(r,"n")).unwrap_or(0);
+            if streak_n>=5 {
+                if let Ok(Some(sub0))=st.db.one("SELECT org_id FROM webhook_subscriptions WHERE id=?",&[json!(&wid0)]).await {
+                    let org0=db::s(&sub0,"org_id");
+                    let fields: [&str;6]=[&org0,"","","system","webhook.auto_disabled",""];
+                    let _=st.audited_batch(&[
+                        ("UPDATE webhook_subscriptions SET enabled=0,disabled_reason='consecutive_dead_letters',version=version+1,updated_at=? WHERE id=? AND enabled=1 AND disabled_reason=''".into(),vec![json!(now()),json!(&wid0)]),
+                        ("UPDATE webhook_deliveries SET status='cancelled',claim_id='',updated_at=?,error_code='subscription_disabled' WHERE webhook_id=? AND status IN ('pending','failed','processing')".into(),vec![json!(now()),json!(&wid0)]),
+                    ],&[0],fields).await;
+                    st.drain_outbox().await;
+                }
+            }
+        }
     }
 } }

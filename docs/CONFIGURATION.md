@@ -121,6 +121,7 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 | `OPENWARP_TRUST_PROXY` | Disabled | `1` enables forwarded client-IP handling from trusted peers |
 | `OPENWARP_TRUSTED_PROXIES` | `127.0.0.1/32,::1` | Comma-separated proxy IPs or CIDRs |
 | `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits trusted private/loopback destinations where egress checks apply; native event webhooks also use it to permit HTTP and private resolved addresses |
+| `OPENWARP_WEBHOOK_RETRY_BASE_SECS` | 5 | Base delay for native webhook delivery retries (clamped 0-3600); retries remain capped at eight attempts with exponential backoff and jitter |
 | `OPENWARP_ALLOWED_DB_HOSTS` | Empty | Comma-separated `host[:port]` allowlist for dynamic database leases (PostgreSQL, MySQL and MariaDB); empty disables that capability |
 
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.

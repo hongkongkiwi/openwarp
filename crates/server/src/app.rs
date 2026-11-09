@@ -4007,6 +4007,11 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
                     tx.exec(&format!("UPDATE {} SET secret_enc=? WHERE id=?",table),&[json!(oc::encrypt_symmetric_aad(&new,aad.as_bytes(),&plain)),json!(wid)])?;
                 }
             }
+            for row in tx.query("SELECT id,sign_key_enc FROM webhook_subscriptions WHERE sign_key_enc<>''",&[])? {
+                let wid=db::s(&row,"id"); let aad=format!("webhook-sign:{}",wid);
+                let plain=oc::decrypt_symmetric_aad(&old,aad.as_bytes(),&db::s(&row,"sign_key_enc")).map_err(|_|"a webhook signing key cannot be decrypted; refusing master rotation")?;
+                tx.exec("UPDATE webhook_subscriptions SET sign_key_enc=? WHERE id=?",&[json!(oc::encrypt_symmetric_aad(&new,aad.as_bytes(),&plain)),json!(wid)])?;
+            }
             let mut counts=(0usize,0usize,0usize,0usize,0usize,0usize); let mut auth_count=0usize; let mut ldap_count=0usize;
             for row in tx.query("SELECT id,env_key_wrapped FROM envs",&[])? {
                 let id=db::s(&row,"id"); let wrapped=db::s(&row,"env_key_wrapped");
