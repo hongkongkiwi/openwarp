@@ -54,20 +54,11 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    // Parallel test binaries must not hand the same port to two servers.
-    let base = 20000 + (std::process::id() % 30000) as u16;
-    for offset in 0..500u16 {
-        let port = base.saturating_add(offset);
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            drop(listener);
-            return port;
-        }
-    }
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    // True ephemeral: the OS never hands out a port that is still bound, so
+    // parallel test binaries cannot converge the way a PID-derived scan
+    // does. The only residual hazard is the gap between dropping this
+    // listener and the child binding it, which the startup retry covers.
+    TcpListener::bind("127.0.0.1:0").expect("ephemeral port").local_addr().expect("local addr").port()
 }
 
 impl Server {
@@ -1822,7 +1813,7 @@ async fn ssh_ca_principals_are_gated_by_role_grants() {
     let owner = register(&s, "sshowner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
-    grant_features(&s, &ot, &org, &["ssh-ca"]).await;
+    grant_features(&s, &ot, &org, &["ssh-ca", "pki"]).await;
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);

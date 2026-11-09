@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const PASSWORD: &str = "cookie-scope-test-password";
 const REDIRECT: &str = "http://127.0.0.1:8917/callback";
@@ -61,6 +62,11 @@ impl Server {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { drop(_lock); return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
     async fn response(r: reqwest::Response) -> Resp {

@@ -13,9 +13,10 @@ async fn state() -> (S, HeaderMap) {
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('owner','owner@example.test','','','',?)", &[json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'owner',?)", &[json!(oc::hash_token("rotation-session")), json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await.unwrap();
-    // Boot persists the verifier row the rotation re-encrypts; the direct
-    // state construction skips that path, so seed it here.
-    st.db.exec("INSERT OR IGNORE INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&[1; 32], b"openwarp-master-key-v1"))]).await.unwrap();
+    // Mirror a booted server: boot installs the master verifier before any
+    // request can rotate the key, and rotation's batch updates that row by
+    // name with a required count, so a fixture without it always 409s.
+    persist_verifier(&st.db, &[1; 32]).await.unwrap();
     let mut h = HeaderMap::new();
     h.insert("authorization", "Bearer rotation-session".parse().unwrap());
     (st, h)
