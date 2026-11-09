@@ -252,14 +252,7 @@ test('master rotation commits encrypted records atomically before publishing the
   contains(rotation, /owkms:/, 'master rotation must recognize externally wrapped environment keys');
 });
 
-test('Workers master rotation fails closed while the native server commits atomically', () => {
-  const stub = worker('rotate_master');
-  assert.ok(/NOT_IMPLEMENTED|requires the native server/.test(stub), 'the Workers rotation stub must fail closed with an explicit unsupported error');
-  assert.ok(!/checked_batch|encrypt_symmetric/.test(mask(stub)), 'the stub must never rewrap or publish key material');
-  const nativeText = native('rotate_master');
-  contains(nativeText, /checked_batch\(&statements/, 'the native server must commit rotation records atomically before publishing the new key');
-  contains(nativeText, /decrypt_symmetric/, 'the native server must preflight every encrypted record before rotating');
-});
+test('Workers master rotation uses the real rotation path', () => { portable('rotate_master'); });
 
 test('Workers cold start validates persisted master-key identity before serving encrypted data', () => {
   const init = initialization();

@@ -13,6 +13,7 @@ use crate::ssh_ca;
 #[cfg(feature = "change-requests")]
 #[path = "change_requests.rs"] mod change_requests;
 #[cfg(feature = "ldap")] use crate::ldap;
+#[cfg(not(target_arch = "wasm32"))]
 use axum::body::Bytes;
 use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, middleware::Next, response::{Html, IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
 #[cfg(not(target_arch = "wasm32"))]
@@ -3972,6 +3973,7 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let lifecycle_guard=st.lifecycle.clone().write_owned().await;
     let uid = st.token_user(&h).await?;
@@ -4093,8 +4095,69 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
 
 // The Workers build has no blocking runtime, rusqlite, or OCSP/CRL signing;
 // these instance and PKI routes answer 501 there.
+// The Workers deployment rotates online through the configured KMS bridge:
+// the batch runs inline on the single-threaded runtime (the DO storage driver
+// is synchronous under the hood), so there is no blocking wrapper here.
 #[cfg(target_arch = "wasm32")]
-async fn rotate_master(State(_): State<S>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
+async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    let uid = st.token_user(&h).await?;
+    if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
+    let new: [u8; 32] = oc::unb64(body.get("new_key").and_then(|v| v.as_str()).unwrap_or("")).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    let old = st.master();
+    if old == new { return Err(bad("new_key is the current key")); }
+    verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
+    // Preflight every encrypted value before touching the database. The same
+    // record sets rotate here as on the native server; feature-specific
+    // stores (pki, saml, ldap, hooks) exist in the canonical schema even when
+    // their routes are compiled out, so an empty sweep stays correct.
+    let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
+    let mut env_updates = Vec::new();
+    for r in &envs {
+        let wrapped = db::s(r, "env_key_wrapped");
+        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
+        let plain = oc::decrypt_symmetric(&old, &wrapped)
+            .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
+        env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
+    }
+    let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%' OR k LIKE 'hibp_api_key:%' OR k LIKE 'enzoic_credentials:%'", &[]).await.map_err(|e| bad(&e))?;
+    let mut meta_updates = Vec::new();
+    for r in &metas {
+        let value = db::s(r, "v"); if value.is_empty() { continue; }
+        let plain = oc::decrypt_symmetric(&old, &value)
+            .map_err(|_| bad(&format!("stored secret {} cannot be decrypted with the current master key; refusing rotation", db::s(r, "k"))))?;
+        meta_updates.push((db::s(r, "k"), oc::encrypt_symmetric(&new, &plain)));
+    }
+    let users = st.db.query("SELECT id,auth_key_enc FROM users WHERE auth_key_enc<>''", &[]).await.map_err(|e| bad(&e))?;
+    let mut auth_updates = Vec::new();
+    for r in users { let uid = db::s(&r, "id"); let aad = auth_key_aad(&uid); let plain = oc::decrypt_symmetric_aad(&old, &aad, &db::s(&r, "auth_key_enc")).map_err(|_| bad("authentication key unavailable; refusing root rotation"))?; auth_updates.push((uid, oc::encrypt_symmetric_aad(&new, &aad, &plain))); }
+    let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
+    let mut statements: Vec<(String, Vec<Value>, Option<u64>)> = Vec::new();
+    for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(id)], Some(1))); }
+    for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value), json!(k)], Some(1))); }
+    for (uid, value) in &auth_updates { statements.push(("UPDATE users SET auth_key_enc=? WHERE id=?".into(), vec![json!(value), json!(uid)], Some(1))); }
+    statements.push(("DELETE FROM email_codes".into(), vec![], None));
+    if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
+    statements.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))], Some(1)));
+    // A configured KMS bridge wraps the replacement root; a failed wrap
+    // surfaces as HTTP 400 after exactly one attempt, leaving the batch
+    // unexecuted and the old root authoritative.
+    if let Some(kms) = st.kms() {
+        let wrapped = kms.wrap(&new, "master").await.map_err(|e| bad(&e))?;
+        statements.push(("UPDATE meta SET v=? WHERE k='kms_root'".into(), vec![json!(wrapped)], Some(1)));
+    } else if st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() {
+        return Err(err(StatusCode::CONFLICT, "restore the KMS bridge before rotating its root"));
+    }
+    let counts = (env_updates.len(), meta_updates.len(), auth_updates.len());
+    st.db.checked_batch(&statements, false).await
+        .map_err(|_| err(StatusCode::CONFLICT, "master rotation conflicted with a key mutation; no changes applied"))?;
+    *st.master.write().unwrap_or_else(|e| e.into_inner()) = new;
+    // Fingerprints are keyed by the master key and salted by workspace, so
+    // rebuild them under the new root before the response completes.
+    let _ = st.db.exec("UPDATE secrets SET value_fp=''", &[]).await;
+    let _ = st.db.exec("DELETE FROM meta WHERE k='migration:value_fp'", &[]).await;
+    backfill_value_fingerprints(&st).await;
+    st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} auth={}", counts.0, counts.1, counts.2)).await;
+    Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "auth": counts.2}, "rotated_records": counts.0 + counts.1 + counts.2, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 #[cfg(target_arch = "wasm32")]
 async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
 #[cfg(target_arch = "wasm32")]

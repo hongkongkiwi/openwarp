@@ -81,7 +81,10 @@ mod inner {
             let body = request.body().and_then(|body| body.as_bytes()).ok_or("provider request failed")?;
             let mut init = worker::RequestInit::new();
             init.with_method(worker::Method::Post).with_headers(headers)
-                .with_redirect(worker::RequestRedirect::Error)
+                // workerd rejects `redirect: "error"`, so hand back any redirect
+                // response untouched; the non-2xx check below fails it closed,
+                // mirroring the native client's no-redirect policy.
+                .with_redirect(worker::RequestRedirect::Manual)
                 .with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
             let request = worker::Request::new_with_init(request.url().as_str(), &init).map_err(|_| "provider request failed")?;
             // Dropping the Rust future must also cancel the JS fetch and its body.
