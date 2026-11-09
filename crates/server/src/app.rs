@@ -4803,7 +4803,6 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     Ok(j(json!({"id": cert_id, "certificate": issued.certificate_pem, "private_key": issued.private_key_pem, "ca_certificate": db::s(&ca,"cert_pem"), "ca_chain": ca_chain(&st,&ca).await, "device_id": device_id, "expires_at": expires}))) }
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(feature = "pki")]
-#[cfg(feature = "pki")]
 async fn ocsp_respond(State(st): State<S>, PeerAddr(addr): PeerAddr, Path(caid): Path<String>, body: Bytes) -> Response {
     // Unauthenticated by design and one signing operation per call, so it
     // carries its own budget. The limit sits far above what a caching client
@@ -4866,7 +4865,6 @@ async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>)
     if !did.is_empty() { let _ = st.db.exec("UPDATE pki_devices SET active_cert_id='',updated_at=? WHERE id=? AND active_cert_id=?", &[json!(t), json!(&did), json!(cid)]).await; }
     Ok(j(json!({"revoked": cid}))) }
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(feature = "pki")]
 #[cfg(feature = "pki")]
 async fn ca_crl(State(st): State<S>, Path(caid): Path<String>) -> Response {
     // A CRL is a signed public artifact; brokers fetch it without a credential.
@@ -7494,8 +7492,6 @@ pub async fn deliver_job(db: &Db, job: Job) {
             let _ = crate::http::Client::new().post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({}))).send().await; }
     }
 }
-#[cfg(target_arch = "wasm32")]
-async fn rotate_master(State(_): State<S>, _: HeaderMap, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
 #[cfg(test)]
 mod tests {
     use super::*;

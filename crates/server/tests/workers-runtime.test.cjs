@@ -43,7 +43,7 @@ test('Workers initialization enforces the shared sign-in configuration validator
 });
 
 test('production Workers require a pinned HTTPS public URL', () => {
-  contains(worker, /OPENWARP_ENV/, 'Workers startup must distinguish production configuration');
+  contains(worker, /crate::production\s*\(\s*\)/, 'Workers startup must distinguish production configuration');
   contains(worker, /https:\/\//, 'Workers production public URL validation must require HTTPS');
   assert.ok(!/let\s+pub_url\s*=\s*envcfg::var\("OPENWARP_PUBLIC_URL"\)\.unwrap_or_default\(\)/.test(worker),
     'production Workers must not silently use an empty public URL');
