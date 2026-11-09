@@ -80,7 +80,9 @@ tokio-postgres = { version = "0.7", default-features = false, features = ["js"] 
 default = []
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
-saml = ["dep:risaml", "dep:rcgen"]
+# SAML metadata signing mints its SP certificate through rcgen, which the
+# pki feature brings in.
+saml = ["dep:risaml", "dep:rcgen", "pki"]
 scim = []
 pki = ["dep:x509-cert", "dep:p256", "dep:keystore-ocsp", "dep:keystore-pki", "dep:rcgen"]
 ssh-ca = ["dep:ssh-key"]
