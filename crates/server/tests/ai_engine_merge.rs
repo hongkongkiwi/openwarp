@@ -11,7 +11,7 @@ use axum::{body::{to_bytes, Body}, http::{Method, Request}};
 use openwarp_crypto as oc;
 use openwarp_server::db::{n, s, Db, Row};
 use openwarp_server::migrate::{self, Options, MIGRATIONS};
-use openwarp_server::{app::PeerAddr, clock, new_state, router, S};
+use openwarp_server::{app::PeerAddr, clock, new_state, persist_verifier, router, S};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -161,10 +161,12 @@ fn released_engine_sql_1_through_29_is_immutable() {
 }
 
 #[tokio::test]
-async fn fresh_engine_reaches_30_with_exact_ai_schema() {
-    assert_eq!(MIGRATIONS.last().expect("manifest").version, 30, "the merged engine must append the AI assistant schema as migration 30");
+async fn fresh_engine_reaches_latest_with_exact_ai_schema() {
+    // The AI schema keeps its released position (migration 30); migrations may
+    // still be appended after it without touching this suite.
+    assert_eq!(MIGRATIONS[29].version, 30, "the AI assistant schema must stay exactly migration 30");
     let db = Db::open_memory().await.unwrap();
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, MIGRATIONS.last().unwrap().version).await;
     assert_ai_tables_exact(&db).await;
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
@@ -188,9 +190,9 @@ async fn engine29_upgrade_appends_migration_30_and_preserves_data() {
     let ledger29 = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("the merged engine upgrades an engine-29 database");
-    assert_eq!(report.applied, vec![30], "the AI schema must land as exactly migration 30 on an engine-29 database");
+    assert_eq!(report.applied, (30..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>(), "an engine-29 database must gain migration 30 and everything shipped after it");
     assert!(!report.squashed);
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, MIGRATIONS.last().unwrap().version).await;
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=29 ORDER BY version", &[]).await.unwrap(), ledger29, "engine history 1..29 must survive the upgrade untouched");
     let row = &db.query("SELECT name,checksum,success FROM schema_migrations WHERE version=30", &[]).await.unwrap()[0];
@@ -234,6 +236,9 @@ struct Fixture { state: S, app: axum::Router }
 impl Fixture {
     async fn open(database: &Database, master: [u8; 32]) -> Self {
         let db = Db::open(&database.url).await.expect("open and migrate private SQLite database");
+        // Boot writes a master verifier before serving; the handler's ledger
+        // updates expect that row, so the fixture finishes the same step.
+        persist_verifier(&db, &master).await.expect("install the boot master verifier");
         let (live, _) = tokio::sync::broadcast::channel(16);
         let state = new_state(db, database.url.clone(), "ai-engine-merge".into(), "https://openwarp.test.invalid".into(), master, live,
             #[cfg(feature = "redis-cache")] None);

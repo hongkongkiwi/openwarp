@@ -3858,8 +3858,10 @@ async fn adopt_kms_root(db: &Db, kms: &kms::Kms, supplied: Option<[u8; 32]>) -> 
     Ok(winner)
 }
 // Mint the boot verifier by CAS: a loser revalidates the authoritative row and
-// refuses when another boot established a different root.
-async fn persist_verifier(db: &Db, key: &[u8; 32]) -> Result<(), String> {
+// refuses when another boot established a different root. Public because test
+// fixtures that construct state without the boot path must install the same
+// verifier; rotation's ledger depends on this row existing.
+pub async fn persist_verifier(db: &Db, key: &[u8; 32]) -> Result<(), String> {
     if db.insert_if_absent("master_key_check", &oc::encrypt_symmetric(key, b"openwarp-master-key-v1")).await? { return Ok(()); }
     let row = db.one("SELECT v FROM meta WHERE k='master_key_check'", &[]).await?.ok_or("the concurrent master verifier is missing")?;
     let plain = oc::decrypt_symmetric(key, &db::s(&row, "v")).map_err(|_| "another boot established a different master root".to_string())?;
@@ -4078,7 +4080,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
         let mut guard = st2.master.write().unwrap_or_else(|e| e.into_inner());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| bad(&e.to_string()))?;
         let result = runtime.block_on(st2.db.checked_batch(&statements, false))
-            .map_err(|_| err(StatusCode::CONFLICT, "master rotation conflicted with a key mutation; no changes applied"));
+            .map_err(|e| err(StatusCode::CONFLICT, &format!("master rotation conflicted with a key mutation; no changes applied ({e})")));
         if result.is_ok() { *guard = new; }
         result
     }).await.map_err(|e| bad(&e.to_string()))?;
