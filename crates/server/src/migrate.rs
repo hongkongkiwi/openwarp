@@ -137,10 +137,9 @@ impl Target for worker::D1Database {
         let words: Vec<_> = sql.split_whitespace().collect();
         if let ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] = words.as_slice() {
             let column = column.trim_end_matches(',').trim_matches('"').to_string();
-            let info = self.prepare(&format!("PRAGMA table_info({table})")).all().await.map_err(|e| e.to_string())?;
-            for row in info.results() {
-                if row.get(&column).map(|v| !v.is_null()).unwrap_or(false) { return Ok(()); }
-            }
+            let rows: Vec<serde_json::Value> = self.prepare(&format!("PRAGMA table_info({table})")).all().await
+                .map_err(|e| e.to_string())?.results::<serde_json::Value>().map_err(|e| e.to_string())?;
+            if rows.iter().any(|row| row.get("name").and_then(|v| v.as_str()) == Some(column.as_str())) { return Ok(()); }
         }
         self.prepare(sql).run().await.map(|_| ()).map_err(|e| e.to_string())
     }
