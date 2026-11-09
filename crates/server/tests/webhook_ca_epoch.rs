@@ -1,3 +1,5 @@
+#![cfg(feature = "pki")]
+
 // Master epoch fencing for the PKI CA write paths. Every route that persists
 // master-encrypted key material must fail closed with epoch_stale on a replica
 // still holding the pre-rotation master: an intermediate CA private key and the

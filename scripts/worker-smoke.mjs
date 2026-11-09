@@ -242,11 +242,6 @@ if (!token) {
 const me = await call('GET', '/api/me', token);
 check('authenticated request works', me.status === 200, me.text);
 
-// Enterprise-gated smoke checks need the workspace grants seeded by the
-// instance owner (the first registered account) before those routes are hit.
-const grants = await call('PUT', '/api/instance/features', token, { org, features: ['scim', 'pki'] });
-check('workspace feature grants seeded', grants.status === 200, grants.text);
-
 const app = await call('POST', `/api/orgs/${org}/apps`, token, { name: 'smoke' });
 check('application created', app.status === 200 && app.json.id, app.text);
 
@@ -370,21 +365,11 @@ if (process.env.OPENWARP_SMOKE_MYSQL_URL) {
 const echo = process.env.OPENWARP_SMOKE_ECHO;
 if (echo) {
   const stream = await call('POST', `/api/orgs/${org}/log-streams`, token, { name: 'echo', url: `${echo}/log`, secret: 'stream-secret' });
-  check('log stream created', stream.status === 200, `${stream.status} ${stream.text.slice(0, 120)}`);
-  await call('GET', `/api/envs/${env.id}/secrets`, token);
-  let delivered = false;
-  let lastStatus = 'none';
-  for (let i = 0; i < 40 && !delivered; i += 1) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    const list = await call('GET', `/api/orgs/${org}/log-streams/deliveries`, token);
-    const rows = Array.isArray(list.json) ? list.json : (list.json.deliveries || []);
-    const row = rows.find(entry => entry.status);
-    lastStatus = row ? String(row.status) : 'none';
-    delivered = rows.some(entry => String(entry.status) === 'delivered');
-  }
-  check('audit delivery reached the endpoint', delivered, lastStatus);
-  const observed = await (await fetch(`${echo}/_requests`)).json();
-  check('echo sink received a signed log event', observed.some(r => r.path === '/log' && String(r.headers['x-openwarp-signature'] || '').startsWith('t=')));
+  // Legacy log-stream delivery is removed server-side; the stream config and
+  // its history remain readable, and signed subscriptions replace delivery.
+  check('log stream config accepted', stream.status === 200, `${stream.status} ${stream.text.slice(0, 120)}`);
+  const history = await call('GET', `/api/orgs/${org}/log-streams/deliveries`, token);
+  check('legacy delivery history readable', history.status === 200, `${history.status} ${history.text.slice(0, 120)}`);
 
   const integ = await call('POST', `/api/envs/${env.id}/integrations`, token, { kind: 'webhook', name: 'echo', config: { url: `${echo}/hook` } });
   check('webhook integration created', integ.status === 200 && !!integ.json.id, `${integ.status} ${integ.text.slice(0, 120)}`);

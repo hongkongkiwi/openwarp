@@ -1,3 +1,5 @@
+#![cfg(feature = "ssh-ca")]
+
 // Master epoch fencing. A master rotation rewraps every master-encrypted blob
 // in one database transaction and advances the shared epoch fingerprint in
 // webhook_serialization. A replica that still holds the old master in memory is

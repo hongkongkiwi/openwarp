@@ -1,3 +1,5 @@
+#![cfg(feature = "transit")]
+
 // Transit and change request integration with the outbox/epoch write path,
 // exercised through the public routes. These tests pin three invariants: a
 // master rotation rewraps every transit version in place so existing
