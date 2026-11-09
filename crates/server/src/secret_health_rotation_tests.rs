@@ -1,18 +1,18 @@
 use super::*;
-use std::{future::Future, task::{Context, Poll, Wake, Waker}};
-
-struct NoopWake;
-impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+use std::{future::Future, task::{Context, Poll, Waker}};
 
 fn assert_waiting<F: Future>(future: std::pin::Pin<&mut F>) {
-    let waker = Waker::from(Arc::new(NoopWake));
-    assert!(matches!(future.poll(&mut Context::from_waker(&waker)), Poll::Pending), "operation crossed the held credential gate");
+    let waker = Waker::noop();
+    assert!(matches!(future.poll(&mut Context::from_waker(waker)), Poll::Pending), "operation crossed the held credential gate");
 }
 
 async fn state() -> (S, HeaderMap) {
     let db = Db::open_memory().await.unwrap();
     let (live, _) = broadcast::channel(16);
     let st = new_state(db, String::new(), "rotation-test".into(), String::new(), [1; 32], live, #[cfg(feature = "redis-cache")] None);
+    // Boot installs the master verifier before serving; the rotation ledger
+    // updates that row, so the fixture finishes the same boot step.
+    persist_verifier(&st.db, &[1; 32]).await.expect("install the boot master verifier");
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('owner','owner@example.test','','','',?)", &[json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'owner',?)", &[json!(oc::hash_token("rotation-session")), json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await.unwrap();
