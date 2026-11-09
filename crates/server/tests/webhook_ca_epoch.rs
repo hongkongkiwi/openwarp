@@ -51,6 +51,9 @@ impl Rotated {
         db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)",
             &[json!(USER), json!("ca-epoch@test.invalid"), json!(""), json!(""), json!(""), json!(t)]).await.unwrap();
         db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(ORG), json!("ca-epoch"), json!(t)]).await.unwrap();
+        // The CA routes require a workspace pki grant on top of the compiled feature.
+        db.exec("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,?,?)",
+            &[json!(ORG), json!("pki"), json!(USER), json!(t)]).await.unwrap();
         db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(ORG), json!(USER), json!("owner")]).await.unwrap();
         db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)",
             &[json!(oc::hash_token(TOKEN)), json!(USER), json!(t)]).await.unwrap();

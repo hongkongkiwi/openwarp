@@ -49,6 +49,9 @@ impl Rotated {
         db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)",
             &[json!(USER), json!("epoch@test.invalid"), json!(""), json!(""), json!(""), json!(t)]).await.unwrap();
         db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(ORG), json!("epoch"), json!(t)]).await.unwrap();
+        // SSH CA and PKI routes require workspace grants on top of compiled features.
+        db.exec("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,?,?)",
+            &[json!(ORG), json!("ssh-ca pki"), json!(USER), json!(t)]).await.unwrap();
         db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(ORG), json!(USER), json!("owner")]).await.unwrap();
         db.exec("INSERT INTO apps(id,org_id,name,created_at) VALUES(?,?,?,?)", &[json!(APP), json!(ORG), json!("epoch"), json!(t)]).await.unwrap();
         db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)",

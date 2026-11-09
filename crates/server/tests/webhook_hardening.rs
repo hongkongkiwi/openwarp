@@ -146,7 +146,7 @@ async fn encoded_workspace_path_cannot_escape_ip_allowlist_or_missing_org_denial
     good(s.call(Method::PUT,&format!("/api/orgs/{org}/settings"),t,Some(json!({"ip_allowlist":"192.0.2.0/24"}))).await);
     let raw=s.call(Method::GET,&format!("/api/orgs/{org}/apps"),t,None).await; assert_eq!(raw.0,403);
     let encoded=s.call(Method::GET,&format!("/api/orgs/{}/apps",encoded(org)),t,None).await;
-    assert_eq!(encoded.0,403,"encoded org bypassed policy: {}",encoded.1);
+    assert_eq!(encoded.0,400,"encoded org bypassed policy: {}",encoded.1);
     deny(&s.call(Method::GET,"/api/orgs/does-not-exist/apps",t,None).await);
 }
 
@@ -155,9 +155,11 @@ async fn encoded_environment_does_not_bypass_pat_scope() {
     let s=Server::start().await; let u=s.register("encoded-env@test.invalid").await; let t=u["token"].as_str().unwrap(); let (aid,eid)=s.app(t,u["org_id"].as_str().unwrap()).await;
     let envs=good(s.call(Method::GET,&format!("/api/apps/{aid}/envs"),t,None).await); let other=envs.as_array().unwrap().iter().find(|v|v["id"]!=eid).unwrap()["id"].as_str().unwrap();
     let pat=good(s.call(Method::POST,&format!("/api/apps/{aid}/tokens"),t,Some(json!({"name":"scope","env_id":eid}))).await); let pt=pat["token"].as_str().unwrap();
-    good(s.call(Method::GET,&format!("/api/envs/{}/integrations",encoded(&eid)),pt,None).await);
+    // Percent-encoded API paths are rejected outright now; the bypass is
+    // impossible because routing never sees a decoded spelling.
+    assert_eq!(s.call(Method::GET,&format!("/api/envs/{}/integrations",encoded(&eid)),pt,None).await.0,400);
     deny(&s.call(Method::GET,&format!("/api/envs/{other}/integrations"),pt,None).await);
-    deny(&s.call(Method::GET,&format!("/api/envs/{}/integrations",encoded(other)),pt,None).await);
+    assert_eq!(s.call(Method::GET,&format!("/api/envs/{}/integrations",encoded(other)),pt,None).await.0,400);
 }
 
 #[tokio::test]

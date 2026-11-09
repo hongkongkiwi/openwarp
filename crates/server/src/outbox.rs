@@ -15,8 +15,18 @@ impl AuditEvent {
         { let wall=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_micros() as i64;
           let prior=tx.one("SELECT MAX(id) AS last_id FROM live_events", &[])?.map(|r|db::n(&r,"last_id")).unwrap_or(0); let live_id=wall.max(prior+1);
           tx.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(live_id),json!(org),json!(app),json!(env),json!(action),json!(detail),json!(self.created_at)])?; }
+        // Workers keeps the same live-event feed: a transaction-local cursor
+        // stands in for the wall clock, and a taken id retries forward.
+        #[cfg(target_arch="wasm32")]
+        { let prior=tx.one("SELECT COALESCE(MAX(id),0) AS last_id FROM live_events", &[])?.map(|r|db::n(&r,"last_id")).unwrap_or(0);
+          for seq in (prior+1..).take(4) {
+              if tx.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq),json!(org),json!(app),json!(env),json!(action),json!(detail),json!(self.created_at)]).is_ok() { break; }
+          } }
         let count = tx.one("SELECT COUNT(*) AS n FROM webhook_outbox", &[])?.map(|r| db::n(&r,"n")).unwrap_or(0);
-        if count >= 10000 { return Err("webhook outbox capacity exhausted".into()); }
+        // Subscription-management events (pause, delete, auto-disable) must
+        // still commit when the outbox is full, or the operator could not stop
+        // the very subscription that is filling it.
+        if count >= 10000 && !action.starts_with("webhook.") { return Err("webhook outbox capacity exhausted".into()); }
         let payload = json!({"id":self.id,"type":action,"timestamp":self.created_at,"workspace_id":org,"app_id":app,"env_id":env,"actor_id":actor}).to_string();
         tx.exec("INSERT INTO webhook_outbox(id,payload,created_at) VALUES(?,?,?)", &[json!(self.id),json!(payload),json!(self.created_at)])?;
         for row in tx.query("SELECT id,version,events FROM webhook_subscriptions WHERE org_id=? AND enabled=1 AND (app_id='' OR app_id=?)", &[json!(org),json!(app)])? {
@@ -84,7 +94,13 @@ impl AppState {
                 let current=tx.one("SELECT id FROM webhook_subscriptions WHERE id=? AND version=? AND enabled=1", &[json!(wid),json!(version)])?.is_some();
                 if current {
                     let queued=tx.one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id=? AND status IN ('pending','failed','processing')", &[json!(wid)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
-                    if queued>=1000 { continue; }
+                    if queued>=1000 {
+                        // Surface the backpressure the console reports; a later successful
+                        // drain resets the counter.
+                        let _=tx.exec("UPDATE webhook_subscriptions SET enqueue_failures=enqueue_failures+1,last_enqueue_error_at=? WHERE id=?",&[json!(now()),json!(wid)]);
+                        continue;
+                    }
+                    let _=tx.exec("UPDATE webhook_subscriptions SET enqueue_failures=0 WHERE id=? AND enqueue_failures<>0",&[json!(wid)]);
                     tx.exec("INSERT INTO webhook_deliveries(id,webhook_id,event_id,payload,version,status,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,'pending',?,?,?)", &[json!(db::s(&target,"delivery_id")),json!(wid),json!(event),json!(db::s(&target,"payload")),json!(version),json!(db::n(&target,"created_at")),json!(now()),json!(now())])?;
                 }
                 tx.exec("DELETE FROM webhook_outbox_targets WHERE event_id=? AND webhook_id=?", &[json!(event),json!(wid)])?;

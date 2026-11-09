@@ -121,12 +121,17 @@ async fn history(st: &S,table: &str,wid: &str,q: &HashMap<String,String>) -> Res
 async fn test_outgoing(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>) -> Res { supported()?; st.epoch_ok().await?; let r=out(&st,&h,&wid).await?; if db::n(&r,"enabled")==0 { return Err(bad("subscription disabled")); } let event=id(); enqueue(&st,&r,&event,&json!({"id":event,"type":"webhook.test","timestamp":now(),"workspace_id":db::s(&r,"org_id"),"app_id":db::s(&r,"app_id"),"env_id":"","actor_id":st.token_user(&h).await?}).to_string()).await?; Ok(j(json!({"event_id":event,"queued":true}))) }
 async fn attempts(State(st): State<S>,h: HeaderMap,Path(did): Path<String>,Query(q): Query<HashMap<String,String>>) -> Res { let delivery=st.db.one("SELECT webhook_id FROM webhook_deliveries WHERE id=?",&[json!(did)]).await.map_err(|e|bad(&e))?.ok_or_else(||err(StatusCode::NOT_FOUND,"delivery not found"))?; out(&st,&h,&db::s(&delivery,"webhook_id")).await?; let (limit,offset)=page(&q); let rows=st.db.query("SELECT id,status,http_status,duration_ms,error_code,created_at,updated_at FROM webhook_attempts WHERE delivery_id=? ORDER BY created_at DESC,id LIMIT ? OFFSET ?",&[json!(did),json!(limit),json!(offset)]).await.map_err(|e|bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn retry_delivery(State(st): State<S>,h: HeaderMap,Path(did): Path<String>) -> Res { supported()?; let r=st.db.one("SELECT webhook_id FROM webhook_deliveries WHERE id=?",&[json!(did)]).await.map_err(|e|bad(&e))?.ok_or_else(||err(StatusCode::NOT_FOUND,"delivery not found"))?; let sub=out(&st,&h,&db::s(&r,"webhook_id")).await?; if db::n(&sub,"enabled")==0 { return Err(bad("subscription disabled")); } let retry_id=did.clone(); let retry_wid=db::s(&sub,"id"); let version=db::n(&sub,"version"); let changed=st.db.webhook_atomic(move |tx| {
-    tx.exec("UPDATE webhook_deliveries SET status='pending',attempts=0,next_attempt_at=?,updated_at=?,version=?,claim_id='',lease_until=0,error_code='' WHERE id=? AND status IN ('failed','dead_lettered') AND EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id=? AND enabled=1 AND version=?) AND (SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=? AND id<>? AND status IN ('pending','failed','processing'))<1000",&[json!(now()),json!(now()),json!(version),json!(retry_id),json!(retry_wid),json!(version),json!(retry_wid),json!(retry_id)])
+    // MySQL rejects an UPDATE whose subquery reads the target table, so the
+    // capacity check runs as its own statement inside the same transaction.
+    let queued=tx.one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id=? AND id<>? AND status IN ('pending','failed','processing')",&[json!(&retry_wid),json!(&retry_id)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
+    if queued>=1000 { return Ok(0); }
+    tx.exec("UPDATE webhook_deliveries SET status='pending',attempts=0,next_attempt_at=?,updated_at=?,version=?,claim_id='',lease_until=0,error_code='' WHERE id=? AND status IN ('failed','dead_lettered') AND EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id=? AND enabled=1 AND version=?)",&[json!(now()),json!(now()),json!(version),json!(retry_id),json!(&retry_wid),json!(version)])
 }).await.map_err(|e|bad(&e))?; if changed==0 { return Err(err(StatusCode::CONFLICT,"only failed or dead-lettered deliveries can be retried")); } Ok(j(json!({"id":did,"queued":true}))) }
 async fn enqueue(st: &AppState,r: &Row,event: &str,payload: &str) -> Result<(),(StatusCode,Json<Value>)> {
     let wid=db::s(r,"id"); let version=db::n(r,"version"); let event=event.to_string(); let payload=payload.to_string();
     st.db.webhook_atomic(move |tx| {
-        let changed=tx.exec("INSERT INTO webhook_deliveries(id,webhook_id,event_id,payload,version,status,created_at,updated_at,next_attempt_at) SELECT ?,?,?,?,?,'pending',?,?,? WHERE EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id=? AND version=? AND enabled=1) AND (SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id=? AND status IN ('pending','processing','failed'))<1000",&[json!(id()),json!(wid),json!(event),json!(payload),json!(version),json!(now()),json!(now()),json!(now()),json!(wid),json!(version),json!(wid)])?;
+        let queued=tx.one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id=? AND status IN ('pending','processing','failed')",&[json!(&wid)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
+        let changed=if queued>=1000 { 0 } else { tx.exec("INSERT INTO webhook_deliveries(id,webhook_id,event_id,payload,version,status,created_at,updated_at,next_attempt_at) SELECT ?,?,?,?,?,'pending',?,?,? WHERE EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id=? AND version=? AND enabled=1)",&[json!(id()),json!(&wid),json!(&event),json!(&payload),json!(version),json!(now()),json!(now()),json!(now()),json!(&wid),json!(version)])? };
         if changed!=1 {return Err("webhook changed or queue full".into());} Ok(())
     }).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))
 }
@@ -168,13 +173,20 @@ async fn receipt_replay(State(st): State<S>,h: HeaderMap,Path((wid,rid)): Path<(
     let changed=st.db.webhook_atomic(move |tx| {
         let count=tx.one("SELECT COUNT(*) AS n FROM webhook_receipts WHERE webhook_id=? AND status IN ('pending','processing','failed')",&[json!(wid2)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
         if count>=1000 {return Err("incoming queue full".into());}
-        tx.exec("UPDATE webhook_receipts SET status='pending',attempts=0,http_status=0,duration_ms=0,error_code='',outcome='',claim_id='',lease_until=0,next_attempt_at=?,updated_at=? WHERE id=? AND webhook_id=? AND status IN ('delivered','failed','dead_lettered')",&[json!(now()),json!(now()),json!(rid2),json!(wid2)])
+        // A replay only runs under the current enabled subscription version;
+        // an older or paused hook would cancel the receipt unread otherwise.
+        let version=tx.one("SELECT version FROM webhook_subscriptions WHERE id=? AND enabled=1",&[json!(wid2)])?.ok_or("incoming webhook is paused or removed")?.clone();
+        tx.exec("UPDATE webhook_receipts SET status='pending',attempts=0,http_status=0,duration_ms=0,error_code='',outcome='',claim_id='',lease_until=0,version=?,next_attempt_at=?,updated_at=? WHERE id=? AND webhook_id=? AND status IN ('delivered','failed','dead_lettered')",&[json!(db::n(&version,"version")),json!(now()),json!(now()),json!(rid2),json!(wid2)])
     }).await.map_err(|e|err(StatusCode::CONFLICT,&e))?;
     if changed==0 { return Err(err(StatusCode::CONFLICT,"only delivered, failed or dead-lettered receipts can be replayed")); }
     st.drain_outbox().await; Ok(j(json!({"id":rid,"queued":true}))) }
 fn client_address(h: &HeaderMap,peer: PeerAddr) -> String { let ip=peer.0.to_string(); let trust=crate::envcfg::var("OPENWARP_TRUST_PROXY").as_deref()==Ok("1") && crate::envcfg::var("OPENWARP_TRUSTED_PROXIES").unwrap_or_else(|_|"127.0.0.1/32,::1".into()).split(',').any(|c|ip_in_cidr(&ip,c)); if trust { if let Some(v)=h.get("x-forwarded-for").and_then(|v|v.to_str().ok()).and_then(|v|v.split(',').next()) { return v.trim().to_string(); } } ip }
 async fn allowed_ip(st: &S,oid: &str,ip: &str) -> bool { match st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?",&[json!(oid)]).await { Ok(Some(r)) => { let list=db::s(&r,"ip_allowlist"); list.trim().is_empty() || list.split(',').any(|c|ip_in_cidr(ip,c)) }, _=>false } }
 async fn creator_valid(st: &S,r: &Row) -> Result<(),(StatusCode,Json<Value>)> { let uid=db::s(r,"creator_id"); let hash=db::s(r,"credential_hash"); if !st.principal_active(&uid).await { return Err(err(StatusCode::FORBIDDEN,"creator inactive")); }
+    // A restricted principal must not drive server-side exports: the sync runs
+    // outside the path-policy middleware, so restricted creators are refused
+    // outright, matching the manual sync trigger's guard.
+    if st.restricted_principal(&uid).await.unwrap_or(true) { return Err(err(StatusCode::FORBIDDEN,"creator cannot trigger integration sync")); }
     let credential=st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND created_at>?",&[json!(hash),json!(now()-7*86400)]).await.map_err(|e|bad(&e))?.map(|v|db::s(&v,"user_id")==uid).unwrap_or(false)
         || st.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?",&[json!(hash),json!(now())]).await.map_err(|e|bad(&e))?.map(|v|db::s(&v,"user_id")==uid).unwrap_or(false)
         || st.db.one("SELECT created_by FROM tokens WHERE token_hash=? AND (expires_at=0 OR expires_at>?) AND (kind<>'machine' OR created_at>?)",&[json!(hash),json!(now()),json!(now()-3600)]).await.map_err(|e|bad(&e))?.map(|v|db::s(&v,"created_by")==uid).unwrap_or(false);
@@ -188,12 +200,18 @@ async fn creator_valid(st: &S,r: &Row) -> Result<(),(StatusCode,Json<Value>)> { 
 async fn accept(State(st): State<S>,h: HeaderMap,peer: PeerAddr,Path(wid): Path<String>,body: Bytes) -> Response { if let Err(e)=st.epoch_ok().await { return e.into_response(); } match accept_inner(&st,&h,peer,&wid,&body).await { Ok((status,v))=>(status,Json(v)).into_response(), Err(e)=>e.into_response() } }
 async fn accept_inner(st: &S,h: &HeaderMap,peer: PeerAddr,wid: &str,body: &[u8]) -> Result<(StatusCode,Value),(StatusCode,Json<Value>)> { supported()?;
     let source=client_address(h,peer); let ratekey=format!("incoming_source:{}",source);
-    let budget=st.db.webhook_atomic(move |tx| {
-        let prior=tx.one("SELECT count,window_start FROM rate_limits WHERE key=?",&[json!(ratekey)])?;
+    // The pre-auth source budget runs outside webhook_atomic: an unauthenticated
+    // request must never contend on the instance serialization row.
+    async fn source_budget(st: &S, ratekey: &str) -> Option<i64> {
+        // A first-ever source has no row yet: that is count 1, not an outage.
+        let prior=st.db.one("SELECT count,window_start FROM rate_limits WHERE key=?",&[json!(ratekey)]).await.ok().flatten();
         let count=prior.as_ref().filter(|r|db::n(r,"window_start")>now()-60).map(|r|db::n(r,"count")+1).unwrap_or(1);
-        if prior.is_some() {tx.exec("UPDATE rate_limits SET count=?,window_start=CASE WHEN window_start<=? THEN ? ELSE window_start END WHERE key=?",&[json!(count),json!(now()-60),json!(now()),json!(ratekey)])?;}
-        else {tx.exec("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,?)",&[json!(ratekey),json!(now()),json!(count)])?;} Ok(count)
-    }).await.map_err(|_|err(StatusCode::SERVICE_UNAVAILABLE,"source limiter unavailable"))?;
+        if st.db.exec("UPDATE rate_limits SET count=?,window_start=CASE WHEN window_start<=? THEN ? ELSE window_start END WHERE key=?",&[json!(count),json!(now()-60),json!(now()),json!(ratekey)]).await.is_ok() { return Some(count); }
+        if st.db.exec("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,?)",&[json!(ratekey),json!(now()),json!(count)]).await.is_ok() { return Some(count); }
+        None
+    }
+    let budget=source_budget(st,&ratekey).await;
+    let budget=match budget { Some(b)=>b, None=>return Err(err(StatusCode::SERVICE_UNAVAILABLE,"source limiter unavailable")) };
     if budget>180 {return Err(err(StatusCode::TOO_MANY_REQUESTS,"source request budget exceeded"));} let r=st.db.one("SELECT * FROM incoming_webhooks WHERE id=?",&[json!(wid)]).await.map_err(|e|bad(&e))?.ok_or_else(||err(StatusCode::NOT_FOUND,"webhook not found"))?; if db::n(&r,"enabled")==0 { return Err(err(StatusCode::FORBIDDEN,"webhook disabled")); }
     let header=|k|h.get(k).and_then(|v|v.to_str().ok()).unwrap_or(""); let mid=header("webhook-id"); let ts=header("webhook-timestamp"); let timestamp=ts.parse::<i64>().map_err(|_|err(StatusCode::UNAUTHORIZED,"invalid signature"))?;
     if mid.is_empty() || mid.len()>128 || !mid.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'_' || b==b'-') || timestamp.abs_diff(now())>300 { return Err(err(StatusCode::UNAUTHORIZED,"invalid signature")); }

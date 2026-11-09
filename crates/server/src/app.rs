@@ -122,6 +122,18 @@ pub(crate) fn bad(msg: &str) -> (StatusCode, Json<Value>) { err(StatusCode::BAD_
 fn unique_violation(e: &str) -> bool { let e = e.to_ascii_lowercase(); e.contains("unique constraint") || e.contains("duplicate key") || e.contains("duplicate entry") }
 fn master_write_error(e: String) -> (StatusCode, Json<Value>) { if e == webhooks::EPOCH_STALE { webhooks::epoch_stale() } else { bad(&e) } }
 pub(crate) fn mfa_failure(e: String) -> (StatusCode, Json<Value>) { if e == webhooks::EPOCH_STALE { webhooks::epoch_stale() } else { err(StatusCode::SERVICE_UNAVAILABLE, "two-factor verification is temporarily unavailable") } }
+/// Splits checked-batch triples into audited-batch pairs plus the require-one
+/// index list, so feature modules can compose their mutations with the audit
+/// append and outbox fan-out in one transaction.
+#[cfg(any(feature = "transit", feature = "change-requests"))]
+pub(crate) fn checked_pairs(v: Vec<(String, Vec<Value>, Option<u64>)>, all_checked: bool) -> (Vec<(String, Vec<Value>)>, Vec<usize>) {
+    let mut checked = Vec::new();
+    let out = v.into_iter().enumerate().map(|(i,(sql,params,required))| {
+        if all_checked || required.is_some() { checked.push(i); }
+        (sql,params)
+    }).collect();
+    (out,checked)
+}
 pub(crate) fn epoch_failure_msg(e: (StatusCode, Json<Value>)) -> String { if e.1.0.get("code").and_then(|v| v.as_str()) == Some(webhooks::EPOCH_STALE) { webhooks::EPOCH_STALE.into() } else { "instance key epoch check failed".into() } }
 pub(crate) fn now() -> i64 { crate::clock::now() }
 pub(crate) fn id() -> String { oc::random_token("id").replace("id_", "") }
@@ -729,6 +741,9 @@ async fn me_auth(State(st): State<S>, h: HeaderMap) -> Res {
     Ok(j(json!({"auth_version": db::n(&row,"auth_version"), "kdf_salt": db::s(&row,"kdf_salt"), "kdf_iterations": db::n(&row,"kdf_iterations"), "kdf_algo": db::s(&row,"kdf_algo"), "public_key": db::s(&row,"pubkey"), "wrapped_privkey": db::s(&row,"wrapped_privkey")}))) }
 #[derive(Deserialize, Default)] struct InviteV2Req { token: String, #[serde(default)] salt: String, #[serde(default)] iterations: i64, #[serde(default)] algo: String, #[serde(default)] auth_key: String, #[serde(default)] public_key: String, #[serde(default)] wrapped_privkey: String }
 async fn accept_invite_v2(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteV2Req>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // The acceptance writes a master-encrypted auth key; a replica on an older
+    // key must fail closed before consuming the invitation.
+    st.epoch_ok().await.map_err(|e| if e.1.get("code").and_then(|v| v.as_str())==Some(webhooks::EPOCH_STALE) { e } else { err(StatusCode::SERVICE_UNAVAILABLE,"instance key epoch check failed") })?;
     let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
     if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
     if !auth_enabled(&st, "password").await { return Err(err(StatusCode::FORBIDDEN, "password sign-in is disabled on this instance; sign in with the configured provider to redeem this invite")); }
@@ -1049,6 +1064,7 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
 
 #[derive(Deserialize)] struct InviteReq { token: String, #[serde(default)] password: String }
 async fn accept_invite(State(st): State<S>, PeerAddr(addr): PeerAddr, h: HeaderMap, Json(r): Json<InviteReq>) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    st.epoch_ok().await?;
     let row = workspaces::valid_invite(&st,&r.token,&h,addr).await?;
     if let Some(out) = workspaces::existing(&st,&row,&r.token,&h).await? { return Ok(out); }
     if !auth_enabled(&st,"password").await { return Err(err(StatusCode::FORBIDDEN,"password sign-in is disabled; sign in with a configured provider to join")); }
@@ -3957,12 +3973,15 @@ pub async fn load_master(db: &Db, kms: Option<&kms::Kms>) -> Result<[u8; 32], St
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    // Acquire in the same order as request middleware (key-lifecycle read then
+    // lifecycle read); the reverse order here would deadlock against a request
+    // holding the key-lifecycle read while waiting for the lifecycle read.
+    let rotation_permit = st.key_lifecycle.clone().write_owned().await;
     let lifecycle_guard=st.lifecycle.clone().write_owned().await;
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
     let new_key = body.get("new_key").and_then(|v| v.as_str()).unwrap_or("");
     let new: [u8; 32] = oc::unb64(new_key).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
-    let rotation_permit = st.key_lifecycle.clone().write_owned().await;
     if st.kms().is_some() || st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT,"master rotation is unavailable while KMS auto-unseal is configured")); }
     if !matches!(&*st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
@@ -4692,6 +4711,9 @@ async fn insert_enrollment(st: &S, did: &str, row: &Row, ttl: i64, revoke_previo
     Ok((code, expires, nonce)) }
 #[cfg(feature = "pki")]
 async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    // Signing an intermediate decrypts the parent CA key; a replica on an old
+    // master must answer epoch_stale instead of a bare decrypt failure.
+    st.epoch_ok().await?;
     st.check_admin(&oid,&uid).await?; st.require_feature(&oid,"pki").await?;
     let name = body_str(&body,"name").unwrap_or_else(|| "OpenWarp CA".to_string());
     let parent_id = body_str(&body,"parent_id").unwrap_or_default();
@@ -5374,7 +5396,9 @@ async fn put_ca_hook(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>
     let url = body_str(&body,"url").unwrap_or_default();
     if !url.is_empty() && (!url_ok(&url) || !egress_allowed(&url)) { return Err(bad("hook url must be http(s) and outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1")); }
     let secret_enc = if let Some(s) = body.get("secret").and_then(|v| v.as_str()) { if s.is_empty() { String::new() } else { oc::encrypt_symmetric(&st.master(), s.as_bytes()) } } else { db::s(&ca,"hook_secret_enc") };
-    st.db.exec("UPDATE pki_cas SET hook_url=?,hook_secret_enc=? WHERE id=?", &[json!(&url), json!(&secret_enc), json!(&caid)]).await.map_err(|e| bad(&e))?;
+    let master = st.master();
+    // The hook secret is master-encrypted, so the write must fail closed on a stale epoch.
+    st.epoch_write(&[("UPDATE pki_cas SET hook_url=?,hook_secret_enc=? WHERE id=?".into(), vec![json!(&url), json!(&secret_enc), json!(&caid)])], &[0], master).await.map_err(|e| if e==webhooks::EPOCH_STALE {webhooks::epoch_stale()} else { bad(&e) })?;
     st.audit(&org,"","",&uid,"pki.ca.hook",&format!("{} ({})", db::s(&ca,"name"), caid)).await;
     Ok(j(json!({"url": url, "secret_set": !secret_enc.is_empty()}))) }
 #[cfg(feature = "pki")]

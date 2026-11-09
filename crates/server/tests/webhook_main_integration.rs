@@ -48,6 +48,10 @@ async fn seed_owner(db: &Db, master: &[u8; 32], with_env: bool) {
     db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES(?,?,?,?,?,?)",
         &[json!(USER), json!("webhook-main@test.invalid"), json!(""), json!(""), json!(""), json!(t)]).await.unwrap();
     db.exec("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(ORG), json!("webhook-main"), json!(t)]).await.unwrap();
+    // Transit and change-request routes require a workspace feature grant on
+    // top of the compiled feature.
+    db.exec("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,?,?)",
+        &[json!(ORG), json!("transit change-requests"), json!(USER), json!(t)]).await.unwrap();
     db.exec("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)", &[json!(ORG), json!(USER), json!("owner")]).await.unwrap();
     db.exec("INSERT INTO apps(id,org_id,name,created_at) VALUES(?,?,?,?)", &[json!(APP), json!(ORG), json!("webhook-main"), json!(t)]).await.unwrap();
     db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)",
