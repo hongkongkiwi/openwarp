@@ -101,7 +101,9 @@ jobs:
         run: |
           cargo install worker-build --version 0.8.7
           cargo install wasm-bindgen-cli --version 0.2.130
-          cd crates/server && worker-build --release --no-default-features
+          # A debug worker honors OPENWARP_LICENSE=development, which the smoke
+          # needs to exercise the enterprise-gated routes end to end.
+          cd crates/server && worker-build --no-default-features
       - name: Deployment configuration gate
         run: node --test scripts/tests/portable-runtime/worker-deployment.test.cjs
       - name: Workerd smoke test
