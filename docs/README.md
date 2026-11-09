@@ -17,6 +17,8 @@ OpenWarp is a self-hosted secrets manager with a browser console, a Rust CLI, an
 | --- | --- |
 | Deploy behind HTTPS and configure sign-in | [Deployment](DEPLOY.md) |
 | Look up environment variables and defaults | [Configuration](CONFIGURATION.md) |
+| Understand the self-hosted and enterprise plans | [Editions and licensing](EDITIONS.md) |
+| Upgrade a database across releases, inspect the ledger, repair a failed run | [Schema migrations](MIGRATIONS.md) |
 | Understand encryption, access control, and trust boundaries | [Security model](SECURITY.md) |
 | Compare SSE, delegated and E2E key custody | [Encryption and key custody](ENCRYPTION.md) |
 | Back up data and rehearse a restore | [Backup and restore](BACKUP.md) |
@@ -31,6 +33,7 @@ OpenWarp is a self-hosted secrets manager with a browser console, a Rust CLI, an
 | Review secret changes across environments | [Batched change requests](CHANGE-REQUESTS.md) |
 | Exchange workload JWTs for scoped access | [Workload identity](WORKLOAD-IDENTITY.md) |
 | Encrypt application data with workspace keys | [Transit encryption](TRANSIT.md) |
+| Configure BYOK assistance and investigate security findings | [Assistant and security insights](AI.md) |
 | Inject secrets into Kubernetes pods or worker nodes | [Kubernetes](KUBERNETES.md) |
 | Configure workload JWT identity and folder restrictions | [Workload access](WORKLOADS.md) |
 | Use workload, path-policy, rotation and transit endpoints | [API reference](API.md) |

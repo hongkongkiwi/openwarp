@@ -1,3 +1,5 @@
+#![cfg(feature = "change-requests")]
+
 include!("product_features.rs");
 
 impl Fixture {
@@ -17,6 +19,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn lockdown_blocks_owner_transit_until_workspace_or_project_is_restored() {
+    if !suite_gated() { return; }
     for scope in ["workspace", "project"] {
         let f = Fixture::new().await;
         let key = f.transit_key("lockdown-existing", "org-a", OWNER).await;
@@ -48,6 +51,7 @@ async fn lockdown_blocks_owner_transit_until_workspace_or_project_is_restored() 
 
 #[tokio::test]
 async fn lockdown_blocks_owner_workload_trusts_until_workspace_or_project_is_restored() {
+    if !suite_gated() { return; }
     for scope in ["workspace", "project"] {
         let f = Fixture::new().await;
         let trust = f.trust(trust_body(), OWNER).await;
@@ -66,6 +70,7 @@ async fn lockdown_blocks_owner_workload_trusts_until_workspace_or_project_is_res
 
 #[tokio::test]
 async fn lockdown_blocks_owner_change_requests_until_workspace_or_project_is_restored() {
+    if !suite_gated() { return; }
     for scope in ["workspace", "project"] {
         let f = Fixture::new().await;
         let id = f.create_change(batch(), OWNER).await;
@@ -86,6 +91,7 @@ async fn lockdown_blocks_owner_change_requests_until_workspace_or_project_is_res
 
 #[tokio::test]
 async fn lockdown_blocks_workload_exchange_without_consuming_proof_until_restored() {
+    if !suite_gated() { return; }
     for scope in ["workspace", "project"] {
         let f = Fixture::new().await;
         let trust = f.trust(trust_body(), OWNER).await;

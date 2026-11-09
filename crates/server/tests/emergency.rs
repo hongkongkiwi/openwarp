@@ -68,7 +68,7 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_PUBLIC_URL", &base)
-            .env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
+            .env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("OPENWARP_LICENSE", "development").env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_TRUST_PROXY").env_remove("OPENWARP_ALLOWED_DB_HOSTS")
             .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS")
@@ -178,6 +178,11 @@ impl Server {
     async fn invite(&self, token: &str, org: &str, email: &str, role: &str) {
         let r = self.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(token), Some(json!({"email": email, "role": role}))).await;
         assert_eq!(r.status, 200, "membership setup");
+        // An invitation is a pending grant; the recipient redeems it.
+        let invite = field(&r.body, "invite_token");
+        let invitee = self.login(email).await;
+        let accepted = self.call(Method::POST, "/api/auth/accept-invite", Some(&invitee), Some(json!({"token": invite}))).await;
+        assert_eq!(accepted.status, 200, "invitation redemption: {:?}", accepted.body);
     }
 
     async fn app(&self, token: &str, org: &str) -> (String, String) {

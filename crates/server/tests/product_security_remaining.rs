@@ -1,3 +1,5 @@
+#![cfg(feature = "change-requests")]
+
 include!("product_features.rs");
 
 async fn remaining_history(f: &Fixture, sid: &str) -> Value {
@@ -11,6 +13,7 @@ async fn remaining_retention(f: &Fixture, env: &str, limit: i64) {
 
 #[tokio::test]
 async fn remaining_batch_apply_obeys_retention_and_preserves_unlimited_history() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     remaining_retention(&f, "dev", 1).await;
     remaining_retention(&f, "prod", 0).await;
@@ -36,6 +39,7 @@ async fn remaining_batch_apply_obeys_retention_and_preserves_unlimited_history()
 
 #[tokio::test]
 async fn remaining_rejected_batch_preserves_retained_history_and_current_values() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     remaining_retention(&f, "dev", 1).await;
     for env in ["dev", "prod"] { f.put(env, json!([{"key":"TARGET","value":"retained-before"}])).await; }
@@ -114,6 +118,7 @@ impl Drop for RemainingMysql {
 
 #[tokio::test]
 async fn remaining_mysql_valid_signed_workload_exchange_is_not_rate_limited() {
+    if !suite_gated() { return; }
     let Some(database) = RemainingMysql::new().await else { return; };
     let f = database.fixture([7;32], true).await;
     let trust = f.trust(trust_body(), OWNER).await;
@@ -129,6 +134,7 @@ async fn remaining_mysql_valid_signed_workload_exchange_is_not_rate_limited() {
 
 #[tokio::test]
 async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext() {
+    if !suite_gated() { return; }
     let Some(database) = RemainingMysql::new().await else { return; };
     let f = database.fixture([7;32], true).await;
     let key = f.transit_key("remaining", "org-a", OWNER).await;
@@ -155,6 +161,7 @@ async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext(
 
 #[tokio::test]
 async fn remaining_postgres_retention_policy_change_during_apply_cannot_use_stale_limit() {
+    if !suite_gated() { return; }
     let admin_url = match std::env::var("OPENWARP_TEST_POSTGRES_URL") {
         Ok(url) => { assert!(!url.trim().is_empty(), "provided OPENWARP_TEST_POSTGRES_URL must not be empty"); url },
         Err(std::env::VarError::NotPresent) => { eprintln!("SKIP PostgreSQL policy race: OPENWARP_TEST_POSTGRES_URL is absent"); return; },

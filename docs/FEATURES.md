@@ -2,7 +2,8 @@
 
 | Phase feature | Tier in Phase | OpenWarp |
 |---|---|---|
-| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings; explicit invitation consent, public preview and scoped pending list/revoke/resend with rotated seven-day tokens |
+| Workspace creation policy | n/a | instance-owner `PUT /api/instance/workspaces`, separate from signup; `OPENWARP_WORKSPACE_CREATION` override; no personal workspace when disabled, zero-workspace console recovery and last-workspace deletion protection |
 | Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
 | OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
 | Apps + readme | Free | yes |
@@ -14,7 +15,7 @@
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
 | Sign-in methods and second factors | n/a | password, ten social providers, workspace OIDC/SAML and LDAP; TOTP, WebAuthn passkeys and emailed codes; instance switches with `OPENWARP_AUTH_PROVIDERS` |
-| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console still uses v1 |
+| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console uses v2 for new invited accounts and detects v2 login, while normal console registration/reset retain v1 |
 | Encryption modes and KMS | n/a | SSE per-environment keys, external KMS bridge, client-held keys for delegated and E2E environments, `ow2` record-bound ciphertext |
 | Customer-run sync runner | n/a | outbound job queue, runner-sealed provider configs, claim fencing and stale-job recovery |
 | Global search | Free | `GET /api/search?q=` across orgs/apps/envs |
@@ -38,7 +39,51 @@
 | Static PostgreSQL role rotation | n/a | rotate an existing remote login and store its password in an SSE secret; encrypted pending candidate supports retries after uncertain outcomes; see [integrations](INTEGRATIONS.md#static-postgresql-password-rotation) |
 | Transit encryption | n/a | workspace payload encryption, version rotation and rewrap with distinct transit permissions; no key export; see [API](API.md#transit) |
 | CLI template agent | n/a | literal secret placeholders, bounded in-memory cache and atomic output; no disk cache or offline fallback; see [CLI](CLI.md) |
-| Licence checks / seat limits | n/a | **none, by design** |
+| Licence checks / seat limits | n/a | two plans: self-hosted needs no key and keeps every core feature; an offline ES256 enterprise licence unlocks workspace SAML/OIDC, LDAP, SCIM and audit streaming. No seat counts; see [editions](EDITIONS.md) |
+
+## Enterprise surfaces: build features and workspace grants
+
+Eight surfaces are opt-in twice, and both gates must pass: the binary must be
+built with the Cargo feature, and the workspace must hold a grant.
+
+| Feature | Surface |
+|---|---|
+| `saml` | SAML 2.0 service provider, per-workspace IdP configuration |
+| `scim` | SCIM 2.0 Users and Groups provisioning under `/scim/v2` |
+| `pki` | X.509 certificate authorities, issuance, CRL and OCSP |
+| `ssh-ca` | SSH user and host certificates, KRL and RevokedKeys |
+| `transit` | Workspace transit keys (`/api/orgs/:id/transit/keys`) |
+| `workload-identity` | Workload trust records and JWT exchange |
+| `change-requests` | Batched multi-environment change requests |
+| `ldap` | Per-workspace LDAPS directory sign-in |
+
+The default build compiles none of them. `cargo build --features enterprise`
+enables all eight, and `enterprise` expands to the individual names, so a
+narrower build such as `--features ssh-ca` is possible. The container image
+builds with `enterprise,redis-cache` unless
+`--build-arg OPENWARP_FEATURES=` overrides it.
+
+Grants are per workspace and only the instance owner changes them:
+
+```
+GET  /api/instance/features        # compiled names plus every workspace's grants
+PUT  /api/instance/features        # {"org": "ORG_ID", "features": ["saml"]}
+GET  /api/orgs/:id/features        # any member: {"compiled": [...], "granted": [...]}
+```
+
+A surface compiled out has no route at all, so requests get 404. A surface that
+is compiled in but not granted answers 403 with a message naming the feature.
+OCSP is the one exception: it stays reachable without a grant, because a client
+checking a certificate must still learn that it was revoked after a workspace
+loses the grant. Elsewhere authentication and workspace membership run before
+the grant check, so an ungranted request never reveals whether an object
+exists; the SAML metadata and start endpoints are unauthenticated by design and
+return no object data.
+The `PUT` body is the full set the workspace should hold, and an empty array
+revokes everything. Grant rows survive a build that omits the feature, so
+rebuilding with it restores the previous choice. The console hides a settings
+card unless both gates pass, and the instance owner gets a feature matrix in
+Settings.
 
 ## Integrations (`POST /api/envs/:id/integrations`, auto-sync on deploy, manual `POST /api/integrations/:id/sync`)
 
@@ -656,6 +701,27 @@ fails unless the key is already in the response. Cloudflare `policies` are sent
 as given, so the parent token's `API Tokens Write` permission is what bounds
 them. xAI defaults the child to every model and endpoint the team can use, and
 accepts `qps`, `qpm` and `tpm`. ElevenLabs defaults `permissions` to `"all"`.
+
+Two infrastructure providers issue a credential rather than an API key:
+
+- `type: "planetscale"` creates a branch password from a service token and
+  deletes it on revoke. It takes `service_token` (plus `service_token_id` when
+  the token authenticates only as the raw `id:token` pair), `organization`,
+  `database`, `branch`, optional `engine` (`mysql` by default, or `postgres`)
+  and `role` (`reader`, `writer`, `readwriter` by default, or `admin`). The
+  lease TTL is sent as PlanetScale's `ttl`, so the remote password expires even
+  if this server stops. The response carries `password`, `username`, `host` and
+  `database`. Postgres has no role flag, so the lease role maps to
+  `pg_read_all_data` or `pg_read_all_data` plus `pg_write_all_data`, and
+  `admin` adds `pg_monitor`. Branch names containing `/` are refused because the
+  branch is a URL path segment.
+- `type: "instabox"` mints a per-sandbox SSH token, the only Instabox
+  credential an API key can create and revoke. It takes `api_key`,
+  `machine_id`, and sends the lease TTL as `ttlSeconds`; the Instabox API allows
+  one second to 30 days, and the lease TTL floor of 60 seconds applies here.
+  The response carries the token, `host`, `port` and the ready `command`. The
+  token is used as the SSH user name. Instabox API keys cannot be minted from
+  another key and have a one-day minimum lifetime, so they are not a lease type.
 
 The parent credential is encrypted on the lease so revoke can authenticate; the
 response returns only the child secret. A failed remote delete leaves the lease

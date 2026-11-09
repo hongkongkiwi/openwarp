@@ -259,6 +259,27 @@
               "open",
               "invite"
             ]
+          },
+          "region": {
+            "type": "string",
+            "description": "Jurisdiction this deployment serves, from its own configuration",
+            "example": "global"
+          },
+          "regions": {
+            "type": "array",
+            "description": "Jurisdictions the sign-in card may hand off to; empty when this deployment is the only one",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            }
           }
         }
       },
@@ -276,6 +297,10 @@
           },
           "role": {
             "type": "string"
+          },
+          "members": {
+            "type": "integer",
+            "description": "Number of members in the workspace"
           }
         }
       },
@@ -924,6 +949,33 @@
           },
           "username": {
             "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "description": "Child database password for postgres, mysql and planetscale leases."
+          },
+          "host": {
+            "type": "string",
+            "description": "Connection host for planetscale and instabox leases."
+          },
+          "database": {
+            "type": "string",
+            "description": "Connectable database name for planetscale leases."
+          },
+          "port": {
+            "type": "integer",
+            "description": "SSH port for instabox leases."
+          },
+          "command": {
+            "type": "string",
+            "description": "Ready SSH command for instabox leases."
+          },
+          "remote_id": {
+            "type": "string",
+            "description": "Provider id of the issued credential, for provider leases."
+          },
+          "credentials": {
+            "description": "AWS STS response for aws_iam leases."
           },
           "expires_at": {
             "type": "integer"
@@ -5630,6 +5682,7 @@
       },
       "post": {
         "summary": "Create a dynamic lease",
+        "description": "Supports postgres, mysql, aws_iam, planetscale and instabox types plus inference provider child keys; other types create generic random tokens. planetscale needs config.service_token, organization, database and branch (optional service_token_id for tokens that authenticate as id:token) and accepts engine mysql or postgres; instabox needs config.api_key and machine_id. ttl_secs defaults to 3600 and is clamped to 60-2592000.",
         "tags": [
           "leases"
         ],

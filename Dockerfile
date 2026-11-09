@@ -6,13 +6,18 @@ COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 # The workspace patches lber to this vendored copy, so the build needs it.
 COPY vendor ./vendor
-RUN cargo build --release -p openwarp-server -p openwarp-cli -p openwarp-eso
+# The image ships the enterprise surfaces because a container is not rebuilt
+# per deployment. Pass --build-arg OPENWARP_FEATURES= to ship core only.
+ARG OPENWARP_FEATURES=enterprise,redis-cache
+RUN cargo build --release -p openwarp-server --features "${OPENWARP_FEATURES}" \
+ && cargo build --release -p openwarp-cli -p openwarp-eso
 FROM debian:bookworm-slim
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home openwarp && mkdir -p /data && chown openwarp:openwarp /data
 COPY --from=build /src/target/release/openwarp-server /usr/local/bin/
 COPY --from=build /src/target/release/openwarp /usr/local/bin/
+COPY --from=build /src/target/release/openwarp-migrate /usr/local/bin/
 COPY --from=build /src/target/release/openwarp-eso /usr/local/bin/
 COPY --from=build /src/target/release/openwarp-runner /usr/local/bin/
 ENV ADDR=0.0.0.0:8080 DATABASE_URL=sqlite:///data/openwarp.db OPENWARP_ENV=production

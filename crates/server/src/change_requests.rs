@@ -55,7 +55,9 @@ async fn snapshot(st: &S, h: &HeaderMap, uid: &str, org: &str, pid: &str, revisi
     Ok(statements)
 }
 async fn request(st: &S, pid: &str) -> Result<Row, (StatusCode, Json<Value>)> {
-    st.db.one("SELECT * FROM change_requests WHERE id=?", &[json!(pid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"change request not found"))
+    let row = st.db.one("SELECT * FROM change_requests WHERE id=?", &[json!(pid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"change request not found"))?;
+    st.require_feature(&db::s(&row,"org_id"), "change-requests").await?;
+    Ok(row)
 }
 async fn payloads(st: &S, row: &Row, h: &HeaderMap, uid: &str) -> Result<Payloads, (StatusCode, Json<Value>)> {
     let pid = db::s(row,"id"); let org = db::s(row,"org_id");
@@ -71,6 +73,7 @@ async fn payloads(st: &S, row: &Row, h: &HeaderMap, uid: &str) -> Result<Payload
 }
 pub(super) async fn create(State(st): State<S>, h: HeaderMap, Path(org): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?; st.check_perm(&org,&uid,"proposals:write").await?;
+    st.require_feature(&org,"change-requests").await?;
     let pid = id(); let mut statements = snapshot(&st,&h,&uid,&org,&pid,1,&body).await?;
     statements.insert(0,("INSERT INTO change_requests(id,org_id,title,author,revision,status,created_at) VALUES(?,?,?,?,1,'pending',?)".into(),vec![json!(pid),json!(org),body["title"].clone(),json!(uid),json!(now())],Some(1)));
     st.db.checked_batch(&statements,false).await.map_err(tx_error)?;
@@ -94,6 +97,7 @@ pub(super) async fn edit(State(st): State<S>, h: HeaderMap, Path(pid): Path<Stri
 }
 pub(super) async fn list(State(st): State<S>, h: HeaderMap, Path(org): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; st.require_org(&org,&uid).await?;
+    st.require_feature(&org,"change-requests").await?;
     let rows = st.db.query("SELECT * FROM change_requests WHERE org_id=? ORDER BY created_at,id", &[json!(org)]).await.map_err(|e| bad(&e))?;
     let mut result = Vec::new();
     for row in rows { if payloads(&st,&row,&h,&uid).await.is_ok() { result.push(db::obj(&row)); } }

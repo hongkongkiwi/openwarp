@@ -9,11 +9,13 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Apps | Create applications, select environments, manage secrets |
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
-| Webhooks | Configure workspace or app event subscriptions and inspect delivery metadata |
-| Audit log | Inspect workspace activity |
+| Webhooks | Configure event subscriptions and incoming hooks, inspect deliveries and receipts |
+| Audit log | Inspect workspace activity, sync outcomes, and log-stream delivery attempts |
+| Assistant | Search permitted metadata, ask contextual questions, preview folders and integration drafts |
+| Security insights | Inspect rule-based findings, evidence, acknowledgments, and expiring exceptions |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
-Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority.
+Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority. An unknown hash route renders a Not found screen with links back to Apps and Members & access instead of leaving a blank view.
 
 ## Appearance and languages
 
@@ -25,9 +27,15 @@ The interface is translated into English, Traditional Chinese, Simplified Chines
 
 Register or sign in using a password. Google, Microsoft, Apple, GitHub, Okta, Auth0, GitLab, Atlassian, Slack, Salesforce, OpenAI and X appear when the instance operator has configured them. A password signup must open the emailed verification link before signing in; provider sign-in trusts the address the provider asserts. Invitations can admit new people even when public signup is closed.
 
+Signing in is account-level, not workspace-level. One account can hold memberships in several workspaces; when it holds more than one, the console asks which workspace to open and remembers that choice for the account on this device. The switcher at the top of the sidebar lists the workspaces with the role held in each, keeps **Account settings** and **Sign out** apart from them, and closes on Escape or an outside click. Sign-in through a workspace's single sign-on needs the workspace ID, because an address alone cannot reveal which workspace is meant; the dialog offers SAML and OIDC.
+
+The sign-in card also names the data jurisdiction the instance serves, and offers **Change region** only when the operator lists another jurisdiction in `OPENWARP_REGIONS`. The hand-off is a link to that origin; a jurisdiction is never selected inside the current server, because it is where the account and its data live.
+
 Save the recovery kit shown during account creation. It is your private key, not an API token. If password reset asks for the kit, supplying it preserves the existing key. Choosing to discard a lost key prevents that account from decrypting existing E2E grants.
 
 Enable TOTP MFA from settings and keep the recovery codes somewhere other than your authenticator device. If verification email or reset delivery fails, contact your instance operator; a generic success message does not prove the relay sent the email.
+
+Settings also manages passkeys and browser sessions. Adding a passkey asks for your password first and then creates the WebAuthn credential in the browser; the recovery codes shown afterwards are the only fallback if the authenticator is lost. Removing a passkey requires the password again. The sessions card lists each signed-in browser session with its sign-in time and marks the current one; revoking another session ends it immediately, and revoking the current session signs this browser out. End all sessions revokes every browser session for the account, including the one you are using; API keys and OAuth tokens are unaffected. My tokens opens the API token list instead of browser sessions.
 
 ## Delete an account or workspace
 
@@ -39,9 +47,79 @@ A workspace owner can use Delete workspace in Settings after typing its exact na
 
 ## Workspaces and applications
 
+The sidebar offers New workspace when creation is enabled and Join workspace regardless of that policy. Accounts with no workspaces see these recovery actions instead of application controls and can still open account and instance Settings. Workspace Settings offers rename and leave; the last owner must transfer ownership before leaving.
+
+Members & access issues invitations for both existing and new accounts, without adding membership immediately. Share the returned link securely. The preview names the workspace, email, role and expiry. Existing accounts must sign in with the invited account and choose Join workspace; a different signed-in account must sign out first. New invitees can create a client-derived account or sign in with a configured provider, then explicitly join. Provider sign-in alone does not consume a pending social invitation. Pending invitations can be revoked or resent; resend rotates the token, invalidating the previous link and starting a new seven-day lifetime. The console displays a link for manual delivery, not an email delivery confirmation.
+
 Select the workspace before changing membership or application data. Create an application from Apps and give it a descriptive name. Application readme content can record ownership, purpose, and operational notes; do not put plaintext credentials there.
 
 New applications include Development, Staging, and Production environments. Custom environment names support letters, digits, hyphens, and underscores, up to 32 characters. Application and environment IDs are separate from these names. The CLI's discovery commands return IDs for automation.
+
+## Optional secret health
+
+SSE and E2E add/edit dialogs have a compact Secret health section. "Check as
+password" runs bundled zxcvbn 4.4.2 locally (up to 1024 characters). This is
+human password advice, not a requirement for API tokens or SSH keys.
+"Check password breaches" asks permission before sending only a five-character
+SHA-1 prefix directly to HIBP Pwned Passwords with padded responses. The full
+password and hash stay in the browser, including for E2E values. No checks run
+on keystrokes, save or import. Results are advisory and never prove safety.
+
+Settings has a personal HIBP key card. "Show stored status" reports whether a
+key exists; the key field is always blank on entry. Save replaces the key and
+Remove deletes it. A paid Core key supports the standard email endpoint.
+For email-looking values, opening Secret health offers an email action when
+your key is configured. Its confirmation discloses that the full email goes
+to the OpenWarp server and HIBP, breaking server-blind handling for that value.
+Only breach names are returned; results are not persisted. Email checks are
+limited to one attempt per user per minute and require the native server;
+Workers returns 501 rather than risk sending credentials through redirects.
+
+The same personal settings card accepts a separate Enzoic API key and secret.
+Both are password fields, blank on entry and cleared after Save or Remove.
+Stored status reports encrypted credentials, never their contents. Both values
+must be supplied together; Remove deletes both. A configured account gains a
+"Check password with Enzoic" button. Each click asks permission to relay the
+first ten lowercase hexadecimal characters of the exact password's SHA-256
+hash through OpenWarp to Enzoic. The password and full submitted hash stay in
+the browser. Only an exact full-hash candidate marked exposed reports found;
+not found does not prove safety. Checks require the native server and consume
+one attempt per user per minute. Operators need an applicable subscription
+and must meet Enzoic's terms and privacy obligations. Vendor approval and
+resale rights are not claimed.
+
+A configured Enzoic account also shows "Check email/password pair" with a
+separate labeled email input. The secret value is the password; the console
+never infers an email from other fields or stores the entered address. Each
+click warns that a stable full SHA-256 hash of the lowercased exact email,
+without trimming, and ten-character password-derived prefixes pass through
+OpenWarp to Enzoic. These identifiers permit correlation and guessing. Plain
+emails, passwords, legacy hashes and full derived hashes stay in the browser.
+
+Pair checks use bundled local hash-wasm, including MD5 and Argon2d, with no
+CDN or frontend build. Supported legacy hash types are
+1, 2, 3, 13, 14, 19, 25, 27, 32, 35, 37 and 40. Unknown requirements or encoded
+salts invalidate the whole check before the second request. Unavailable also
+covers malformed responses, primitive failures, quota and provider errors;
+it is not a clean result. Each of the two native relay stages has a separate
+one-attempt-per-user-per-minute limit. No results are stored. Editor changes,
+modal closure and lockdown invalidate pending work and stale results.
+See [the pair protocol and formula table](API.md#enzoic-credential-pairs).
+
+For email-looking values, "Check email with LeakCheck (free)" is available
+without configuring a key. Its per-request confirmation explains that the
+browser trims and lowercases the address, computes SHA-256, and sends its
+first 24 hexadecimal characters through OpenWarp to LeakCheck Public. A
+stable hash identifier is not anonymous and can reveal guesses. Only source
+names are shown, with "Powered by LeakCheck" attribution; results are not
+persisted. It requires the native server, with one attempt per user per minute
+and an instance-wide shared-egress throttle guaranteeing at least one second
+between attempts. Errors report unavailable, not unexposed.
+
+See [the API contract](API.md). Live provider calls, Rust execution and browser
+rendering were not executed for these extensions; local Node checks exercise
+fixture responses. LeakCheck's first-24-character interpretation has not been
+verified against the live provider. BreachDirectory is not implemented.
 
 ## Standard secrets and drafts
 
@@ -76,7 +154,7 @@ Standard environment reads can resolve references such as `${KEY}` and `${/path/
 
 Import accepts dotenv text. Review both the destination and any keys that already exist before applying it. Export produces plaintext, which needs the same protection as the original credentials.
 
-Environment comparison and cloning are available through API operations. Do not assume that copying secrets copies every policy, integration, or access grant. Consult the [OpenAPI contract](../openapi.json) for documented API operations when a task is not available in the console.
+Compare and Clone sit in the environment toolbar. Compare lists keys only in this environment, only in the other one, and keys whose base values differ; it shows key names, never values, and needs read access to both. Clone copies readable base secrets into another server-encrypted environment of the same app, skips sealed values, and optionally overwrites keys that already exist. Neither action copies personal overrides, policies, integrations, grants, rotation schedules or history, and client-encrypted environments require the CLI instead. Consult the [OpenAPI contract](../openapi.json) when a task has no console control.
 
 ## Members and automation access
 
@@ -94,9 +172,21 @@ Members & access also contains three workspace tools:
 
 Review screens and transit decrypt responses display plaintext in the browser. Use these controls only on a trusted device; do not paste real credentials into recordings or shared screens.
 
+## Managing apps, environments and teams
+
+App settings (from an app's environment toolbar) edits the app name and its plain-text readme, toggles its reuse warning, or deletes the app. The readme is stored and shown as text, not rendered; do not put credentials in it. The delete action requires confirmation and removes the app's environments, secrets and grants; revoke dynamic leases first.
+
+Env settings rename the environment, set how many versions history keeps (`0` keeps every version), restrict access to explicit grants, require an approved proposal for non-admin writes, or delete the environment. Policy changes apply immediately.
+
+Teams group members for environment grants. Manage a team from Members & access to add or remove workspace members; roles are unchanged by team membership.
+
+The audit log has three tabs. Audit shows workspace activity with a client-side filter over the loaded events and a Load older events control. Sync activity narrows the same events to integration, runner and rotation work. Delivery attempts lists log-stream deliveries with their stream, event, status and attempt count; failed rows name the stream so you can fix or remove it. Large workspaces should also use log streams for durable forwarding.
+
 ## Integrations and sharing
 
 Select the source environment and destination before creating an integration. Sync sends shared, non-sealed SSE values to the provider. Test is implemented for Trigger.dev, Instabox, Boat, and Daytona; other kinds require a sync to exercise their connection, which can write remote data.
+
+Each integration row can Edit it, open its sync History, run a sync, or delete it. Edit renames the integration, changes its kind, and replaces its stored configuration; the encrypted configuration is never shown back, so leave the field empty to keep the existing one. Configuration fields validate JSON as you type, name the exact error, and offer Format JSON. History lists the last 50 sync and sync-failure audit entries for that integration.
 
 Only supported providers understand dry-run and mirror options. Mirror can delete previously managed remote names. Review the [integration guide](INTEGRATIONS.md) before using it.
 
@@ -118,6 +208,13 @@ E2E environments show a dedicated decrypt panel rather than the ordinary SSE edi
 
 Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, read, and grant wrapped keys. Removing a grant prevents future access to that wrapped key through the server; it cannot erase plaintext or keys that a recipient already copied.
 
+## Assistant and insights
+
+The assistant starts disabled for each workspace. Administrators select an operator-approved endpoint and separately enable metadata disclosure, confirmed actions, and local value matching. Metadata search stays on the instance. Model questions go to the selected endpoint with authorised managed-environment metadata; do not type credentials into a question. Stored values, comments, and provider configuration are excluded. Use the separate import input for local parsing rather than pasting dotenv into a question.
+
+Setup suggestions first become a preview with an expiry. Only "Confirm these changes" executes its stored operations. Folder previews create real empty paths; integration previews create drafts without credentials. Complete an integration draft through its configuration form, then test or sync it separately. Future normal deployments can sync configured integrations.
+
+Security insights are administrator-only and work without a model. Inspect the coverage report before interpreting an empty findings list. Acknowledgments and expiring exceptions record investigation state; AI explanations do not change evidence or revoke credentials. See [assistant and security insights](AI.md) for API boundaries, encryption limits, and endpoint policy.
 ## Emergency lockdown
 
 Workspace owners can halt a whole workspace from Settings, or choose **Project lockdown** on an app card to halt that project. A project is an application in the API. Confirm the selected scope before activation.
@@ -132,6 +229,10 @@ The console clears cached secret values and drafts when it detects a halt. Open 
 
 Lockdown cannot erase values already copied by a client, secrets already sent to a provider, or a runner payload already downloaded. Previously created Lockbox shares have no workspace association and remain usable. Rotate exposed credentials and revoke external access separately when responding to an incident.
 
+## Plan and enterprise features
+
+Settings shows the current plan. A self-hosted installation has every core feature and needs no key. The SAML, workspace OIDC, LDAP and log-stream cards show an Enterprise label and stay unavailable until an enterprise license is installed by the instance operator; the rest of the console is unchanged. See [editions and licensing](EDITIONS.md).
+
 ## Administrative settings
 
 Workspace settings include IP allowlists and OIDC configuration. Test policy changes with a second authorised session before ending your working session. Only trust forwarded client IPs when the instance operator has configured the actual reverse proxies.
@@ -142,7 +243,7 @@ Manage an SSH CA to see the CA fingerprint, the sshd block, the issued certifica
 
 Register hosts here too: a host certificate is only issued for a hostname and public key pair an admin registered, because a host certificate is exactly as trustworthy as the key it names. Removing a registration is how a host key is rotated. Revoking records the certificate, but a host enforces it only after refreshing its `RevokedKeys` file, served here as both the plain list and an OpenSSH KRL.
 
-Closing signups is an instance policy, while inviting members is a workspace action. A deployment-level `OPENWARP_SIGNUPS` setting can lock the console toggle.
+Closing signups and disabling workspace creation are separate instance-owner policies. Inviting members is a workspace action and remains available when either policy is closed. `OPENWARP_SIGNUPS` and `OPENWARP_WORKSPACE_CREATION` lock their respective console toggles. The last workspace cannot be deleted while creation is disabled; reopen creation first. The API refuses to disable creation on an empty instance so a signed-in account can create a replacement workspace.
 
 ## Device certificates without a TPM
 

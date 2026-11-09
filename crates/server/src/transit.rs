@@ -1,12 +1,5 @@
 use super::*;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) type Lifecycle = tokio::sync::RwLock<()>;
-#[cfg(target_arch = "wasm32")]
-#[derive(Default)]
-pub(super) struct Lifecycle;
-#[cfg(target_arch = "wasm32")]
-impl Lifecycle { pub async fn read(&self) {} }
 const ROOT: &str = "transit:root-generation";
 type Statement = (String, Vec<Value>, Option<u64>);
 fn conflict() -> (StatusCode, Json<Value>) { err(StatusCode::CONFLICT, "transit key lifecycle changed; retry with the current master key") }
@@ -44,6 +37,7 @@ pub(super) fn rotation_tx(tx: &db::WebhookTx<'_>, old: &[u8;32], new: &[u8;32], 
 async fn authorize(st: &S, h: &HeaderMap, org: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
     st.require_org_running(org).await?;
+    st.require_feature(org, "transit").await?;
     if !env_scope_of(st,h).await?.is_empty() { return Err(err(StatusCode::FORBIDDEN,"environment credentials cannot use transit")); }
     credential_scope(st,h,org,action).await?;
     st.check_perm(org,&uid,action).await?;

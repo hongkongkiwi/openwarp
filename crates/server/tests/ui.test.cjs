@@ -54,6 +54,8 @@ class Element {
   set className(value) { this.setAttribute('class', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { value ? this.setAttribute('hidden', '') : this.removeAttribute('hidden'); }
+  get checked() { return this._checked ?? this.hasAttribute('checked'); }
+  set checked(value) { this._checked = Boolean(value); }
   get disabled() { return this.hasAttribute('disabled'); }
   set disabled(value) { value ? this.setAttribute('disabled', '') : this.removeAttribute('disabled'); }
   get value() {
@@ -140,7 +142,8 @@ function parse(markup, root) {
     for (const [, name, , quoted, bare] of rest.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+)))?/g)) attrs[name] = decode(quoted ?? bare ?? '');
     const el = new Element(tag, root.ownerDocument, attrs);
     stack.at(-1).appendChild(el);
-    if (!/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
+    const selfClosing = /\/\s*>$/.test(token);
+    if (!selfClosing && !/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
   }
 }
 
@@ -184,16 +187,23 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   document.body = document.querySelector('body');
   document.documentElement = document.querySelector('html');
   document.activeElement = document.body;
-  const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
+  // A remembered workspace keeps the existing flows inside the shell. The
+  // picker tests clear it to exercise the choice itself.
+  const calls = [], unexpected = [], confirmations = [], timers = [], store = { 'ow.org.fixture@example.invalid': 'org-a', ...opts.store };
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
-    '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
     '/api/instance': { instance_owner: false },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },
-    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin' }, { id: 'org-b', name: 'Second org', role: 'admin' }],
+    '/api/orgs': [{ id: 'org-a', name: 'First org', role: 'admin', members: 3 }, { id: 'org-b', name: 'Second org', role: 'admin', members: 1 }],
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
+    // Fixture workspaces hold every grant; a test that wants an ungranted
+    // surface overrides this entry.
+    '/api/orgs/org-a/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
+    '/api/orgs/org-b/features': { compiled: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'], granted: ['saml', 'scim', 'pki', 'ssh-ca', 'transit', 'workload-identity', 'change-requests', 'ldap'] },
     '/api/orgs/org-a/pki/cas': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
@@ -203,6 +213,10 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/envs/env-b/secrets': { secrets: [] },
     '/api/envs/env-c/secrets': { secrets: [] },
     '/api/envs/env-d/secrets': { secrets: [] },
+    '/api/envs/env-a/folders': { folders: [] },
+    '/api/envs/env-b/folders': { folders: [] },
+    '/api/envs/env-c/folders': { folders: [] },
+    '/api/envs/env-d/folders': { folders: [] },
     '/api/secrets/saved-secret/history': [],
     '/api/orgs/org-a/webhooks': [{ id: 'hook-1', name: '<script>fixture</script>', url: 'https://receiver.example.invalid/events', app_id: 'app-a', events: ['secret.update'], enabled: true }, { id: 'hook/workspace', name: 'Workspace hook', url: 'https://receiver.example.invalid/workspace', app_id: '', events: ['*'], enabled: false }],
     '/api/orgs/org-b/webhooks': [],
@@ -219,6 +233,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/integrations/integration-1/webhooks': [{ id: 'incoming-1', name: 'Deployment trigger', enabled: true, url: 'https://console.invalid/hooks/integrations/incoming-1' }],
     '/api/incoming-webhooks/incoming-1/receipts?limit=25&offset=0': [{ id: 'receipt-1', message_id: 'message-1', status: 'queued', attempts: 0 }],
     '/api/orgs/org-a/ssh/cas': [],
+    '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/emergency': { locked: false },
     '/api/orgs/org-b/emergency': { locked: false },
     '/api/apps/app-a/emergency': { locked: false, direct_locked: false, workspace_locked: false },
@@ -229,6 +244,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
     ...opts.responses,
   };
+  const session = new Map();
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
     localStorage: {
@@ -236,6 +252,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       setItem: (key, value) => { store[key] = String(value); },
       removeItem: key => { delete store[key]; },
     },
+    sessionStorage: { getItem: key => session.get(key) ?? null, setItem: (key, value) => session.set(key, String(value)), removeItem: key => session.delete(key) },
     navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
@@ -247,6 +264,13 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     fetch: async (url, options) => {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
+      const fixtureKey = call.method + ' ' + url;
+      if (Object.hasOwn(opts.responses || {}, fixtureKey)) {
+        const fixture = opts.responses[fixtureKey];
+        const response = typeof fixture === 'function' ? await fixture(call) : fixture;
+        const status = response.status ?? 200;
+        return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(response.body) };
+      }
       let body;
       if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
@@ -257,6 +281,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'PUT' && url === '/api/apps/app-a/settings') body = { ok: true };
       else if (options.method === 'PUT' && url === '/api/orgs/org-a/settings') body = { ok: true };
       else if (options.method === 'DELETE' && url === '/api/secrets/saved-secret') body = {};
+      else if (options.method === 'DELETE' && /^\/api\/me\/sessions\/[^/]+$/.test(url)) body = { revoked: url.split('/').pop(), current: false };
       // These routes return success so a forbidden staged-row request fails an assertion, not the harness.
       else if (/^\/api\/secrets\/new-[^/]+(?:\/history)?$/.test(url)) body = url.endsWith('/history') ? [] : {};
       else if (options.method === 'POST' && url === '/api/auth/ldap') body = { mfa_required: true, mfa_token: 'mfa-1' };
@@ -323,8 +348,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   // Browser load order: the i18n runtime executes before the inline console script.
   vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
-  await ui.invoke('enterApp()');
-  await ui.invoke("openApp('app-a')");
+  if (!opts.manualBoot) { await ui.invoke('enterApp()'); await ui.invoke("openApp('app-a')"); }
   calls.length = 0;
   return ui;
 }
@@ -579,10 +603,8 @@ for (const boundary of ['navigation', 'app', 'organization']) {
     } else if (boundary === 'app') {
       await ui.invoke("openApp('app-b')");
     } else {
-      ui.el('orgs').value = 'org-b';
-      await ui.invoke('switchOrg()');
-      ui.el('orgs').value = 'org-a';
-      await ui.invoke('switchOrg()');
+      await ui.invoke("switchOrg('org-b')");
+      await ui.invoke("switchOrg('org-a')");
     }
     await ui.invoke("openApp('app-a')");
     assert.ok(ui.row(draft.key), 'the original environment must still expose its staged draft');
@@ -750,6 +772,20 @@ test('project lockdown leaves metadata readable and blocks secrets and changes',
   assert.match(ui.run('emergencyCard(true)'), /workspace lockdown also applies/);
 });
 
+test('a sibling project lockdown clears an open AI view without recursive polling', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/settings': { status: 403, body: { error: 'a project emergency lockdown is active' } },
+  } });
+  await ui.invoke("APP=null;ENV=null;VIEW='assistant';AI_REFS=[{key:'private-name'}];AI_PLAN={id:'pending'};$('view').innerHTML='<p>private-name</p>'");
+  ui.calls.length = 0;
+  await ui.invoke('refreshEmergency()');
+  assert.doesNotMatch(ui.el('view').textContent, /private-name/);
+  assert.match(ui.el('view').textContent, /Project emergency lockdown active/);
+  assert.equal(ui.run('AI_REFS.length'), 0);
+  assert.equal(ui.run('AI_PLAN'), null);
+  assert.equal(ui.calls.filter(c => c.url === '/api/orgs/org-a/ai/settings').length, 1, 'a single poll must not recursively trigger another probe');
+});
+
 test('an ended session removes plaintext and returns to sign-in', async () => {
   const ui = await consoleUI();
   await ui.invoke("E2E_KIT='private-kit';PKI_SELECTED.add('dev-a');PKI_CODE_RESULTS=[{code:'stale'}];PKI_HOOK={ca:'ca-a',render:PKI_RENDER};PKI_ATT={ca:'ca-a',render:PKI_RENDER};applyEmergency(true);sessionEnded()");
@@ -803,6 +839,33 @@ test('the LDAP settings card is absent when the server does not advertise the pr
   assert.equal(ui.document.getElementById('ld-url'), null,
     'a build without the ldap feature must not render directory settings');
   assert.ok(ui.document.getElementById('set-oidc-iss'), 'the rest of the settings view still renders');
+});
+
+test('the SAML sign-in button follows the build, not the workspace grant', async () => {
+  // A build that carries SAML keeps the button even when a workspace has not
+  // enabled it; the attempt explains why. A build without it has no route, so
+  // the button would be dead and is hidden.
+  const withSaml = await consoleUI();
+  await withSaml.invoke('loadProviders()');
+  assert.ok(withSaml.document.getElementById('saml-signin'),
+    'the sign-in view always carries the SAML button node');
+  assert.notEqual(withSaml.el('saml-signin').style.display, 'none',
+    'a build with SAML shows the button regardless of workspace grants');
+
+  const withoutSaml = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { google: false, github: false, saml: false, signups: 'open' },
+  } });
+  await withoutSaml.invoke('loadProviders()');
+  assert.equal(withoutSaml.el('saml-signin').style.display, 'none',
+    'a build without SAML hides the button because the route does not exist');
+});
+
+test('a workspace-disabled sign-in method reports a readable reason, not JSON', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  assert.match(source, /saml_not_enabled:'SAML sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the saml_not_enabled code into a sentence');
+  assert.match(source, /ldap_not_enabled:'Directory sign-in is not enabled for this workspace\.'/,
+    'the sign-in screen must translate the ldap_not_enabled code into a sentence');
 });
 
 const reuseMatch = { key: 'NEW_CONFIG', path: '/draft', items: [{ secret_id: 'saved-secret', key: 'DATABASE_URL', path: '/service', app_id: 'app-a', app_name: 'First app', env_id: 'env-a', env_name: 'Development' }] };
@@ -928,6 +991,187 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+const aiPolicy = {
+  enabled: true, allow_metadata: true, allow_actions: true, allow_local_search: false,
+  monitoring_enabled: false, can_admin: true, has_api_key: true,
+  endpoint: 'https://ai.test.invalid/v1/chat/completions', model: 'fixture-model',
+  allowed_endpoints: ['https://ai.test.invalid/v1/chat/completions'],
+  request_limit: 100, token_limit: 100000, max_output_tokens: 1024,
+};
+const folderOps = [{ kind: 'create_folder', env_id: 'env-a', path: '/reviewed-folder' }];
+const aiPlan = { id: 'plan-fixture', status: 'pending', operations: folderOps, expires_at: 2000000000 };
+function aiFixtures(policy = {}, extra = {}) {
+  return {
+    'GET /api/orgs/org-a/ai/settings': { body: { ...aiPolicy, ...policy } },
+    'GET /api/orgs/org-a/ai/context': { body: { envs: [{ id: 'env-a', app_id: 'app-a', app_name: 'First app', name: 'Development', mode: 'sse' }], integrations: [] } },
+    'GET /api/orgs/org-a/ai/drafts': { body: { drafts: [] } },
+    ...extra,
+  };
+}
+async function assistantUI(policy = {}, extra = {}) {
+  const ui = await consoleUI([saved], [], { responses: aiFixtures(policy, extra) });
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  return ui;
+}
+async function prepareFolder(ui) {
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-env').value = 'env-a';
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  await ui.click(ui.button(ui.el('modal'), /^Preview changes$/));
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test('assistant defaults off without context fetch, questions or inference', async () => {
+  const ui = await assistantUI({ enabled: false, allow_metadata: false, allow_actions: false });
+  assert.match(ui.el('view').textContent, /assistant is off/i);
+  assert.equal(ui.document.getElementById('ai-question'), null);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/settings']]);
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  for (const flag of ['enabled', 'allow_metadata', 'allow_actions']) assert.equal(ui.el('ai-set-' + flag).checked, false);
+  assert.deepEqual(ui.writes(), [], 'opening disabled assistant and policy must never infer or persist');
+});
+
+test('metadata search stays a GET without secret values or model requests', async () => {
+  const ui = await assistantUI({}, {
+    'GET /api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a': { body: { results: [{ id: saved.id, key: saved.key, path: saved.path, env_id: 'env-a', app_id: 'app-a' }] } },
+  });
+  ui.calls.length = 0;
+  ui.el('ai-search').value = 'DATABASE';
+  await ui.click(ui.el('ai-search-btn'));
+  assert.deepEqual(ui.calls, [{ method: 'GET', url: '/api/orgs/org-a/ai/search?q=DATABASE&env_id=env-a', body: undefined }]);
+  assert.match(ui.el('ai-search-results').textContent, /DATABASE_URL/);
+  assert.ok(!ui.el('view').textContent.includes(saved.value));
+  assert.ok(!JSON.stringify(ui.calls).includes(saved.value), 'stored secret values must not be assembled into search requests');
+});
+
+test('assistant answers and source labels render hostile model text without HTML elements', async () => {
+  const hostile = '<img src=x onerror="alert(1)"><script>bad()</script>';
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: hostile, citations: [{ id: 'source-fixture', key: hostile, path: hostile, app_name: hostile, env_name: hostile, app_id: 'app-a', env_id: 'env-a' }], suggested_operations: [] } },
+  });
+  ui.el('ai-question').value = 'Where is the database key?';
+  await ui.click(ui.el('ai-ask'));
+  assert.ok(ui.el('ai-answer').textContent.includes(hostile), 'escaping must preserve the literal answer and citation text');
+  assert.equal(ui.el('ai-answer').querySelectorAll('img,script').length, 0, 'model and citation content must never create markup');
+  assert.ok(ui.el('ai-answer').querySelectorAll('button').every(b => /^aiOpenRef\(\d+\)$/.test(b.getAttribute('onclick'))), 'source actions use local references, not model-authored handlers');
+});
+
+test('import content uses its dedicated field and never becomes the model question', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/chat': { body: { answer: 'Use a service folder.', citations: [], suggested_operations: [] } },
+  });
+  ui.el('ai-task').value = 'import';
+  await ui.invoke('aiTaskChanged()');
+  assert.ok(!hidden(ui.el('ai-import-wrap')));
+  assert.match(ui.el('ai-disclosure').textContent, /do not type passwords, keys, or connection strings/i);
+  const importText = 'DATABASE_URL=fake-import-private-value\nAPI_KEY=fake-import-key';
+  ui.el('ai-question').value = 'Suggest folder names for this import';
+  ui.el('ai-import').value = importText;
+  await ui.click(ui.el('ai-ask'));
+  const request = ui.calls.find(c => c.method === 'POST' && c.url.endsWith('/ai/chat'));
+  assert.deepEqual(request.body, { message: 'Suggest folder names for this import', task: 'import', env_id: 'env-a', import_text: importText });
+  assert.ok(!request.body.message.includes('fake-import-'));
+  assert.ok(!request.body.message.includes(saved.value));
+  assert.equal(ui.el('ai-import').value, '', 'discard raw import input after a successful response');
+});
+
+test('folder setup previews exact operations and executes only after Confirm with a minimal body', async () => {
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/plans/plan-fixture/execute': { body: { results: [{ kind: 'create_folder', status: 'created' }] } },
+  });
+  ui.calls.length = 0;
+  await prepareFolder(ui);
+  assert.deepEqual(ui.writes(), [{ method: 'POST', url: '/api/orgs/org-a/ai/plans', body: { operations: folderOps } }]);
+  assert.match(ui.el('ai-plan').textContent, /reviewed-folder/);
+  assert.equal(ui.el('ai-plan').querySelectorAll('input,textarea,select').length, 0, 'preview operations are not editable');
+  await ui.click(ui.el('ai-confirm'));
+  const execute = ui.calls.filter(c => c.url.endsWith('/execute'));
+  assert.deepEqual(execute, [{ method: 'POST', url: '/api/orgs/org-a/ai/plans/plan-fixture/execute', body: { confirm: true } }]);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 1, 'repeated activation cannot reuse the consumed preview');
+});
+
+test('workspace switches discard previews and stale chat responses cannot populate the new workspace', async () => {
+  const pending = deferred();
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': { body: aiPlan },
+    'POST /api/orgs/org-a/ai/chat': () => pending.promise,
+    'GET /api/orgs/org-b/ai/settings': { body: { ...aiPolicy, enabled: false } },
+  });
+  await prepareFolder(ui);
+  ui.el('ai-question').value = 'Ask the old workspace';
+  const asking = ui.run('aiAsk()');
+  await ui.settle();
+  await ui.invoke("switchOrg('org-b')");
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  const newWorkspace = ui.el('view').textContent;
+  pending.resolve({ body: { answer: 'STALE_ORG_A_PRIVATE_RESPONSE', citations: [], suggested_operations: folderOps } });
+  await asking;
+  await ui.settle();
+  assert.equal(ui.el('view').textContent, newWorkspace);
+  assert.ok(!ui.el('view').textContent.includes('STALE_ORG_A_PRIVATE_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0, 'old workspace preview must no longer execute');
+});
+
+test('reset discards a preview and a pending plan response cannot restore it', async () => {
+  const pending = deferred();
+  let requests = 0;
+  const ui = await assistantUI({}, {
+    'POST /api/orgs/org-a/ai/plans': () => ++requests === 1 ? { body: aiPlan } : pending.promise,
+  });
+  await prepareFolder(ui);
+  await ui.invoke('aiReset(); aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+  await ui.click(ui.document.querySelector('[data-nav="assistant"]'));
+  await ui.click(ui.button(ui.el('view'), /^Prepare folder$/));
+  ui.el('ai-op-path').value = '/reviewed-folder';
+  const planning = ui.run("aiPreviewSetup('create_folder')");
+  await ui.settle();
+  await ui.invoke('aiReset(); closeModal()');
+  pending.resolve({ body: { ...aiPlan, id: 'stale-plan', operations: [{ ...folderOps[0], path: '/STALE_PLAN_RESPONSE' }] } });
+  await planning;
+  await ui.settle();
+  assert.ok(!ui.el('view').textContent.includes('STALE_PLAN_RESPONSE'));
+  assert.equal(ui.document.getElementById('ai-confirm'), null);
+  await ui.invoke('aiExecutePlan()');
+  assert.equal(ui.calls.filter(c => c.url.endsWith('/execute')).length, 0);
+});
+
+test('settings preserve a saved provider key when blank and clear it only explicitly', async () => {
+  const ui = await assistantUI({}, { 'PUT /api/orgs/org-a/ai/settings': { body: { ok: true } } });
+  for (const clear of [false, true]) {
+    await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+    assert.equal(ui.el('ai-set-key').value, '', 'saved key must never populate the password field');
+    ui.el('ai-set-clear').checked = clear;
+    await ui.click(ui.el('ai-settings-save'));
+    const request = ui.calls.filter(c => c.method === 'PUT' && c.url.endsWith('/ai/settings')).at(-1);
+    assert.equal(Object.hasOwn(request.body, 'api_key'), false, 'blank replacement must be omitted rather than clearing the key');
+    assert.equal(request.body.clear_api_key, clear);
+  }
+  await ui.click(ui.button(ui.el('view'), /^Assistant settings$/));
+  ui.el('ai-set-key').value = 'fake-new-provider-key';
+  await ui.click(ui.el('ai-settings-save'));
+  assert.equal(ui.calls.filter(c => c.method === 'PUT').at(-1).body.api_key, 'fake-new-provider-key');
+});
+
+test('security insights display admin authorization failures instead of an empty findings claim', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/ai/findings': { status: 403, body: { error: 'Workspace administrator access required.' } },
+  } });
+  await ui.click(ui.document.querySelector('[data-nav="insights"]'));
+  assert.match(ui.el('view').textContent, /Workspace administrator access required/);
+  assert.equal(ui.el('view').getAttribute('role'), 'alert');
+  assert.doesNotMatch(ui.el('view').textContent, /No findings/);
+  assert.deepEqual(ui.calls.map(c => [c.method, c.url]), [['GET', '/api/orgs/org-a/ai/findings']]);
 });
 
 test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {
@@ -1165,8 +1409,7 @@ test('switching workspace clears PKI selections, codes and cached policy for the
   await ui.click(ui.el('pki-mint-selected'));
   assert.match(ui.el('pki-codes-out').textContent, /test-code/);
   assert.equal(ui.run('PKI_SELECTED.size'), 1);
-  ui.run("$('orgs').value='org-b'");
-  await ui.invoke('switchOrg()');
+  await ui.invoke("switchOrg('org-b')");
   assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
   assert.equal(ui.run('PKI_SELECTED.size'), 0);
   assert.equal(ui.run('PKI_SELECTION_CA'), '');
@@ -1343,4 +1586,165 @@ test('language follows the browser, translates the chrome, and the override pers
   assert.equal(ui.el('authtitle').textContent, 'おかえりなさい', 'switching languages re-translates the chrome');
   await ui.run(`owSetLang('en')`);
   assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
+});
+
+test('settings lists browser sessions and revokes only the chosen one', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/me/sessions': [
+      { id: 'session-current', created_at: 1700000000, current: true },
+      { id: 'session-other', created_at: 1699990000, current: false },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  await ui.invoke('loadSessions()');
+  const rows = ui.el('session-list').querySelectorAll('tbody tr');
+  assert.equal(rows.length, 2, 'one row per browser session');
+  assert.match(rows[0].textContent, /this session/, 'the current session is marked');
+  ui.confirm = true;
+  await ui.click(ui.button(rows[1], /^Revoke$/));
+  assert.deepEqual(ui.writes().map(c => [c.method, c.url]), [['DELETE', '/api/me/sessions/session-other']],
+    'revoking one session targets that id only');
+});
+
+test('the logs screen separates audit, sync activity and delivery attempts', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/audit': [
+      { action: 'secret.read', detail: '1 key', actor: 'fixture-user', created_at: 1700000000 },
+      { action: 'integration.sync_failed', detail: 'int-1: provider rejected the token', actor: 'fixture-user', created_at: 1700000001 },
+      { action: 'rotation.run', detail: 'STRIPE_KEY', actor: 'fixture-user', created_at: 1700000002 },
+    ],
+    '/api/orgs/org-a/log-streams/deliveries': [
+      { id: 'd1', stream_name: 'SIEM', stream_url: 'https://siem.example/ingest', event: 'secret.read', status: 'failed', attempts: 3, created_at: 1700000003 },
+    ],
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderAudit()');
+  assert.match(ui.el('auditrows').textContent, /secret\.read/, 'the audit tab lists workspace events');
+  await ui.invoke("setLogTab('sync')");
+  const sync = ui.el('auditrows').textContent;
+  assert.match(sync, /integration\.sync_failed/);
+  assert.match(sync, /rotation\.run/);
+  assert.doesNotMatch(sync, /secret\.read/, 'sync activity hides unrelated events');
+  await ui.invoke("setLogTab('delivery')");
+  const deliveries = ui.el('auditrows').textContent;
+  assert.match(deliveries, /SIEM/, 'delivery rows name the target stream');
+  assert.match(deliveries, /failed/);
+  assert.match(deliveries, /3/);
+  assert.equal(ui.el('auditcount').textContent, '1 attempts shown');
+});
+
+test('the self-hosted plan shows its plan card and locks enterprise settings', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Self-hosted/, 'the plan card names the self-hosted plan');
+  assert.match(view.textContent, /All core features are enabled without a license/);
+  assert.match(view.textContent, /SAML SSO/, 'the locked SAML card is still discoverable');
+  assert.match(view.textContent, /Enterprise/, 'the locked cards carry the enterprise label');
+  assert.equal(ui.el('set-oidc-iss').disabled, true, 'workspace OIDC fields are read-only without a license');
+  assert.equal(ui.button(view, /^Save SAML$/), undefined, 'no SAML save action is offered while locked');
+});
+
+test('an enterprise edition unlocks the settings forms', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/auth/providers': { ldap: true },
+    '/api/orgs/org-a/ldap': {},
+  } });
+  ui.run("ORG='org-a'");
+  ui.run("EDITION={tier:'enterprise',enterprise:true,customer:'Acme Ltd',expires_at:null,development:false,warning:null}");
+  await ui.invoke('renderSettings()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /Licensed to Acme Ltd/);
+  assert.equal(ui.el('set-oidc-iss').disabled, false, 'OIDC fields are editable with a license');
+  assert.ok(ui.button(view, /^Save SAML$/), 'the SAML form is available with a license');
+});
+// A stale digest silently blocks the console's translation script in every
+// browser, so each SRI hash must match the file it names.
+test('console script digests match the files they load', () => {
+  const crypto = require('node:crypto');
+  const files = {
+    'i18n.js': path.join(__dirname, '../src/i18n.js'),
+    'libsodium.js': path.join(__dirname, '../src/vendor/libsodium.js'),
+    'libsodium-wrappers.js': path.join(__dirname, '../src/vendor/libsodium-wrappers.js'),
+  };
+  for (const [name, file] of Object.entries(files)) {
+    const digest = crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64');
+    assert.ok(html.includes(`<script src="/${name}" integrity="sha384-${digest}"`),
+      `${name} must carry the digest of its current contents`);
+  }
+});
+test('a member of several workspaces chooses one, and the choice survives the next visit', async () => {
+  const ui = await consoleUI([saved], [], { manualBoot: true, store: { 'ow.org.fixture@example.invalid': '' } });
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'grid', 'a member of two workspaces must be asked which one to open');
+  assert.equal(ui.el('shell').style.display, 'none', 'the shell must not open behind the picker');
+  const rows = ui.el('pickerlist').children.filter(child => typeof child !== 'string');
+  assert.equal(rows.length, 2, 'both workspaces must be offered');
+  assert.match(rows[0].textContent, /First org/);
+  assert.match(rows[0].textContent, /3 members/, 'the picker shows how large a workspace is');
+  assert.match(rows[1].textContent, /1 member\b/, 'a single-member workspace is not pluralised');
+  assert.match(rows[1].textContent, /admin/, 'the picker shows the role held there');
+
+  await ui.invoke("pickOrg('org-b')");
+  assert.equal(ui.el('picker').style.display, 'none', 'picking a workspace closes the picker');
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'the switcher names the chosen workspace');
+
+  // The remembered choice is what a returning browser lands in.
+  await ui.invoke('enterApp()');
+  assert.equal(ui.el('picker').style.display, 'none', 'a remembered workspace must not ask again');
+  assert.equal(ui.el('orgname').textContent, 'Second org');
+});
+
+test('the login screen names its jurisdiction and offers another only when one exists', async () => {
+  const local = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'global', regions: [], google: false, signups: 'open' },
+  } });
+  await local.invoke('loadProviders()');
+  assert.match(local.el('regionline').textContent, /global/, 'a single deployment still states its jurisdiction');
+  assert.doesNotMatch(local.el('regionline').textContent, /Change region/, 'no switch is offered when there is nowhere to go');
+
+  const multi = await consoleUI([saved], [], { manualBoot: true, responses: {
+    '/api/auth/providers': { region: 'eu', regions: [
+      { label: 'global', origin: 'https://global.example.test' },
+      { label: 'eu', origin: 'https://eu.example.test' },
+    ] },
+  } });
+  await multi.invoke('loadProviders()');
+  assert.match(multi.el('regionline').textContent, /eu/, 'the login screen names the jurisdiction it will authenticate against');
+  assert.match(multi.el('regionline').textContent, /Change region/, 'a second jurisdiction is offered as a hand-off');
+  await multi.invoke('regionPick()');
+  assert.match(multi.el('modal').textContent, /GLOBAL/, 'the picker lists the jurisdictions by name');
+  assert.match(multi.el('modal').textContent, /EU/, 'the picker lists the jurisdictions by name');
+});
+
+test('the workspace menu keeps workspace actions apart from account actions', async () => {
+  const ui = await consoleUI();
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false', 'the menu starts closed');
+  await ui.invoke('toggleOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'true', 'the trigger reports the open state');
+  const menu = ui.el('orgmenu').textContent;
+  assert.match(menu, /First org/);
+  assert.match(menu, /Second org/);
+  assert.match(menu, /fixture@example\.invalid/, 'the account holding the session is named once');
+  assert.match(menu, /Account settings/);
+  assert.match(menu, /Sign out/);
+  assert.ok(menu.indexOf('Second org') < menu.indexOf('Account settings'), 'workspaces come before account actions');
+  const items = ui.el('orgmenu').querySelectorAll('button.orgitem');
+  assert.ok(items.length >= 4, 'the menu exposes its actions as buttons');
+  assert.equal(ui.document.activeElement, items[0], 'opening the menu focuses its first action');
+  await ui.invoke('orgMenuKey({key: "ArrowDown", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[1], 'ArrowDown moves within the menu');
+  await ui.invoke('orgMenuKey({key: "ArrowUp", preventDefault() {}})');
+  assert.equal(ui.document.activeElement, items[0], 'ArrowUp moves back');
+  await ui.invoke('closeOrgMenu()');
+  assert.equal(ui.el('orgbtn').getAttribute('aria-expanded'), 'false');
+  await ui.invoke("switchOrg('org-b')");
+  assert.equal(ui.el('orgname').textContent, 'Second org', 'switching updates the trigger, not just the state');
+  await ui.invoke('toggleOrgMenu()');
+  assert.match(ui.el('orgmenu').textContent, /✓\s*Second org/, 'the open menu marks the selected workspace');
 });

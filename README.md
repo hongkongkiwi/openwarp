@@ -26,7 +26,7 @@ OpenWarp groups secrets into workspaces, applications, and environments. Teams c
 | Choose encryption | Server-side encryption for automation, or client-managed end-to-end environments |
 | Automate | REST API, OAuth with PKCE, MCP tools, rotation schedules, and dynamic credentials |
 
-There are no licence checks, paid feature gates, or configured seat and environment tiers. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
+There are no licence checks, paid feature gates, or configured seat and environment tiers. The enterprise surfaces (SAML, SCIM, X.509 PKI, SSH certificates, transit, workload identity, change requests and LDAP) are opt-in twice: a default build compiles them out, and a workspace needs a grant before it can use one. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
 
 > [!IMPORTANT]
 > OpenWarp handles sensitive data. Obtain an independent security and cryptography review before relying on it in production. Server-side encryption trusts the server with plaintext. End-to-end environments require client-managed keys and do not support the same automation paths. Read the [security model](docs/SECURITY.md).
@@ -148,6 +148,6 @@ The repository includes crypto tests, database tests, HTTP integration suites, a
 
 ## Project boundaries
 
-OpenWarp is a native Rust service, not a Cloudflare Worker. Its server needs operating-system networking and a database driver. Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
+OpenWarp runs as a native Rust service or as a Cloudflare Worker with Durable Object storage. Platform-specific features and deployment limits are listed in the [deployment guide](docs/DEPLOY.md). Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
 
 The [documentation index](docs/README.md) links every guide. Start with [security](docs/SECURITY.md) and [backup and restore](docs/BACKUP.md) before storing secrets you cannot afford to lose.
