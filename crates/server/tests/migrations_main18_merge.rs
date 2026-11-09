@@ -97,10 +97,10 @@ async fn assert_emergency_schema(db: &Db, expected: i64) {
 }
 
 async fn assert_final22(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), 30, "the conflicting main18 history needs an appended reconciliation");
+    assert_eq!(db.version().await.unwrap(), openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "the conflicting main18 history needs an appended reconciliation");
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, 30);
-    assert_eq!(status.latest, 30);
+    assert_eq!(status.current, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(status.latest, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
@@ -179,7 +179,7 @@ async fn upgrade_engine_history(version: usize) {
         assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=? ORDER BY version", &[serde_json::json!(version)]).await.unwrap(), ledger, "engine{} ledger rows and checksums are immutable", version);
         assert_eq!(restricted(&db, "main18-member-env").await, 0, "the existing engine sentinel preserves later unrestricted environments");
         assert_emergency_schema(&db, 0).await;
-        assert_eq!(report.applied, ((version as i64 + 1)..=30).collect::<Vec<_>>());
+        assert_eq!(report.applied, ((version as i64 + 1)..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0)).collect::<Vec<_>>());
         assert_final22(&db).await;
         assert_eq!(common_data(&db).await, before);
 }

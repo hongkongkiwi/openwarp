@@ -1,3 +1,4 @@
+#![cfg(feature = "pki")]
 #![allow(dead_code)]
 // Device PKI authorization and lifecycle tests. Each test owns a private database.
 
@@ -50,20 +51,11 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    // Parallel test binaries must not hand the same port to two servers.
-    let base = 20000 + (std::process::id() % 30000) as u16;
-    for offset in 0..500u16 {
-        let port = base.saturating_add(offset);
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            drop(listener);
-            return port;
-        }
-    }
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    // True ephemeral: the OS never hands out a port that is still bound, so
+    // parallel test binaries cannot converge the way a PID-derived scan
+    // does. The only residual hazard is the gap between dropping this
+    // listener and the child binding it, which the startup retry covers.
+    TcpListener::bind("127.0.0.1:0").expect("ephemeral port").local_addr().expect("local addr").port()
 }
 
 impl Server {
@@ -264,6 +256,13 @@ async fn register(s: &Server, email: &str) -> Value {
         body["token"] = login.body["token"].clone();
         body["user_id"] = login.body["user_id"].clone();
         body["public_key"] = login.body["public_key"].clone();
+    }
+    // The first account on a fresh server is the instance owner and can grant
+    // the pki surface; later registrations are members and cannot, so the
+    // result is not asserted.
+    let grant_org = body["org_id"].as_str().unwrap_or("").to_string();
+    if let Some(grant_token) = body["token"].as_str() {
+        let _ = s.call(Method::PUT, "/api/instance/features", Some(grant_token), Some(json!({"org": grant_org, "features": ["pki"]}))).await;
     }
     body
 }

@@ -16,6 +16,10 @@ async fn state() -> (S, HeaderMap) {
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('owner','owner@example.test','','','',?)", &[json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'owner',?)", &[json!(oc::hash_token("rotation-session")), json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await.unwrap();
+    // Mirror a booted server: boot installs the master verifier before any
+    // request can rotate the key, and rotation's batch updates that row by
+    // name with a required count, so a fixture without it always 409s.
+    persist_verifier(&st.db, &[1; 32]).await.unwrap();
     let mut h = HeaderMap::new();
     h.insert("authorization", "Bearer rotation-session".parse().unwrap());
     (st, h)

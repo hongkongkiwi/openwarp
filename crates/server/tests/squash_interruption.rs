@@ -69,9 +69,9 @@ fn assert_history(rows: &[Row], through: i64) {
 
 async fn assert_complete_and_stable(db: &Db) {
     let before = ledger(db).await;
-    assert_history(&before, 30);
+    assert_history(&before, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
     let status = migrate::status(db, MIGRATIONS).await.expect("inspect completed history");
-    assert_eq!(status.current, 30);
+    assert_eq!(status.current, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.expect("completed squash remains restartable");
@@ -115,8 +115,8 @@ async fn interrupted_squash_resumes(version: i64) {
     assert_eq!(db.query("SELECT k,v FROM meta WHERE k='squash-fixture'", &[]).await.unwrap(), meta_before, "restart must preserve initialized metadata");
     let rows = ledger(&db).await;
     assert_eq!(&rows[..prefix.len()], prefix.as_slice(), "restart must retain already completed ledger entries");
-    assert_history(&rows, 30);
-    assert_eq!(report.applied, vec![18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], "restart must run only migrations beyond the consolidated baseline");
+    assert_history(&rows, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(report.applied, (18i64..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0)).collect::<Vec<_>>(), "restart must run only migrations beyond the consolidated baseline");
     assert_complete_and_stable(&db).await;
 }
 
@@ -136,6 +136,8 @@ async fn fresh_squash_completes_and_restart_is_noop() {
     let db = Db::connect(&scratch.url()).await.expect("connect private database");
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("uninterrupted fresh apply");
     assert!(report.squashed);
-    assert_eq!(report.applied, vec![1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
+    let mut expected = vec![1i64];
+    expected.extend(18i64..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(report.applied, expected);
     assert_complete_and_stable(&db).await;
 }

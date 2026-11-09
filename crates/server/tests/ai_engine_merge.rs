@@ -162,9 +162,11 @@ fn released_engine_sql_1_through_29_is_immutable() {
 
 #[tokio::test]
 async fn fresh_engine_reaches_30_with_exact_ai_schema() {
-    assert_eq!(MIGRATIONS.last().expect("manifest").version, 30, "the merged engine must append the AI assistant schema as migration 30");
+    // Migration 30 must exist; the manifest may carry later migrations after it.
+    assert!(MIGRATIONS.iter().any(|m| m.version == 30), "the merged engine must carry the AI assistant schema as migration 30");
+    let latest = MIGRATIONS.last().expect("manifest").version;
     let db = Db::open_memory().await.unwrap();
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, latest).await;
     assert_ai_tables_exact(&db).await;
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
@@ -188,14 +190,16 @@ async fn engine29_upgrade_appends_migration_30_and_preserves_data() {
     let ledger29 = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("the merged engine upgrades an engine-29 database");
-    assert_eq!(report.applied, vec![30], "the AI schema must land as exactly migration 30 on an engine-29 database");
+    let latest = MIGRATIONS.last().expect("manifest").version;
+    assert_eq!(report.applied, (30i64..=latest).collect::<Vec<_>>(), "migration 30 and every migration after it must land on an engine-29 database");
     assert!(!report.squashed);
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, latest).await;
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=29 ORDER BY version", &[]).await.unwrap(), ledger29, "engine history 1..29 must survive the upgrade untouched");
+    let migration30 = MIGRATIONS.iter().find(|m| m.version == 30).expect("migration 30 in the manifest");
     let row = &db.query("SELECT name,checksum,success FROM schema_migrations WHERE version=30", &[]).await.unwrap()[0];
-    assert_eq!(s(row, "name"), MIGRATIONS[29].name);
-    assert_eq!(s(row, "checksum"), migrate::checksum(MIGRATIONS[29].sql));
+    assert_eq!(s(row, "name"), migration30.name);
+    assert_eq!(s(row, "checksum"), migrate::checksum(migration30.sql));
     assert_eq!(n(row, "success"), 1);
     assert_ai_tables_exact(&db).await;
 
@@ -274,6 +278,10 @@ async fn seed_instance(f: &Fixture) {
     f.sql("INSERT INTO org_members(org_id,user_id,role) VALUES('org','owner','owner')", &[]).await;
     f.sql("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await;
     f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&OLD))]).await;
+    // Boot installs the master verifier before any request can rotate the key,
+    // and the rotation batch updates that row by name with a required count,
+    // so the fixture must carry it or every rotation answers 409.
+    f.sql("INSERT INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&OLD, b"openwarp-master-key-v1"))]).await;
 }
 
 #[tokio::test]
