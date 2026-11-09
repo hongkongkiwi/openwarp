@@ -42,8 +42,13 @@ impl AppState {
         self.audited_batch_inner(statements,require_one,fields,Some(master)).await
     }
     async fn audited_batch_inner(&self, statements: &[(String,Vec<Value>)], require_one: &[usize], fields: [&str;6], master: Option<[u8;32]>) -> Result<(),String> {
-        let event = AuditEvent::new(fields); let statements=statements.to_vec(); let checked=require_one.to_vec();
+        self.audited_rotation_batch(statements,require_one,fields,master,"SELECT id FROM rotation_schedules WHERE 1=0",&[]).await
+    }
+    async fn audited_rotation_batch(&self, statements: &[(String,Vec<Value>)], require_one: &[usize], fields: [&str;6], master: Option<[u8;32]>, blocked: &str, params: &[Value]) -> Result<(),String> {
+        let event = AuditEvent::new(fields); let statements=statements.to_vec(); let checked=require_one.to_vec(); let blocked=blocked.to_string(); let params=params.to_vec();
         self.db.webhook_atomic(move |tx| {
+            tx.exec("UPDATE meta SET v=v WHERE k='rotation_lifecycle'",&[])?;
+            if !tx.query(&blocked,&params)?.is_empty() { return Err("version conflict: static rotation pending or executing; reconcile before changing its target".into()); }
             if let Some(master)=master { webhooks::epoch_lock(tx,&master)?; }
             for (index,(sql,params)) in statements.iter().enumerate() {
                 let affected=tx.exec(sql,params)?;

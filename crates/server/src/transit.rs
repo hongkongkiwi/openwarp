@@ -29,17 +29,17 @@ pub(super) fn fence(expected: &str, master: &[u8;32]) -> Statement {
     ("UPDATE meta SET v=? WHERE k=? AND v=?".into(),vec![json!(generation(master)),json!(ROOT),json!(expected)],Some(1))
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) async fn rotation(st: &S, old: &[u8;32], new: &[u8;32], expected: &str) -> Result<Vec<Statement>, (StatusCode, Json<Value>)> {
-    let rows = st.db.query("SELECT key_id,org_id,version,key_enc FROM transit_versions", &[]).await.map_err(|e| bad(&e))?;
-    let mut statements = vec![fence(expected,new)];
-    for r in rows {
-        let org = db::s(&r,"org_id"); let kid = db::s(&r,"key_id"); let version = db::n(&r,"version"); let wrapped = db::s(&r,"key_enc");
-        let aad = wrap_aad(&org,&kid,version);
-        let raw = oc::decrypt_symmetric_aad(old,&aad,&wrapped).map_err(|_| bad("transit key cannot be unwrapped; refusing master rotation"))?;
-        if raw.len()!=32 { return Err(bad("invalid transit key; refusing master rotation")); }
-        statements.push(("UPDATE transit_versions SET key_enc=? WHERE key_id=? AND org_id=? AND version=? AND key_enc=?".into(),vec![json!(oc::encrypt_symmetric_aad(new,&aad,&raw)),json!(kid),json!(org),json!(version),json!(wrapped)],Some(1)));
+pub(super) fn rotation_tx(tx: &db::WebhookTx<'_>, old: &[u8;32], new: &[u8;32], expected: &str) -> Result<(), String> {
+    let (sql, params, required) = fence(expected,new);
+    if Some(tx.exec(&sql,&params)?) != required { return Err("transit root changed during rotation".into()); }
+    for r in tx.query("SELECT key_id,org_id,version,key_enc FROM transit_versions", &[])? {
+        let org=db::s(&r,"org_id"); let kid=db::s(&r,"key_id"); let version=db::n(&r,"version"); let wrapped=db::s(&r,"key_enc");
+        let aad=wrap_aad(&org,&kid,version);
+        let raw=oc::decrypt_symmetric_aad(old,&aad,&wrapped).map_err(|_| "transit key cannot be unwrapped; refusing master rotation")?;
+        if raw.len()!=32 { return Err("invalid transit key; refusing master rotation".into()); }
+        if tx.exec("UPDATE transit_versions SET key_enc=? WHERE key_id=? AND org_id=? AND version=? AND key_enc=?", &[json!(oc::encrypt_symmetric_aad(new,&aad,&raw)),json!(kid),json!(org),json!(version),json!(wrapped)])? != 1 { return Err("transit key changed during rotation".into()); }
     }
-    Ok(statements)
+    Ok(())
 }
 async fn authorize(st: &S, h: &HeaderMap, org: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
