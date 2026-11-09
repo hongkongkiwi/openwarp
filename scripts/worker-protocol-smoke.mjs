@@ -84,10 +84,10 @@ async function pki(f, dir) {
   ensure(typeof leaf.id === 'string' && typeof leaf.private_key === 'string', 'leaf issuance must return id and private key');
   const caFile = path.join(dir, 'ca.pem'), leafFile = path.join(dir, 'leaf.pem'), otherFile = path.join(dir, 'other.pem');
   const crlFile = path.join(dir, 'crl.pem'), requestFile = path.join(dir, 'request.der'), responseFile = path.join(dir, 'response.der');
-  await fs.writeFile(caFile, ca.certificate, { mode: 0o600 });
+  await fs.writeFile(caFile, caData.certificate, { mode: 0o600 });
   await fs.writeFile(leafFile, leaf.certificate, { mode: 0o600 });
   await fs.writeFile(otherFile, other.certificate, { mode: 0o600 });
-  const parsed = new crypto.X509Certificate(leaf.certificate), issuer = new crypto.X509Certificate(ca.certificate);
+  const parsed = new crypto.X509Certificate(leaf.certificate), issuer = new crypto.X509Certificate(caData.certificate);
   ensure(parsed.verify(issuer.publicKey), 'leaf signature must match the returned CA');
   ensure(parsed.checkHost('service.test.invalid') === 'service.test.invalid', 'issued SAN must match requested DNS name');
   ensure(parsed.publicKey.export({ type: 'spki', format: 'der' }).equals(crypto.createPublicKey(leaf.private_key).export({ type: 'spki', format: 'der' })), 'issued private key must match leaf public key');
