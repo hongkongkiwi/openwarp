@@ -63,6 +63,12 @@ impl Fixture {
         let (live, _) = tokio::sync::broadcast::channel(16);
         let st = new_state(db, database.url.clone(), namespace.into(), "https://openwarp.test.invalid".into(), master, live,
             #[cfg(feature = "redis-cache")] None);
+        if let Err(e) = openwarp_server::persist_verifier(st.db(), &master).await {
+            // A restart carrying a stale root is refused by the same CAS check
+            // boot uses; these cases keep serving with the stale key to prove
+            // requests fail closed, so only that refusal is acceptable here.
+            assert!(e.contains("different master root"), "install the boot master verifier: {e}");
+        }
         let f = Self { app: router(st.clone()), st, org: format!("{namespace}-org"), dev: format!("{namespace}-dev"), prod: format!("{namespace}-prod"), identity: format!("{namespace}-identity") };
         if seed {
             let owner = format!("{namespace}-owner"); let admin = format!("{namespace}-admin"); let app = format!("{namespace}-app");

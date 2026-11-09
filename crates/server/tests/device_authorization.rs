@@ -314,6 +314,8 @@ async fn org_with_viewer(s: &Server, suffix: &str) -> (String, String, String, S
         .call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&ot), Some(json!({"name": "viewer", "permissions": []})))
         .await;
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
+    let r = s.call(Method::PUT, "/api/instance/features", Some(&ot), Some(json!({"org": org, "features": ["pki"]}))).await;
+    assert_eq!(r.status, 200, "pki grant failed: {}", r.text);
     invite(s, &ot, &org, &format!("viewer{}@test.invalid", suffix), "viewer", &mt).await;
     let (app, envs) = app_with_envs(s, &ot, &org).await;
     set_secret(s, &ot, &envs[0], "SECRET1", "v1").await;
@@ -323,6 +325,8 @@ async fn org_with_viewer(s: &Server, suffix: &str) -> (String, String, String, S
 // Device certificates: the key stays on the device, enrollment is a one-time
 // code plus a CSR, and the CRL is public because a broker fetches it.
 async fn pki_ca(s: &Server, token: &str, org: &str, name: &str) -> (String, String) {
+    let g = s.call(Method::PUT, "/api/instance/features", Some(token), Some(json!({"org": org, "features": ["pki"]}))).await;
+    assert_eq!(g.status, 200, "pki grant failed: {}", g.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": name}))).await;
     assert_eq!(r.status, 200, "create CA failed: {}", r.text);
     (r.body["id"].as_str().unwrap().to_string(), r.body["certificate"].as_str().unwrap().to_string())

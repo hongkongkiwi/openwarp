@@ -177,7 +177,10 @@ async fn pg_owner(server: &PgServer, client: &Client, base: &str) -> (String, St
     assert_eq!(verified.status(), 200);
     let login = call(client, base, Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": password}))).await;
     assert_eq!(login.status, 200, "login: {}", login.text);
-    (login.body["token"].as_str().expect("session token").to_string(), registered.body["org_id"].as_str().expect("org id").to_string())
+    let token = login.body["token"].as_str().expect("session token").to_string();
+    let org = registered.body["org_id"].as_str().expect("org id").to_string();
+    assert_eq!(call(client, base, Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["pki"]}))).await.status, 200, "pki grant");
+    (token, org)
 }
 
 #[tokio::test]

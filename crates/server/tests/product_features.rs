@@ -31,6 +31,9 @@ impl Fixture {
         let (live, _) = tokio::sync::broadcast::channel(16);
         let st = new_state(db, ":memory:".into(), "fixture-instance".into(), "https://openwarp.test.invalid".into(), [7; 32], live,
             #[cfg(feature = "redis-cache")] None);
+        // Boot installs the master verifier before serving; the rotation ledger
+        // updates that row, so the fixture finishes the same boot step.
+        openwarp_server::persist_verifier(st.db(), &[7; 32]).await.expect("install the boot master verifier");
         let f = Self { app: router(st.clone()), st };
         for org in ["org-a", "org-b"] {
             f.sql("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(org), json!(org), json!(now())]).await;

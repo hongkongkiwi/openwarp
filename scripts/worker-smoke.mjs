@@ -289,8 +289,8 @@ for (const [name, later, status] of [
 // branches on the DELETE count and would report "cannot remove the last owner"
 // while already having removed the row.
 const scim = await call('POST', `/scim/v2/Users?org_id=${org}`, token, { userName: `member-${Date.now()}@test.invalid` });
-if (scim.status === 403 && scim.json.feature === 'directory_sync') {
-  check('SCIM gated on a self-hosted deployment', true, 'directory_sync requires an enterprise licence');
+if ((scim.status === 403 && scim.json.feature === 'directory_sync') || scim.status === 404) {
+  check('SCIM gated on a self-hosted deployment', true, 'directory_sync requires an enterprise licence or a native build');
 } else {
   check('SCIM user created', scim.status === 200 && scim.json.id, scim.text);
   const removed = await call('DELETE', `/scim/v2/Users/${scim.json.id}?org_id=${org}`, token);
@@ -337,7 +337,11 @@ if (state) {
 
 // Certificate authority and leaf issuance through the RustCrypto stack.
 const ca = await call('POST', `/api/orgs/${org}/pki/cas`, token, { name: 'smoke-ca' });
-check('CA created on the Worker', ca.status === 200 && (ca.json.certificate || '').includes('BEGIN CERTIFICATE'), `${ca.status} ${ca.text.slice(0, 120)}`);
+if (ca.status === 404) {
+  check('PKI absent on a core worker build', true, 'the pki feature compiles into native builds only');
+} else {
+  check('CA created on the Worker', ca.status === 200 && (ca.json.certificate || '').includes('BEGIN CERTIFICATE'), `${ca.status} ${ca.text.slice(0, 120)}`);
+}
 if (ca.json.id) {
   const leaf = await call('POST', `/api/pki/cas/${ca.json.id}/issue`, token, { cn: 'svc.test.invalid', sans: ['svc.test.invalid'], days: 30 });
   check('leaf certificate and key issued', leaf.status === 200 && (leaf.json.certificate || '').includes('BEGIN CERTIFICATE') && (leaf.json.private_key || '').includes('BEGIN PRIVATE KEY'), `${leaf.status} ${leaf.text.slice(0, 160)}`);

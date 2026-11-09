@@ -100,6 +100,7 @@ async fn setup(s: &Server) -> (String, String, String) {
     assert_eq!(s.call(Method::GET, &path, None, None).await.status, 200, "verify");
     let r = s.post("/api/auth/login", None, json!({"email": "renew@test.invalid", "password": "correct-horse-battery"})).await;
     assert_eq!(r.status, 200, "login"); let token = r.body["token"].as_str().unwrap().to_string();
+    assert_eq!(s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["pki"]}))).await.status, 200, "pki grant");
     let r = s.post(&format!("/api/orgs/{}/pki/cas", org), Some(&token), json!({"name": "renew-root"})).await;
     assert_eq!(r.status, 200, "CA"); (token, org, r.body["id"].as_str().unwrap().to_string())
 }

@@ -1822,7 +1822,10 @@ async fn ssh_ca_principals_are_gated_by_role_grants() {
     let owner = register(&s, "sshowner@test.invalid").await;
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
-    grant_features(&s, &ot, &org, &["ssh-ca"]).await;
+    // Both surfaces are granted: the X.509 handlers must be reachable so the
+    // test can prove they reject an SSH CA with the kind mismatch, which is a
+    // different answer from the workspace not holding the feature at all.
+    grant_features(&s, &ot, &org, &["ssh-ca", "pki"]).await;
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);

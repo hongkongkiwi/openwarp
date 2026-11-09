@@ -77,6 +77,7 @@ async fn setup(s: &Server) -> Fixture {
     assert_eq!(s.call(Method::GET, &path, None, None).await.status, 200, "verify owner");
     let r = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "group-owner@test.invalid", "password": "correct-horse-battery"}))).await;
     assert_eq!(r.status, 200, "owner session"); let owner = r.body["token"].as_str().unwrap().to_string();
+    s.ok(Method::PUT, "/api/instance/features", &owner, Some(json!({"org": org, "features": ["pki"]}))).await;
     s.ok(Method::POST, &format!("/api/orgs/{}/roles", org), &owner, Some(json!({"name": "pki-operator", "permissions": ["pki:read", "pki:write"]}))).await;
     let invite = s.ok(Method::POST, &format!("/api/orgs/{}/members", org), &owner, Some(json!({"email": "group-member@test.invalid", "role": "pki-operator"}))).await;
     let r = s.call(Method::POST, "/api/auth/accept-invite", None, Some(json!({"token": invite["invite_token"].as_str().expect("new account invite"), "password": "correct-horse-battery"}))).await;

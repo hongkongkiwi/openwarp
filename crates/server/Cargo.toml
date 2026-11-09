@@ -98,6 +98,39 @@ name = "rotation_regressions"
 path = "tests/rotation_regressions.rs"
 required-features = ["live-db-tests"]
 
+
+# The device suites drive the PKI routes, which compile only with the pki
+# feature; the enterprise CI pass runs them with --all-features.
+[[test]]
+name = "device_authorization"
+path = "tests/device_authorization.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_delivery"
+path = "tests/device_delivery.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_group_security"
+path = "tests/device_group_security.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_lockdown"
+path = "tests/device_lockdown.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_postgres"
+path = "tests/device_postgres.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_remaining"
+path = "tests/device_remaining.rs"
+required-features = ["pki"]
+
 [[test]]
 name = "worker_saml"
 path = "tests/worker_saml.rs"
