@@ -65,14 +65,20 @@ first="$(request_migration)"
 second="$(request_migration)"
 echo "first:  $first"
 echo "second: $second"
-case "$first" in
-  *"applied=[1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]"*|*"applied=[1,18,19,20,21,22,23,24,25,26,27,28,29,30]"*) ;;
-  *) echo "d1 smoke: unexpected first apply result: $first" >&2; tail -60 "$persist/dev.log" >&2; exit 1 ;;
-esac
-case "$second" in
-  *"applied=[]"*) ;;
-  *) echo "d1 smoke: the second apply was not a no-op: $second" >&2; tail -60 "$persist/dev.log" >&2; exit 1 ;;
-esac
+# The expected first apply is the baseline followed by every migration the
+# lineage squash collapsed through, up to the manifest tip; derive the tip
+# from the manifest so appended migrations do not stale the pin. The report
+# text is matched with grep -F: a case glob would treat the bracketed list
+# as a character class and never match the literal result.
+TIP=$(grep -c '^    Migration {' "${ROOT}/crates/server/src/migrate.rs")
+EXPECTED="applied=[$(python3 -c "print(', '.join(['1'] + [str(v) for v in range(18, ${TIP} + 1)]))")]"
+printf '%s\n' "$first"   | grep -qF "$EXPECTED" || { echo "d1 smoke: unexpected first apply result: $first (expected ${EXPECTED})" >&2; tail -60 "$persist/dev.log" >&2; exit 1; }
+printf '%s\n' "$second" | grep -qF "applied=[]"       || { echo "d1 smoke: the second apply was not a no-op: $second" >&2; tail -60 "$persist/dev.log" >&2; exit 1; }
+if printf '%s\n' "$first" "$second" | grep -q 'not marked as `catch`'; then
+  echo "d1 smoke: a D1 statement threw through the non-catch binding" >&2
+  tail -60 "$persist/dev.log" >&2
+  exit 1
+fi
 
 query() {
   "$wrangler" d1 execute DB --local --config wrangler.d1-smoke.toml --persist-to "$persist" --json --command "$1"
