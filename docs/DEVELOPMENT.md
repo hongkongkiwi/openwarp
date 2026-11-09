@@ -61,6 +61,8 @@ node --test crates/server/tests/ui.test.cjs
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
+The coverage matrix, acceptance scenarios and rollout plan for every feature area live in [testing](TESTING.md).
+
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
 
 ## Container validation
