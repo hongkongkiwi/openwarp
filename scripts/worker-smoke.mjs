@@ -331,6 +331,8 @@ idp.close();
 {
   const ca = await call('POST', `/api/orgs/${org}/pki/cas`, token, { name: 'smoke-ca' });
   check('PKI absent from the Worker build', ca.status === 404, `${ca.status} ${ca.text.slice(0, 120)}`);
+  const leaf = await call('POST', `/api/pki/cas/${org}/issue`, token, { cn: 'svc.test.invalid', sans: ['svc.test.invalid'], days: 30 });
+  check('PKI issuance absent from the Worker build', leaf.status === 404, `${leaf.status} ${leaf.text.slice(0, 120)}`);
 }
 
 // Optional: a live PostgreSQL lease through the Worker socket path.
