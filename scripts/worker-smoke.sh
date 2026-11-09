@@ -36,7 +36,7 @@ node "${ROOT}/scripts/worker-config-smoke.mjs" "${STATE_DIR}/config"
 MASTER=$(head -c 32 /dev/urandom | base64)
 PORT="${ECHO_PORT}" node "${ROOT}/scripts/smoke-echo.mjs" >"${LOG}.echo" 2>&1 &
 ECHO_PID=$!
-(cd "${ROOT}" && exec ${WRANGLER} dev --local --config "${STATE_DIR}/config/wrangler.toml" --port "${PORT}" --test-scheduled --persist-to "${STATE_DIR}/state" --var "OPENWARP_MASTER_KEY:${MASTER}" --var "OPENWARP_ENV:development" --var "OPENWARP_PUBLIC_URL:${BASE}" --var "OPENWARP_ALLOW_PRIVATE_EGRESS:1" --var "OPENWARP_ALLOWED_DB_HOSTS:127.0.0.1:5432,127.0.0.1:3306,127.0.0.1:3307" --var "OPENWARP_EMAIL_WEBHOOK:http://127.0.0.1:${ECHO_PORT}/mail" --var "OPENWARP_LICENSE:development" >"${LOG}" 2>&1) &
+(cd "${ROOT}" && exec ${WRANGLER} dev --local --config "${STATE_DIR}/config/wrangler.toml" --port "${PORT}" --test-scheduled --persist-to "${STATE_DIR}/state" --var "OPENWARP_MASTER_KEY:${MASTER}" --var "OPENWARP_ENV:development" --var "OPENWARP_PUBLIC_URL:${BASE}" --var "OPENWARP_ALLOW_PRIVATE_EGRESS:1" --var "OPENWARP_ALLOWED_DB_HOSTS:127.0.0.1:5432,127.0.0.1:3306,127.0.0.1:3307" --var "OPENWARP_EMAIL_WEBHOOK:http://127.0.0.1:${ECHO_PORT}/mail" >"${LOG}" 2>&1) &
 DEV_PID=$!
 
 i=0
