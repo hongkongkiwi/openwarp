@@ -27,7 +27,7 @@ impl AuditEvent {
           for seq in (prior+1..).take(4) {
               if tx.exec("INSERT INTO live_events(id,org_id,app_id,env_id,action,detail,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(seq),json!(org),json!(app),json!(env),json!(action),json!(detail),json!(self.created_at)]).is_ok() { done=true; break; }
           }
-          if done { tx.exec("INSERT INTO meta(k,v) VALUES('live_event_floor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", &[json!((prior+1).to_string())]).map_err(|_|())?; } }
+          if done { tx.exec("INSERT INTO meta(k,v) VALUES('live_event_floor',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", &[json!((prior+1).to_string())])?; } }
         let count = tx.one("SELECT COUNT(*) AS n FROM webhook_outbox", &[])?.map(|r| db::n(&r,"n")).unwrap_or(0);
         // Subscription-management events (pause, delete, auto-disable) must
         // still commit when the outbox is full, or the operator could not stop
@@ -96,7 +96,10 @@ impl AppState {
         let result=self.db.webhook_atomic(move |tx| {
             // Subscriptions already at their queue cap must still surface
             // backpressure before their targets are excluded from admission.
-            let _=tx.exec("UPDATE webhook_subscriptions SET enqueue_failures=enqueue_failures+1,last_enqueue_error_at=? WHERE id IN (SELECT s.id FROM webhook_subscriptions s WHERE s.enabled=1 AND EXISTS (SELECT 1 FROM webhook_outbox_targets t WHERE t.webhook_id=s.id) AND (SELECT COUNT(*) FROM webhook_deliveries d WHERE d.webhook_id=s.id AND d.status IN ('pending','failed','processing'))>=1000) AND enqueue_failures=0",&[json!(now())])?;
+            // MySQL rejects an UPDATE whose WHERE reselects the target table,
+            // so the inner queries touch only the deliveries and target tables
+            // and correlate the outer row's id.
+            let _=tx.exec("UPDATE webhook_subscriptions SET enqueue_failures=enqueue_failures+1,last_enqueue_error_at=? WHERE enabled=1 AND enqueue_failures=0 AND EXISTS (SELECT 1 FROM webhook_outbox_targets t WHERE t.webhook_id=webhook_subscriptions.id) AND EXISTS (SELECT 1 FROM webhook_deliveries d WHERE d.webhook_id=webhook_subscriptions.id AND d.status IN ('pending','failed','processing')) AND (SELECT COUNT(*) FROM webhook_deliveries d2 WHERE d2.webhook_id=webhook_subscriptions.id AND d2.status IN ('pending','failed','processing'))>=1000",&[json!(now())])?;
             let targets=tx.query("SELECT t.event_id,t.webhook_id,t.version,t.delivery_id,o.payload,o.created_at FROM webhook_outbox_targets t JOIN webhook_outbox o ON o.id=t.event_id WHERE NOT EXISTS (SELECT 1 FROM webhook_subscriptions s WHERE s.id=t.webhook_id AND s.version=t.version AND s.enabled=1) OR (SELECT COUNT(*) FROM webhook_deliveries d WHERE d.webhook_id=t.webhook_id AND d.status IN ('pending','failed','processing'))<1000 ORDER BY o.created_at,t.event_id,t.webhook_id LIMIT 100", &[])?;
             for target in targets {
                 let event=db::s(&target,"event_id"); let wid=db::s(&target,"webhook_id"); let version=db::n(&target,"version");

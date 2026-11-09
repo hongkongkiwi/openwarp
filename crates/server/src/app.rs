@@ -4107,8 +4107,6 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
 // The Workers build has no blocking runtime, rusqlite, or OCSP/CRL signing;
 // these instance and PKI routes answer 501 there.
 #[cfg(target_arch = "wasm32")]
-async fn rotate_master(State(_): State<S>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
-#[cfg(target_arch = "wasm32")]
 async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
 #[cfg(target_arch = "wasm32")]
 async fn ca_crl() -> Response { err(StatusCode::NOT_IMPLEMENTED, "CRL generation requires the native server").into_response() }
