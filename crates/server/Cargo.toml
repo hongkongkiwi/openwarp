@@ -30,6 +30,8 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 x509-cert = { version = "0.2.5", features = ["builder", "pem"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
+keystore-pki = "1.0"
+keystore-ocsp = "1.0"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -47,8 +49,6 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 redis = { version = "0.27", optional = true }
 rcgen = "0.13"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa"] }
-keystore-ocsp = "1.0"
-keystore-pki = "1.0"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 time = "0.3"
 risaml = { version = "0.7", default-features = false, features = ["crypto-rustcrypto"] }
@@ -75,6 +75,12 @@ tokio = { version = "1", default-features = false, features = ["io-util"] }
 default = ["redis-cache", "ldap"]
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
+live-db-tests = []
+
+[[test]]
+name = "rotation_regressions"
+path = "tests/rotation_regressions.rs"
+required-features = ["live-db-tests"]
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

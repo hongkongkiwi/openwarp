@@ -8,6 +8,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+const i18nSource = fs.readFileSync(path.join(__dirname, '../src/i18n.js'), 'utf8');
 const html = source.match(/r##"([\s\S]*)"##;/)?.[1];
 assert.ok(html, 'the embedded console HTML must be extractable');
 const script = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
@@ -47,6 +48,7 @@ class Element {
       if (at > 0) this.style[decl.slice(0, at).trim()] = decl.slice(at + 1).trim();
     }
   }
+  get childNodes() { return this.children; }
   get id() { return this.getAttribute('id') || ''; }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
@@ -180,8 +182,10 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   document.createElement = tag => new Element(tag, document);
   parse(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style>[\s\S]*?<\/style>/gi, ''), document);
   document.body = document.querySelector('body');
+  document.documentElement = document.querySelector('html');
   document.activeElement = document.body;
-  const calls = [], unexpected = [], confirmations = [], timers = [];
+  const calls = [], unexpected = [], confirmations = [], timers = [], store = { ...opts.store };
+  const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
     '/api/auth/providers': { google: false, github: false, signups: 'open' },
     '/api/instance': { instance_owner: false },
@@ -190,6 +194,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/orgs/org-a/apps': [{ id: 'app-a', name: 'First app' }, { id: 'app-b', name: 'Second app' }],
     '/api/orgs/org-a/settings': { ip_allowlist: '', oidc_issuer: '', oidc_client_id: '', oidc_redirect_uri: '', oidc_client_secret_set: false, oidc_auto_provision: false, oidc_allowed_domains: '', audit_webhook: '' },
     '/api/orgs/org-a/saml': { configured: false },
+    '/api/orgs/org-a/pki/cas': [],
     '/api/orgs/org-b/apps': [{ id: 'app-c', name: 'Other org app' }],
     '/api/apps/app-a/envs': [{ id: 'env-a', name: 'Development' }, { id: 'env-b', name: 'Production' }],
     '/api/apps/app-b/envs': [{ id: 'env-c', name: 'Other app env' }],
@@ -222,11 +227,16 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     '/api/ssh/cas/ca-ssh-1': { id: 'ca-ssh-1', name: 'ssh-ca', public_key: 'ssh-ed25519 AAAAC3Nza', fingerprint: 'SHA256:fixture', allow_forwarding: false, sshd: 'TrustedUserCAKeys /etc/ssh/openwarp/ca.pub', grants: [{ role: 'developer', principals: ['web-*'], max_ttl: 900 }] },
     '/api/ssh/cas/ca-ssh-1/certs': [{ id: 'ssh-cert-1', key_id: 'openwarp:ssh-cert-1', principal: 'web-1', serial: 7, revoked: 0, valid_before: 1800000000, cert_type: 'user' }],
     '/api/ssh/cas/ca-ssh-1/hosts': [{ id: 'host-1', hostname: 'db-1.internal', fingerprint: 'SHA256:hostkey' }],
+    ...opts.responses,
   };
   const context = vm.createContext({
-    document, console, URL, TextDecoder, TextEncoder,
-    localStorage: { getItem: () => '', setItem() {}, removeItem() {} },
-    navigator: { clipboard: { writeText: async () => {} } },
+    document, console, URL, TextDecoder, TextEncoder, matchMedia: () => media,
+    localStorage: {
+      getItem: key => (Object.hasOwn(store, key) ? store[key] : ''),
+      setItem: (key, value) => { store[key] = String(value); },
+      removeItem: key => { delete store[key]; },
+    },
+    navigator: { clipboard: { writeText: async () => {} }, languages: opts.languages, language: opts.languages && opts.languages[0] },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
     history: { replaceState() {} },
     setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {},
@@ -238,6 +248,7 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       const call = { method: options.method, url, body: options.body ? JSON.parse(options.body) : undefined };
       calls.push(call);
       let body;
+      if (opts.fetchOverride) { const answer = opts.fetchOverride(call); if (answer !== undefined) return { ok: true, status: 200, text: async () => JSON.stringify(await answer) }; }
       if (options.method === 'PUT' && /^\/api\/envs\/[^/]+\/secrets$/.test(url)) body = { deployed: call.body.secrets.length };
       else if (options.method === 'POST' && /^\/api\/envs\/[^/]+\/secrets\/reuse-check$/.test(url)) {
         if (opts.reuseFail) return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'preflight unavailable' }) };
@@ -258,13 +269,16 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
       else if (options.method === 'POST' && /\/webhooks\/hook-1\/rotate$/.test(url)) body = { id: 'hook-1', secret: 'whsec_fixture-one-time-key' };
       else if (options.method === 'POST' && url === '/api/webhook-deliveries/delivery-1/retry') body = { ok: true };
       else if (Object.hasOwn(responses, options.method + ' ' + url)) body = responses[options.method + ' ' + url];
+      else if (opts.pki && options.method === 'POST' && url === '/api/pki/cas/ca-a/devices/codes') body = { codes: call.body.device_ids.map(id => id === 'dev-b' ? { id, error: 'device no longer available' } : { id, name: 'sensor-a', code: 'test-code', nonce: 'test-nonce', expires_at: 1900000000 }) };
+      else if (options.method === 'GET' && opts.responses && Object.hasOwn(opts.responses, url)) body = opts.responses[url];
       else if (options.method === 'GET' && Object.hasOwn(responses, url)) body = responses[url];
       else { unexpected.push(call); throw new Error('Unexpected fixture request: ' + options.method + ' ' + url); }
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
     },
   });
   const ui = {
-    document, calls, confirmations, confirm: false,
+    document, calls, confirmations, confirm: false, store, media,
+    systemDark(dark) { media.matches = dark; for (const fn of media.listeners) fn({ matches: dark }); },
     el(id) { const el = document.getElementById(id); assert.ok(el, 'missing rendered element #' + id); return el; },
     run(code) { return vm.runInContext(code, context, { timeout: 1000 }); },
     async settle() {
@@ -306,6 +320,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     flushTimers() { const pending = timers.splice(0); for (const fn of pending) fn(); },
   };
   context.window = context;
+  // Browser load order: the i18n runtime executes before the inline console script.
+  vm.runInContext(i18nSource, context, { filename: 'i18n.js', timeout: 1000 });
   vm.runInContext(script, context, { filename: 'console-inline.js', timeout: 1000 });
   await ui.invoke('enterApp()');
   await ui.invoke("openApp('app-a')");
@@ -736,12 +752,16 @@ test('project lockdown leaves metadata readable and blocks secrets and changes',
 
 test('an ended session removes plaintext and returns to sign-in', async () => {
   const ui = await consoleUI();
-  await ui.invoke("E2E_KIT='private-kit';applyEmergency(true);sessionEnded()");
+  await ui.invoke("E2E_KIT='private-kit';PKI_SELECTED.add('dev-a');PKI_CODE_RESULTS=[{code:'stale'}];PKI_HOOK={ca:'ca-a',render:PKI_RENDER};PKI_ATT={ca:'ca-a',render:PKI_RENDER};applyEmergency(true);sessionEnded()");
   assert.equal(ui.el('shell').style.display, 'none');
   assert.equal(ui.el('auth').style.display, 'grid');
   assert.equal(ui.el('view').innerHTML, '');
   assert.equal(ui.run('E2E_KIT'), '');
   assert.equal(ui.run('AUTH_READY'), false);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
   assert.equal(ui.run('EMERGENCY'), false, 'an ended session must not block the next sign-in');
 });
 
@@ -853,7 +873,7 @@ test('SSH CA settings create a CA, edit grants and revoke a certificate', async 
   const create = ui.calls.find(c => c.method === 'POST' && c.url === '/api/orgs/org-a/ssh/cas');
   assert.ok(create, 'creating a CA must reach the workspace');
   assert.equal(create.body.name, 'ssh-ca');
-  assert.ok(ui.el('ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
+  assert.ok(ui.el('ssh-ca-out').textContent.includes('SHA256:fixture'), 'the new CA reports its fingerprint');
   assert.ok(ui.el('ssh-ca-detail').textContent.includes('TrustedUserCAKeys'), 'the new CA opens straight to the sshd block');
   await ui.invoke("openSshCA('ca-ssh-1')");
   assert.ok(ui.el('ssh-grants').value.includes('developer: web-*'), 'existing grants load into the editor');
@@ -908,4 +928,419 @@ test('a failed reuse preflight leaves staging available', async () => {
   assert.ok(ui.row('NEW_CONFIG'), 'the draft must still stage');
   assert.ok(!hidden(ui.el('deploybar')), 'the draft remains deployable');
   assert.ok(!ui.el('modalwrap').classList.contains('show'), 'a failed check must not open a dialog');
+});
+
+test('delayed PKI rendering and minted codes cannot cross workspaces', async () => {
+  let releaseMint, releaseRender, holdRender=false;
+  const opts={pki:true,responses:{
+    '/api/orgs/org-a/pki/cas':[{id:'ca-a',name:'A',kind:'root',certificate:'A-CERT'}],
+    '/api/orgs/org-b/pki/cas':[{id:'ca-b',name:'B',kind:'root',certificate:'B-CERT'}],
+    '/api/orgs/org-b/settings':{}, '/api/orgs/org-b/saml':{configured:false}, '/api/orgs/org-b/ssh/cas':[],
+    '/api/pki/cas/ca-a/devices':[{id:'dev-a',name:'sensor-a'}], '/api/pki/cas/ca-b/devices':[],
+    '/api/pki/cas/ca-a/groups':[], '/api/pki/cas/ca-b/groups':[],
+    '/api/orgs/org-a/pki/expiring?days=30':{counts:{7:0,14:0,30:0}}, '/api/orgs/org-b/pki/expiring?days=30':{counts:{7:0,14:0,30:0}},
+    '/api/pki/cas/ca-a/hook':{url:''}, '/api/pki/cas/ca-b/hook':{url:''},
+    '/api/pki/cas/ca-a/attestation':{}, '/api/pki/cas/ca-b/attestation':{},
+  },fetchOverride:call=>{
+    if(call.url==='/api/pki/cas/ca-a/devices/codes')return new Promise(resolve=>{releaseMint=resolve});
+    if(holdRender&&call.url==='/api/orgs/org-a/pki/cas')return new Promise(resolve=>{releaseRender=resolve});
+  }};
+  const ui=await consoleUI([saved],[],opts);await ui.invoke('renderSettings()');await ui.invoke('selectAllPki()');
+  ui.run('pendingMint=mintSelectedPki()');await ui.settle();holdRender=true;ui.run('pendingRender=renderPki()');await ui.settle();
+  await ui.invoke("ORG='org-b';renderSettings()");
+  releaseRender(opts.responses['/api/orgs/org-a/pki/cas']);await ui.invoke('pendingRender');
+  releaseMint({codes:[{id:'dev-a',name:'sensor-a',code:'A-SECRET-CODE',nonce:'a'}]});await ui.invoke('pendingMint');
+  assert.equal(ui.run('PKI_CA'),'ca-b');assert.equal(ui.el('pki-codes-out').textContent,'');
+  assert.ok(ui.el('pki-download-codes').disabled);assert.ok(!ui.el('view').textContent.includes('A-SECRET-CODE'));
+});
+
+test('PKI bulk codes use explicit selection and show partial failures', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('pki-mint-selected').disabled);
+  await ui.invoke('selectAllPki()');
+  assert.equal(ui.el('pki-selection-count').textContent, '2 selected');
+  await ui.click(ui.el('pki-mint-selected'));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/codes');
+  assert.deepEqual(Array.from(call.body.device_ids), ['dev-a', 'dev-b']);
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.match(ui.el('pki-codes-out').textContent, /device no longer available/);
+  assert.equal(ui.el('pki-download-codes').disabled, false);
+  await ui.invoke('clearPkiSelection()');
+  assert.equal(ui.el('pki-mint-selected').disabled, true);
+  opts.responses['/api/orgs/org-a/pki/cas'] = [{ id: 'ca-b', name: 'Other root', kind: 'root', certificate: 'OTHER PUBLIC CERT' }];
+  opts.responses['/api/pki/cas/ca-b/devices'] = [];
+  opts.responses['/api/pki/cas/ca-b/groups'] = [];
+  opts.responses['/api/pki/cas/ca-b/hook'] = { url: '' };
+  opts.responses['/api/pki/cas/ca-b/attestation'] = { issuer: '', algorithm: 'ES256' };
+  await ui.invoke("PKI_CODE_RESULTS=[{code:'stale'}];PKI_SELECTED.add('dev-a');renderPki()");
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
+});
+
+test('PKI device import accepts exported headers, quoted cells and the legacy headerless rows', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => call.method === 'POST' && call.url === '/api/pki/cas/ca-a/devices/import'
+    ? { created: 2, failed: 0, results: [] } : undefined };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  const rows = JSON.parse(ui.run(`JSON.stringify(parseCsvRows(${JSON.stringify('name,model\r\n"a,b","say ""hi"""\r\n')}))`));
+  assert.deepEqual(rows, [['name', 'model'], ['a,b', 'say "hi"']],
+    'quoted cells keep commas, newlines and doubled quotes');
+  ui.el('pki-import').value = [
+    'name,model,hardware_serial,tags,env_id,group_id,sans,cert_days,serial,expires_at,revoked,attested',
+    'sensor-1,model-a,S123,"site=a,b",env-9,group-9,"gw.local;192.0.2.10",45,ABC,1900000000,false,false',
+    'sensor-2,model-b,S456,site=c,env-9,,"gw2.local,192.0.2.11",30,DEF,1900000000,false,false',
+  ].join('\r\n');
+  await ui.click(ui.button(ui.el('pki-body'), /Import and mint codes/));
+  const call = ui.calls.find(c => c.url === '/api/pki/cas/ca-a/devices/import');
+  assert.deepEqual(call.body.devices, [
+    { name: 'sensor-1', model: 'model-a', hardware_serial: 'S123', tags: 'site=a,b', env_id: 'env-9', group_id: 'group-9', sans: ['gw.local', '192.0.2.10'], cert_days: 45 },
+    { name: 'sensor-2', model: 'model-b', hardware_serial: 'S456', tags: 'site=c', env_id: 'env-9', sans: ['gw2.local', '192.0.2.11'], cert_days: 30 },
+  ], 'exported columns map by header and status columns are ignored');
+  const legacy = JSON.parse(ui.run(`JSON.stringify(deviceImportRows(${JSON.stringify('sensor-3,model-c,S789,site=d,env-9,gw.local;192.0.2.12,60')}))`));
+  assert.deepEqual(legacy, [{ name: 'sensor-3', model: 'model-c', hardware_serial: 'S789', tags: 'site=d', env_id: 'env-9', sans: ['gw.local', '192.0.2.12'], cert_days: 60 }],
+    'the previous headerless line format keeps working');
+  assert.throws(() => ui.run(`parseCsvRows(${JSON.stringify('"open')})`), /Unterminated quoted CSV cell/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('model,tags\nsensor,site=a')})`), /must include a name column/);
+  assert.throws(() => ui.run(`deviceImportRows(${JSON.stringify('name,cert_days\nsensor,soon')})`), /invalid cert_days/);
+  assert.ok(!JSON.stringify(call.body.devices).includes('private'), 'imports never carry private key material');
+});
+
+test('minted PKI codes are repopulated after a render', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }, { id: 'dev-b', name: 'sensor-b' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { issuer: '', algorithm: 'ES256', required: false },
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  const minted = ui.el('pki-codes-out').textContent;
+  assert.match(minted, /sensor-a: test-code/);
+  await ui.invoke('renderPki()');
+  assert.equal(ui.el('pki-codes-out').textContent, minted, 'the issued codes stay visible after a full render');
+  assert.equal(ui.el('pki-download-codes').disabled, false, 'a render keeps the download control usable');
+});
+
+test('device CSV download checks the response status', async () => {
+  const ui = await consoleUI();
+  ui.run("fetch=async()=>({ok:false,status:403,text:async()=>JSON.stringify({error:'pki:read denied'})})");
+  await ui.invoke('downloadDevices()');
+  assert.match(ui.el('toasts').textContent, /pki:read denied/, 'a rejected export must report the server error');
+});
+
+test('hook and attestation settings fail closed when their reads fail', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook') throw new Error('hook read denied');
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation') throw new Error('attestation read denied');
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  for (const id of ['hook-url', 'hook-secret', 'hook-save', 'att-issuer', 'att-alg', 'att-required', 'att-key', 'att-save'])
+    assert.ok(ui.el(id).disabled, id + ' must stay disabled after a failed read');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'a failed read must never let a save overwrite the stored policy');
+  assert.match(ui.el('toasts').textContent, /hook read denied/);
+  assert.match(ui.el('toasts').textContent, /attestation read denied/);
+});
+
+test('policy forms enable only after their reads and attestation keeps the stored mode', async () => {
+  let resolveHook, resolveAtt;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+  }, fetchOverride: call => {
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/hook')
+      return new Promise(resolve => { resolveHook = () => resolve({ url: 'https://inventory.example/pki/enroll' }); });
+    if (call.method === 'GET' && call.url === '/api/pki/cas/ca-a/attestation')
+      return new Promise(resolve => { resolveAtt = () => resolve({ mode: 'tpm2', issuer: 'att-svc', algorithm: 'ES256', required: true }); });
+    if (call.method === 'PUT' && call.url === '/api/pki/cas/ca-a/attestation')
+      return { mode: call.body.mode, issuer: call.body.issuer, algorithm: call.body.algorithm, required: call.body.required };
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  assert.ok(ui.el('hook-save').disabled);
+  assert.ok(ui.el('att-save').disabled);
+  await ui.invoke('saveHook()');
+  await ui.invoke('saveAttestation()');
+  assert.deepEqual(ui.writes(), [], 'no save may run before the reads complete');
+  resolveHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://inventory.example/pki/enroll');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.ok(ui.el('att-save').disabled, 'attestation stays locked until its own read returns');
+  resolveAtt(); await ui.settle();
+  assert.equal(ui.el('att-required').checked, true);
+  assert.equal(ui.run('PKI_ATT.mode'), 'tpm2');
+  await ui.click(ui.el('att-save'));
+  const put = ui.calls.find(c => c.method === 'PUT' && c.url === '/api/pki/cas/ca-a/attestation');
+  assert.ok(put, 'the loaded form saves');
+  assert.equal(put.body.mode, 'tpm2', 'an ordinary save preserves the stored tpm2 mode');
+  assert.equal(put.body.required, true);
+});
+
+test('switching CA discards the previous policy form before the new settings load', async () => {
+  let holdB = false, resolveBHook;
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Root A', kind: 'root', certificate: 'A-CERT' }, { id: 'ca-b', name: 'Root B', kind: 'root', certificate: 'B-CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-b/devices': [],
+    '/api/pki/cas/ca-a/groups': [], '/api/pki/cas/ca-b/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: 'https://a.example/hook' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: 'a-svc', algorithm: 'ES256', required: true },
+    '/api/pki/cas/ca-b/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+  }, fetchOverride: call => {
+    if (holdB && call.method === 'GET' && call.url === '/api/pki/cas/ca-b/hook')
+      return new Promise(resolve => { resolveBHook = () => resolve({ url: 'https://b.example/hook' }); });
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.settle();
+  const oldSave = ui.el('att-save');
+  assert.equal(oldSave.disabled, false);
+  assert.equal(ui.run('PKI_ATT.ca'), 'ca-a');
+  holdB = true;
+  ui.run("switchPkiCA('ca-b')");
+  assert.equal(ui.document.getElementById('att-save'), null, 'the old form is replaced immediately');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  assert.equal(ui.run('PKI_CA'), 'ca-b');
+  await ui.click(oldSave);
+  await ui.invoke('saveHook()');
+  assert.deepEqual(ui.writes(), [], 'detached handlers must not save under the new CA');
+  assert.ok(ui.el('att-save').disabled, 'the new attestation form waits for its own read');
+  assert.ok(ui.el('hook-save').disabled, 'the new hook form waits for its own read');
+  resolveBHook(); await ui.settle();
+  assert.equal(ui.el('hook-url').value, 'https://b.example/hook');
+  assert.equal(ui.el('hook-save').disabled, false);
+  assert.equal(ui.el('att-required').checked, false);
+  assert.equal(ui.run('PKI_ATT.mode'), 'jwt');
+  assert.deepEqual(ui.writes(), [], 'loading the new policy must not write anything');
+});
+
+test('switching workspace clears PKI selections, codes and cached policy for the same CA id', async () => {
+  const opts = { pki: true, responses: {
+    '/api/orgs/org-a/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/orgs/org-b/pki/cas': [{ id: 'ca-a', name: 'Shared', kind: 'root', certificate: 'PUBLIC TEST CERT' }],
+    '/api/pki/cas/ca-a/devices': [{ id: 'dev-a', name: 'sensor-a' }],
+    '/api/pki/cas/ca-a/groups': [],
+    '/api/orgs/org-a/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/orgs/org-b/pki/expiring?days=30': { counts: { 7: 0, 14: 0, 30: 0 } },
+    '/api/pki/cas/ca-a/hook': { url: '' },
+    '/api/pki/cas/ca-a/attestation': { mode: 'jwt', issuer: '', algorithm: 'ES256', required: false },
+    '/api/orgs/org-b/settings': {}, '/api/orgs/org-b/saml': { configured: false }, '/api/orgs/org-b/ssh/cas': [],
+  } };
+  const ui = await consoleUI([saved], [], opts);
+  await ui.invoke('renderSettings()');
+  await ui.invoke('selectAllPki()');
+  await ui.click(ui.el('pki-mint-selected'));
+  assert.match(ui.el('pki-codes-out').textContent, /test-code/);
+  assert.equal(ui.run('PKI_SELECTED.size'), 1);
+  ui.run("$('orgs').value='org-b'");
+  await ui.invoke('switchOrg()');
+  assert.equal(ui.run('PKI_CODE_RESULTS.length'), 0);
+  assert.equal(ui.run('PKI_SELECTED.size'), 0);
+  assert.equal(ui.run('PKI_SELECTION_CA'), '');
+  assert.equal(ui.run('PKI_HOOK'), null);
+  assert.equal(ui.run('PKI_ATT'), null);
+  await ui.invoke('renderSettings()');
+  assert.equal(ui.el('pki-codes-out').textContent, '');
+  assert.equal(ui.el('pki-selection-count').textContent, '0 selected');
+  assert.equal(ui.el('pki-download-codes').disabled, true);
+});
+
+test('the theme resolves from the system by default and the toggle persists an override', async () => {
+  const ui = await consoleUI();
+  const html = ui.document.documentElement;
+  assert.equal(html.getAttribute('data-theme-pref'), 'system', 'with nothing stored the console follows the system');
+  assert.equal(html.getAttribute('data-theme'), 'light', 'the shim exposes no dark system preference');
+  const toggle = ui.document.querySelector('.topbar [data-themetoggle]');
+  assert.ok(toggle, 'the topbar exposes a theme toggle');
+  assert.ok(ui.document.querySelector('.authprefs [data-themetoggle]'), 'the auth card exposes one too');
+  await ui.click(toggle);
+  assert.equal(ui.store['ow_theme'], 'light', 'cycling from system selects light');
+  assert.equal(html.getAttribute('data-theme'), 'light');
+  await ui.click(ui.document.querySelector('.topbar [data-themetoggle]'));
+  assert.equal(ui.store['ow_theme'], 'dark', 'a second click selects dark');
+  assert.equal(html.getAttribute('data-theme'), 'dark');
+  await ui.click(ui.document.querySelector('.topbar [data-themetoggle]'));
+  assert.equal(ui.store['ow_theme'], 'system', 'a third click returns to following the system');
+  assert.equal(html.getAttribute('data-theme'), 'light', 'system resolves through the (light) shim preference');
+});
+
+test('OS theme changes follow the current choice, not the initial choice', async () => {
+  for (const initial of ['system', 'dark']) {
+    const ui = await consoleUI([saved], [], { store: { ow_theme: initial } });
+    const html = ui.document.documentElement;
+    await ui.invoke("setTheme('light')");
+    ui.systemDark(true);
+    assert.equal(html.dataset.theme, 'light');
+    await ui.invoke("setTheme('dark')");
+    ui.systemDark(false);
+    assert.equal(html.dataset.theme, 'dark');
+    await ui.invoke("setTheme('system')");
+    ui.systemDark(true);
+    assert.equal(html.dataset.theme, 'dark');
+    ui.systemDark(false);
+    assert.equal(html.dataset.theme, 'light');
+  }
+});
+
+test('light and dark are fully tokenized and the i18n runtime is wired', () => {
+  for (const token of ['--bg', '--panel', '--text', '--acc', '--toast-bg', '--sh-auth']) {
+    assert.match(source, new RegExp(`:root{[^}]*${token}:`), `the light theme must define ${token}`);
+    assert.match(source, new RegExp(`:root\\[data-theme=dark\\]{[^}]*${token}:`), `the dark theme must define ${token}`);
+  }
+  assert.match(source, /color-scheme:light/, 'the light root declares color-scheme');
+  assert.match(source, /:root\[data-theme=dark\]{color-scheme:dark/, 'the dark root declares color-scheme');
+  const appSource = fs.readFileSync(path.join(__dirname, '../src/app.rs'), 'utf8');
+  assert.match(appSource, /route\("\/i18n\.js"/, 'the server must serve /i18n.js');
+  assert.match(source, /<script src="\/i18n\.js"/, 'the console must load the i18n runtime before the inline script');
+  assert.match(source, /data-themetoggle/, 'theme toggles must exist in the chrome');
+});
+
+test('every language dictionary carries the same keys and every key exists in the console', () => {
+  const ctx = vm.createContext({ localStorage: { getItem: () => '', setItem() {}, removeItem() {} } });
+  vm.runInContext(i18nSource, ctx, { filename: 'i18n.js' });
+  const langs = vm.runInContext('Object.keys(OW_LANGS)', ctx);
+  assert.ok(langs.length >= 9, 'at least nine locales ship, English included');
+  const keys = vm.runInContext(`Object.keys(OW_I18N['zh-TW']).sort()`, ctx);
+  assert.ok(keys.length > 200, 'the dictionaries are substantive, not a stub');
+  for (const lang of langs.filter(l => l !== 'en')) {
+    assert.deepEqual(vm.runInContext(`Object.keys(OW_I18N[${JSON.stringify(lang)}]).sort()`, ctx), keys,
+      `${lang} must cover the same strings as the other languages`);
+  }
+  const flat = source.replace(/\\'/g, "'").replace(/&amp;/g, '&');
+  const composed = ['Request approved', 'Request rejected', 'Signups enabled', 'Signups disabled',
+    'Theme: system', 'Theme: light', 'Theme: dark'];
+  for (const key of keys) {
+    if (composed.includes(key)) continue;
+    assert.ok(flat.includes(key), `dictionary key missing from the console source: ${key}`);
+  }
+});
+
+test('language changes do not translate app names matching interface labels', async () => {
+  const names = ['Settings', '設定'];
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/apps': names.map((name, i) => ({ id: i ? 'app-b' : 'app-a', name })),
+  } });
+  for (const lang of ['ja', 'fr', 'en']) {
+    await ui.invoke('renderApps()');
+    await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+    assert.deepEqual(ui.el('view').querySelectorAll('.appcard h3').map(el => el.textContent), names,
+      `app cards must preserve names in ${lang}`);
+    for (const [i, name] of names.entries()) {
+      await ui.invoke(`openApp('${i ? 'app-b' : 'app-a'}')`);
+      await ui.invoke('owApply()');
+      assert.equal(ui.el('pagetitle').textContent, name, `the app title must preserve its name in ${lang}`);
+    }
+  }
+});
+
+for (const [label, initial, next] of [['Settings', 'en', 'ja'], ['設定', 'ja', 'en']]) {
+  test(`language changes preserve audit detail ${JSON.stringify(label)} from ${initial} to ${next}`, async () => {
+    const ui = await consoleUI([saved], [], { store: { ow_lang: initial }, responses: {
+      '/api/orgs/org-a/audit': [{ action: 'fixture.event', actor: 'fixture-user', detail: label }],
+    } });
+    await ui.invoke('renderAudit()');
+    assert.equal(ui.el('view').querySelector('tbody tr').querySelectorAll('td')[3].textContent, label);
+    for (const lang of [next, 'fr', initial]) {
+      await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+      assert.equal(ui.el('view').querySelector('tbody tr').querySelectorAll('td')[3].textContent, label,
+        `audit data must remain verbatim after switching to ${lang}`);
+      assert.equal(ui.el('pagetitle').textContent,
+        { en: 'Audit log', ja: '監査ログ', fr: "Journal d'audit" }[lang], 'the surrounding UI still translates');
+    }
+  });
+}
+
+test('language changes preserve label-like access request reasons and translate their controls', async () => {
+  const reasons = ['Settings', '設定'];
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [], '/api/orgs/org-a/members': [],
+    '/api/envs/env-a/proposals': [],
+    '/api/envs/env-a/access-requests': reasons.map((reason, i) => ({ id: 'request-' + i, reason, status: 'pending' })),
+  } });
+  await ui.invoke('renderAccess()');
+  for (const [lang, approve] of [['ja', '承認'], ['en', 'Approve']]) {
+    await ui.invoke(`owSetLang(${JSON.stringify(lang)})`);
+    const cards = ui.el('view').querySelectorAll('.card');
+    const requests = cards.find(card => card.querySelector('button[onclick="requestAccess()"]'));
+    assert.ok(requests, 'the access request card must render');
+    assert.deepEqual(requests.querySelectorAll('.row .small').map(el => el.textContent),
+      reasons.map(reason => reason + ' · pending'), 'request reasons must remain verbatim');
+    assert.equal(requests.querySelector('button').textContent, approve, 'request controls still translate');
+  }
+});
+
+test('the full removed-key-grant security explanation translates and returns to English', async () => {
+  const ui = await consoleUI();
+  ui.run("ENV.mode='e2e'; E2E_DATA[ENV.id]=[]; E2E_META[ENV.id]={rekey_required:true}");
+  await ui.invoke('renderE2eEnv()');
+  const explanation = ui.el('view').querySelector('.card p');
+  assert.ok(explanation, 'removing a grant must expose the rotation explanation');
+  const english = explanation.textContent;
+  assert.match(english, /Rotation cannot take back ciphertext someone already copied\./);
+  await ui.invoke("owSetLang('ja')");
+  assert.equal(explanation.textContent,
+    'メンバーの鍵グラントが削除されましたが、保存された暗号文はまだ古い環境鍵で暗号化されています。鍵をローテーションして、すべてのシークレットを新しい鍵で再暗号化し、現在のメンバーへ包鍵してください。ローテーションでも、すでにコピーされた暗号文は取り戻せません。');
+  await ui.invoke("owSetLang('en')");
+  assert.equal(explanation.textContent, english, 'switching back restores the full security explanation');
+});
+
+test('language reset clears the override and detects the current browser language', async () => {
+  const ui = await consoleUI([saved], [], { languages: ['ja'], store: { ow_lang: 'fr' } });
+  assert.equal(ui.document.documentElement.getAttribute('lang'), 'fr');
+  assert.ok(ui.document.querySelector('select[data-langsel]').querySelector('option[value="system"]'));
+  await ui.invoke("owSetLang('en')");
+  assert.equal(ui.store.ow_lang, 'en');
+  await ui.invoke("owSetLang('system')");
+  assert.equal(ui.store.ow_lang, undefined);
+  assert.equal(ui.document.documentElement.getAttribute('lang'), 'ja');
+  for (const select of ui.document.querySelectorAll('select[data-langsel]')) assert.equal(select.value, 'system');
+});
+
+test('language follows the browser, translates the chrome, and the override persists', async () => {
+  const ui = await consoleUI([saved], [], { languages: ['zh-TW', 'en'] });
+  const html = ui.document.documentElement;
+  assert.equal(html.getAttribute('lang'), 'zh', 'the document language tracks the browser');
+  assert.equal(ui.store['ow_lang'], undefined, 'a detected language writes no override');
+  assert.equal(ui.el('authtitle').textContent, '歡迎回來', 'the static auth screen is translated at boot');
+  await ui.invoke('renderApps(); owApply()');
+  assert.ok(ui.el('view').innerHTML.includes('個應用程式'), 'rendered app counts are translated');
+  await ui.run(`owSetLang('ja')`);
+  assert.equal(ui.store['ow_lang'], 'ja', 'the override persists');
+  assert.equal(html.getAttribute('lang'), 'ja');
+  assert.equal(ui.el('authtitle').textContent, 'おかえりなさい', 'switching languages re-translates the chrome');
+  await ui.run(`owSetLang('en')`);
+  assert.equal(ui.el('authtitle').textContent, 'Welcome back', 'returning to English restores the source strings');
 });

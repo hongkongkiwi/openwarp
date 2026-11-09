@@ -1,3 +1,7 @@
+mod agent;
+mod encrypted_file;
+mod references;
+
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -28,7 +32,11 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     /// base skips your personal overrides, which is what a deployment wants
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
-    Run { #[arg(long, default_value = "")] env: String, #[arg(last = true)] command: Vec<String> },
+    Run { #[arg(long, default_value = "")] env: String, #[arg(long)] refs_file: Option<String>, #[arg(long)] identity: Option<String>, #[arg(last = true)] command: Vec<String> },
+    Inject { #[arg(long)] input: String, #[arg(long)] out: Option<String>, #[arg(long)] identity: Option<String> },
+    File { #[command(subcommand)] cmd: encrypted_file::FileCmd },
+    /// Render a local template from base secrets with an in-memory cache
+    Agent { #[arg(long, default_value = "")] env: String, #[arg(long)] template: PathBuf, #[arg(long)] out: PathBuf, #[arg(long, default_value_t = 30)] interval_secs: u64, #[arg(long, default_value_t = 30)] cache_ttl_secs: u64, #[arg(long)] once: bool },
     /// SSH certificates: sign a public key, or mint one and run ssh with it
     Ssh { #[command(subcommand)] cmd: SshCmd },
     E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
@@ -357,14 +365,23 @@ fn management_api(host: &str, token: &str, method: &str, path: &str, body: Optio
     Ok(())
 }
 
+fn reference_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client")
+}
+
 fn main() {
     let cli = Cli::parse();
+    if let Cmd::File { cmd } = &cli.cmd {
+        if let Err(e) = encrypted_file::execute(cmd) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
     let local = load_local_config();
     let mut cfg = load_config();
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
     let saved_host = cfg["host"].as_str().map(|s| s.to_string());
-    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
+    let is_agent = matches!(&cli.cmd, Cmd::Agent { .. });
+    if !is_agent && cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
         match refresh_lock() {
             Some(lock) => {
                 let fresh = load_config();
@@ -376,7 +393,9 @@ fn main() {
             None => { std::thread::sleep(std::time::Duration::from_millis(300)); if let Ok(s) = std::fs::read_to_string(config_path()) { if let Ok(v) = serde_json::from_str::<Value>(&s) { cfg = v; } } }
         }
     }
-    let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
+    let token = cli.token.clone().or_else(|| {
+        if is_agent && saved_host.as_deref() != Some(host.as_str()) { None } else { cfg["access_token"].as_str().map(|s| s.to_string()) }
+    }).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
     match &cli.cmd {
@@ -451,13 +470,34 @@ fn main() {
                 _ => { for s in &items { println!("{}={}", s["key"].as_str().unwrap_or(""), dotenv_value(s["value"].as_str().unwrap_or(""))); } } } }
         Cmd::Import { env, file } => { let env = pick(env, &local, "env_id", "--env"); let text = std::fs::read_to_string(file).expect("read file");
             let d: Value = client.post(format!("{}/api/envs/{}/import", host, env)).bearer_auth(&token).json(&json!({"text": text})).send().expect("request").json().expect("json"); println!("{}", d); }
-        Cmd::Run { env, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
+        Cmd::File { .. } => unreachable!(),
+        Cmd::Inject { input, out, identity } => {
+            let client = reference_client();
+            let mut resolver = references::Resolver::new(&client, &host, &token, identity.as_deref());
+            let result = references::inject(&mut resolver, Path::new(input)).and_then(|bytes| match out {
+                Some(path) => encrypted_file::write_new(Path::new(path), &bytes),
+                None => std::io::stdout().write_all(&bytes).map_err(|_| "could not write output".into()),
+            });
+            if let Err(e) = result { eprintln!("{}", e); std::process::exit(1); }
+        }
+        Cmd::Run { env, refs_file, identity, command } => { let env = pick(env, &local, "env_id", "--env"); if command.is_empty() { eprintln!("usage: openwarp run --env <ID> -- <cmd...>"); std::process::exit(2); }
+            if let Some(file) = refs_file {
+                let client = reference_client();
+                let mut resolver = references::Resolver::new(&client, &host, &token, identity.as_deref());
+                let values = references::bindings(&mut resolver, Path::new(file)).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) });
+                let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]).env_remove("OPENWARP_TOKEN").env_remove("OPENWARP_PRIVKEY").envs(values);
+                std::process::exit(cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+            }
             let d = get(&format!("{}/api/envs/{}/export", host, env));
             let mut cmd = Command::new(&command[0]); cmd.args(&command[1..]);
             for s in d["secrets"].as_array().cloned().unwrap_or_default() {
                 if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
             }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
+        Cmd::Agent { env, template, out, interval_secs, cache_ttl_secs, once } => {
+            let env = pick(env, &local, "env_id", "--env");
+            if let Err(e) = agent::run(&host, &token, &env, template, out, *interval_secs, *cache_ttl_secs, *once) { eprintln!("{}", e); std::process::exit(1); }
+        }
         Cmd::Ssh { cmd } => match cmd {
             SshCmd::Cert { ca, principal, key, ttl, out, print, quiet } => {
                 let (key_path, default_cert) = ssh_key_paths(key);
