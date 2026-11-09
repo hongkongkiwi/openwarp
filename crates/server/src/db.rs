@@ -859,8 +859,8 @@ mod tests {
         // The shipped receipt DDL, read from the migration files so the test
         // drifts with the shipped schema instead of a hand-written copy.
         let receipt = crate::migrate::MIGRATIONS.iter()
-            .find(|m| m.sql.contains("CREATE TABLE webhook_receipts("))
-            .map(|m| m.sql.split(';').map(str::trim).find(|s| s.starts_with("CREATE TABLE webhook_receipts(")).expect("the webhook migration defines webhook_receipts"))
+            .find(|m| m.sql.contains("CREATE TABLE IF NOT EXISTS webhook_receipts("))
+            .map(|m| m.sql.split(';').map(str::trim).find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS webhook_receipts(")).expect("the webhook migration defines webhook_receipts"))
             .expect("the webhook migration defines webhook_receipts");
         let ddl = mysql_sql(receipt);
         assert!(ddl.contains("`message_id` VARCHAR(255) NOT NULL"), "an inline UNIQUE column must be promoted to an indexable type: {}", ddl);

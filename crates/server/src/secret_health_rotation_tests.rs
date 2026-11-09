@@ -1,12 +1,10 @@
 use super::*;
-use std::{future::Future, task::{Context, Poll, Wake, Waker}};
-
-struct NoopWake;
-impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+use std::{future::Future, task::{Context, Poll, Waker}};
 
 fn assert_waiting<F: Future>(future: std::pin::Pin<&mut F>) {
-    let waker = Waker::from(Arc::new(NoopWake));
-    assert!(matches!(future.poll(&mut Context::from_waker(&waker)), Poll::Pending), "operation crossed the held credential gate");
+    // A no-op waker: the polled operation must stay pending without progress.
+    let waker = Waker::noop();
+    assert!(matches!(future.poll(&mut Context::from_waker(waker)), Poll::Pending), "operation crossed the held credential gate");
 }
 
 async fn state() -> (S, HeaderMap) {
