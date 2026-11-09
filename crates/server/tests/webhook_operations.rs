@@ -328,7 +328,9 @@ async fn mcp_query_pagination_and_custom_role_preserve_route_permissions() {
     let (_,eid) = s.app(t,org).await; deploy(&s,t,&eid).await;
     let user = s.register("mcp-reader@test.invalid").await; let reader = user["token"].as_str().unwrap();
     success(s.call(Method::POST,&format!("/api/orgs/{org}/roles"),t,Some(json!({"name":"operations-reader","permissions":["secrets:read"]}))).await);
-    success(s.call(Method::POST,&format!("/api/orgs/{org}/members"),t,Some(json!({"email":"mcp-reader@test.invalid","role":"operations-reader"}))).await);
+    let invite = success(s.call(Method::POST,&format!("/api/orgs/{org}/members"),t,Some(json!({"email":"mcp-reader@test.invalid","role":"operations-reader"}))).await);
+    // Issuing an invite never adds membership; the invitee accepts explicitly.
+    success(s.call(Method::POST,"/api/auth/accept-invite",reader,Some(json!({"token":invite["invite_token"],"password":"correct-horse-battery"}))).await);
     for (method,path,body,status) in [
         ("GET",format!("/api/envs/{eid}/secrets?limit=1&offset=0"),Value::Null,200),
         ("GET",format!("/api/envs/{eid}/secrets?limit=1&offset=1"),Value::Null,200),

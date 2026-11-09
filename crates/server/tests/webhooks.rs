@@ -154,7 +154,11 @@ async fn app(s: &Server, token: &str, org: &str) -> (String, String) {
 async fn member(s: &Server, owner: &str, org: &str, email: &str, role: &str, permissions: &[&str]) -> Value {
     let user = register(s, email).await;
     ok(&s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(owner), Some(json!({"name":role,"permissions":permissions}))).await);
-    ok(&s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(owner), Some(json!({"email":email,"role":role}))).await);
+    // Issuing an invite never adds membership; the invitee accepts explicitly
+    // with their own session.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(owner), Some(json!({"email":email,"role":role}))).await; ok(&r);
+    let invite_token = r.body["invite_token"].as_str().expect("invite token").to_string();
+    ok(&s.call(Method::POST, "/api/auth/accept-invite", Some(user["token"].as_str().unwrap()), Some(json!({"token":invite_token,"password":"correct-horse-battery"}))).await);
     user
 }
 async fn oauth(s: &Server, session: &str) -> String {

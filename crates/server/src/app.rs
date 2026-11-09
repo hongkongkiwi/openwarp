@@ -5708,15 +5708,17 @@ fn canonical_policy_path(path: &str) -> Result<String, ()> {
         if bytes==b"." || bytes==b".." || bytes.iter().any(|b|matches!(b,b'/'|b'\\'|b'%'|0..=31|127)) {return Err(());} out.push(String::from_utf8(bytes).map_err(|_|())?);
     } Ok(out.join("/"))
 }
-fn administrative_transport(path: &str, method: &axum::http::Method) -> bool {
-    if path.starts_with("/api/webhooks/") || path.starts_with("/api/webhook-deliveries/") || path.ends_with("/webhooks") && path.starts_with("/api/orgs/") { return true; }
-    if !path.starts_with("/api/orgs/") {return false;}
-    let tail=path.split('/').skip(4).collect::<Vec<_>>().join("/");
-    if matches!(*method,axum::http::Method::GET|axum::http::Method::HEAD|axum::http::Method::OPTIONS) { return tail=="settings" || tail=="saml" || tail=="ldap" || tail=="rotation-hook" || tail=="members" || tail.starts_with("members/"); }
-    !matches!(tail.as_str(),"apps"|"leave")
+fn administrative_transport(path: &str, _method: &axum::http::Method) -> bool {
+    // Webhook transport administration only; every other admin surface keeps
+    // its own permission path (role grants, enterprise gates, feature grants).
+    path.starts_with("/api/webhooks/") || path.starts_with("/api/webhook-deliveries/") || path.ends_with("/webhooks") && path.starts_with("/api/orgs/")
 }
 async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
-    let path = match canonical_policy_path(req.uri().path()) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
+    let raw_path = req.uri().path().to_string();
+    // Percent-encoded API paths are rejected outright before any decoding so
+    // route matching, scoping and policy all see one canonical spelling.
+    if raw_path.starts_with("/api/") && raw_path.contains('%') { return bad("percent-encoded API paths are not supported").into_response(); }
+    let path = match canonical_policy_path(&raw_path) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
     let protected = path.starts_with("/api/") || path == "/mcp" || path.starts_with("/scim/");
     if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
     let headers = req.headers().clone(); let uid = match st.token_user(&headers).await { Ok(u) => u, Err(_) => return next.run(req).await };
@@ -5762,10 +5764,14 @@ async fn oauth_scope_middleware(State(st): State<S>, req: axum::extract::Request
     if !(path.starts_with("/api/") || path.starts_with("/scim/")) || path == "/api/auth/logout" { return next.run(req).await; }
     let token = bearer_token(req.headers());
     if token.is_empty() { return next.run(req).await; }
+    // The MCP management dispatch re-binds the caller's own audience; plain
+    // REST requests fall through to the standard scope and audience checks so
+    // their status codes stay unchanged.
     if let Some((_, _, audience)) = oauth_access(&st, req.headers()).await {
-        if administrative_transport(&path, req.method()) && webhooks::transport_admin(&st, req.headers()).await.is_err() { return err(StatusCode::FORBIDDEN, "org:admin transport scope required").into_response(); }
-        let expected = if req.extensions().get::<McpDispatch>().is_some() { format!("{}/mcp", issuer(&st, req.headers())) } else { issuer(&st, req.headers()) };
-        if audience != expected { return err(StatusCode::UNAUTHORIZED, "token audience does not match endpoint").into_response(); }
+        if req.extensions().get::<McpDispatch>().is_some() {
+            if administrative_transport(&path, req.method()) && webhooks::transport_admin(&st, req.headers()).await.is_err() { return err(StatusCode::FORBIDDEN, "org:admin transport scope required").into_response(); }
+            if audience != format!("{}/mcp", issuer(&st, req.headers())) { return err(StatusCode::UNAUTHORIZED, "token audience does not match endpoint").into_response(); }
+        }
     }
     let hash = oc::hash_token(&token);
     let oauth = match st.db.one("SELECT scope,resource FROM oauth_tokens WHERE token_hash=? AND kind='access' AND expires_at>?", &[json!(&hash),json!(now())]).await { Ok(r)=>r,Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"credential scopes unavailable").into_response() };
