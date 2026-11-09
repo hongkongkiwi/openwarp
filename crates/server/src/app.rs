@@ -857,7 +857,7 @@ async fn user_guarded_batch(st: &S, users: &[&str], statements: &[(String, Vec<V
     batch.extend_from_slice(statements);
     st.db.batch_checked(&batch, &checked).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "account or ownership changed; refresh and try again") } else { bad(&e) })
 }
-#[cfg(any(feature = "scim", feature = "saml", feature = "ldap"))]
+#[cfg(feature = "ldap")]
 async fn add_provisioned_member(st: &S, org: &str, uid: &str, role: &str) -> Result<(), (StatusCode, Json<Value>)> {
     user_guarded_batch(st, &[uid], &[
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(uid)]),
