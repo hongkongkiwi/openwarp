@@ -62,6 +62,9 @@ impl Fixture {
 
     fn request(&self, method: &str, path: &str, uid: &str, body: Value) -> Request<Body> {
         Request::builder().method(method).uri(path).extension(PeerAddr(std::net::IpAddr::from([127, 0, 0, 1])))
+            // A browser always sends Host; the same-origin guard needs it to
+            // compare the Origin against the deployment.
+            .header("host", "openwarp.test")
             .header("cookie", format!("ow_session={}-session-fixture", uid))
             .header("origin", "https://openwarp.test")
             .header("content-type", "application/json")
