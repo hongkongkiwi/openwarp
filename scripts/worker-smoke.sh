@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ ! -f "${ROOT}/crates/server/build/worker/shim.mjs" ]; then
-  echo "worker bundle missing; run: (cd crates/server && worker-build --no-default-features)" >&2
+  echo "worker bundle missing; run: (cd crates/server && worker-build --release --no-default-features)" >&2
   exit 2
 fi
 

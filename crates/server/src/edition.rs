@@ -95,15 +95,18 @@ impl LicenseState {
     /// Pure resolution used by tests. `raw` is the configured value, not the
     /// environment itself, so unit tests do not race on process state.
     pub fn resolve(raw: Option<&str>, production: bool, debug: bool) -> Self {
+        let _ = debug;
         let value = raw.map(str::trim).unwrap_or("");
         if value.is_empty() || value.eq_ignore_ascii_case("none") {
             return Self::self_hosted();
         }
         if value.eq_ignore_ascii_case("development") {
-            if debug && !production {
+            // Non-production deployments (staging, smoke workers) may unlock
+            // with the development licence; production always refuses it.
+            if !production {
                 return Self::enterprise("development".into(), 0, true);
             }
-            return Self::with_warning("the development licence is ignored by release and production builds".into());
+            return Self::with_warning("the development licence is ignored by production builds".into());
         }
         match verify(value) {
             Ok(claims) => Self::enterprise(claims.customer, claims.exp, false),
