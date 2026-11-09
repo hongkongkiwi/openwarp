@@ -85,8 +85,8 @@ echo "tables:   $tables"
 echo "version:  $version"
 echo "squashed: $squashed"
 case "$version" in
-  *'"v":30'*|*'"v": 30'*) ;;
-  *) echo "d1 smoke: D1 did not reach version 30" >&2; exit 1 ;;
+  *'"v":'"${TIP}"*|*'"v": '"${TIP}"*) ;;
+  *) echo "d1 smoke: D1 did not reach version ${TIP}" >&2; exit 1 ;;
 esac
 case "$squashed" in
   *'"n":16'*|*'"n": 16'*) ;;
