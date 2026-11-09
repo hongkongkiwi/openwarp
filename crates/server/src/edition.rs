@@ -257,9 +257,10 @@ HJskdQKZt9FYTaecNMk5RI19UoRO5ifHi3ut27X2wx/mtBlIcT+m5LJP
     }
 
     #[test]
-    fn development_licenses_are_debug_only() {
+    fn development_licenses_are_non_production_only() {
         assert_eq!(LicenseState::resolve(Some("development"), false, true).tier(), Tier::Enterprise);
         assert_eq!(LicenseState::resolve(Some("development"), true, true).tier(), Tier::SelfHosted);
-        assert_eq!(LicenseState::resolve(Some("development"), false, false).tier(), Tier::SelfHosted);
+        // Non-production release builds (staging, smoke workers) also accept it.
+        assert_eq!(LicenseState::resolve(Some("development"), false, false).tier(), Tier::Enterprise);
     }
 }
