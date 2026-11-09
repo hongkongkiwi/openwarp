@@ -1,12 +1,9 @@
 use super::*;
-use std::{future::Future, task::{Context, Poll, Wake, Waker}};
-
-struct NoopWake;
-impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+use std::{future::Future, task::{Context, Poll, Waker}};
 
 fn assert_waiting<F: Future>(future: std::pin::Pin<&mut F>) {
-    let waker = Waker::from(Arc::new(NoopWake));
-    assert!(matches!(future.poll(&mut Context::from_waker(&waker)), Poll::Pending), "operation crossed the held credential gate");
+    let waker = Waker::noop();
+    assert!(matches!(future.poll(&mut Context::from_waker(waker)), Poll::Pending), "operation crossed the held credential gate");
 }
 
 async fn state() -> (S, HeaderMap) {
@@ -16,6 +13,9 @@ async fn state() -> (S, HeaderMap) {
     st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('owner','owner@example.test','','','',?)", &[json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'owner',?)", &[json!(oc::hash_token("rotation-session")), json!(now())]).await.unwrap();
     st.db.exec("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await.unwrap();
+    // Boot persists the verifier row the rotation re-encrypts; the direct
+    // state construction skips that path, so seed it here.
+    st.db.exec("INSERT OR IGNORE INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&[1; 32], b"openwarp-master-key-v1"))]).await.unwrap();
     let mut h = HeaderMap::new();
     h.insert("authorization", "Bearer rotation-session".parse().unwrap());
     (st, h)
