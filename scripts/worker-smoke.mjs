@@ -216,10 +216,6 @@ const reg = await call('POST', '/api/auth/register', null, { email, password });
 console.log(`INFO register round trip ${Date.now() - registerStarted}ms (includes one Argon2 wrap)`);
 check('register creates a workspace', reg.status === 200 && !!reg.json.org_id, reg.text);
 const org = reg.json.org_id;
-// Enterprise-gated smoke checks need the workspace grants seeded by the
-// instance owner (the first registered account) before those routes are hit.
-const grants = await call('PUT', '/api/instance/features', token, { org, features: ['scim', 'pki'] });
-check('workspace feature grants seeded', grants.status === 200, grants.text);
 let token = reg.json.token || '';
 
 // Main requires the emailed verification link before a password session exists.
@@ -245,6 +241,11 @@ if (!token) {
 
 const me = await call('GET', '/api/me', token);
 check('authenticated request works', me.status === 200, me.text);
+
+// Enterprise-gated smoke checks need the workspace grants seeded by the
+// instance owner (the first registered account) before those routes are hit.
+const grants = await call('PUT', '/api/instance/features', token, { org, features: ['scim', 'pki'] });
+check('workspace feature grants seeded', grants.status === 200, grants.text);
 
 const app = await call('POST', `/api/orgs/${org}/apps`, token, { name: 'smoke' });
 check('application created', app.status === 200 && app.json.id, app.text);
