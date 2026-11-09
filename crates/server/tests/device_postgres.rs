@@ -167,6 +167,11 @@ async fn pg_server() -> Option<(PgServer, Client, String, String)> {
     Some((server, client, base, db_url))
 }
 
+async fn grant_pki(client: &Client, base: &str, token: &str, org: &str) {
+        let granted = call(client, base, Method::PUT, "/api/instance/features", Some(token), Some(json!({"org": org, "features": ["pki"]}))).await;
+        assert_eq!(granted.status, 200, "grant pki to the fixture workspace: {}", granted.text);
+    }
+
 async fn pg_owner(server: &PgServer, client: &Client, base: &str) -> (String, String) {
     let email = "postgres@test.invalid";
     let password = "postgres-password-1";
@@ -282,6 +287,7 @@ fn blocked_hook() -> (String, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Se
 async fn postgres_renewal_rechecks_expiry_after_device_lock() {
     let Some((server,client,base,url))=pg_server().await else{return};
     let (token,org)=pg_owner(&server,&client,&base).await;
+    grant_pki(&client,&base,&token,&org).await;
     let r=call(&client,&base,Method::POST,&format!("/api/orgs/{}/pki/cas",org),Some(&token),Some(json!({"name":"expiry-lock"}))).await;
     assert_eq!(r.status,200);let ca=r.body["id"].as_str().unwrap();
     let r=call(&client,&base,Method::POST,&format!("/api/pki/cas/{}/devices",ca),Some(&token),Some(json!({"name":"expiry-sensor"}))).await;
@@ -310,6 +316,7 @@ async fn postgres_renewal_rechecks_expiry_after_device_lock() {
 async fn postgres_enrollment_cannot_cross_revocation_or_group_deletion() {
     let Some((server, client, base, url)) = pg_server().await else { return; };
     let (token, org) = pg_owner(&server, &client, &base).await;
+    grant_pki(&client, &base, &token, &org).await;
     let observer = pg_client(&url).await;
     for mutation in ["device-revoke", "group-revoke", "group-delete", "ca-revoke", "root-revoke", "device-policy"] {
         let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": mutation}))).await;
