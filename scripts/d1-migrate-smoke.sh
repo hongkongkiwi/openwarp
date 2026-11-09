@@ -70,7 +70,7 @@ echo "second: $second"
 # from the manifest so appended migrations do not stale the pin. The report
 # text is matched with grep -F: a case glob would treat the bracketed list
 # as a character class and never match the literal result.
-TIP=$(grep -c '^    Migration {' "${ROOT}/crates/server/src/migrate.rs")
+TIP=$(grep -c '^    Migration {' "${root}/crates/server/src/migrate.rs")
 EXPECTED="applied=[$(python3 -c "print(', '.join(['1'] + [str(v) for v in range(18, ${TIP} + 1)]))")]"
 printf '%s\n' "$first"   | grep -qF "$EXPECTED" || { echo "d1 smoke: unexpected first apply result: $first (expected ${EXPECTED})" >&2; tail -60 "$persist/dev.log" >&2; exit 1; }
 printf '%s\n' "$second" | grep -qF "applied=[]"       || { echo "d1 smoke: the second apply was not a no-op: $second" >&2; tail -60 "$persist/dev.log" >&2; exit 1; }
