@@ -7496,8 +7496,6 @@ pub async fn deliver_job(db: &Db, job: Job) {
             let _ = crate::http::Client::new().post(&url).json(&serde_json::from_str::<Value>(&payload).unwrap_or(json!({}))).send().await; }
     }
 }
-#[cfg(target_arch = "wasm32")]
-async fn rotate_master(State(_): State<S>, _: HeaderMap, _: Json<Value>) -> Res { Err(err(StatusCode::NOT_IMPLEMENTED, "master key rotation requires the native server")) }
 #[cfg(test)]
 mod tests {
     use super::*;
