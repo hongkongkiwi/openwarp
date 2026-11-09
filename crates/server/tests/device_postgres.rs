@@ -289,7 +289,7 @@ async fn postgres_renewal_rechecks_expiry_after_device_lock() {
     let (token,org)=pg_owner(&server,&client,&base).await;
     grant_pki(&client,&base,&token,&org).await;
     let r=call(&client,&base,Method::POST,&format!("/api/orgs/{}/pki/cas",org),Some(&token),Some(json!({"name":"expiry-lock"}))).await;
-    assert_eq!(r.status,200);let ca=r.body["id"].as_str().unwrap();
+    assert_eq!(r.status,200,"CA creation: {}",r.text);let ca=r.body["id"].as_str().unwrap();
     let r=call(&client,&base,Method::POST,&format!("/api/pki/cas/{}/devices",ca),Some(&token),Some(json!({"name":"expiry-sensor"}))).await;
     assert_eq!(r.status,200);let device=r.body["id"].as_str().unwrap().to_string();
     let old=rcgen::KeyPair::generate().unwrap();let csr=rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().serialize_request(&old).unwrap().pem().unwrap();
@@ -320,7 +320,7 @@ async fn postgres_enrollment_cannot_cross_revocation_or_group_deletion() {
     let observer = pg_client(&url).await;
     for mutation in ["device-revoke", "group-revoke", "group-delete", "ca-revoke", "root-revoke", "device-policy"] {
         let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": mutation}))).await;
-        assert_eq!(r.status,200); let root = r.body["id"].as_str().unwrap().to_string();
+        assert_eq!(r.status,200,"CA creation for {}: {}",mutation,r.text); let root = r.body["id"].as_str().unwrap().to_string();
         let ca = if mutation == "root-revoke" {
             let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "child", "parent_id": root}))).await;
             assert_eq!(r.status,200); r.body["id"].as_str().unwrap().to_string()
