@@ -287,11 +287,17 @@ for (const [name, later, status] of [
 
 // A Durable Object statement must report its affected rows: SCIM deactivation
 // branches on the DELETE count and would report "cannot remove the last owner"
-// while already having removed the row.
+// while already having removed the row. SCIM is an enterprise cargo feature
+// the deployment bundle omits, so an unlicensed build answers 404; a build
+// that includes it must run the affected-row assertions instead.
 const scim = await call('POST', `/scim/v2/Users?org_id=${org}`, token, { userName: `member-${Date.now()}@test.invalid` });
-check('SCIM user created', scim.status === 200 && scim.json.id, scim.text);
-const removed = await call('DELETE', `/scim/v2/Users/${scim.json.id}?org_id=${org}`, token);
-check('SCIM deactivation reports success (affected-row count)', removed.status === 200, `${removed.status} ${removed.text}`);
+if (scim.status === 200) {
+  check('SCIM user created', !!scim.json.id, scim.text);
+  const removed = await call('DELETE', `/scim/v2/Users/${scim.json.id}?org_id=${org}`, token);
+  check('SCIM deactivation reports success (affected-row count)', removed.status === 200, `${removed.status} ${removed.text}`);
+} else {
+  check('SCIM routes are gated off the deployment build', scim.status === 404, `${scim.status} ${scim.text.slice(0, 120)}`);
+}
 
 // Workspace settings writes work portably; workspace OIDC is an enterprise
 // feature, so an unlicensed deployment answers with the stable 403 gate body
