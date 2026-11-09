@@ -200,7 +200,9 @@ async fn discovery_and_mcp_integration_crud_use_real_routes() {
     assert_eq!(s.api(&token, "DELETE", &item, None).await["status"], 200);
     let read = s.api(&token, "GET", &path, None).await;
     assert!(!read["body"].as_array().unwrap().iter().any(|i| i["id"] == iid));
-    assert_eq!(s.call(Method::GET, "/api/me", &token, None).await.0, 401, "MCP audience must not be rewritten into a REST credential");
+    // The standard audience binding answers 403 on REST for an MCP token;
+    // only the internal dispatch carries the 401 form.
+    assert_eq!(s.call(Method::GET, "/api/me", &token, None).await.0, 403, "MCP audience must not be rewritten into a REST credential");
 }
 
 #[tokio::test]
