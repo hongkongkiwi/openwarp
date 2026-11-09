@@ -85,6 +85,10 @@ async function secrets(env) { return (await expect('GET', `/api/envs/${env}/secr
 await put(dev, [{ key: 'TARGET', value: 'before-dev' }]);
 await put(prod, [{ key: 'TARGET', value: 'before-prod' }]);
 
+// Workload identity and transit are feature-gated per workspace; the smoke
+// seeds its own grants (the fixture account is the instance owner).
+const grants = await expect('PUT', '/api/instance/features', token, { org, features: ['workload-identity', 'transit', 'change-requests'] });
+assert.equal(grants.org, org, 'feature grants seeded');
 const identity = id(await expect('POST', `/api/orgs/${org}/identities`, token, { name: 'worker-product', role: 'developer' }));
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'product-test', alg: 'ES256', use: 'sig', key_ops: ['verify'] };
