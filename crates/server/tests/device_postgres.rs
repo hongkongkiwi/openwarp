@@ -143,6 +143,9 @@ async fn pg_server() -> Option<(PgServer, Client, String, String)> {
         .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
         .env("TOKIO_WORKER_THREADS", "2")
         .env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1")
+        // PKI is an enterprise feature; the debug test build accepts the
+        // development license, which unlocks it without a signed token.
+        .env("OPENWARP_LICENSE", "development")
         .env_remove("OPENWARP_MASTER_KEY")
         .env_remove("REDIS_URL")
         .env_remove("OPENWARP_TRUST_PROXY")
