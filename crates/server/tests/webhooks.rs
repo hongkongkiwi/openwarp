@@ -301,3 +301,53 @@ async fn incoming_rechecks_creator_permissions_and_environment_policy() {
     let r = s.call(Method::GET,&format!("{}/receipts",path),Some(t),None).await; redacted(&r,&[&key,"whsec_"]);
     assert_eq!(r.body.as_array().expect("receipts").len(),1,"denied invocations must not enqueue work");
 }
+
+#[tokio::test]
+async fn incoming_receipts_capture_inspect_replay_and_master_rotation_clears_payloads() {
+    let s = Server::start().await; let u = register(&s,"incoming-inspect@test.invalid").await;
+    let t = u["token"].as_str().unwrap(); let (_,eid) = app(&s,t,u["org_id"].as_str().unwrap()).await;
+    let iid = integration(&s,t,&eid).await; let (hid,key) = incoming(&s,t,&iid).await;
+    let raw = br#"{"inspected":"captured-payload-marker"}"#;
+    ok(&s.signed(&hid,&key,"inspect_1",now(),raw,raw).await);
+    let list = format!("/api/incoming-webhooks/{}/receipts",hid);
+    let r = s.call(Method::GET,&list,Some(t),None).await; ok(&r);
+    assert!(!r.text.contains("captured-payload-marker"),"receipt lists must stay redacted: {}",r.text);
+    let rows = r.body.as_array().expect("receipt array"); assert_eq!(rows.len(),1);
+    assert!(rows[0].get("body").is_none(),"lists must not carry captured payloads");
+    let rid = id(&rows[0]);
+    let detail = format!("{}/{}",list,rid);
+    let r = s.call(Method::GET,&detail,Some(t),None).await; ok(&r);
+    assert_eq!(r.body["body_available"],true,"capture must decrypt for the operator: {}",r.text);
+    assert!(r.body["body"].as_str().expect("captured body").contains("captured-payload-marker"));
+    assert_eq!(r.body["content_type"],"application/json");
+    // Inspection and replay are integrations:write surfaces, not read-only ones.
+    let viewer = member(&s,t,u["org_id"].as_str().unwrap(),"receipt-reader@test.invalid","receipt-reader",&["secrets:read"]).await;
+    let vt = viewer["token"].as_str().unwrap();
+    denied(&s.call(Method::GET,&detail,Some(vt),None).await);
+    denied(&s.call(Method::POST,&format!("{}/replay",detail),Some(vt),Some(json!({}))).await);
+    // The dummy sync target always fails, so the receipt reaches a terminal
+    // state and becomes replayable; a replay resets attempts to zero.
+    let deadline = Instant::now()+Duration::from_secs(45);
+    loop {
+        let r = s.call(Method::GET,&list,Some(t),None).await; ok(&r);
+        let status = r.body[0]["status"].as_str().unwrap_or("").to_string();
+        if ["delivered","failed","dead_lettered"].contains(&status.as_str()) {
+            let r = s.call(Method::POST,&format!("{}/replay",detail),Some(t),Some(json!({}))).await;
+            ok(&r); assert_eq!(r.body["queued"],true);
+            let r = s.call(Method::GET,&detail,Some(t),None).await; ok(&r);
+            assert_eq!(r.body["status"],"pending","replay must requeue: {}",r.text);
+            assert_eq!(r.body["attempts"],0,"replay resets the attempt counter");
+            break;
+        }
+        assert!(Instant::now()<deadline,"receipt never reached a terminal state: {}",status);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Captured payloads are sealed with the instance master. Rotating that key
+    // erases them rather than rewrapping debug data.
+    let new_key = Base64::encode_string(&Sha256::digest(b"rotate-incoming-receipts"));
+    ok(&s.call(Method::POST,"/api/instance/rotate-master",Some(t),Some(json!({"new_key":new_key}))).await);
+    let r = s.call(Method::GET,&detail,Some(t),None).await; ok(&r);
+    assert_eq!(r.body["body_available"],false,"rotation must erase captured payloads: {}",r.text);
+    assert!(r.body["body"].is_null());
+    assert!(!r.text.contains("captured-payload-marker"));
+}

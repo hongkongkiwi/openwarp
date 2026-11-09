@@ -86,12 +86,8 @@ pub struct AppState {
     transit_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(not(target_arch="wasm32"))]
     lifecycle: Arc<tokio::sync::RwLock<()>>,
-    // Master-rotation fence shared with the transit key store. With the
-    // transit feature the Lifecycle guards transactional rewraps; without it
-    // a plain lock keeps the field and the rotation serialization alive.
-    #[cfg(feature = "transit")]
-    transit_lifecycle: Arc<transit::Lifecycle>,
-    #[cfg(not(feature = "transit"))]
+    // Master-rotation fence shared with the transit key store; an Arc so the
+    // write guard can move into the blocking rotation task.
     transit_lifecycle: Arc<TransitLifecycle>,
     kms: std::sync::OnceLock<Option<kms::Kms>>,
     key_gate: tokio::sync::RwLock<()>,
@@ -108,7 +104,7 @@ struct TransitLifecycle;
 impl TransitLifecycle { #[allow(dead_code)] pub async fn read(&self) {} }
 pub type S = Arc<AppState>;
 pub fn new_state(db: Db, _db_url: String, instance_id: String, pub_url: String, master: [u8; 32], live: LiveSender, #[cfg(feature = "redis-cache")] redis: Option<redis::Connection>) -> S {
-    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch = "wasm32"))] secret_health_credentials: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] key_lifecycle: Arc::new(tokio::sync::RwLock::new(())), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), #[cfg(feature = "transit")] transit_lifecycle: Arc::new(transit::Lifecycle::default()), #[cfg(not(feature = "transit"))] transit_lifecycle: Arc::new(TransitLifecycle::default()), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), license: edition::LicenseState::from_env(), live })
+    Arc::new(AppState { db: Arc::new(db), instance_id, pub_url, master: std::sync::RwLock::new(master), #[cfg(not(target_arch = "wasm32"))] secret_health_credentials: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] ai_credentials: tokio::sync::Mutex::new(()), #[cfg(not(target_arch="wasm32"))] key_lifecycle: Arc::new(tokio::sync::RwLock::new(())), #[cfg(not(target_arch="wasm32"))] transit_gate: Arc::new(tokio::sync::Mutex::new(())), #[cfg(not(target_arch="wasm32"))] lifecycle: Arc::new(tokio::sync::RwLock::new(())), transit_lifecycle: Arc::new(TransitLifecycle::default()), kms: std::sync::OnceLock::new(), key_gate: tokio::sync::RwLock::new(()), #[cfg(feature = "redis-cache")] redis: std::sync::Mutex::new(redis), license: edition::LicenseState::from_env(), live })
 }
 /// Install the validated bridge before serving requests on either runtime.
 pub fn install_kms(st: &S, kms: Option<kms::Kms>) { assert!(st.kms.set(kms).is_ok(), "KMS already initialized"); }
@@ -3503,20 +3499,19 @@ async fn resolve_social(st: &S, provider: &str, subject: &str, email: &str) -> R
     let wrapped = oc::wrap_with_password(&pw, kp.secret_b64().as_bytes()).map_err(|e| bad(&e))?;
     // The provider asserted a verified address, so this account needs no
     // separate email round-trip.
-    let mut statements = vec![
+    // The provider asserted the address, so the account itself needs no email
+    // round-trip. A pending invite admits the account only: like OIDC and
+    // SAML, membership requires the invitee to accept the token explicitly.
+    let statements = vec![
         ("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,email_verified) VALUES(?,?,?,?,?,?,1)".into(), vec![json!(uid), json!(email), json!(pass_hash), json!(kp.public), json!(wrapped), json!(now())]),
         ("INSERT INTO social_subjects(provider,subject,user_id,created_at) VALUES(?,?,?,?)".into(), vec![json!(provider), json!(subject), json!(uid), json!(now())]),
     ];
-    match invite {
-        Some(inv) => {
-            statements.push(("INSERT INTO org_members(org_id,user_id,role) VALUES(?,?,?)".into(), vec![json!(db::s(&inv, "org_id")), json!(uid), json!(db::s(&inv, "role"))]));
-            statements.push(("UPDATE invites SET accepted=1 WHERE token_hash=?".into(), vec![json!(db::s(&inv, "token_hash"))])); }
-        // Without an invite the workspace rules still decide: an invite-only
-        // instance leaves the account with none until one is accepted.
-        None => { workspaces::default_workspace(st, &uid, email).await?; }
-    }
     st.audited_batch(&statements, &[], ["", "", "", &uid, "auth.social_login", &format!("{} {}", provider, email)]).await.map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid).await;
+    // Without an invite the workspace rules still decide: an invite-only
+    // instance leaves the account with none until one is accepted. Runs after
+    // the account row exists because the guarded batch locks the user row.
+    if invite.is_none() { workspaces::default_workspace(st, &uid, email).await?; }
     Ok(uid) }
 async fn auth_providers(State(st): State<S>) -> Res {
     let mut out = auth_settings(&st).await;
@@ -3971,9 +3966,6 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     if st.kms().is_some() || st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT,"master rotation is unavailable while KMS auto-unseal is configured")); }
     if !matches!(&*st.db,Db::Sqlite(_)) { return Err(err(StatusCode::CONFLICT,"online master rotation requires single-process SQLite; PostgreSQL and MySQL require offline coordinated rotation")); }
     let transit_guard=st.transit_gate.clone().lock_owned().await;
-    #[cfg(feature = "transit")]
-    let transit_lifecycle=st.transit_lifecycle.clone().write_owned().await;
-    #[cfg(not(feature = "transit"))]
     let transit_lifecycle=st.transit_lifecycle.clone().write_owned().await;
     // Serialize personal credential snapshots and writes with this replica's rotation.
     let credential_guard = st.secret_health_credentials.clone().lock_owned().await;
@@ -4004,6 +3996,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
             transit::rotation_tx(tx,&old,&new,&transit_root)?;
             transit_compat::rewrap_master_tx(tx,&old,&new)?;
             tx.exec("DELETE FROM email_codes",&[])?;
+            // Captured incoming payloads are transient debug data sealed with
+            // the old master; rotation erases them rather than rewrapping.
+            tx.exec("UPDATE webhook_receipts SET body_enc=''",&[])?;
             for (sql,params) in &ai_updates { if tx.exec(sql,params)? != 1 { return Err("AI credential changed during rotation".into()); } }
             for table in ["webhook_subscriptions","incoming_webhooks"] {
                 for row in tx.query(&format!("SELECT id,secret_enc FROM {}",table),&[])? {
@@ -7134,7 +7129,7 @@ fn api_router(state: S) -> Router {
         .route("/api/auth/verify", get(verify_email)).route("/api/auth/forgot", post(forgot_password)).route("/api/auth/reset", post(reset_password)).route("/api/auth/resend-verification", post(resend_verification))
         .route("/api/auth/social/{provider}/start", get(social_start)).route("/api/auth/social/{provider}/callback", get(social_callback).post(social_callback))
         .route("/api/instance", get(instance_info)).route("/api/instance/edition", get(edition_info)).route("/api/instance/features", get(list_feature_grants).put(put_feature_grants)).route("/api/instance/signups", put(set_signups)).route("/api/instance/workspaces", put(workspaces::set_creation)).route("/api/instance/owner", put(set_instance_owner)).route("/api/instance/auth", put(set_auth_providers)).route("/api/instance/email-test", post(test_email)).route("/api/instance/rewrap", post(rewrap_env_keys)).route("/api/instance/encrypt-metadata", post(encrypt_metadata)).route("/api/instance/rotate-master", post(rotate_master))
-        .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke)).route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
+        .route("/health", get(health)).route("/.well-known/oauth-protected-resource", get(prm)).route("/.well-known/oauth-authorization-server", get(asm)).route("/oauth/register", post(oauth_register)).route("/oauth/authorize", get(oauth_authorize)).route("/oauth/authorize/decision", post(oauth_decision)).route("/oauth/token", post(oauth_token)).route("/oauth/revoke", post(oauth_revoke))
         .route("/api/orgs/{oid}/emergency", get(get_emergency).put(put_emergency))
         .route("/api/apps/{aid}/emergency", get(get_app_emergency).put(put_app_emergency))
         .route("/api/auth/register", post(register)).route("/api/auth/login", post(login)).route("/api/auth/logout", post(logout)).route("/api/me", get(me).delete(delete_me)).route("/api/me/sessions", get(list_sessions).delete(revoke_all_sessions)).route("/api/me/sessions/{sid}", delete(revoke_session))

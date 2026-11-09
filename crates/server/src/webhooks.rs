@@ -19,6 +19,8 @@ pub(super) fn routes() -> Router<S> { Router::new()
     .route("/api/incoming-webhooks/{wid}/rotate", post(rotate_incoming))
     .route("/api/incoming-webhooks/{wid}/reauthorize", post(reauthorize))
     .route("/api/incoming-webhooks/{wid}/receipts", get(receipts))
+    .route("/api/incoming-webhooks/{wid}/receipts/{rid}", get(receipt_detail))
+    .route("/api/incoming-webhooks/{wid}/receipts/{rid}/replay", post(receipt_replay))
     .route("/hooks/integrations/{wid}", post(accept).layer(axum::extract::DefaultBodyLimit::max(65536)))
 }
 fn supported() -> Result<(), (StatusCode, Json<Value>)> { if cfg!(target_arch="wasm32") { Err(err(StatusCode::NOT_IMPLEMENTED,"webhook dispatch requires the native runtime")) } else { Ok(()) } }
@@ -134,6 +136,25 @@ async fn reauthorize(State(st): State<S>,h: HeaderMap,peer: PeerAddr,Path(wid): 
     st.drain_outbox().await; Ok(j(visible(&inc(&st,&h,&wid).await?)))
 }
 async fn receipts(State(st): State<S>,h: HeaderMap,Path(wid): Path<String>,Query(q): Query<HashMap<String,String>>) -> Res { inc(&st,&h,&wid).await?; history(&st,"webhook_receipts",&wid,&q).await }
+async fn receipt_detail(State(st): State<S>,h: HeaderMap,Path((wid,rid)): Path<(String,String)>) -> Res { inc(&st,&h,&wid).await?;
+    let row=st.db.one("SELECT id,message_id,status,attempts,http_status,duration_ms,error_code,outcome,content_type,source_ip,body_enc,created_at,updated_at FROM webhook_receipts WHERE id=? AND webhook_id=?",&[json!(rid),json!(wid)]).await.map_err(|e|bad(&e))?.ok_or_else(||err(StatusCode::NOT_FOUND,"receipt not found"))?;
+    let mut out=db::obj(&row); let enc=db::s(&row,"body_enc");
+    // A master rotation wipes captured bodies instead of rewrapping them;
+    // an undecryptable capture surfaces as unavailable rather than plaintext.
+    let body=if enc.is_empty() { Value::Null } else {
+        oc::decrypt_symmetric_aad(&st.master(),format!("webhook-receipt:{}",rid).as_bytes(),&enc).map(|b|json!(String::from_utf8_lossy(&b))).unwrap_or(Value::Null) };
+    let available=!enc.is_empty() && !body.is_null();
+    out["body"]=body; out["body_available"]=json!(available);
+    Ok(j(out)) }
+async fn receipt_replay(State(st): State<S>,h: HeaderMap,Path((wid,rid)): Path<(String,String)>) -> Res { inc(&st,&h,&wid).await?;
+    let wid2=wid.clone(); let rid2=rid.clone();
+    let changed=st.db.webhook_atomic(move |tx| {
+        let count=tx.one("SELECT COUNT(*) AS n FROM webhook_receipts WHERE webhook_id=? AND status IN ('pending','processing','failed')",&[json!(wid2)])?.map(|r|db::n(&r,"n")).unwrap_or(0);
+        if count>=1000 {return Err("incoming queue full".into());}
+        tx.exec("UPDATE webhook_receipts SET status='pending',attempts=0,http_status=0,duration_ms=0,error_code='',outcome='',claim_id='',lease_until=0,next_attempt_at=?,updated_at=? WHERE id=? AND webhook_id=? AND status IN ('delivered','failed','dead_lettered')",&[json!(now()),json!(now()),json!(rid2),json!(wid2)])
+    }).await.map_err(|e|err(StatusCode::CONFLICT,&e))?;
+    if changed==0 { return Err(err(StatusCode::CONFLICT,"only delivered, failed or dead-lettered receipts can be replayed")); }
+    st.drain_outbox().await; Ok(j(json!({"id":rid,"queued":true}))) }
 fn client_address(h: &HeaderMap,peer: PeerAddr) -> String { let ip=peer.0.to_string(); let trust=crate::envcfg::var("OPENWARP_TRUST_PROXY").as_deref()==Ok("1") && crate::envcfg::var("OPENWARP_TRUSTED_PROXIES").unwrap_or_else(|_|"127.0.0.1/32,::1".into()).split(',').any(|c|ip_in_cidr(&ip,c)); if trust { if let Some(v)=h.get("x-forwarded-for").and_then(|v|v.to_str().ok()).and_then(|v|v.split(',').next()) { return v.trim().to_string(); } } ip }
 async fn allowed_ip(st: &S,oid: &str,ip: &str) -> bool { match st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?",&[json!(oid)]).await { Ok(Some(r)) => { let list=db::s(&r,"ip_allowlist"); list.trim().is_empty() || list.split(',').any(|c|ip_in_cidr(ip,c)) }, _=>false } }
 async fn creator_valid(st: &S,r: &Row) -> Result<(),(StatusCode,Json<Value>)> { let uid=db::s(r,"creator_id"); let hash=db::s(r,"credential_hash"); if !st.principal_active(&uid).await { return Err(err(StatusCode::FORBIDDEN,"creator inactive")); }
@@ -165,6 +186,7 @@ async fn accept_inner(st: &S,h: &HeaderMap,peer: PeerAddr,wid: &str,body: &[u8])
     let hash=Base64::encode_string(&Sha256::digest(body));
     if let Some(old)=st.db.one("SELECT body_hash FROM webhook_receipts WHERE webhook_id=? AND message_id=?",&[json!(wid),json!(mid)]).await.map_err(|e|bad(&e))? { if db::s(&old,"body_hash")!=hash { return Err(err(StatusCode::CONFLICT,"message ID reused with different bytes")); } return Ok((StatusCode::OK,json!({"duplicate":true}))); }
     let wid=wid.to_string(); let mid=mid.to_string(); let version=db::n(&r,"version");
+    let master=st.master(); let content_type=header("content-type").to_string(); let body_owned=body.to_vec();
     let outcome=st.db.webhook_atomic(move |tx| {
         if let Some(old)=tx.one("SELECT body_hash FROM webhook_receipts WHERE webhook_id=? AND message_id=?",&[json!(wid),json!(mid)])? {return if db::s(&old,"body_hash")==hash {Ok((200,json!({"duplicate":true})))} else {Ok((409,json!({"error":"message ID reused with different bytes"})))};}
         if tx.one("SELECT id FROM incoming_webhooks WHERE id=? AND enabled=1 AND version=?",&[json!(wid),json!(version)])?.is_none() {return Ok((403,json!({"error":"webhook changed"})));}
@@ -174,7 +196,13 @@ async fn accept_inner(st: &S,h: &HeaderMap,peer: PeerAddr,wid: &str,body: &[u8])
         if tx.exec("UPDATE rate_limits SET count=CASE WHEN window_start<=? THEN 1 ELSE count+1 END,window_start=CASE WHEN window_start<=? THEN ? ELSE window_start END WHERE key=?",&[json!(now()-60),json!(now()-60),json!(now()),json!(ratekey)])?==0 {
             tx.exec("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1)",&[json!(ratekey),json!(now())])?;
         }
-        let rid=id();tx.exec("INSERT INTO webhook_receipts(id,webhook_id,message_id,body_hash,version,status,source_ip,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,'pending',?,?,?,?)",&[json!(rid),json!(wid),json!(mid),json!(hash),json!(version),json!(ip),json!(now()),json!(now()),json!(now())])?;
+        // The body is captured encrypted for console inspection; the sender's
+        // bytes are never written in plaintext and never forwarded. Captures
+        // share the MySQL TEXT row budget, so oversized bodies are admitted
+        // without a capture rather than risking a truncated insert.
+        let rid=id();
+        let body_enc=if body_owned.len()<=32*1024 { oc::encrypt_symmetric_aad(&master,format!("webhook-receipt:{}",rid).as_bytes(),&body_owned) } else { String::new() };
+        tx.exec("INSERT INTO webhook_receipts(id,webhook_id,message_id,body_hash,version,status,source_ip,content_type,body_enc,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?)",&[json!(rid),json!(wid),json!(mid),json!(hash),json!(version),json!(ip),json!(content_type),json!(body_enc),json!(now()),json!(now()),json!(now())])?;
         Ok((202,json!({"id":rid,"queued":true})))
     }).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok((StatusCode::from_u16(outcome.0).map_err(|_|bad("invalid admission status"))?,outcome.1)) }
@@ -203,12 +231,15 @@ pub(super) async fn process(st: &S) {
         let attempts=db::n(&row,"attempts")+1; row.insert("attempts".into(),json!(attempts)); let sub=st.db.one(&format!("SELECT * FROM {} WHERE id=? AND enabled=1 AND version=?",subs),&[json!(db::s(&row,"webhook_id")),json!(db::n(&row,"version"))]).await.ok().flatten();
         let attempt_id=id();
         if !incoming && st.db.exec("INSERT INTO webhook_attempts(id,delivery_id,claim_id,status,created_at,updated_at) VALUES(?,?,?,'processing',?,?)",&[json!(attempt_id),json!(did),json!(claim),json!(now()),json!(now())]).await.is_err() { continue; }
-        let start=std::time::Instant::now(); let (ok,status,code,retry)=if let Some(sub)=sub { if incoming {
+        let start=std::time::Instant::now(); let mut outcome=String::new();
+        let (ok,status,code,retry)=if let Some(sub)=sub { if incoming {
             let authorization=creator_valid(st,&sub).await.is_ok() && allowed_ip(st,&db::s(&sub,"org_id"),&db::s(&row,"source_ip")).await;
-            if !authorization {(false,0,"authorization_revoked".into(),0)} else { match tokio::time::timeout(std::time::Duration::from_secs(90),sync_one_for_webhook(st,&db::s(&sub,"integration_id"),&db::s(&sub,"creator_id"))).await { Ok(Ok(_))=>(true,0,String::new(),0),Ok(Err(_))=>(false,0,"integration_sync_failed".into(),0),Err(_)=>(false,0,"integration_sync_timeout".into(),0) } }
+            if !authorization {(false,0,"authorization_revoked".into(),0)} else { match tokio::time::timeout(std::time::Duration::from_secs(90),sync_one_for_webhook(st,&db::s(&sub,"integration_id"),&db::s(&sub,"creator_id"))).await {
+                Ok(Ok(msg))=>{outcome=msg.chars().take(200).collect();(true,0,String::new(),0)},
+                Ok(Err(_))=>(false,0,"integration_sync_failed".into(),0),Err(_)=>(false,0,"integration_sync_timeout".into(),0) } }
         } else { let app=db::s(&sub,"app_id"); let running=if app.is_empty() {st.require_org_running(&db::s(&sub,"org_id")).await} else {st.require_app_running(&app).await}; if running.is_err() {(false,0,"emergency_lockdown".into(),0)} else {send(st,&sub,&row).await} } } else {(false,0,"subscription_changed".into(),0)};
         let terminal=attempts>=8 || ["authorization_revoked","subscription_changed","destination_blocked"].contains(&code.as_str()); let state=if ok {"delivered"} else if terminal {"dead_lettered"} else {"failed"}; let delay=(5_i64*2_i64.pow(attempts.min(10) as u32)).min(3600)+i64::from(oc::random_key()[0]%16); let next=now()+delay.max(retry);
         if !incoming { let _=st.db.exec("UPDATE webhook_attempts SET status=?,http_status=?,duration_ms=?,error_code=?,updated_at=? WHERE id=? AND claim_id=?",&[json!(if ok {"delivered"} else {"failed"}),json!(status),json!(start.elapsed().as_millis() as i64),json!(code),json!(now()),json!(attempt_id),json!(claim)]).await; }
-        let _=st.db.exec(&format!("UPDATE {} SET status=CASE WHEN EXISTS(SELECT 1 FROM {} s WHERE s.id={}.webhook_id AND s.version={}.version AND s.enabled=1) THEN ? ELSE 'cancelled' END,http_status=?,duration_ms=?,error_code=?,next_attempt_at=?,updated_at=?,claim_id='',lease_until=0 WHERE id=? AND claim_id=? AND lease_until>=?",table,subs,table,table),&[json!(state),json!(status),json!(start.elapsed().as_millis() as i64),json!(code),json!(next),json!(now()),json!(did),json!(claim),json!(now())]).await;
+        let _=st.db.exec(&format!("UPDATE {} SET status=CASE WHEN EXISTS(SELECT 1 FROM {} s WHERE s.id={}.webhook_id AND s.version={}.version AND s.enabled=1) THEN ? ELSE 'cancelled' END,http_status=?,duration_ms=?,error_code=?,outcome=?,next_attempt_at=?,updated_at=?,claim_id='',lease_until=0 WHERE id=? AND claim_id=? AND lease_until>=?",table,subs,table,table),&[json!(state),json!(status),json!(start.elapsed().as_millis() as i64),json!(code),json!(if ok {outcome} else {String::new()}),json!(next),json!(now()),json!(did),json!(claim),json!(now())]).await;
     }
 } }
