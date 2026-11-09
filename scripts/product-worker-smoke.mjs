@@ -75,6 +75,9 @@ const invited = await expect('POST', `/api/orgs/${org}/members`, token, { email:
 assert.equal(typeof invited.invite_token, 'string');
 const reviewer = (await expect('POST', '/api/auth/accept-invite', null, { token: invited.invite_token, password })).token;
 assert.equal(typeof reviewer, 'string');
+// Workload trust is feature-gated per workspace; the smoke's deployment is
+// self-hosted, so the instance owner grants it before the exchange.
+await expect('PUT', '/api/instance/features', token, { org, features: ['workload-identity'] });
 const app = id(await expect('POST', `/api/orgs/${org}/apps`, token, { name: `product-${suffix}` }));
 const envResponse = await expect('GET', `/api/apps/${app}/envs`, token);
 const envs = Array.isArray(envResponse) ? envResponse : envResponse.envs;
