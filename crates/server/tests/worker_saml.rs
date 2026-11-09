@@ -60,7 +60,7 @@ async fn worker_saml_round_trip_validates_signatures_provisions_and_rejects_repl
     // SAML is an enterprise feature the unlicensed deployment bundle omits;
     // when the routes are gated off, the round trip is skipped the same way
     // the live-database suites return early without their fixture.
-    let probe = call(&client, &base, Method::PUT, &format!("/api/orgs/{}/saml", org), Some(&token), Some(json!({}))).await;
+    let probe = call(&client, &base, Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({}))).await;
     if probe.status().as_u16() == 404 {
         eprintln!("SKIP SAML: routes are gated off the unlicensed deployment build");
         return;

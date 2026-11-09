@@ -130,7 +130,20 @@ impl Target for Db {
 impl Target for worker::D1Database {
     // D1's `exec` splits its input on newlines, which mangles a multi-line
     // statement. `prepare().run()` executes exactly one statement as written.
-    async fn exec(&self, sql: &str) -> Result<(), String> { self.prepare(sql).run().await.map(|_| ()).map_err(|e| e.to_string()) }
+    // D1's JS binding throws instead of returning Err, so a duplicate-column
+    // ALTER becomes a wasm trap that bypasses exec_tolerant's convergence
+    // tolerance; preflight the column the same way the runner would have.
+    async fn exec(&self, sql: &str) -> Result<(), String> {
+        let words: Vec<_> = sql.split_whitespace().collect();
+        if let ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] = words.as_slice() {
+            let column = column.trim_end_matches(',').trim_matches('"').to_string();
+            let info = self.prepare(&format!("PRAGMA table_info({table})")).all().await.map_err(|e| e.to_string())?;
+            for row in info.results() {
+                if row.get(&column).map(|v| !v.is_null()).unwrap_or(false) { return Ok(()); }
+            }
+        }
+        self.prepare(sql).run().await.map(|_| ()).map_err(|e| e.to_string())
+    }
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> {
         let result = self.prepare(sql).all().await.map_err(|e| e.to_string())?;
         let rows: Vec<HashMap<String, serde_json::Value>> = result.results().map_err(|e| e.to_string())?;
