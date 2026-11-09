@@ -38,7 +38,9 @@ jobs:
       OPENWARP_TEST_POSTGRES_URL: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
       OPENWARP_TEST_MYSQL_URL: mysql://root:openwarp@127.0.0.1:3306/mysql
       # The static-rotation regressions drive a real PostgreSQL role lifecycle.
-      OPENWARP_TEST_STATIC_PG: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
+      # sslmode=disable: the fixture connects with NoTls and the static-rotation
+      # validator only accepts explicit disable on a literal loopback address.
+      OPENWARP_TEST_STATIC_PG: postgres://openwarp:openwarp@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
