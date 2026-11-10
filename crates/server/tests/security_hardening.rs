@@ -89,7 +89,9 @@ impl Server {
     }
     async fn member(&self, owner: &Value, role: &str) -> Value {
         let u = self.user("member@test.invalid").await;
-        self.ok(Method::POST, &format!("/api/orgs/{}/members", owner["org_id"].as_str().unwrap()), owner["token"].as_str().unwrap(), Some(json!({"email": "member@test.invalid", "role": role}))).await; u
+        let inv = self.ok(Method::POST, &format!("/api/orgs/{}/members", owner["org_id"].as_str().unwrap()), owner["token"].as_str().unwrap(), Some(json!({"email": "member@test.invalid", "role": role}))).await;
+        let invite = inv["invite_token"].as_str().unwrap().to_string();
+        self.ok(Method::POST, "/api/auth/accept-invite-v2", u["token"].as_str().unwrap(), Some(json!({"token": invite}))).await; u
     }
     async fn pat(&self, app: &str, token: &str, env: &str, scopes: &str) -> String {
         self.ok(Method::POST, &format!("/api/apps/{}/tokens", app), token, Some(json!({"name": "bounded", "env_id": env, "scopes": scopes}))).await["token"].as_str().unwrap().to_string()
@@ -140,8 +142,8 @@ async fn cookie_cannot_bypass_service_or_oauth_read_only_scopes() {
     let pat = s.pat(&app, ot, "", "secrets:read").await;
     // Seed an issued OAuth credential, not an OAuth server implementation detail.
     let oauth = "disposable-oauth-access";
-    s.db().execute("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,expires_at,created_at) VALUES(?,?,?,?,?,?)",
-        rusqlite::params![oc::hash_token(oauth), "fixture-client", u["user_id"].as_str().unwrap(), "secrets:read", 4_000_000_000i64, 0i64]).unwrap();
+    s.db().execute("INSERT INTO oauth_tokens(token_hash,client_id,user_id,scope,resource,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        rusqlite::params![oc::hash_token(oauth), "fixture-client", u["user_id"].as_str().unwrap(), "secrets:read", s.base, 4_000_000_000i64, 0i64]).unwrap();
     let path = format!("/api/envs/{}/secrets", envs[0]);
     let mut cookie_statuses = Vec::new();
     for token in [pat.as_str(), oauth] {
