@@ -14,6 +14,8 @@ pub mod integrations;
 pub mod log;
 pub mod mailer;
 pub mod migrate;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod net;
 pub mod mysqllease;
 pub mod pglease;
 #[cfg(not(target_arch = "wasm32"))]

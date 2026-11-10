@@ -789,3 +789,10 @@ live-server tests against the built binary.
 A Kubernetes operator, provider adapters beyond OpenAI, OpenRouter and Resend,
 and automatic Postgres failover remain. Do not treat CRL support as an OCSP
 replacement.
+- Organisation settings store a provider preset (`custom`, `google`, `microsoft`,
+  `okta`, `jumpcloud`, `gitlab`, `authentik`, `authelia`) and the console pre-fills
+  the issuers it knows. The preset changes what the settings explain; the issuer
+  and client credentials you save stay authoritative.
+- The outbound HTTP client resolves names through a public-address filter in
+  production, so a hostname that later points at loopback or a private range is
+  rejected at connection time, not only when the URL was saved.

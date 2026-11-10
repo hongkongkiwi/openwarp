@@ -2047,8 +2047,10 @@ async fn get_org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<Str
         Err(e) => return Err(e),
     }
     let secret = meta_get(&st, &format!("oidc_client_secret:{}", oid)).await;
+    let provider = { let p = meta_get(&st, &format!("oidc_provider:{}", oid)).await; if p.is_empty() { "custom".to_string() } else { p } };
     Ok(j(json!({
         "ip_allowlist": ip,
+        "oidc_provider": provider,
         "reuse_check": db::n(&row,"reuse_check") != 0,
         "oidc_issuer": meta_get(&st, &format!("oidc_issuer:{}", oid)).await,
         "oidc_client_id": meta_get(&st, &format!("oidc_client_id:{}", oid)).await,
@@ -2084,7 +2086,8 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
         if issuer != stored_issuer && supplied_secret.is_empty() { statements.extend(meta_statements(&format!("oidc_client_secret:{}", oid), "")); }
     }
     if let Some(v)=body.get("oidc_auto_provision").and_then(|x|x.as_bool()) { statements.extend(meta_statements(&format!("oidc_auto_provision:{}",oid), if v {"1"} else {"0"})); }
-    for (field, enc) in [("oidc_issuer", false), ("oidc_client_id", false), ("oidc_redirect_uri", false), ("oidc_allowed_domains", false), ("oidc_client_secret", true)] {
+    if let Some(v)=body.get("oidc_provider").and_then(|x|x.as_str()) { if !OIDC_PROVIDERS.contains(&v) { return Err(bad("oidc_provider must be custom, google, microsoft, okta, jumpcloud, gitlab, authentik or authelia")); } }
+    for (field, enc) in [("oidc_issuer", false), ("oidc_provider", false), ("oidc_client_id", false), ("oidc_redirect_uri", false), ("oidc_allowed_domains", false), ("oidc_client_secret", true)] {
         if let Some(v)=body.get(field).and_then(|x|x.as_str()) {
             // An omitted secret keeps the stored one; an explicit empty secret
             // clears it only when the caller asks for that.
@@ -2445,11 +2448,12 @@ fn url_host(u: &str) -> &str {
         (true, Some(end)) => &rest[..=end],
         _ => rest.split(':').next().unwrap_or("") } }
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::new()) }
+pub(crate) fn http_client() -> crate::http::Client { crate::net::client(std::time::Duration::from_secs(15)) }
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn http_client() -> crate::http::Client { crate::http::Client::new() }
 // Dynamic database leases dial a host from the request. Nothing may dial unless
 // the operator named that host: this is the SSRF boundary for the feature.
+const OIDC_PROVIDERS: &[&str] = &["custom", "google", "microsoft", "okta", "jumpcloud", "gitlab", "authentik", "authelia"];
 fn db_target_allowed(conn: &str) -> Result<&'static str, String> {
     let allow = crate::envcfg::var("OPENWARP_ALLOWED_DB_HOSTS").unwrap_or_default();
     let entries: Vec<String> = allow.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -2465,6 +2469,24 @@ fn db_target_allowed(conn: &str) -> Result<&'static str, String> {
     let target = format!("{}:{}", host, port);
     if entries.iter().any(|e| e == host || e == &target || e == &format!("[{}]:{}", host, port)) { return Ok(scheme); }
     Err(format!("{} host is not permitted; OPENWARP_ALLOWED_DB_HOSTS must list {} (allowed: {})", scheme, target, entries.join(","))) }
+// Public: a sign-in screen asks which workspace owns an email domain and which
+// identity provider serves it. Only domains a workspace already allows match,
+// and only the workspace name and provider preset are returned.
+async fn oidc_providers(State(st): State<S>, Query(q): Query<HashMap<String,String>>) -> Res {
+    let email = q.get("email").cloned().unwrap_or_default().trim().to_lowercase();
+    let domain = email.split('@').nth(1).unwrap_or("");
+    if domain.is_empty() { return Ok(j(json!({"providers": []}))); }
+    let orgs = st.db.query("SELECT id,name FROM orgs ORDER BY name", &[]).await.map_err(|e| bad(&e))?;
+    let mut out = Vec::new();
+    for o in &orgs {
+        let oid = db::s(o, "id");
+        if meta_get(&st, &format!("oidc_issuer:{}", oid)).await.is_empty() { continue; }
+        let domains = meta_get(&st, &format!("oidc_allowed_domains:{}", oid)).await;
+        if !domains.split(',').map(str::trim).any(|d| d.eq_ignore_ascii_case(domain)) { continue; }
+        let provider = { let p = meta_get(&st, &format!("oidc_provider:{}", oid)).await; if p.is_empty() { "custom".to_string() } else { p } };
+        out.push(json!({"org_id": oid, "org_name": db::s(o, "name"), "provider": provider}));
+    }
+    Ok(j(json!({"providers": out}))) }
 async fn oidc_discovery(issuer: &str) -> Result<Value, (StatusCode, Json<Value>)> {
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     http_client().get(&url).send().await.map_err(|e| bad(&e.to_string()))?.json().await.map_err(|e| bad(&e.to_string())) }
@@ -7494,7 +7516,7 @@ fn api_router(state: S) -> Router {
         .route("/api/secrets/{sid}/restore/{ver}", post(restore)).route("/api/secrets/{sid}/override", get(get_override).post(set_override).delete(delete_override))
         .route("/api/secrets/{sid}/undelete", post(undelete_secret)).route("/api/secrets/{sid}/destroy", post(destroy_secret))
         .route("/api/search", get(search)).route("/api/me/totp/setup", post(totp_setup)).route("/api/me/totp/verify", post(totp_verify)).route("/api/me/totp", delete(mfa::totp_disable)).route("/api/me/mfa", get(mfa::status)).route("/api/me/mfa/recovery-codes", post(mfa::recovery_regenerate)).route("/api/me/mfa/email/start", post(mfa::email_enroll_start)).route("/api/me/mfa/email/verify", post(mfa::email_enroll_verify)).route("/api/me/mfa/email", delete(mfa::email_disable)).route("/api/me/passkeys/start", post(mfa::passkey_register_start)).route("/api/me/passkeys/finish", post(mfa::passkey_register_finish)).route("/api/me/passkeys/{pid}", delete(mfa::passkey_delete)).route("/api/auth/mfa", post(mfa_login)).route("/api/auth/mfa/options", post(mfa::mfa_options)).route("/api/auth/mfa/email/send", post(mfa::email_login_send)).route("/api/auth/mfa/passkey/start", post(mfa::passkey_login_start)).route("/api/auth/mfa/passkey/finish", post(mfa::passkey_login_finish)).route("/api/envs/{eid}/proposals", get(list_proposals).post(create_proposal)).route("/api/proposals/{pid}/{action}", post(decide_proposal)).route("/api/envs/{eid}/access-requests", get(list_access_requests).post(request_access)).route("/api/access-requests/{rid}/{action}", post(decide_access))
-        .route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));
+        .route("/api/auth/oidc/providers", get(oidc_providers)).route("/api/auth/oidc/{oid}/start", get(oidc_start)).route("/api/auth/oidc/callback", get(oidc_callback)).route("/api/lockbox", post(create_lockbox)).route("/api/lockbox/{lid}", get(open_lockbox));
     // LDAP needs raw TCP/TLS sockets, so the feature is off in a Workers build
     // and these routes do not exist there.
     #[cfg(feature = "ldap")]
