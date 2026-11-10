@@ -125,7 +125,7 @@ pass('Worker workload exchange, concurrent replay, environment scope and revocat
 const keysPath = `/api/orgs/${org}/transit/keys`;
 const transitProbe = await call('POST', keysPath, token, { name: `worker-${suffix}` });
 if (transitProbe.status === 404) {
-  check('transit absent from the Worker build', true);
+  pass('transit absent from the Worker build');
   pass('Worker transit absence is the documented build shape');
 } else {
   const key = id(await expect('POST', keysPath, token, { name: `worker-${suffix}` }));

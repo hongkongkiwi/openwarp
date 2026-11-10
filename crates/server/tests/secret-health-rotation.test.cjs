@@ -15,7 +15,9 @@ test('rotation owns the credential gate before the key and metadata snapshots, i
   const gate = body.indexOf('let credential_guard = st.secret_health_credentials.clone().lock_owned().await;');
   assert.ok(gate >= 0, 'rotation must acquire the shared credential gate');
   assert.ok(gate < body.indexOf('let old = st.master()'), 'gate must precede the master snapshot');
-  assert.ok(gate < body.indexOf('let metas = st.db.query'), 'gate must precede the metadata snapshot');
+  // The lane's transactional rotation runs the metadata sweep inside
+  // webhook_atomic; the gate still precedes that sweep.
+  assert.ok(gate < body.indexOf('SELECT k,v FROM meta'), 'gate must precede the metadata snapshot');
   const blocking = body.indexOf('tokio::task::spawn_blocking(move || {');
   const owned = body.indexOf('let _credential_guard = credential_guard;', blocking);
   assert.ok(owned > blocking && owned < body.indexOf('st2.master.write()', blocking), 'blocking task must own the guard even if the request is cancelled');
