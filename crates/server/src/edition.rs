@@ -184,7 +184,7 @@ pub fn verify(token: &str) -> Result<Claims, String> {
     if claims.customer.trim().is_empty() {
         return Err("license is missing the customer name".into());
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::clock::now();
     if claims.iat > now + 300 {
         return Err("license was issued in the future; check the system clock".into());
     }

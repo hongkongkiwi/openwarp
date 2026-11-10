@@ -143,6 +143,9 @@ async fn pg_server() -> Option<(PgServer, Client, String, String)> {
         .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
         .env("TOKIO_WORKER_THREADS", "2")
         .env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1")
+        // PKI is an enterprise feature; the debug test build accepts the
+        // development license, which unlocks it without a signed token.
+        .env("OPENWARP_LICENSE", "development")
         .env_remove("OPENWARP_MASTER_KEY")
         .env_remove("REDIS_URL")
         .env_remove("OPENWARP_TRUST_PROXY")
@@ -163,6 +166,11 @@ async fn pg_server() -> Option<(PgServer, Client, String, String)> {
     admin_driver.abort();
     Some((server, client, base, db_url))
 }
+
+async fn grant_pki(client: &Client, base: &str, token: &str, org: &str) {
+        let granted = call(client, base, Method::PUT, "/api/instance/features", Some(token), Some(json!({"org": org, "features": ["pki"]}))).await;
+        assert_eq!(granted.status, 200, "grant pki to the fixture workspace: {}", granted.text);
+    }
 
 async fn pg_owner(server: &PgServer, client: &Client, base: &str) -> (String, String) {
     let email = "postgres@test.invalid";
@@ -279,8 +287,9 @@ fn blocked_hook() -> (String, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Se
 async fn postgres_renewal_rechecks_expiry_after_device_lock() {
     let Some((server,client,base,url))=pg_server().await else{return};
     let (token,org)=pg_owner(&server,&client,&base).await;
+    grant_pki(&client,&base,&token,&org).await;
     let r=call(&client,&base,Method::POST,&format!("/api/orgs/{}/pki/cas",org),Some(&token),Some(json!({"name":"expiry-lock"}))).await;
-    assert_eq!(r.status,200);let ca=r.body["id"].as_str().unwrap();
+    assert_eq!(r.status,200,"CA creation: {}",r.text);let ca=r.body["id"].as_str().unwrap();
     let r=call(&client,&base,Method::POST,&format!("/api/pki/cas/{}/devices",ca),Some(&token),Some(json!({"name":"expiry-sensor"}))).await;
     assert_eq!(r.status,200);let device=r.body["id"].as_str().unwrap().to_string();
     let old=rcgen::KeyPair::generate().unwrap();let csr=rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().serialize_request(&old).unwrap().pem().unwrap();
@@ -307,10 +316,11 @@ async fn postgres_renewal_rechecks_expiry_after_device_lock() {
 async fn postgres_enrollment_cannot_cross_revocation_or_group_deletion() {
     let Some((server, client, base, url)) = pg_server().await else { return; };
     let (token, org) = pg_owner(&server, &client, &base).await;
+    grant_pki(&client, &base, &token, &org).await;
     let observer = pg_client(&url).await;
     for mutation in ["device-revoke", "group-revoke", "group-delete", "ca-revoke", "root-revoke", "device-policy"] {
         let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": mutation}))).await;
-        assert_eq!(r.status,200); let root = r.body["id"].as_str().unwrap().to_string();
+        assert_eq!(r.status,200,"CA creation for {}: {}",mutation,r.text); let root = r.body["id"].as_str().unwrap().to_string();
         let ca = if mutation == "root-revoke" {
             let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "child", "parent_id": root}))).await;
             assert_eq!(r.status,200); r.body["id"].as_str().unwrap().to_string()

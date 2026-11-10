@@ -379,7 +379,7 @@ async fn migration22_resumes_on_mysql_when_lifecycle_row_exists_but_ledger_absen
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on MySQL: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(reopened.version().await.unwrap(), MIGRATIONS.last().expect("manifest").version);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1
@@ -407,7 +407,7 @@ async fn migration22_resumes_on_postgres_when_lifecycle_row_exists_but_ledger_ab
     let reopened = Db::open(&db_url).await;
     assert!(reopened.is_ok(), "migration 22 resume failed on Postgres: {:?}", reopened.err());
     let reopened = reopened.unwrap();
-    assert_eq!(reopened.version().await.unwrap(), openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(reopened.version().await.unwrap(), MIGRATIONS.last().expect("manifest").version);
     assert_eq!(
         reopened.query("SELECT v FROM meta WHERE k='rotation_lifecycle'", &[]).await.unwrap().len(),
         1

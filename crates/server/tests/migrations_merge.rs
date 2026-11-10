@@ -79,7 +79,12 @@ async fn assert_main17_defaults(db: &Db) {
 }
 
 async fn assert_final22(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "the merge appends reconciliation without renumbering either history");
+    // The merge appended main17 and main18 reconciliation as versions 19 and 20;
+    // later migrations may extend the manifest, so pin those instead of the tip.
+    assert_eq!(MIGRATIONS[18].version, 19, "the merge appends reconciliation without renumbering either history");
+    assert_eq!(MIGRATIONS[19].version, 20, "the merge appends reconciliation without renumbering either history");
+    let tip = MIGRATIONS.last().expect("manifest").version;
+    assert_eq!(db.version().await.unwrap(), tip);
     for table in ["orgs", "apps"] {
         let rows = db.query(&format!("SELECT emergency_locked FROM {}", table), &[]).await.unwrap();
         assert!(!rows.is_empty(), "{} must contain the seeded row", table);
@@ -88,8 +93,8 @@ async fn assert_final22(db: &Db) {
         }
     }
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
-    assert_eq!(status.latest, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(status.current, tip);
+    assert_eq!(status.latest, tip);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
@@ -142,7 +147,7 @@ async fn shipped_main17_legacy_ledger_upgrade_preserves_data() {
     assert!(!report.squashed, "a main17 database must not be replaced by the branch baseline");
     assert_eq!(main_data(&db).await, before, "all shipped main17 data must survive reconciliation");
     assert_main17_schema(&db).await;
-    assert_eq!(report.applied, (18i64..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0)).collect::<Vec<_>>());
+    assert_eq!(report.applied, (18..=MIGRATIONS.last().expect("manifest").version).collect::<Vec<_>>());
     assert_eq!(db.query("SELECT version,applied_at FROM schema_migrations WHERE version<=17 ORDER BY version", &[]).await.unwrap(), ledger);
     assert_final22(&db).await;
     assert_eq!(main_data(&db).await, before, "the second boot must also preserve ciphertext, chain state and used flags");
@@ -164,7 +169,7 @@ async fn branch18_upgrade_appends19_without_rewriting_checksums() {
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade a checksum-bearing branch18 ledger without repair");
     assert_main17_schema(&db).await;
-    assert_eq!(report.applied, (19i64..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0)).collect::<Vec<_>>());
+    assert_eq!(report.applied, (19..=MIGRATIONS.last().expect("manifest").version).collect::<Vec<_>>());
     assert!(!report.squashed);
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=18 ORDER BY version", &[]).await.unwrap(), ledger, "the pre-merge engine ledger must remain unchanged");
     assert_eq!(db.one("SELECT id,app_id,name,env_key_wrapped,created_at FROM envs WHERE id='merge-env'", &[]).await.unwrap(), env_before);

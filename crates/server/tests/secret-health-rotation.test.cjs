@@ -25,7 +25,10 @@ test('credential writes, deletes and read/decrypt snapshots share the rotation g
   for (const name of ['secret_health_settings', 'secret_health_save', 'enzoic_settings', 'enzoic_save']) {
     const body = handler(name);
     const gate = body.indexOf('let _credential_guard = st.secret_health_credentials.lock().await;');
-    assert.ok(gate >= 0 && gate < body.indexOf('st.db.'), `${name} must gate its complete database operation`);
+    // DB access may be inline (`st.db.`) or factored into the guarded helpers.
+    const access = ['st.db.', 'secret_health_revalidate', 'secret_health_store', 'secret_health_delete']
+      .map(token => body.indexOf(token)).filter(index => index >= 0);
+    assert.ok(gate >= 0 && access.length > 0 && access.every(index => gate < index), `${name} must gate its complete database operation`);
   }
   for (const name of ['secret_health_email', 'enzoic_password']) {
     const body = handler(name);

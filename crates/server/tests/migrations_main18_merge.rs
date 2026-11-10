@@ -97,10 +97,15 @@ async fn assert_emergency_schema(db: &Db, expected: i64) {
 }
 
 async fn assert_final22(db: &Db) {
-    assert_eq!(db.version().await.unwrap(), openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "the conflicting main18 history needs an appended reconciliation");
+    // Main18's reconciliation is canonically migration 20; later migrations may
+    // extend the manifest, so pin version 20 itself instead of the tip.
+    assert_eq!(MIGRATIONS[19].version, 20, "the conflicting main18 history needs an appended reconciliation");
+    assert_eq!(MIGRATIONS[19].name, "main18_reconciliation");
+    let tip = MIGRATIONS.last().expect("manifest").version;
+    assert_eq!(db.version().await.unwrap(), tip);
     let status = migrate::status(db, MIGRATIONS).await.unwrap();
-    assert_eq!(status.current, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
-    assert_eq!(status.latest, openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0));
+    assert_eq!(status.current, tip);
+    assert_eq!(status.latest, tip);
     assert!(status.problems.is_empty(), "{:?}", status.problems);
     assert!(status.pending().is_empty());
     let again = migrate::apply(db, MIGRATIONS, Options::default()).await.unwrap();
@@ -179,7 +184,7 @@ async fn upgrade_engine_history(version: usize) {
         assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=? ORDER BY version", &[serde_json::json!(version)]).await.unwrap(), ledger, "engine{} ledger rows and checksums are immutable", version);
         assert_eq!(restricted(&db, "main18-member-env").await, 0, "the existing engine sentinel preserves later unrestricted environments");
         assert_emergency_schema(&db, 0).await;
-        assert_eq!(report.applied, ((version as i64 + 1)..=openwarp_server::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0)).collect::<Vec<_>>());
+        assert_eq!(report.applied, ((version as i64 + 1)..=MIGRATIONS.last().expect("manifest").version).collect::<Vec<_>>());
         assert_final22(&db).await;
         assert_eq!(common_data(&db).await, before);
 }

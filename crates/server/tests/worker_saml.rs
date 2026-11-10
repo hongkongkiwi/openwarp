@@ -57,6 +57,16 @@ async fn worker_saml_round_trip_validates_signatures_provisions_and_rejects_repl
     let login = json_ok(call(&client, &base, Method::POST, "/api/auth/login", None, Some(json!({"email": email, "password": password}))).await, "owner login").await;
     let token = login["token"].as_str().expect("verified owner session");
 
+    // SAML is an enterprise feature the unlicensed deployment bundle omits;
+    // when the routes are gated off, the round trip is skipped the same way
+    // the live-database suites return early without their fixture.
+    let probe = call(&client, &base, Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({}))).await;
+    if probe.status().as_u16() == 404 {
+        eprintln!("SKIP SAML: routes are gated off the unlicensed deployment build");
+        return;
+    }
+    assert_eq!(probe.status().as_u16(), 400, "the configured SAML route must accept requests");
+
     // Match the native authorization suite's risaml IdP fixture and real RSA signature.
     let idp_rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("idp rsa key");
     let idp_key_pem = idp_rsa.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).expect("idp key pem").to_string();

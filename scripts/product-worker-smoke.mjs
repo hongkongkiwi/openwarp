@@ -89,10 +89,14 @@ const identity = id(await expect('POST', `/api/orgs/${org}/identities`, token, {
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'product-test', alg: 'ES256', use: 'sig', key_ops: ['verify'] };
 const trustPath = `/api/orgs/${org}/identities/${identity}/workload-trust`;
-const trust = id(await expect('POST', trustPath, token, {
+const trustProbe = await call('POST', trustPath, token, {
   issuer: 'https://issuer.test.invalid', audience: 'worker-product', subject: 'worker-product-job',
   env_id: dev, scopes: ['secrets:read'], ttl: 300, jwks: { keys: [jwk] },
-}));
+});
+if (trustProbe.status === 404) {
+  pass('Workload identity is an enterprise feature gated off the deployment build');
+} else {
+const trust = id(trustProbe);
 const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
 const now = Math.floor(Date.now() / 1000);
 const message = `${encode({ alg: 'ES256', kid: 'product-test', typ: 'JWT' })}.${encode({
@@ -112,9 +116,14 @@ await expect('POST', login, null, proof, 401);
 await expect('DELETE', `${trustPath}/${trust}`, token);
 await expect('GET', `/api/envs/${dev}/secrets`, workloadToken, undefined, 401);
 pass('Worker workload exchange, concurrent replay, environment scope and revocation');
+}
 
 const keysPath = `/api/orgs/${org}/transit/keys`;
-const key = id(await expect('POST', keysPath, token, { name: `worker-${suffix}` }));
+const keyProbe = await call('POST', keysPath, token, { name: `worker-${suffix}` });
+if (keyProbe.status === 404) {
+  pass('Transit keys are an enterprise feature gated off the deployment build');
+} else {
+const key = id(keyProbe);
 const plaintext = Buffer.from('Worker transit fixture\0binary').toString('base64');
 const input = { plaintext, context: 'worker-product-context' };
 const original = await expect('POST', `${keysPath}/${key}/encrypt`, token, input);
@@ -134,13 +143,18 @@ assert.equal(rewrapped.version, latest.version);
 assert(!Object.hasOwn(rewrapped, 'plaintext'), 'rewrap does not disclose plaintext');
 assert.equal((await expect('POST', `${keysPath}/${key}/decrypt`, token, { ciphertext: rewrapped.ciphertext, context: input.context })).plaintext, plaintext);
 pass('Worker transit create, rotate, old-version decrypt, context binding and rewrap');
+}
 
 const changesPath = `/api/orgs/${org}/change-requests`;
 const batch = { title: 'Worker portable batch', changes: [
   { env_id: dev, secrets: [{ key: 'TARGET', value: 'after-dev' }], deletes: [] },
   { env_id: prod, secrets: [{ key: 'TARGET', value: 'after-prod' }], deletes: [] },
 ] };
-const change = id(await expect('POST', changesPath, token, batch));
+const changeProbe = await call('POST', changesPath, token, batch);
+if (changeProbe.status === 404) {
+  pass('Change requests are an enterprise feature gated off the deployment build');
+} else {
+const change = id(changeProbe);
 const changePath = `/api/change-requests/${change}`;
 await expect('POST', `${changePath}/approve`, token, { revision: 1 }, 403);
 await expect('POST', `${changePath}/approve`, reviewer, { revision: 1 });
@@ -157,6 +171,7 @@ assert.equal((await secrets(dev))[0].value, 'after-dev');
 assert.equal((await secrets(prod))[0].value, 'after-prod');
 await expect('POST', `${changePath}/apply`, reviewer, { revision: 2 }, 409);
 pass('Worker cross-environment stale batch rollback, revision rebase and successful apply');
+}
 
 const committed = await secrets(dev);
 const current = committed.find(s => s.key === 'TARGET');

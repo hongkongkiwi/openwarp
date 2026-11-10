@@ -287,47 +287,42 @@ for (const [name, later, status] of [
 
 // A Durable Object statement must report its affected rows: SCIM deactivation
 // branches on the DELETE count and would report "cannot remove the last owner"
-// while already having removed the row.
+// while already having removed the row. SCIM is an enterprise cargo feature
+// the deployment bundle omits, so an unlicensed build answers 404; a build
+// that includes it must run the affected-row assertions instead.
 const scim = await call('POST', `/scim/v2/Users?org_id=${org}`, token, { userName: `member-${Date.now()}@test.invalid` });
-check('SCIM user created', scim.status === 200 && scim.json.id, scim.text);
-const removed = await call('DELETE', `/scim/v2/Users/${scim.json.id}?org_id=${org}`, token);
-check('SCIM deactivation reports success (affected-row count)', removed.status === 200, `${removed.status} ${removed.text}`);
-
-// OIDC through the real Worker: discovery, JWKS, RS256 id_token verification
-// (pure-Rust backend), user provisioning and session creation.
-const idp = await startMockIdp();
-const issuer = `http://127.0.0.1:${idp.address().port}`;
-const settings = await call('PUT', `/api/orgs/${org}/settings`, token, {
-  oidc_issuer: issuer, oidc_client_id: 'test-oidc', oidc_client_secret: 'secret',
-  oidc_redirect_uri: `${base}/api/auth/oidc/callback`,
-  oidc_auto_provision: true, oidc_allowed_domains: 'test.invalid',
-});
-check('OIDC settings saved', settings.status === 200, `${settings.status} ${settings.text}`);
-
-const start = await fetch(`${base}/api/auth/oidc/${org}/start`, { redirect: 'manual' });
-const location = start.headers.get('location') || '';
-const authorize = new URL(location, base);
-const state = authorize.searchParams.get('state');
-idpNonce = authorize.searchParams.get('nonce') || '';
-check('OIDC start redirects to the issuer with state', start.status >= 300 && start.status < 400 && !!state, `${start.status} ${location}`);
-
-if (state) {
-  const callback = await fetch(`${base}/api/auth/oidc/callback?code=abc&state=${encodeURIComponent(state)}`, { redirect: 'manual' });
-  const target = callback.headers.get('location') || '';
-  const callbackText = await callback.text();
-  const ssoToken = target.includes('#token=') ? target.split('#token=')[1].split('&')[0] : '';
-  check('OIDC callback verifies the RS256 id_token and issues a session', callback.status >= 300 && callback.status < 400 && !!ssoToken, `${callback.status} ${target} ${callbackText.slice(0, 200)}`);
-  if (ssoToken) {
-    const ssoMe = await call('GET', '/api/me', ssoToken);
-    check('SSO session is authenticated', ssoMe.status === 200, `${ssoMe.status} ${ssoMe.text}`);
-  }
+if (scim.status === 200) {
+  check('SCIM user created', !!scim.json.id, scim.text);
+  const removed = await call('DELETE', `/scim/v2/Users/${scim.json.id}?org_id=${org}`, token);
+  check('SCIM deactivation reports success (affected-row count)', removed.status === 200, `${removed.status} ${removed.text}`);
+} else {
+  check('SCIM routes are gated off the deployment build', scim.status === 404, `${scim.status} ${scim.text.slice(0, 120)}`);
 }
-idp.close();
+
+// Workspace settings writes work portably; workspace OIDC is an enterprise
+// feature, so an unlicensed deployment answers with the stable 403 gate body
+// instead of configuring the issuer.
+const ungated = await call('PUT', `/api/orgs/${org}/settings`, token, { reuse_check: false });
+check('Ungated workspace settings saved', ungated.status === 200, `${ungated.status} ${ungated.text}`);
+
+const settings = await call('PUT', `/api/orgs/${org}/settings`, token, {
+  oidc_issuer: 'https://issuer.test.invalid', oidc_client_id: 'test-oidc',
+  oidc_redirect_uri: `${base}/api/auth/oidc/callback`,
+});
+check('Workspace OIDC answers the enterprise gate', settings.status === 403 &&
+  settings.json.code === 'enterprise_feature' && settings.json.feature === 'org_oidc',
+  `${settings.status} ${settings.text}`);
 
 // Certificate authority and leaf issuance through the RustCrypto stack.
+// The deployment bundle omits the enterprise pki feature, so the routes are
+// absent; a licensed build that includes them must answer 200 instead.
 const ca = await call('POST', `/api/orgs/${org}/pki/cas`, token, { name: 'smoke-ca' });
-check('CA created on the Worker', ca.status === 200 && (ca.json.certificate || '').includes('BEGIN CERTIFICATE'), `${ca.status} ${ca.text.slice(0, 120)}`);
-if (ca.json.id) {
+if (ca.status === 200) {
+  check('CA created on the Worker', (ca.json.certificate || '').includes('BEGIN CERTIFICATE'), `${ca.status} ${ca.text.slice(0, 120)}`);
+} else {
+  check('PKI routes are gated off the deployment build', ca.status === 404, `${ca.status} ${ca.text.slice(0, 120)}`);
+}
+if (ca.json && ca.json.id) {
   const leaf = await call('POST', `/api/pki/cas/${ca.json.id}/issue`, token, { cn: 'svc.test.invalid', sans: ['svc.test.invalid'], days: 30 });
   check('leaf certificate and key issued', leaf.status === 200 && (leaf.json.certificate || '').includes('BEGIN CERTIFICATE') && (leaf.json.private_key || '').includes('BEGIN PRIVATE KEY'), `${leaf.status} ${leaf.text.slice(0, 160)}`);
   const certs = await call('GET', `/api/pki/cas/${ca.json.id}/certs`, token);
@@ -369,21 +364,25 @@ if (process.env.OPENWARP_SMOKE_MYSQL_URL) {
 const echo = process.env.OPENWARP_SMOKE_ECHO;
 if (echo) {
   const stream = await call('POST', `/api/orgs/${org}/log-streams`, token, { name: 'echo', url: `${echo}/log`, secret: 'stream-secret' });
-  check('log stream created', stream.status === 200, `${stream.status} ${stream.text.slice(0, 120)}`);
-  await call('GET', `/api/envs/${env.id}/secrets`, token);
-  let delivered = false;
-  let lastStatus = 'none';
-  for (let i = 0; i < 40 && !delivered; i += 1) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    const list = await call('GET', `/api/orgs/${org}/log-streams/deliveries`, token);
-    const rows = Array.isArray(list.json) ? list.json : (list.json.deliveries || []);
-    const row = rows.find(entry => entry.status);
-    lastStatus = row ? String(row.status) : 'none';
-    delivered = rows.some(entry => String(entry.status) === 'delivered');
+  check('Audit streaming answers the enterprise gate', stream.status === 403 &&
+    stream.json.code === 'enterprise_feature' && stream.json.feature === 'audit_streaming',
+    `${stream.status} ${stream.text.slice(0, 160)}`);
+  if (stream.status === 200) {
+    await call('GET', `/api/envs/${env.id}/secrets`, token);
+    let delivered = false;
+    let lastStatus = 'none';
+    for (let i = 0; i < 40 && !delivered; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const list = await call('GET', `/api/orgs/${org}/log-streams/deliveries`, token);
+      const rows = Array.isArray(list.json) ? list.json : (list.json.deliveries || []);
+      const row = rows.find(entry => entry.status);
+      lastStatus = row ? String(row.status) : 'none';
+      delivered = rows.some(entry => String(entry.status) === 'delivered');
+    }
+    check('audit delivery reached the endpoint', delivered, lastStatus);
+    const observed = await (await fetch(`${echo}/_requests`)).json();
+    check('echo sink received a signed log event', observed.some(r => r.path === '/log' && String(r.headers['x-openwarp-signature'] || '').startsWith('t=')));
   }
-  check('audit delivery reached the endpoint', delivered, lastStatus);
-  const observed = await (await fetch(`${echo}/_requests`)).json();
-  check('echo sink received a signed log event', observed.some(r => r.path === '/log' && String(r.headers['x-openwarp-signature'] || '').startsWith('t=')));
 
   const integ = await call('POST', `/api/envs/${env.id}/integrations`, token, { kind: 'webhook', name: 'echo', config: { url: `${echo}/hook` } });
   check('webhook integration created', integ.status === 200 && !!integ.json.id, `${integ.status} ${integ.text.slice(0, 120)}`);

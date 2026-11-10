@@ -49,5 +49,7 @@ while [ "${i}" -lt 90 ]; do
 done
 if [ "${i}" -eq 90 ]; then printf '%s\n' 'SAML Worker fixture did not become ready within 90s' >&2; exit 1; fi
 cd "${ROOT}"
-OPENWARP_TEST_WORKER_URL="${BASE}" OPENWARP_TEST_MAIL_URL="http://127.0.0.1:${ECHO_PORT}" cargo test -p openwarp-server --test worker_saml -- --ignored --test-threads=1
+# The saml test target declares the feature it exercises; the assertions
+# themselves drive the Worker fixture over HTTP.
+OPENWARP_TEST_WORKER_URL="${BASE}" OPENWARP_TEST_MAIL_URL="http://127.0.0.1:${ECHO_PORT}" cargo test -p openwarp-server --test worker_saml --features saml -- --ignored --test-threads=1
 SUCCESS=1

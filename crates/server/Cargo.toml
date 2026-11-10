@@ -80,7 +80,9 @@ tokio-postgres = { version = "0.7", default-features = false, features = ["js"] 
 default = []
 redis-cache = ["dep:redis"]
 ldap = ["dep:ldap3", "dep:native-tls"]
-saml = ["dep:risaml", "dep:rcgen"]
+# SAML metadata signing mints its SP certificate through rcgen, which the
+# pki feature brings in.
+saml = ["dep:risaml", "dep:rcgen", "pki"]
 scim = []
 pki = ["dep:x509-cert", "dep:p256", "dep:keystore-ocsp", "dep:keystore-pki", "dep:rcgen"]
 ssh-ca = ["dep:ssh-key"]
@@ -102,6 +104,37 @@ required-features = ["live-db-tests"]
 name = "worker_saml"
 path = "tests/worker_saml.rs"
 required-features = ["saml"]
+
+# The device certificate suites exercise the pki-gated routes.
+[[test]]
+name = "device_authorization"
+path = "tests/device_authorization.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_delivery"
+path = "tests/device_delivery.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_group_security"
+path = "tests/device_group_security.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_lockdown"
+path = "tests/device_lockdown.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_remaining"
+path = "tests/device_remaining.rs"
+required-features = ["pki"]
+
+[[test]]
+name = "device_postgres"
+path = "tests/device_postgres.rs"
+required-features = ["pki"]
 
 [dev-dependencies]
 rcgen = "0.13"

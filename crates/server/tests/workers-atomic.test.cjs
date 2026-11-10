@@ -31,7 +31,11 @@ function batchBody(source) {
   if (/\bDb::\w+\s*\(/.test(mask(batch))) return batch;
   assert.match(mask(batch), /^\s*(?:return\s+)?self\.batch_checked\(statements,\s*&\[\]\)\.await\s*;?\s*$/,
     'batch must return the checked helper result without executing autocommit writes');
-  return body(source, 'batch_checked');
+  const checked = body(source, 'batch_checked');
+  if (/\bDb::\w+\s*\(/.test(mask(checked))) return checked;
+  assert.match(mask(checked), /let\s+expected[\s\S]*?require_one\.contains\(&index\)\.then_some\(1\)[\s\S]*?self\.batch_expected\(statements,\s*&expected,\s*false\)\.await\s*;?/,
+    'checked batches must map required statements to expected exact-one row counts before delegating');
+  return body(source, 'batch_expected');
 }
 function backend(source, name) {
   const batch = batchBody(source);
@@ -42,8 +46,8 @@ function backend(source, name) {
 function nativeContract(source, name) {
   const arm = backend(source, name), code = mask(arm);
   const shared = mask(batchBody(source));
-  assert.match(shared, /if\s+require_one\.contains\(&index\)\s*&&\s*rows\s*!=\s*1\s*\{\s*Err\s*\(/,
-    'required native statements must reject every affected-row count except one');
+  assert.match(shared, /if\s+expected\[index\]\.is_some_and\(\|n\|\s*n\s*!=\s*rows\)\s*\{\s*Err\s*\(/,
+    'required native statements must reject every affected-row count except the expected one');
   assert.ok(!/\b(?:unwrap_or_default|unwrap_or|is_ok)\s*\(/.test(code), 'batch failures must not become success');
   const loopAt = code.search(/for\s*\(index,\s*\(sql,\s*params\)\)\s+in\s+statements\.iter\(\)\.enumerate\(\)/);
   assert.ok(loopAt >= 0, `${name} must execute and check each statement`);
@@ -79,34 +83,32 @@ function nativeContract(source, name) {
   }
 }
 function workerContract(source) {
-  assert.match(mask(backend(source, 'DoSqlite')), /^\s*s\.transaction_sync\(statements,\s*require_one\)\s*$/,
-    'Workers must return the synchronous transaction helper result with exact-one guards');
-  const helper = body(source, 'transaction_sync'), code = mask(helper);
-  assert.match(code, /self\.storage\.as_ref\(\)\.ok_or\([\s\S]*?\)\?/,
-    'Workers must fail closed without transactional Durable Object storage');
-  assert.match(helper, /let\s+transaction\s*=\s*js_sys::Reflect::get\(raw,\s*&JsValue::from_str\("transactionSync"\)\)/,
+  const arm = backend(source, 'DoSqlite'), code = mask(arm);
+  assert.match(code, /let\s+raw:\s*&JsValue\s*=\s*storage\.as_raw\(\)\.as_ref\(\)/,
+    'Workers must open the real Durable Object storage for the transaction');
+  assert.match(arm, /let\s+transaction\s*=\s*js_sys::Reflect::get\(raw,\s*&JsValue::from_str\("transactionSync"\)\)/,
     'Workers must resolve the real storage.transactionSync runtime binding');
   assert.match(code, /\.dyn_into::<js_sys::Function>\(\)\.map_err\([\s\S]*?\)\?/,
     'Workers must reject a missing or invalid runtime transaction function');
   const callbackAt = code.indexOf('Closure::wrap(');
   assert.ok(callbackAt >= 0, 'Workers must provide a synchronous transaction callback');
-  const callback = block(helper, callbackAt), callbackCode = mask(callback);
+  const callback = block(arm, callbackAt), callbackCode = mask(callback);
   assert.ok(!/\basync\b|\.await\b/.test(callbackCode), 'transactionSync callback must not yield');
-  assert.match(callbackCode, /sql\.exec\(statement,\s*do_binds\(params\)\)\.map_err\([\s\S]*?\?;/,
+  assert.match(callbackCode, /sql\.exec\(&?sqlite_sql\(statement\),\s*do_binds\(params\)\)\.map_err\([\s\S]*?\?;/,
     'Workers statement failures must throw out of the transaction callback');
   assert.match(callbackCode, /for\s+row\s+in\s+cursor\.raw\(\)\s*\{\s*row\.map_err\([\s\S]*?\?;/,
     'Workers must consume cursor results and propagate deferred statement failures');
-  const guardAt = callbackCode.search(/if\s+require_one\.contains\(&index\)/);
+  const guardAt = callbackCode.search(/if\s+let\s+Some\(count\)\s*=\s*expected\[index\]/);
   assert.ok(guardAt >= 0, 'Workers must enforce required statement row counts inside the callback');
   const guard = block(callback, guardAt);
   assert.match(guard, /sql\.exec\("SELECT changes\(\) AS affected",\s*None\)/,
     'Workers exact-one checks must use affected table rows, not index writes');
-  assert.match(guard, /if\s+changes\["affected"\]\.as_u64\(\)\s*!=\s*Some\(1\)\s*\{\s*return\s+Err\(/,
+  assert.match(guard, /if\s+changes\["affected"\]\.as_u64\(\)\s*!=\s*Some\(count\)\s*\{\s*return\s+Err\(/,
     'Workers must throw for zero or multiple affected rows');
-  assert.match(code, /transaction\.call1\(raw,\s*callback\.as_ref\(\)\)\.map_err\([\s\S]*?\?;/,
+  assert.match(code, /transaction\.call1\(raw,\s*callback\.as_ref\(\)\)\.map\([\s\S]*?\)\.map_err\(/,
     'Workers must invoke transactionSync with the callback and propagate rollback errors');
   assert.ok(!/\b(?:unwrap_or_default|unwrap_or|is_ok)\s*\(/.test(code), 'Workers must not swallow transaction or statement failure');
-  assert.ok(!/\bsql\.exec\s*\(/.test(mask(helper.replace(callback, ''))),
+  assert.ok(!/\bsql\.exec\s*\(/.test(mask(arm.replace(callback, ''))),
     'Workers batch writes must occur only inside the transaction callback');
 }
 
@@ -137,12 +139,12 @@ test('batch parser follows only a returned checked helper, not comments or autoc
 
 test('native source contracts reject autocommit statements and weakened exact-one guards', () => {
   for (const [name, before, after, reason] of [
-    ['Sqlite', 'exec_sqlite(&tx, sql, params)?', 'exec_sqlite(&conn, sql, params)?', /SQLite statement and exact-one errors/],
+    ['Sqlite', 'checked(index, exec_sqlite(&tx, sql, params)?)?;', 'checked(index, exec_sqlite(&conn, sql, params)?)?;', /SQLite statement and exact-one errors/],
     ['Postgres', 'checked(index, tx.execute', 'checked(index, client.execute', /PostgreSQL execution and exact-one errors/],
     ['Mysql', 'tx.exec_drop(sql2.as_str()', 'client.exec_drop(sql2.as_str()', /MySQL execution errors/],
   ]) assert.throws(() => nativeContract(fixture(before, after), name), reason, `${name} autocommit must be rejected`);
   for (const name of ['Sqlite', 'Postgres', 'Mysql']) {
-    assert.throws(() => nativeContract(fixture('rows != 1', 'rows > 1'), name), /required native statements must reject/);
+    assert.throws(() => nativeContract(fixture('n != rows', 'n > rows'), name), /required native statements must reject/);
   }
   assert.throws(() => nativeContract(fixture('checked(index, exec_sqlite(&tx, sql, params)?)?;',
     'let _ = checked(index, exec_sqlite(&tx, sql, params)?);'), 'Sqlite'), /SQLite statement and exact-one errors/);
@@ -150,11 +152,10 @@ test('native source contracts reject autocommit statements and weakened exact-on
 
 test('Workers source contract rejects fake transactions, autocommit writes and weakened row guards', () => {
   for (const [before, after, reason] of [
-    ['s.transaction_sync(statements, require_one)', 's.exec(statements, require_one)', /Workers must return the synchronous transaction helper/],
-    ['"transactionSync"', '"notATransaction"', /Workers must resolve the real storage.transactionSync/],
-    ['transaction.call1(raw, callback.as_ref())', 'callback.call0(raw)', /Workers must invoke transactionSync/],
-    ['let callback = worker::wasm_bindgen::closure::Closure::wrap', 'sql.exec(statement, do_binds(params))?; let callback = worker::wasm_bindgen::closure::Closure::wrap', /Workers batch writes must occur only inside/],
-    ['changes["affected"].as_u64() != Some(1)', 'changes["affected"].as_u64() > Some(1)', /Workers must throw for zero or multiple/],
+    ['let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync"))\n', 'let transaction = js_sys::Reflect::get(raw, &JsValue::from_str("notATransaction"))\n', /Workers must resolve the real storage.transactionSync/],
+    ['transaction.call1(raw, callback.as_ref()).map(|_| ())', 'let _ = transaction.call1(raw, callback.as_ref());', /Workers must invoke transactionSync/],
+    ['let callback = Closure::wrap(Box::new(move ||', 'sql.exec(&sqlite_sql(statement), do_binds(params))?; let callback = Closure::wrap(Box::new(move ||', /Workers batch writes must occur only inside/],
+    ['changes["affected"].as_u64() != Some(count)', 'changes["affected"].as_u64() > Some(count)', /Workers must throw for zero or multiple/],
     ['for row in cursor.raw() { row.map_err(|e| JsValue::from_str(&e.to_string()))?; }',
       'for row in cursor.raw() { let _ = row; }', /Workers must consume cursor results/],
   ]) assert.throws(() => workerContract(fixture(before, after)), reason);
