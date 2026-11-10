@@ -146,7 +146,7 @@ td input{width:100%;background:transparent;border:0;padding:2px;font-family:var(
 <div class="modalwrap" id="modalwrap"><div class="modal" id="modal"></div></div>
 <div id="palette"><div class="palettecard"><input id="paletteinput" placeholder="Search secrets, apps, environments…" data-i18n-placeholder="Search secrets, apps, environments…" oninput="paletteSearch()"><div id="paletteresults"></div></div></div>
 <div id="toasts"></div>
-<script src="/i18n.js" integrity="sha384-grOAmA6TYjv9ZZ8JCDes2Ok2+pPOWojkd8SDybUuUke1KgWv9x3Fc6PXvgkEubfe"></script>
+<script src="/i18n.js" integrity="sha384-B0DYOqf56WC9yFtU6BZcGQkRK3ROb/+W+KOOxJP7nqoSxOWlAMeaBsZ29SLlV4h7"></script>
 <script>
 let CREATION_OPEN=true, INVITE='', INVITE_META=null;
 let EMERGENCY=false, PROJECT_EMERGENCY=false, PROJECT_DIRECT=false, EMERGENCY_OWNER=false, EMERGENCY_POLL=null, AUTH_READY=false, SECRET_EPOCH=0, EMERGENCY_REQUEST=0, EDITION=null;
@@ -328,10 +328,20 @@ async function acceptInvite(){try{
 function forgotPrompt(){modal(`<h3 data-i18n="Reset your password">Reset your password</h3><p class="mut" data-i18n="Enter your email. If an account exists, a reset link is sent.">Enter your email. If an account exists, a reset link is sent.</p>
   <div class="field"><label for="fp-email" data-i18n="Email">Email</label><input id="fp-email" type="email" value="${esc($('email').value)}"></div>
   <div class="row"><button class="primary" onclick="sendForgot()" data-i18n="Send link">Send link</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Reset password')}
-function workspaceSsoPrompt(){modal(`<h3 data-i18n="Sign in to a workspace">Sign in to a workspace</h3><p class="mut" data-i18n="Single sign-on is configured per workspace, and an address alone cannot reveal which workspace you mean.">Single sign-on is configured per workspace, and an address alone cannot reveal which workspace you mean.</p>
+function workspaceSsoPrompt(){modal(`<h3 data-i18n="Sign in to a workspace">Sign in to a workspace</h3><p class="mut">Enter your work email to find workspaces whose single sign-on covers its domain, or paste a workspace ID directly.</p>
+  <div class="field"><label for="sso-email">Work email</label><input id="sso-email" type="email" autocomplete="email" placeholder="you@company.com" onkeydown="if(event.key==='Enter')ssoFind()"></div>
   <div class="field"><label for="saml-org" data-i18n="Workspace ID">Workspace ID</label><input id="saml-org" placeholder="workspace id" data-i18n-placeholder="workspace id" autocomplete="off" onkeydown="if(event.key==='Enter')samlGo('saml')"></div>
   <p class="small mut" data-i18n="An owner can copy it from Members and access.">An owner can copy it from Members and access.</p>
-  <div class="row" style="margin-top:12px"><button class="primary" onclick="samlGo('saml')" data-i18n="Continue with SAML">Continue with SAML</button><button onclick="samlGo('oidc')" data-i18n="Continue with OIDC">Continue with OIDC</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Workspace sign-in')}
+  <div class="row" style="margin-top:12px"><button class="primary" onclick="ssoFind()">Find my workspace</button><button onclick="samlGo('saml')" data-i18n="Continue with SAML">Continue with SAML</button><button onclick="samlGo('oidc')" data-i18n="Continue with OIDC">Continue with OIDC</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>`,'Workspace sign-in')}
+async function ssoFind(){try{
+  let email=$('sso-email').value.trim();
+  if(!email){toast('Enter your work email first',true);return}
+  let d=await api('GET','/api/auth/oidc/providers?email='+encodeURIComponent(email));
+  let list=Array.isArray(d.providers)?d.providers:[];
+  if(!list.length){toast('No workspace advertises single sign-on for that email domain. Ask your administrator for the workspace ID.',true);return}
+  if(list.length===1){location.href='/api/auth/oidc/'+encodeURIComponent(list[0].org_id)+'/start';return}
+  $('modal').innerHTML=`<h3>Choose a workspace</h3>${list.map(p=>`<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0"><span>${esc(p.org_name)} <span class="mut small">${esc(p.provider||'custom')}</span></span><button onclick="location.href='/api/auth/oidc/'+encodeURIComponent('${esc(p.org_id)}')+'/start'">Continue</button></div>`).join('')}`;
+}catch(e){toast(e.message,true)}}
 function samlGo(method){let org=$('saml-org').value.trim();if(!org){toast('Enter the workspace ID',true);return}
   location.href='/api/auth/'+(method==='oidc'?'oidc':'saml')+'/'+encodeURIComponent(org)+'/start'}
 // The jurisdiction is a deployment, so the console can only report the one
