@@ -1232,8 +1232,8 @@ async fn set_env_policy(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     st.audited_batch(&statements, &[], [&org, &app, &eid, &uid, "env.policy", &changed.join(",")]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"ok": true, "policy": changed}))) }
 async fn list_members(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
-    let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).await.map_err(|e| bad(&e))?;
-    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role, m.locked AS locked FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(|r| { let mut o = db::obj(r); o["locked"] = json!(db::n(r, "locked") != 0); o }).collect::<Vec<_>>()))) }
 async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     let role = st.require_org(&oid, &uid).await?; st.check_admin(&oid, &uid).await?;
     if target == uid { return Err(bad("use another admin to remove yourself; leaving your own organisation is not supported")); }
@@ -2365,7 +2365,7 @@ async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<
     let denied = || err(StatusCode::FORBIDDEN, "no user with this email shares an organisation with you");
     let row = st.db.one("SELECT id,email,pubkey FROM users WHERE email=?", &[json!(email.to_lowercase())]).await.map_err(|e| bad(&e))?.ok_or_else(denied)?;
     let tid = db::s(&row, "id");
-    if tid != uid { let shared = st.db.query("SELECT a.org_id FROM org_members a JOIN org_members b ON b.org_id=a.org_id WHERE a.user_id=? AND b.user_id=?", &[json!(uid), json!(&tid)]).await.map_err(|e| bad(&e))?; if shared.is_empty() { return Err(denied()); } }
+    if tid != uid { let shared = st.db.query("SELECT a.org_id FROM org_members a JOIN org_members b ON b.org_id=a.org_id WHERE a.user_id=? AND b.user_id=? AND a.locked=0", &[json!(uid), json!(&tid)]).await.map_err(|e| bad(&e))?; if shared.is_empty() { return Err(denied()); } }
     Ok(j(json!({"id": db::s(&row,"id"), "email": db::s(&row,"email"), "pubkey": db::s(&row,"pubkey")}))) }
 
 
@@ -3008,8 +3008,11 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
             let _ = st.db.exec("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?", &[json!(&mapped_role), json!(&org), json!(&user.dn)]).await;
         }
     } else if !locked {
-        let current = st.org_role(&org, &uid).await.unwrap_or_default();
-        if let Some(role) = &mapped {
+        let (current, member_locked) = st.org_membership(&org, &uid).await.unwrap_or_default();
+        // The directory never rewrites a suspended membership: a group change
+        // must not grant access an owner locked out.
+        if member_locked { st.audited_batch(&[], &[], audit).await.map_err(|e| bad(&e))?; }
+        else if let Some(role) = &mapped {
             // The directory's group mapping stays authoritative, except that it
             // never demotes an owner: a group change must not lock out the only one.
             if &current != role && current != "owner" {
@@ -6039,7 +6042,12 @@ async fn list_tokens(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>)
     let rows = st.db.query("SELECT id,app_id,env_id,name,kind,expires_at,scopes,last_used_at,created_at,created_by FROM tokens WHERE app_id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn revoke_token(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT created_by,org_id FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"token not found"))?;
-    if db::s(&row,"created_by") != uid && st.org_role(&db::s(&row,"org_id"),&uid).await.as_deref() != Some("owner") && st.org_role(&db::s(&row,"org_id"),&uid).await.as_deref() != Some("admin") { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+    // Revoking your own token stays available. Managing another member's
+    // credential follows the membership gate, including a workspace lock.
+    if db::s(&row,"created_by") != uid {
+        let role = st.require_org(&db::s(&row,"org_id"), &uid).await?;
+        if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+    }
     st.db.exec("DELETE FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": tid}))) }
 
 

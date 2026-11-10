@@ -1769,11 +1769,12 @@ test('a locked workspace shows the owner contact message without fetching worksp
 });
 
 test('an owner can lock a member from the members list', async () => {
-  const ui = await consoleUI([saved], [], { responses: {
+  const ui = await consoleUI([saved], [], { store: { 'ow.org.owner-a': 'org-a' }, responses: {
     '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
     '/api/orgs/org-a/members': [{ id: 'owner-a', email: 'owner@example.invalid', role: 'owner' }, { id: 'member-a', email: 'member@example.invalid', role: 'developer' }],
     '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/features': { compiled: [], granted: [] },
+    '/api/envs/env-a/proposals': [], '/api/envs/env-a/access-requests': [], '/api/orgs/org-a/identities': [],
     'POST /api/orgs/org-a/members/member-a/lock': { ok: true, locked: true },
   } });
   await ui.invoke("nav('access')");
@@ -1786,11 +1787,12 @@ test('an owner can lock a member from the members list', async () => {
 });
 
 test('an owner can unlock a member from the members list', async () => {
-  const ui = await consoleUI([saved], [], { responses: {
+  const ui = await consoleUI([saved], [], { store: { 'ow.org.owner-a': 'org-a' }, responses: {
     '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
     '/api/orgs/org-a/members': [{ id: 'owner-a', email: 'owner@example.invalid', role: 'owner' }, { id: 'member-a', email: 'member@example.invalid', role: 'developer', locked: true }],
     '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/features': { compiled: [], granted: [] },
+    '/api/envs/env-a/proposals': [], '/api/envs/env-a/access-requests': [], '/api/orgs/org-a/identities': [],
     'POST /api/orgs/org-a/members/member-a/unlock': { ok: true, locked: false },
   } });
   await ui.invoke("nav('access')");
