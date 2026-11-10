@@ -70,7 +70,9 @@ def norm(path: str) -> str:
 
 
 def server_routes() -> dict[str, set[str]]:
-    src = MAIN.read_text()
+    # Webhook routes live in their own module, mounted through
+    # `.merge(webhooks::routes())`; scan it alongside app.rs.
+    src = MAIN.read_text() + "\n" + (ROOT / "crates/server/src/webhooks.rs").read_text()
     routes: dict[str, set[str]] = {}
     pattern = re.compile(
         r'\.route\("([^"]+)"\s*,\s*(.+?)(?=\.route\(|\.layer\(|\.with_state\(|\Z)', re.S

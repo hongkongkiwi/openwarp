@@ -4577,7 +4577,6 @@
   },
   "openapi": "3.1.0",
   "paths": {
-    "$comment": "Ported from the pre-split contract: device PKI lifecycle routes.",
     "/api/access-requests/{rid}/{action}": {
       "post": {
         "description": "Requires environment access and org:admin permission. approve adds an environment member; every other action string rejects. Already-decided requests return 400. Environment-scoped tokens cannot use this route.",

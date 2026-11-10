@@ -1,5 +1,4 @@
 {
-  "$comment": "Ported from the pre-split contract: device PKI lifecycle routes.",
   "/api/orgs/{oid}/pki/expiring": {
     "get": {
       "parameters": [
