@@ -1,12 +1,12 @@
 # Feature coverage matrix
 
-Ledger bound to commit 8425e29, branch `feat/comprehensive-clients` (2026-11-09), read together with the working tree as of that date. How to run things: [../TESTING.md](../TESTING.md). Step-level journeys: [scenarios.md](scenarios.md). Sequencing and rollout: [../plans/2026-11-09-comprehensive-testing.md](../plans/2026-11-09-comprehensive-testing.md).
+Re-baselined 2026-11-10 against the merge of feat/comprehensive-clients (9baf897); first bound to commit 8425e29 (2026-11-09). How to run things: [../TESTING.md](../TESTING.md). Step-level journeys: [scenarios.md](scenarios.md). Sequencing and rollout: [../plans/2026-11-09-comprehensive-testing.md](../plans/2026-11-09-comprehensive-testing.md).
 
 ## How to read this ledger
 
 - Status describes the suite inventory, not a run. Nothing here was executed during planning. `covered` means suites exist for the area; case-level verification of what those suites actually assert happens in the baseline pass (rollout plan, phase A2). `partial` means named gaps remain. `gap` means no dedicated suite was found in the inventory. `proposed` requires new tooling.
 - Every applicable feature needs success, malformed-input, denied-access and persistence/state assertions. A sensitive rejection must leave storage and remote state unchanged and must not reveal secret material.
-- Features known from project history but absent from this revision are listed under "Out of this revision" at the end, with evidence. They enter this ledger only when merged into the tested revision.
+- Features known from project history but absent from this revision are listed under "Out of this revision" at the end, with evidence. They enter this ledger only when merged into the tested revision; rows from the previous revision that have since landed are recorded under "Merged into this revision" with presence evidence only.
 
 ## Security dimensions
 
@@ -62,7 +62,7 @@ Enumerate these boundaries fully. Pairwise combinations are acceptable only for 
 | F21 Audit, live events, notifications | `log.rs`, `worker.rs`, `mailer.rs`; `product_features.rs`, `hardening_merge.rs` | Hash-chain sequence and linkage, tamper detection and first-broken-link reporting, redaction, permission filtering, replay cursors, mail rendering, bounded retries | Mutations produce correct redacted entries; deliberate tampering detected; live reconnect with `?since` does not leak other tenants; delivery failure does not corrupt the primary operation | covered |
 | F22 Emergency lockdown | `main.rs`, `app.rs`; `emergency.rs`, `emergency_merge.rs`, `product_lockdown.rs` | Workspace and app lock composition, cookie-only owner callers, credential invalidation, queued-work revalidation | Lock with clients and runners active; protected reads, writes, exports, history, E2E access and sync dispatch fail; unlocking one layer does not clear the other or revive revoked credentials | covered |
 | F23 Console behavior | `ui.rs`, `e2e.js`, `i18n.js`; `ui.test.cjs`, `product-ui.test.cjs`, `product-ui-races.test.cjs` | Render helpers, escaping, stale-response guards, theme and language state | Every view, dialog and destructive confirmation; navigation during slow requests; keyboard and focus; error, loading and empty states; desktop and mobile layouts; translations preserve user data | covered (source checks) + proposed (browser matrix) |
-| F24 CLI | `crates/cli/src/main.rs`; no test file found in `crates/cli` | Parser, config handling, output formats and escaping, exit codes, credential precedence, redaction | Login, list, read, write, import, export, sync, inject and every other parser-discovered command against a real server; injected child receives the intended environment; errors do not print secrets | gap (verify during A2) |
+| F24 CLI | `crates/cli/src/main.rs`; suites `crates/cli/tests/agent.rs`, `agent_loopback_proxy.rs`, `agent_transport_review.rs`, `developer_workflows.rs`, `management.rs`, `reference_path_regressions.rs` | Parser, config handling, output formats and escaping, exit codes, credential precedence, redaction | Login, list, read, write, import, export, sync, inject and every other parser-discovered command against a real server; injected child receives the intended environment; errors do not print secrets | partial (33 tests cover the template agent, management commands, developer workflows and reference paths; the login, inject, export and sync journeys still verify during A2) |
 | F25 SDKs and OpenAPI | `sdk/rust`, `sdk/go`, `sdks/typescript`, `sdks/python`, `openapi.json`, `scripts/check-openapi.py`; `sdks/typescript/sdk.test.ts`, `sdks/python/test_*.py`, `sdk/rust` tests, `sdk/go/client_test.go` | Serialisation, authentication, errors, pagination, timeouts and documented retries per client | Shared real-server scenario corpus; every supported operation exercised; unsupported operations explicit; `sdk/go` tests exist but no CI step invokes them (A2 item) | partial |
 | F26 Terraform, Action, ESO | `terraform-provider/`, `terraform-provider-openwarp/`, `action/` (no test files present), `crates/eso/src/main.rs` (10 inline tests) | Provider schema, sensitive state, validation; action input handling and output masking; ESO request/response and not-found mapping | Terraform CRUD, import, destroy and an idempotent second plan; action entrypoint in a fixture runner environment; ESO reconcile and delete against an ephemeral Kubernetes cluster; no real deployment | partial |
 | F27 Storage and migrations | `db.rs` (SQLite/PostgreSQL/MySQL/MariaDB translation, numbered `MIGRATIONS`); `postgres_backend.rs`, `mysql_backend.rs`, `product_portability.rs` | Placeholder translation, DDL rewrite rules (TEXT keys, defaults, index guards, collation), transaction semantics, migration ledger ordering, backend reserved words | Fresh install, upgrade along supported histories, no-op on current, interrupted migration retry, concurrent startup; security, CAS, approval, unwrap and lease parity across backends | partial (no dedicated historical-upgrade suite found) |
@@ -72,19 +72,24 @@ Enumerate these boundaries fully. Pairwise combinations are acceptable only for 
 
 One row per adapter is maintained in the sync/lease contract work: every adapter discovered in `integrations.rs` and every lease, identity and mail provider gets contract assertions on its actual protocol, capability set, config redaction, error parsing and deletion behavior, using protocol-family mocks. Explicitly test unsupported capabilities rather than assuming all adapters support import, mirror, dry-run or connection test. Live validation is tier 3 in [../TESTING.md](../TESTING.md) and is never implied by a passing mock.
 
-## Out of this revision
+## Merged into this revision
 
-Verified at 8425e29 by source search (`rg -i`) and `git merge-base --is-ancestor`. These exist on other branches per project history and are not shipped in this revision; they join this ledger when merged.
+The rows below were open in the 8425e29 ledger and all now ship in 9baf897. Each commit was checked with `git merge-base --is-ancestor` and each path with a direct listing on 2026-11-10. These citations are presence evidence, not coverage verdicts: full ledger rows (suites, case columns and covered/partial/gap statuses) for the new areas are still to be authored.
 
-| Feature | Evidence |
+| Feature | Evidence at 9baf897 |
 | --- | --- |
-| Enterprise licensing | No licensing code in `crates/server/src`; merge commit 4385d2c is not an ancestor |
-| AI assistant and insights | No source hits; 00b1204 is not an ancestor |
-| Device certificates and IoT enrollment | No enrollment or attestation code in `pki.rs`; d39138e is not an ancestor |
-| Secret health (breach checks) | 449736b is not an ancestor |
-| Login jurisdiction and region picker | 255dfc6 is not an ancestor |
-| OpenBao transit-compat namespace | b3eea91 is not an ancestor |
-| Agent credential broker | No source hits; feature branch unmerged per project history |
-| Wallet storage and signing | No source hits; feature branch unmerged per project history |
+| Enterprise licensing | `crates/server/src/features.rs` (gated surfaces behind per-workspace grants) and `crates/server/src/edition.rs` (licence tiers); suite `crates/server/tests/licensing.rs`; 4385d2c is an ancestor |
+| AI assistant and insights | `crates/server/src/ai.rs`, mounted through its own router in `app.rs`; 00b1204 is an ancestor |
+| Device certificates and IoT enrollment | `crates/server/src/tpm_attestation.rs`; suites `crates/server/tests/device_authorization.rs`, `device_remaining.rs`, `device_postgres.rs`, `tpm_attestation.rs`, `tpm_boundaries.rs`, `tpm_interoperability.rs`; d39138e is an ancestor |
+| Secret health (breach checks) | `crates/server/src/secret-health.js`, `enzoic-pairs.js`, `secret_health_rotation_tests.rs`; suites `crates/server/tests/secret-health.test.cjs`, `secret-health-rotation.test.cjs`, `secret-health-ui.test.cjs`, `secret-health-lockdown-ui.test.cjs`, `crates/server/tests/secret_health_enzoic_pairs.rs` (Rust, not a Node suite), `tests/secret-health-enzoic.test.cjs`, `tests/secret-health-providers.test.cjs`, `tests/secret-health-enzoic-pairs.test.cjs`, `tests/secret-health-enzoic-vectors.test.cjs`; 449736b is an ancestor |
+| Login jurisdiction and region picker | Deployment-jurisdiction section in `app.rs` (`OPENWARP_REGIONS` parsing and validation); `region()` and `region_choices()` surface through `/api/auth/providers`; 255dfc6 is an ancestor |
+| OpenBao transit-compat namespace | `crates/server/src/transit_compat.rs` (`owtransit:v1` envelopes, `openwarp-transit-v1` AAD contexts), `/api/orgs/{oid}/transit-compat` routes in the default build; b3eea91 is an ancestor |
+
+## Out of this revision (still open)
+
+| Feature | Evidence at 9baf897 |
+| --- | --- |
+| Agent credential broker | No broker routes in `app.rs`. The CLI template agent is present (`crates/cli/src/agent.rs`, the `openwarp agent` subcommand, suites `agent.rs`, `agent_loopback_proxy.rs`, `agent_transport_review.rs`) and may be the landed form of this proposal, but the mapping is unconfirmed |
+| Wallet storage and signing | No source hits outside a string in the vendored `zxcvbn.js`; feature branch unmerged per project history |
 
 Present and confirmed at this revision, despite similar-sounding history: password reuse detection (db7dd27), LDAP directory sign-in (9395c87), SSH certificate authority (9200fdb), SAML and passkeys/WebAuthn (source hits in `app.rs`, `mfa.rs`, `db.rs`), SCIM (source hit in `app.rs`), lockbox (source hits in `app.rs`, `db.rs`, `ui.rs`).
