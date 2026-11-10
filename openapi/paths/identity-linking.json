@@ -1,0 +1,48 @@
+{
+  "/api/auth/link/complete": {
+    "post": {
+      "description": "Completes a proof-based account link: the caller presents the link challenge issued when a provider sign-in matched an existing account, plus that account's password and, when TOTP is configured, an authenticator code. Binds the identity, opens a session and is rate limited per address.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Identity linked and session opened" },
+        "401": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Invalid credentials or expired challenge" }
+      }
+    }
+  },
+  "/api/auth/link/email": {
+    "post": {
+      "description": "Emails the account holder a confirmation link for a pending identity-link challenge, for accounts that prefer email proof over a password prompt. Rate limited per address.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Confirmation email sent" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Challenge invalid or expired" }
+      }
+    }
+  },
+  "/api/auth/link/verify": {
+    "get": {
+      "description": "Confirmation target of the link email: verifies the challenge token, binds the identity and opens a session in the browser. Rate limited per address.",
+      "parameters": [
+        { "in": "query", "name": "token", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "description": "HTML confirmation page or redirect into the console" }
+      }
+    }
+  },
+  "/api/me/identities": {
+    "get": {
+      "description": "Lists the social and workspace SSO identities linked to the caller's account, with provider, subject and link time. Subjects are provider identifiers, not credentials.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Linked identities" }
+      }
+    }
+  },
+  "/api/me/identities/unlink": {
+    "post": {
+      "description": "Removes one linked identity from the caller's account by issuer or provider plus subject, and drops its identity binding. Audited as auth.identity_unlinked.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Identity unlinked" },
+        "404": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Identity not linked to this account" }
+      }
+    }
+  }
+}

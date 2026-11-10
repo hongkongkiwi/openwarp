@@ -5952,6 +5952,80 @@
         ]
       }
     },
+    "/api/auth/link/complete": {
+      "post": {
+        "description": "Completes a proof-based account link: the caller presents the link challenge issued when a provider sign-in matched an existing account, plus that account's password and, when TOTP is configured, an authenticator code. Binds the identity, opens a session and is rate limited per address.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Identity linked and session opened"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid credentials or expired challenge"
+          }
+        }
+      }
+    },
+    "/api/auth/link/email": {
+      "post": {
+        "description": "Emails the account holder a confirmation link for a pending identity-link challenge, for accounts that prefer email proof over a password prompt. Rate limited per address.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Confirmation email sent"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Challenge invalid or expired"
+          }
+        }
+      }
+    },
+    "/api/auth/link/verify": {
+      "get": {
+        "description": "Confirmation target of the link email: verifies the challenge token, binds the identity and opens a session in the browser. Rate limited per address.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "HTML confirmation page or redirect into the console"
+          }
+        }
+      }
+    },
     "/api/auth/login": {
       "post": {
         "requestBody": {
@@ -6387,6 +6461,70 @@
         ]
       }
     },
+    "/api/auth/oidc/providers": {
+      "get": {
+        "description": "Public discovery for workspace sign-in: given an email, returns the workspaces whose SSO email-domain lists explicitly contain that domain, with the workspace name and provider preset. Workspaces without SSO configured or without the domain allowlisted never appear.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "email",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Matching workspace sign-in targets"
+          }
+        }
+      }
+    },
+    "/api/auth/oidc/{oid}/backchannel-logout": {
+      "post": {
+        "description": "OIDC back-channel logout for a workspace: verifies the provider's signed logout_token against the workspace issuer (with multi-tenant issuer support), rejects replay by jti, and ends the sessions of the bound account. Provider-initiated; requires no user agent.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Sessions revoked"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid or replayed logout token"
+          }
+        }
+      }
+    },
     "/api/auth/providers": {
       "get": {
         "responses": {
@@ -6659,6 +6797,53 @@
         "tags": [
           "auth"
         ]
+      }
+    },
+    "/api/auth/social/{provider}/backchannel-logout": {
+      "post": {
+        "description": "Back-channel logout for social sign-in providers that publish the standard logout event. GitHub and X do not support it and return 404; the token must verify against the configured provider issuer and carry an unused jti.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Sessions revoked"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid or replayed logout token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Provider absent, disabled or without logout support"
+          }
+        }
       }
     },
     "/api/auth/step-up/start": {
@@ -10512,6 +10697,78 @@
         ]
       }
     },
+    "/api/envs/{eid}/workers": {
+      "get": {
+        "description": "Lists the private-network workers bound to the environment. Any member with secrets:read can see names, targets and last-seen times; tokens and certificates are never returned.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Worker list"
+          }
+        }
+      },
+      "post": {
+        "description": "Creates a worker bound to this environment and the postgres target and returns a single-use ten-minute enrollment token. Admin-only; audited as worker.create.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Worker created with a one-time enrollment token"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing name or unsupported target"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Admin-only"
+          }
+        }
+      }
+    },
     "/api/envs/{eid}/wrap": {
       "post": {
         "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:read. Uses base shared values without personal overrides; excludes sealed and client-encrypted secrets. TTL is clamped to 60-86400 seconds. Redeem token as Bearer at /api/unwrap.",
@@ -11047,6 +11304,43 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/api/instance/app-env-policy": {
+      "put": {
+        "description": "Instance-owner policy for new apps: managed (server-encrypted default environments) or delegated (client-encrypted, bound to a customer-run sync runner). Existing apps keep their modes. OPENWARP_APP_ENV_POLICY pins the policy and disables this endpoint with 409. Audited as instance.app_env_policy.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Policy stored"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Only the instance owner may change it"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Pinned by OPENWARP_APP_ENV_POLICY"
+          }
+        }
       }
     },
     "/api/instance/auth": {
@@ -12937,6 +13231,50 @@
         "tags": [
           "auth"
         ]
+      }
+    },
+    "/api/me/identities": {
+      "get": {
+        "description": "Lists the social and workspace SSO identities linked to the caller's account, with provider, subject and link time. Subjects are provider identifiers, not credentials.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Linked identities"
+          }
+        }
+      }
+    },
+    "/api/me/identities/unlink": {
+      "post": {
+        "description": "Removes one linked identity from the caller's account by issuer or provider plus subject, and drops its identity binding. Audited as auth.identity_unlinked.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Identity unlinked"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Identity not linked to this account"
+          }
+        }
       }
     },
     "/api/me/mfa": {
@@ -25507,6 +25845,181 @@
         "tags": [
           "webhooks"
         ]
+      }
+    },
+    "/api/worker/certificate": {
+      "post": {
+        "description": "Renews the caller's certificate. Requires a current certificate in the x-openwarp-cert header signed by the instance CA naming the worker.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Renewed certificate"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing, forged or expired certificate"
+          }
+        }
+      }
+    },
+    "/api/worker/enroll": {
+      "post": {
+        "description": "Public enrollment: exchanges a one-time enrollment token and an OpenSSH ed25519 public key for a ten-minute certificate whose only principal is worker:<id>, pinned with force-command none and loopback source-address. Single use; audited enrollment updates last the worker row.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Certificate and instance CA public key"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed key or already enrolled"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown, spent or expired enrollment token"
+          }
+        }
+      }
+    },
+    "/api/worker/jobs/claim": {
+      "post": {
+        "description": "Claims the oldest queued job for the authenticated worker. Payloads are encrypted to the environment key; claims older than sixty seconds return to the queue and the conditional update lets only one caller take a job.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job or null job field when the queue is empty"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Certificate rejected"
+          }
+        }
+      }
+    },
+    "/api/worker/jobs/{jid}": {
+      "post": {
+        "description": "Finishes a claimed job with an encrypted outcome. Only the worker that claimed it; the update repeats the claimed guard.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "jid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job marked done or failed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Job not claimed by this worker"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown job"
+          }
+        }
+      }
+    },
+    "/api/workers/{wid}": {
+      "delete": {
+        "description": "Deletes a worker and its queued jobs and enrollments. Admin in the worker's workspace; audited as worker.delete.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Worker deleted"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown worker"
+          }
+        }
       }
     },
     "/health": {

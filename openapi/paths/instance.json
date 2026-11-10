@@ -223,5 +223,42 @@
         "instance"
       ]
     }
+  },
+  "/api/instance/app-env-policy": {
+    "put": {
+      "description": "Instance-owner policy for new apps: managed (server-encrypted default environments) or delegated (client-encrypted, bound to a customer-run sync runner). Existing apps keep their modes. OPENWARP_APP_ENV_POLICY pins the policy and disables this endpoint with 409. Audited as instance.app_env_policy.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Policy stored"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Only the instance owner may change it"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Pinned by OPENWARP_APP_ENV_POLICY"
+        }
+      }
+    }
   }
 }

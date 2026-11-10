@@ -1,0 +1,38 @@
+{
+  "/api/auth/oidc/providers": {
+    "get": {
+      "description": "Public discovery for workspace sign-in: given an email, returns the workspaces whose SSO email-domain lists explicitly contain that domain, with the workspace name and provider preset. Workspaces without SSO configured or without the domain allowlisted never appear.",
+      "parameters": [
+        { "in": "query", "name": "email", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Matching workspace sign-in targets" }
+      }
+    }
+  },
+  "/api/auth/oidc/{oid}/backchannel-logout": {
+    "post": {
+      "description": "OIDC back-channel logout for a workspace: verifies the provider's signed logout_token against the workspace issuer (with multi-tenant issuer support), rejects replay by jti, and ends the sessions of the bound account. Provider-initiated; requires no user agent.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Sessions revoked" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Invalid or replayed logout token" }
+      }
+    }
+  },
+  "/api/auth/social/{provider}/backchannel-logout": {
+    "post": {
+      "description": "Back-channel logout for social sign-in providers that publish the standard logout event. GitHub and X do not support it and return 404; the token must verify against the configured provider issuer and carry an unused jti.",
+      "parameters": [
+        { "in": "path", "name": "provider", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Sessions revoked" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Invalid or replayed logout token" },
+        "404": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Provider absent, disabled or without logout support" }
+      }
+    }
+  }
+}

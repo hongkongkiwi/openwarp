@@ -6682,14 +6682,6 @@ async fn finish_worker_job(State(st): State<S>, h: HeaderMap, Path(jid): Path<St
     if wrote != 1 { return Err(bad("job was no longer claimed")); }
     Ok(j(json!({"id": jid, "status": status})))
 }
-pub fn worker_routes() -> Router<S> {
-    #[cfg(not(target_arch = "wasm32"))]
-    { Router::new()
-        .route("/api/envs/{eid}/workers", get(list_workers).post(create_worker)).route("/api/workers/{wid}", delete(delete_worker))
-        .route("/api/worker/enroll", post(enroll_worker)).route("/api/worker/certificate", post(renew_worker_cert)).route("/api/worker/jobs/claim", post(claim_worker_job)).route("/api/worker/jobs/{jid}", post(finish_worker_job)) }
-    #[cfg(target_arch = "wasm32")]
-    { Router::new() }
-}
 
 // ---------- custom RBAC roles (T07) ----------
 async fn create_role(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
@@ -7905,6 +7897,15 @@ async fn lifecycle_middleware(State(_st): State<S>, req: axum::extract::Request,
     #[cfg(not(target_arch="wasm32"))] let _guard=_st.lifecycle.read().await;
     next.run(req).await
 }
+pub fn worker_routes() -> Router<S> {
+    #[cfg(not(target_arch = "wasm32"))]
+    { Router::new()
+        .route("/api/envs/{eid}/workers", get(list_workers).post(create_worker)).route("/api/workers/{wid}", delete(delete_worker))
+        .route("/api/worker/enroll", post(enroll_worker)).route("/api/worker/certificate", post(renew_worker_cert)).route("/api/worker/jobs/claim", post(claim_worker_job)).route("/api/worker/jobs/{jid}", post(finish_worker_job)) }
+    #[cfg(target_arch = "wasm32")]
+    { Router::new() }
+}
+
 pub fn router(state: S) -> Router {
     let mcp = Router::new().route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))

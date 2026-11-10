@@ -1,0 +1,77 @@
+{
+  "/api/envs/{eid}/workers": {
+    "get": {
+      "description": "Lists the private-network workers bound to the environment. Any member with secrets:read can see names, targets and last-seen times; tokens and certificates are never returned.",
+      "parameters": [
+        { "in": "path", "name": "eid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "array" } } }, "description": "Worker list" }
+      }
+    },
+    "post": {
+      "description": "Creates a worker bound to this environment and the postgres target and returns a single-use ten-minute enrollment token. Admin-only; audited as worker.create.",
+      "parameters": [
+        { "in": "path", "name": "eid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Worker created with a one-time enrollment token" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Missing name or unsupported target" },
+        "403": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Admin-only" }
+      }
+    }
+  },
+  "/api/workers/{wid}": {
+    "delete": {
+      "description": "Deletes a worker and its queued jobs and enrollments. Admin in the worker's workspace; audited as worker.delete.",
+      "parameters": [
+        { "in": "path", "name": "wid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Worker deleted" },
+        "404": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Unknown worker" }
+      }
+    }
+  },
+  "/api/worker/enroll": {
+    "post": {
+      "description": "Public enrollment: exchanges a one-time enrollment token and an OpenSSH ed25519 public key for a ten-minute certificate whose only principal is worker:<id>, pinned with force-command none and loopback source-address. Single use; audited enrollment updates last the worker row.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Certificate and instance CA public key" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Malformed key or already enrolled" },
+        "401": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Unknown, spent or expired enrollment token" }
+      }
+    }
+  },
+  "/api/worker/certificate": {
+    "post": {
+      "description": "Renews the caller's certificate. Requires a current certificate in the x-openwarp-cert header signed by the instance CA naming the worker.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Renewed certificate" },
+        "401": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Missing, forged or expired certificate" }
+      }
+    }
+  },
+  "/api/worker/jobs/claim": {
+    "post": {
+      "description": "Claims the oldest queued job for the authenticated worker. Payloads are encrypted to the environment key; claims older than sixty seconds return to the queue and the conditional update lets only one caller take a job.",
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Job or null job field when the queue is empty" },
+        "401": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Certificate rejected" }
+      }
+    }
+  },
+  "/api/worker/jobs/{jid}": {
+    "post": {
+      "description": "Finishes a claimed job with an encrypted outcome. Only the worker that claimed it; the update repeats the claimed guard.",
+      "parameters": [
+        { "in": "path", "name": "jid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": { "content": { "application/json": { "schema": { "type": "object" } } }, "description": "Job marked done or failed" },
+        "400": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Job not claimed by this worker" },
+        "404": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }, "description": "Unknown job" }
+      }
+    }
+  }
+}
