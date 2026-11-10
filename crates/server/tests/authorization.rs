@@ -2388,15 +2388,20 @@ async fn racing_a_member_lock_and_ownership_transfer_never_commits_a_locked_owne
 
     // Both preflight reads can observe the unlocked, un-promoted state; the
     // writes carry the owner and lock exclusions, so at most one commits no
-    // matter how the server interleaves them.
+    // matter how the server interleaves them. HTTP scheduling decides which
+    // order completes: if the transfer commits first, the lock legitimately
+    // fails with 403 (its caller is no longer an owner) instead of 409.
     let transfer_path = format!("/api/orgs/{}/transfer", org);
     let transfer_body = json!({"user_id": mu});
     let (lock, transfer) = tokio::join!(
         set_member_lock(&s, ot, org, mu, true),
         s.call(Method::POST, &transfer_path, Some(ot), Some(transfer_body))
     );
-    assert!(lock.status == 409 || transfer.status == 409,
-        "one racing operation must be rejected: lock={} {} transfer={} {}",
+    assert!((lock.status == 200) != (transfer.status == 200),
+        "exactly one racing operation must succeed: lock={} {} transfer={} {}",
+        lock.status, lock.text, transfer.status, transfer.text);
+    assert!(lock.status == 403 || lock.status == 409 || transfer.status == 409,
+        "the rejected operation must explain the ownership change: lock={} {} transfer={} {}",
         lock.status, lock.text, transfer.status, transfer.text);
     let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
     let row = members.body.as_array().expect("member list").iter()

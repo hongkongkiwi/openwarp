@@ -397,7 +397,15 @@
       ],
       "responses": {
         "200": {
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deleted" } } },
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": { "deleted": { "type": "boolean" } },
+                "required": ["deleted"],
+                "type": "object"
+              }
+            }
+          },
           "description": "Draft deleted"
         },
         "400": {
