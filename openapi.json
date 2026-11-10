@@ -16556,7 +16556,7 @@
                 }
               }
             },
-            "description": "Caller lacks broker:use or environment authority"
+            "description": "Caller is not an organisation admin or lacks authority over the service's environment"
           }
         }
       }
