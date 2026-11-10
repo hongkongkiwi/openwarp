@@ -2160,3 +2160,280 @@ async fn go_ungranted(s: &Server, token: &str, org: &str) {
     assert_eq!(cleared.status, 200, "clearing grants failed: {}", cleared.text);
     assert_eq!(cleared.body["features"], json!([]));
 }
+async fn set_member_lock(s: &Server, token: &str, org: &str, uid: &str, lock: bool) -> Resp {
+    let action = if lock { "lock" } else { "unlock" };
+    s.call(Method::POST, &format!("/api/orgs/{}/members/{}/{}", org, uid, action), Some(token), None).await
+}
+
+fn assert_workspace_locked(r: &Resp, path: &str) {
+    assert_eq!(r.status, 403, "{} must reject a locked membership, got {} {}", path, r.status, r.text);
+    assert_eq!(r.body["code"], json!("workspace_locked"), "{} must identify the lock: {}", path, r.text);
+    let error = r.body["error"].as_str().unwrap_or("").to_lowercase();
+    assert!(error.contains("workspace owner"), "{} must point the member at the workspace owner: {}", path, r.text);
+}
+
+#[tokio::test]
+async fn workspace_lock_blocks_member_data_but_not_login_or_other_workspaces() {
+    let s = Server::start().await;
+    let owner = register(&s, "lock-owner@test.invalid").await;
+    let member = register(&s, "lock-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let mt = member["token"].as_str().unwrap().to_string();
+    let mu = member["user_id"].as_str().unwrap().to_string();
+    let morg = member["org_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "lock-member@test.invalid", "developer").await;
+    let (app, envs) = app_with_envs(&s, &ot, &org).await;
+    set_secret(&s, &ot, &envs[0], "LOCKED_SECRET", "value").await;
+
+    let r = set_member_lock(&s, &ot, &org, &mu, true).await;
+    assert_eq!(r.status, 200, "locking a member failed: {} {}", r.status, r.text);
+    assert_eq!(r.body["locked"], json!(true), "{}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "the owner must still see the member list: {}", r.text);
+    let member_row = r.body.as_array().expect("member list").iter().find(|m| m["id"] == json!(&mu)).expect("locked member row");
+    assert_eq!(member_row["locked"], json!(true), "the members list must expose the lock: {}", r.text);
+
+    // Sign-in and workspace discovery keep working; only this membership is shut.
+    let r = s.call(Method::GET, "/api/me", Some(&mt), None).await;
+    assert_eq!(r.status, 200, "a locked member must still be able to call /api/me: {}", r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(&mt), None).await;
+    assert_eq!(r.status, 200, "a locked member must still see their workspace list: {}", r.text);
+    let listed = r.body.as_array().expect("org list");
+    let locked = listed.iter().find(|o| o["id"] == json!(&org)).expect("the locked workspace must stay listed");
+    assert_eq!(locked["locked"], json!(true), "{}", r.text);
+    let own = listed.iter().find(|o| o["id"] == json!(&morg)).expect("the member's own workspace");
+    assert_eq!(own["locked"], json!(false), "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", morg), Some(&mt), None).await;
+    assert_eq!(r.status, 200, "the same account must keep using its other workspace: {}", r.text);
+
+    for path in [
+        format!("/api/orgs/{}/apps", org),
+        format!("/api/apps/{}/envs", app),
+        format!("/api/envs/{}/secrets", envs[0]),
+        format!("/api/orgs/{}/audit", org),
+        format!("/api/orgs/{}/members", org),
+        format!("/api/orgs/{}/settings", org),
+    ] {
+        let r = s.call(Method::GET, &path, Some(&mt), None).await;
+        assert_workspace_locked(&r, &path);
+    }
+
+    let r = s.call(Method::GET, "/api/users/lookup?email=lock-owner@test.invalid", Some(&mt), None).await;
+    assert_eq!(r.status, 403, "a locked membership must not unlock the shared-member lookup: {}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "the owner must keep access: {}", r.text);
+
+    let r = set_member_lock(&s, &ot, &org, &mu, false).await;
+    assert_eq!(r.status, 200, "unlocking a member failed: {} {}", r.status, r.text);
+    assert_eq!(r.body["locked"], json!(false), "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(&ot), None).await;
+    let member_row = r.body.as_array().expect("member list").iter().find(|m| m["id"] == json!(&mu)).expect("unlocked member row");
+    assert_eq!(member_row["locked"], json!(false), "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", org), Some(&mt), None).await;
+    assert_eq!(r.status, 200, "unlock must restore workspace access: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&mt), None).await;
+    assert_eq!(r.status, 200, "unlock must restore secret access: {}", r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(&mt), None).await;
+    let unlocked = r.body.as_array().expect("org list").iter().find(|o| o["id"] == json!(&org)).expect("workspace");
+    assert_eq!(unlocked["locked"], json!(false), "{}", r.text);
+}
+
+#[tokio::test]
+async fn workspace_lock_blocks_the_locked_members_service_token() {
+    let s = Server::start().await;
+    let owner = register(&s, "lock-token-owner@test.invalid").await;
+    let member = register(&s, "lock-token-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let mt = member["token"].as_str().unwrap().to_string();
+    let mu = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "lock-token-member@test.invalid", "developer").await;
+    let (app, envs) = app_with_envs(&s, &ot, &org).await;
+    set_secret(&s, &ot, &envs[0], "TOKEN_SECRET", "value").await;
+
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&mt), Some(json!({"name": "lock-test", "env_id": envs[0]}))).await;
+    assert_eq!(r.status, 200, "creating the member's token failed: {} {}", r.status, r.text);
+    let pat = r.body["token"].as_str().unwrap().to_string();
+    // An app-wide token can reach workspace routes; an env-scoped one is
+    // stopped by the token scope middleware before require_org runs.
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&mt), Some(json!({"name": "lock-test-app"}))).await;
+    assert_eq!(r.status, 200, "creating the app-wide token failed: {} {}", r.status, r.text);
+    let wat = r.body["token"].as_str().unwrap().to_string();
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&pat), None).await;
+    assert_eq!(r.status, 200, "the token must work before the lock: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", org), Some(&wat), None).await;
+    assert_eq!(r.status, 200, "the app-wide token must work before the lock: {}", r.text);
+
+    let r = set_member_lock(&s, &ot, &org, &mu, true).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&pat), None).await;
+    assert_workspace_locked(&r, "a service token of a locked member");
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/apps", org), Some(&wat), None).await;
+    assert_workspace_locked(&r, "an app-wide token against the workspace");
+    let r = s.call(Method::GET, "/api/orgs", Some(&wat), None).await;
+    assert_eq!(r.status, 200, "the token must still resolve to its owner, so the lock is the failure: {}", r.text);
+    let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "the owner's access must survive the member's lock: {}", r.text);
+}
+
+#[tokio::test]
+async fn workspace_lock_is_owner_only_and_cannot_target_owners() {
+    let s = Server::start().await;
+    let owner = register(&s, "lock-rule-owner@test.invalid").await;
+    let admin = register(&s, "lock-rule-admin@test.invalid").await;
+    let developer = register(&s, "lock-rule-developer@test.invalid").await;
+    let coowner = register(&s, "lock-rule-coowner@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let ou = owner["user_id"].as_str().unwrap().to_string();
+    let at = admin["token"].as_str().unwrap().to_string();
+    let du = developer["user_id"].as_str().unwrap().to_string();
+    let cu = coowner["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "lock-rule-admin@test.invalid", "admin").await;
+    invite(&s, &ot, &org, "lock-rule-developer@test.invalid", "developer").await;
+    invite(&s, &ot, &org, "lock-rule-coowner@test.invalid", "owner").await;
+
+    let r = set_member_lock(&s, &at, &org, &du, true).await;
+    assert_eq!(r.status, 403, "a non-owner admin must not lock members: {} {}", r.status, r.text);
+    let r = set_member_lock(&s, &ot, &org, &cu, true).await;
+    assert_eq!(r.status, 409, "an owner must not lock another owner: {} {}", r.status, r.text);
+    let r = set_member_lock(&s, &ot, &org, &ou, true).await;
+    assert_eq!(r.status, 409, "an owner must not lock themselves: {} {}", r.status, r.text);
+    let r = set_member_lock(&s, &ot, &org, "not-a-member", true).await;
+    assert_eq!(r.status, 404, "locking an unknown member must be a not-found: {} {}", r.status, r.text);
+
+    let r = set_member_lock(&s, &ot, &org, &du, true).await;
+    assert_eq!(r.status, 200, "the owner must be able to lock a developer: {} {}", r.status, r.text);
+    let r = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, du), Some(&ot), Some(json!({"role": "owner"}))).await;
+    assert_eq!(r.status, 409, "a locked member must not become an unreachable owner: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/transfer", org), Some(&ot), Some(json!({"user_id": du}))).await;
+    assert_eq!(r.status, 409, "ownership must not transfer to a locked member: {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/audit", org), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let rows = r.body.as_array().expect("audit list");
+    assert!(rows.iter().any(|a| a["action"] == json!("member.lock") && a["detail"].as_str().unwrap_or("").contains(&du)),
+        "the lock must be audited against the target: {}", r.text);
+
+    let r = set_member_lock(&s, &ot, &org, &du, false).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/audit", org), Some(&ot), None).await;
+    let rows = r.body.as_array().expect("audit list");
+    assert!(rows.iter().any(|a| a["action"] == json!("member.unlock") && a["detail"].as_str().unwrap_or("").contains(&du)),
+        "the unlock must be audited against the target: {}", r.text);
+}
+
+#[tokio::test]
+async fn workspace_lock_lets_the_member_leave_the_locked_workspace() {
+    let s = Server::start().await;
+    let owner = register(&s, "lock-leave-owner@test.invalid").await;
+    let member = register(&s, "lock-leave-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let mt = member["token"].as_str().unwrap().to_string();
+    let mu = member["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "lock-leave-member@test.invalid", "developer").await;
+    let r = set_member_lock(&s, &ot, &org, &mu, true).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/leave", org), Some(&mt), None).await;
+    assert_eq!(r.status, 200, "a locked member must be able to leave instead of being trapped: {} {}", r.status, r.text);
+    let r = s.call(Method::GET, "/api/orgs", Some(&mt), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(!r.body.as_array().expect("org list").iter().any(|o| o["id"] == json!(&org)),
+        "a member who left must not remain listed: {}", r.text);
+    let r = set_member_lock(&s, &ot, &org, &mu, false).await;
+    assert_eq!(r.status, 404, "a departed member is no longer lockable: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn workspace_lock_blocks_admin_token_revocation() {
+    let s = Server::start().await;
+    let owner = register(&s, "lock-revoke-owner@test.invalid").await;
+    let admin = register(&s, "lock-revoke-admin@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap().to_string();
+    let org = owner["org_id"].as_str().unwrap().to_string();
+    let at = admin["token"].as_str().unwrap().to_string();
+    let au = admin["user_id"].as_str().unwrap().to_string();
+    invite(&s, &ot, &org, "lock-revoke-admin@test.invalid", "admin").await;
+    let (app, _) = app_with_envs(&s, &ot, &org).await;
+    let r = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), Some(&ot), Some(json!({"name": "owner-token"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let tid = r.body["id"].as_str().unwrap().to_string();
+
+    let r = set_member_lock(&s, &ot, &org, &au, true).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/tokens/{}", tid), Some(&at), None).await;
+    assert_workspace_locked(&r, "a locked admin revoking another member's token");
+    let r = s.call(Method::GET, &format!("/api/apps/{}/tokens", app), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.body.as_array().expect("token list").iter().any(|t| t["id"] == json!(&tid)),
+        "a locked admin must not have revoked the token: {}", r.text);
+    let r = s.call(Method::DELETE, &format!("/api/tokens/{}", tid), Some(&ot), None).await;
+    assert_eq!(r.status, 200, "the owner still revokes tokens: {}", r.text);
+}
+
+#[tokio::test]
+async fn racing_a_member_lock_and_ownership_transfer_never_commits_a_locked_owner() {
+    let s = Server::start().await;
+    let owner = register(&s, "race-owner@test.invalid").await;
+    let member = register(&s, "race-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mu = member["user_id"].as_str().unwrap();
+    invite(&s, ot, org, "race-member@test.invalid", "developer").await;
+
+    // Both preflight reads can observe the unlocked, un-promoted state; the
+    // writes carry the owner and lock exclusions, so at most one commits no
+    // matter how the server interleaves them. HTTP scheduling decides which
+    // order completes: if the transfer commits first, the lock legitimately
+    // fails with 403 (its caller is no longer an owner) instead of 409.
+    let transfer_path = format!("/api/orgs/{}/transfer", org);
+    let transfer_body = json!({"user_id": mu});
+    let (lock, transfer) = tokio::join!(
+        set_member_lock(&s, ot, org, mu, true),
+        s.call(Method::POST, &transfer_path, Some(ot), Some(transfer_body))
+    );
+    assert!((lock.status == 200) != (transfer.status == 200),
+        "exactly one racing operation must succeed: lock={} {} transfer={} {}",
+        lock.status, lock.text, transfer.status, transfer.text);
+    assert!(lock.status == 403 || lock.status == 409 || transfer.status == 409,
+        "the rejected operation must explain the ownership change: lock={} {} transfer={} {}",
+        lock.status, lock.text, transfer.status, transfer.text);
+    let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
+    let row = members.body.as_array().expect("member list").iter()
+        .find(|m| m["id"] == json!(&mu)).expect("raced member row").clone();
+    assert!(!(row["role"] == json!("owner") && row["locked"] == json!(true)),
+        "a locked owner must never be committed: {}", members.text);
+    let unlocked_owners = members.body.as_array().unwrap().iter()
+        .filter(|m| m["role"] == json!("owner") && m["locked"] == json!(false)).count();
+    assert!(unlocked_owners >= 1, "the workspace must keep an unlocked owner: {}", members.text);
+}
+
+#[tokio::test]
+async fn a_path_restricted_locked_member_can_still_leave_the_workspace() {
+    let s = Server::start().await;
+    let owner = register(&s, "path-leave-owner@test.invalid").await;
+    let member = register(&s, "path-leave-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let mu = member["user_id"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "path-leave-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/path-policy/developer", envs[0]), Some(ot), Some(json!({"rules": [{"prefix": "/", "capabilities": ["read"]}]}))).await;
+    assert_eq!(r.status, 200, "path policy setup failed: {}", r.text);
+
+    let r = set_member_lock(&s, ot, org, mu, true).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    // The path policy makes the member path-restricted; the escape hatch stays
+    // open anyway.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/leave", org), Some(mt), None).await;
+    assert_eq!(r.status, 200, "a locked, path-restricted member must be able to leave: {} {}", r.status, r.text);
+    let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
+    assert!(!members.text.contains(&mu.to_string()), "the departed member must be gone: {}", members.text);
+}

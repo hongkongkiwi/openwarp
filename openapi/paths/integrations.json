@@ -1,6 +1,7 @@
 {
   "/api/envs/{eid}/integrations": {
     "get": {
+      "description": "Requires environment access and secrets:read. Lists metadata without provider configuration or credentials.",
       "parameters": [
         {
           "in": "path",
@@ -56,14 +57,14 @@
           "description": "Not permitted"
         },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
         }
       },
       "security": [
@@ -74,10 +75,10 @@
       "summary": "Integrations for an environment",
       "tags": [
         "integrations"
-      ],
-      "description": "Requires environment access and secrets:read. Lists metadata without provider configuration or credentials."
+      ]
     },
     "post": {
+      "description": "Requires environment access and integrations:write. Supported provider kind is required; config defaults to an empty object. Delegated configurations are sealed to the customer runner.",
       "parameters": [
         {
           "in": "path",
@@ -92,23 +93,23 @@
         "content": {
           "application/json": {
             "schema": {
-              "type": "object",
-              "required": [
-                "kind"
-              ],
               "properties": {
+                "config": {
+                  "default": {},
+                  "description": "Provider configuration, sealed to the runner for delegated environments."
+                },
                 "kind": {
                   "type": "string"
                 },
                 "name": {
-                  "type": "string",
-                  "description": "Defaults to kind."
-                },
-                "config": {
-                  "default": {},
-                  "description": "Provider configuration, sealed to the runner for delegated environments."
+                  "description": "Defaults to kind.",
+                  "type": "string"
                 }
-              }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
             }
           }
         },
@@ -156,14 +157,14 @@
           "description": "Not permitted"
         },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
         }
       },
       "security": [
@@ -174,12 +175,12 @@
       "summary": "Create an integration",
       "tags": [
         "integrations"
-      ],
-      "description": "Requires environment access and integrations:write. Supported provider kind is required; config defaults to an empty object. Delegated configurations are sealed to the customer runner."
+      ]
     }
   },
   "/api/integrations/{iid}": {
     "delete": {
+      "description": "Requires environment access and integrations:write. Removes local configuration, sync state and queued jobs; does not delete remote provider secrets.",
       "parameters": [
         {
           "in": "path",
@@ -232,14 +233,14 @@
           "description": "Not permitted"
         },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
         }
       },
       "security": [
@@ -250,10 +251,10 @@
       "summary": "Delete an integration",
       "tags": [
         "integrations"
-      ],
-      "description": "Requires environment access and integrations:write. Removes local configuration, sync state and queued jobs; does not delete remote provider secrets."
+      ]
     },
     "patch": {
+      "description": "Requires environment access and integrations:write. Only supplied kind, name and config fields change. Delegated configurations are sealed to the customer runner.",
       "parameters": [
         {
           "in": "path",
@@ -316,14 +317,14 @@
           "description": "Not permitted"
         },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
         }
       },
       "security": [
@@ -334,12 +335,61 @@
       "summary": "Update an integration",
       "tags": [
         "integrations"
+      ]
+    }
+  },
+  "/api/integrations/{iid}/history": {
+    "get": {
+      "description": "Latest 50 sync and sync-failure audit rows for the integration, newest first. Requires secrets:read on the integration's environment.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "description": "Requires environment access and integrations:write. Only supplied kind, name and config fields change. Delegated configurations are sealed to the customer runner."
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/IntegrationHistoryEntry"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Sync history rows"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Integration not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List integration sync history",
+      "tags": [
+        "integrations"
+      ]
     }
   },
   "/api/integrations/{iid}/sync": {
     "post": {
+      "description": "Requires environment access and integrations:write. Pushes non-sealed environment values; delegated mode queues work for the customer runner. Provider failures return an error, not a successful sync report.",
       "parameters": [
         {
           "in": "path",
@@ -392,14 +442,14 @@
           "description": "Not permitted"
         },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
         }
       },
       "security": [
@@ -410,12 +460,12 @@
       "summary": "Push the environment to the integration",
       "tags": [
         "integrations"
-      ],
-      "description": "Requires environment access and integrations:write. Pushes non-sealed environment values; delegated mode queues work for the customer runner. Provider failures return an error, not a successful sync report."
+      ]
     }
   },
   "/api/integrations/{iid}/test": {
     "post": {
+      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Native provider tests run only for supported kinds; other kinds return 501.",
       "parameters": [
         {
           "in": "path",
@@ -467,25 +517,25 @@
           },
           "description": "Not permitted"
         },
-        "501": {
-          "description": "Connection test not implemented for this provider kind",
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Error"
-              }
-            }
-          }
-        },
         "404": {
-          "description": "Environment or application not found",
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/Error"
               }
             }
-          }
+          },
+          "description": "Environment or application not found"
+        },
+        "501": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Connection test not implemented for this provider kind"
         }
       },
       "security": [
@@ -496,8 +546,7 @@
       "summary": "Test the integration credentials",
       "tags": [
         "integrations"
-      ],
-      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Native provider tests run only for supported kinds; other kinds return 501."
+      ]
     }
   }
 }

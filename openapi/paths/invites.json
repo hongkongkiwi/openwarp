@@ -1,0 +1,220 @@
+{
+  "/api/auth/invite": {
+    "get": {
+      "description": "Public metadata for an invitation token: workspace name and id, invited email, role, expiry and whether the address already has an account. Used by the redemption screen before sign-in.",
+      "parameters": [
+        {
+          "in": "query",
+          "name": "token",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteMetadata"
+              }
+            }
+          },
+          "description": "Invitation metadata"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Token required or invitation invalid"
+        }
+      },
+      "summary": "Read invitation metadata for redemption",
+      "tags": [
+        "invites"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/invites": {
+    "get": {
+      "description": "Lists outstanding (unaccepted, unexpired) invitations. Organisation admin required.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/InviteRow"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Outstanding invitations"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not an organisation admin"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List outstanding invitations",
+      "tags": [
+        "invites"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/invites/{iid}": {
+    "delete": {
+      "description": "Revokes an outstanding invitation. Organisation admin required; audited.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Invitation revoked"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not an organisation admin"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invitation not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Revoke an invitation (org admin)",
+      "tags": [
+        "invites"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/invites/{iid}/resend": {
+    "post": {
+      "description": "Reissues the invitation with a fresh token and a 7-day expiry, keeping email and role. Organisation admin required; audited.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteShare"
+              }
+            }
+          },
+          "description": "New share token"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not an organisation admin"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invitation not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Resend an invitation (org admin)",
+      "tags": [
+        "invites"
+      ]
+    }
+  }
+}

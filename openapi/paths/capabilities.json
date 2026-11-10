@@ -1,0 +1,38 @@
+{
+  "/api/capabilities": {
+    "get": {
+      "description": "Returns the route catalog for this build (method and path per registered machine route, including feature-gated surfaces present in the binary) plus the webhook dispatch capability. Requires any authenticated credential.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Capabilities"
+              }
+            }
+          },
+          "description": "Route catalog"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Discover the API routes served by this build",
+      "tags": [
+        "capabilities"
+      ]
+    }
+  }
+}

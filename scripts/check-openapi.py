@@ -29,6 +29,10 @@ EXCLUDED = {
     "/libsodium.js",
     "/libsodium-wrappers.js",
     "/metrics",
+    "/zxcvbn.js",
+    "/hash-wasm.js",
+    "/secret-health.js",
+    "/enzoic-pairs.js",
     "/lockbox/{lid}",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-authorization-server",
@@ -69,10 +73,44 @@ def norm(path: str) -> str:
     return re.sub(r"\{[^}]+\}", "{}", path)
 
 
+def strip_test_code(src: str) -> str:
+    # Drop test-gated modules (#[cfg(test)], #[cfg(all(test,...))], ...) so
+    # test-only routers (fixture providers and the like) are not counted as
+    # served routes.
+    out: list[str] = []
+    i = 0
+    marker = re.compile(r"#\[cfg\([^\]]*\btest[^\]]*\)\]\s*\nmod\b")
+    while True:
+        j = marker.search(src, i)
+        if j is None:
+            out.append(src[i:])
+            return "".join(out)
+        out.append(src[i : j.start()])
+        k = src.find("{", j.start())
+        if k < 0:
+            return "".join(out)
+        depth = 0
+        m = k
+        while m < len(src):
+            if src[m] == "{":
+                depth += 1
+            elif src[m] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            m += 1
+        i = m + 1
+
+
 def server_routes() -> dict[str, set[str]]:
-    # Webhook routes live in their own module, mounted through
-    # `.merge(webhooks::routes())`; scan it alongside app.rs.
-    src = MAIN.read_text() + "\n" + (ROOT / "crates/server/src/webhooks.rs").read_text()
+    # Routes mounted from their own modules are scanned alongside app.rs so the
+    # strict gate sees everything the server serves, not only what app.rs
+    # registers inline.
+    server = ROOT / "crates/server/src"
+    src = "\n".join(
+        strip_test_code((server / name).read_text())
+        for name in ("app.rs", "webhooks.rs", "ai.rs")
+    )
     routes: dict[str, set[str]] = {}
     pattern = re.compile(
         r'\.route\("([^"]+)"\s*,\s*(.+?)(?=\.route\(|\.layer\(|\.with_state\(|\Z)', re.S
@@ -111,10 +149,14 @@ def main() -> int:
     routes = server_routes()
     errors: list[str] = []
     documented: set[str] = set()
+    documented_methods: dict[str, set[str]] = {}
 
     for path, item in spec.get("paths", {}).items():
         key = norm(path)
         documented.add(key)
+        documented_methods.setdefault(key, set()).update(
+            m.upper() for m in item if not m.startswith("x-") and m != "parameters"
+        )
         if key not in routes:
             errors.append(f"spec documents {path} but the server serves no such route")
             continue
@@ -142,6 +184,14 @@ def main() -> int:
     allowed = {norm(p) for p in EXCLUDED}
     uncovered = [p for p in undocumented if p not in allowed]
     unexpected_exclusions = sorted(allowed - set(routes))
+    # Method-level coverage: a documented path whose served methods are not all
+    # documented is a coverage hole exactly like an undocumented route.
+    missing_methods = sorted(
+        (path, method)
+        for path, served in routes.items()
+        if path in documented
+        for method in sorted(served - documented_methods.get(path, set()))
+    )
 
     operations = sum(
         1
@@ -159,6 +209,12 @@ def main() -> int:
     )
     if uncovered:
         print("  uncovered: " + ", ".join(uncovered[:20]) + (" ..." if len(uncovered) > 20 else ""))
+    if missing_methods:
+        print(
+            "  undocumented operations: "
+            + ", ".join(f"{method} {path}" for path, method in missing_methods[:20])
+            + (" ..." if len(missing_methods) > 20 else "")
+        )
     if unexpected_exclusions:
         print(
             "  excluded but not served (remove from EXCLUDED): "
@@ -166,6 +222,8 @@ def main() -> int:
         )
     if strict and uncovered:
         errors.append(f"{len(uncovered)} machine-relevant routes are undocumented")
+    if strict and missing_methods:
+        errors.append(f"{len(missing_methods)} served operations are undocumented")
     if strict and unexpected_exclusions:
         errors.append("EXCLUDED names a route the server does not serve")
     if errors:

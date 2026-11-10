@@ -1,0 +1,227 @@
+{
+  "/api/instance/edition": {
+    "get": {
+      "description": "Returns the active edition and licensing status. Commercial details (customer, expiry) are visible to the instance owner only.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditionStatus"
+              }
+            }
+          },
+          "description": "Edition status"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Read the active edition and licensing status",
+      "tags": [
+        "instance"
+      ]
+    }
+  },
+  "/api/instance/features": {
+    "get": {
+      "description": "Instance-owner only: every workspace with its granted enterprise features.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeatureGrantList"
+              }
+            }
+          },
+          "description": "Feature grants per workspace"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Only the instance owner can inspect feature grants"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List workspace feature grants (instance owner)",
+      "tags": [
+        "instance"
+      ]
+    },
+    "put": {
+      "description": "Instance-owner only, replacement semantics: the request carries the full feature set for one workspace. Unknown names are rejected; names whose cargo features are not compiled into this build are rejected with 400.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "features": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "org": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "org",
+                "features"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeatureGrant"
+              }
+            }
+          },
+          "description": "Saved grants"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Unknown or uncompiled feature name"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Only the instance owner can change feature grants"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Workspace not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Set workspace feature grants (instance owner)",
+      "tags": [
+        "instance"
+      ]
+    }
+  },
+  "/api/instance/workspaces": {
+    "put": {
+      "description": "Instance-owner only. Opens or closes workspace creation. Conflicts when OPENWARP_WORKSPACE_CREATION pins the setting in the environment. Closing is refused while it would strand the only workspace.",
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "open": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "open"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCreationSetting"
+              }
+            }
+          },
+          "description": "Saved setting"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Only the instance owner can change workspace creation"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "OPENWARP_WORKSPACE_CREATION controls this setting"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Open or close workspace creation (instance owner)",
+      "tags": [
+        "instance"
+      ]
+    }
+  }
+}

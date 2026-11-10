@@ -10,6 +10,8 @@ The comparison column records the upstream tier labels used when this matrix was
 | Workspace creation policy | n/a | instance-owner `PUT /api/instance/workspaces`, separate from signup; `OPENWARP_WORKSPACE_CREATION` override; no personal workspace when disabled, zero-workspace console recovery and last-workspace deletion protection |
 | Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
 | OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
+| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Workspace member lock | n/a | owner-only per-membership lock; sign-in and other workspaces continue, workspace data returns 403 `workspace_locked`, audited |
 | Apps + readme | Free | yes |
 | Environments | 3 / 10 / unlimited | **unlimited custom envs**, name `^[a-zA-Z0-9-_]{1,32}$` |
 | Secrets: secret/sealed/config types | Free | yes; sealed never read back |

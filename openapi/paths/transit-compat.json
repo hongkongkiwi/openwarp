@@ -1,0 +1,419 @@
+{
+  "/api/orgs/{oid}/transit-compat/keys": {
+    "get": {
+      "description": "Lists compatibility transit keys for the workspace. Requires transit:manage.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Keys"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not permitted"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List compatibility transit keys",
+      "tags": [
+        "transit-compat"
+      ]
+    },
+    "post": {
+      "description": "Creates a compatibility transit key. Requires transit:manage.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Created key"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not permitted"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Create a compatibility transit key",
+      "tags": [
+        "transit-compat"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/transit-compat/keys/{kid}/decrypt": {
+    "post": {
+      "description": "Decrypts a ciphertext envelope, rejecting a wrong context. Requires the transit:decrypt scope on the same credential.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "kid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Result"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid ciphertext or request"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Requires transit:decrypt"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Decrypt a compatibility transit payload",
+      "tags": [
+        "transit-compat"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/transit-compat/keys/{kid}/encrypt": {
+    "post": {
+      "description": "Encrypts a payload under the key's current version. Requires the transit:encrypt scope on the same credential.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "kid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Result"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid ciphertext or request"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Requires transit:encrypt"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Encrypt a compatibility transit payload",
+      "tags": [
+        "transit-compat"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/transit-compat/keys/{kid}/rewrap": {
+    "post": {
+      "description": "Reencrypts the payload under the key's latest version. Requires the transit:decrypt scope on the same credential.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "kid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Result"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid ciphertext or request"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Requires transit:decrypt"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Rewrap a compatibility transit payload",
+      "tags": [
+        "transit-compat"
+      ]
+    }
+  },
+  "/api/orgs/{oid}/transit-compat/keys/{kid}/rotate": {
+    "post": {
+      "description": "Creates a new key version and rewraps existing ciphertext on request. Requires the transit:manage scope on the same credential.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "kid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Result"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid ciphertext or request"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Requires transit:manage"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Rotate a compatibility transit payload",
+      "tags": [
+        "transit-compat"
+      ]
+    }
+  }
+}

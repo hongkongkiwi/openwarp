@@ -1,0 +1,558 @@
+{
+  "/api/orgs/{oid}/ai/settings": {
+    "get": {
+      "description": "Returns the workspace AI policy plus has_api_key, the operator endpoint allowlist, admin capability, inference availability and the budget accounting note. Requires an account session (machine tokens are rejected).",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": { "application/json": { "schema": { "type": "object" } } },
+          "description": "Workspace AI settings"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not a workspace member"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Read the workspace AI settings",
+      "tags": ["ai"]
+    },
+    "put": {
+      "description": "Merges the submitted policy onto the stored settings (unknown or invalid fields are rejected) and stores an optional provider key encrypted. endpoint must be on the OPENWARP_AI_ENDPOINTS allowlist; ceilings are 1000 requests, 10000000 reservation units and 4096 output tokens. clear_api_key=true or an endpoint change clears the stored key. Requires org:admin and an account session.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "allow_actions": { "type": "boolean" },
+                "allow_local_search": { "type": "boolean" },
+                "api_key": { "description": "Write-only provider key; stored encrypted, never returned.", "maxLength": 4096, "type": "string" },
+                "clear_api_key": { "type": "boolean" },
+                "enabled": { "type": "boolean" },
+                "endpoint": { "type": "string" },
+                "max_output_tokens": { "maximum": 4096, "minimum": 64, "type": "integer" },
+                "model": { "maxLength": 128, "type": "string" },
+                "request_limit": { "maximum": 1000, "minimum": 1, "type": "integer" },
+                "token_limit": { "maximum": 10000000, "minimum": 1024, "type": "integer" }
+              },
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": { "application/json": { "schema": { "type": "object" } } },
+          "description": "Updated workspace AI settings"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Invalid settings"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not an org admin or AI disabled"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Update the workspace AI settings",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/context": {
+    "get": {
+      "description": "Bounded AI working context: accessible server-encrypted environments, integration metadata with last observed sync status, integration kinds, truncation flags and the context limits. Requires an account session and secrets:read.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "envs": { "items": { "$ref": "#/components/schemas/Env" }, "type": "array" },
+                  "integration_kinds": { "items": { "type": "string" }, "type": "array" },
+                  "integrations": { "items": { "type": "object" }, "type": "array" },
+                  "limits": {
+                    "properties": {
+                      "context_bytes": { "type": "integer" },
+                      "environments": { "type": "integer" },
+                      "inference_available": { "type": "boolean" },
+                      "secrets": { "type": "integer" }
+                    },
+                    "type": "object"
+                  },
+                  "truncated": { "type": "boolean" }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Bounded context"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "AI disabled or not permitted"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Read the bounded AI context",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/search": {
+    "get": {
+      "description": "Substring search over decrypted secret metadata (key, path, tags) in accessible server-encrypted environments; values are never returned. Requires an account session and secrets:read.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } },
+        { "description": "Maximum 256 bytes.", "in": "query", "name": "q", "schema": { "maxLength": 256, "type": "string" } },
+        { "in": "query", "name": "env_id", "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "results": { "items": { "type": "object" }, "type": "array" },
+                  "truncated": { "type": "boolean" }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Matching metadata"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Query too long"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "AI disabled or not permitted"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Search secret metadata for AI context",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/local-search": {
+    "post": {
+      "description": "Matches a query against decrypted secret values in one server-encrypted environment, locally on the server; sealed secrets are skipped. Requires the workspace policy allow_local_search. Requires an account session.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "env_id": { "type": "string" },
+                "query": { "maxLength": 256, "minLength": 1, "type": "string" }
+              },
+              "required": ["env_id", "query"],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "local_only": { "type": "boolean" },
+                  "results": { "items": { "type": "object" }, "type": "array" },
+                  "truncated": { "type": "boolean" }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Matching secrets metadata"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Invalid query"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Local value matching disabled"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Match secret values locally",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/chat": {
+    "post": {
+      "description": "Forwards a bounded metadata context and the message to the configured inference endpoint; request UTF-8 bytes plus maximum output tokens are reserved against the workspace budget. Requires an account session and an enabled policy; inference runs on the native server only.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "compare_env_id": { "type": "string" },
+                "env_id": { "type": "string" },
+                "finding_id": { "type": "string" },
+                "import_text": { "type": "string" },
+                "message": { "type": "string" },
+                "task": { "default": "search", "type": "string" }
+              },
+              "required": ["message"],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": { "application/json": { "schema": { "type": "object" } } },
+          "description": "Assistant reply"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Invalid request"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "AI disabled for this workspace"
+        },
+        "501": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Inference unavailable on this build"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Ask the workspace AI assistant",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/plans": {
+    "post": {
+      "description": "Validates a list of proposed operations against workspace permissions and policy without executing them. Requires an account session and the allow_actions policy.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "operations": { "items": { "type": "object" }, "type": "array" }
+              },
+              "required": ["operations"],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": { "application/json": { "schema": { "type": "object" } } },
+          "description": "Validated plan"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Invalid operation"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Action planning disabled"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Validate an AI action plan",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/plans/{pid}/execute": {
+    "post": {
+      "description": "Executes a previously validated plan after an explicit confirm=true; re-checks every operation against current permissions. Requires an account session and the allow_actions policy.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } },
+        { "in": "path", "name": "pid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "confirm": { "type": "boolean" }
+              },
+              "required": ["confirm"],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": { "application/json": { "schema": { "type": "object" } } },
+          "description": "Execution result"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing confirmation or invalid plan"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "AI actions disabled"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Execute a validated AI plan",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/drafts": {
+    "get": {
+      "description": "Lists AI-proposed integration drafts in environments the caller can reach. Requires an account session and integrations:write.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "drafts": {
+                    "items": {
+                      "properties": {
+                        "created_at": { "type": "integer" },
+                        "env_id": { "type": "string" },
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "provider_kind": { "type": "string" }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Integration drafts"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not permitted"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "List AI integration drafts",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/drafts/{did}": {
+    "delete": {
+      "description": "Deletes an AI-proposed integration draft. Requires an account session.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } },
+        { "in": "path", "name": "did", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": { "deleted": { "type": "boolean" } },
+                "required": ["deleted"],
+                "type": "object"
+              }
+            }
+          },
+          "description": "Draft deleted"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Draft not found"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Delete an AI integration draft",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/findings": {
+    "get": {
+      "description": "Generates security findings from recorded workspace activity under the configured detector thresholds. Requires org:admin and an account session.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "findings": { "items": { "type": "object" }, "type": "array" }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Current findings"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not an org admin"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "List AI security findings",
+      "tags": ["ai"]
+    }
+  },
+  "/api/orgs/{oid}/ai/findings/{fid}": {
+    "put": {
+      "description": "Sets a finding's status to open, acknowledged or exception. Exceptions need a future expiry at most 30 days out; maintenance notes are capped at 1000 characters. The finding must exist in the current evidence. Requires org:admin and an account session.",
+      "parameters": [
+        { "in": "path", "name": "oid", "required": true, "schema": { "type": "string" } },
+        { "in": "path", "name": "fid", "required": true, "schema": { "type": "string" } }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "additionalProperties": false,
+              "properties": {
+                "exception_until": { "description": "Unix seconds; required in the future and at most 30 days out when status is exception.", "type": "integer" },
+                "maintenance_note": { "maxLength": 1000, "type": "string" },
+                "status": { "enum": ["open", "acknowledged", "exception"], "type": "string" }
+              },
+              "required": ["status"],
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": { "saved": { "type": "boolean" } },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Finding state saved"
+        },
+        "400": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Invalid status, note, expiry or unknown finding"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not an org admin"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "Update an AI finding's state",
+      "tags": ["ai"]
+    }
+  },
+  "/api/envs/{eid}/folders": {
+    "get": {
+      "description": "Lists the environment's folder paths (up to 500) for AI context selection. Accepts account sessions and env-scoped tokens with secrets:read.",
+      "parameters": [
+        { "in": "path", "name": "eid", "required": true, "schema": { "type": "string" } }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "folders": {
+                    "items": {
+                      "properties": {
+                        "created_at": { "type": "integer" },
+                        "env_id": { "type": "string" },
+                        "id": { "type": "string" },
+                        "path": { "type": "string" }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "Folder paths"
+        },
+        "401": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+          "description": "Not permitted for this environment"
+        }
+      },
+      "security": [{ "bearerAuth": [] }],
+      "summary": "List environment folders",
+      "tags": ["ai"]
+    }
+  }
+}

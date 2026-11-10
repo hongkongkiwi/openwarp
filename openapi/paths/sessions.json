@@ -1,0 +1,131 @@
+{
+  "/api/me/sessions": {
+    "delete": {
+      "description": "Ends every browser session for the account. API keys and OAuth tokens cannot do this; the caller must authenticate with the account session.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionsRevoked"
+              }
+            }
+          },
+          "description": "Sessions revoked"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "API keys and OAuth tokens cannot revoke browser sessions"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Revoke all browser sessions",
+      "tags": [
+        "sessions"
+      ]
+    },
+    "get": {
+      "description": "Lists the account's browser sessions with a stable id each; `current` marks the session the request authenticated with.",
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Session rows"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List browser sessions",
+      "tags": [
+        "sessions"
+      ]
+    }
+  },
+  "/api/me/sessions/{sid}": {
+    "delete": {
+      "description": "Ends one browser session by id. `current` reports whether the deleted session was the one serving the request.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "sid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRevoked"
+              }
+            }
+          },
+          "description": "Session revoked"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Session not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Revoke one browser session",
+      "tags": [
+        "sessions"
+      ]
+    }
+  }
+}
