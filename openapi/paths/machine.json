@@ -1,0 +1,17 @@
+{
+  "/api/v1/machine/auth/workload/login": {
+    "post": {
+      "summary": "Exchange a workload JWT for an environment token",
+      "description": "Authenticates with trust_id and jwt, not a bearer credential. Proof must match the inline trust keys, exact issuer/audience/subject and bound claims, with iss, aud, sub, exp, iat and jti. Replayed issuer/jti pairs are denied. Token lifetime is the lesser of trust TTL and remaining proof lifetime. Workspace IP allowlist and lockdown apply. Issued tokens can only read or write the trusted environment's permitted secret endpoints.",
+      "tags": ["machine"], "parameters": [], "security": [{"bearerAuth":[]}],
+      "requestBody": {"required":true,"content":{"application/json":{"schema":{"type":"object","required":["trust_id","jwt"],"properties":{"trust_id":{"type":"string","minLength":1,"maxLength":2048},"jwt":{"type":"string","maxLength":32768}}}}}},
+      "responses": {
+        "200":{"description":"Short-lived access token","content":{"application/json":{"schema":{"$ref":"#/components/schemas/MachineLogin"}}}},
+        "401":{"description":"Invalid, expired or replayed proof","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},
+        "403":{"description":"Workspace allowlist or lockdown denial","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},
+        "429":{"description":"Exchange rate exceeded (120 per peer and 60 per peer/trust per minute)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},
+        "501":{"description":"Atomic workload exchange unavailable on Workers","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}
+      }
+    }
+  }
+}

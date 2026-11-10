@@ -1,6 +1,10 @@
-# Feature matrix (Phase clone, everything unlocked)
+# Feature reference
 
-| Phase feature | Tier in Phase | OpenWarp |
+This page describes implemented features and their limits. Start with [core concepts](CONCEPTS.md) for terminology, or use the [documentation index](README.md) for task-oriented guides.
+
+The comparison column records the upstream tier labels used when this matrix was written. It is not a current upstream pricing reference or an OpenWarp licence requirement. This checkout has no paid feature gates; build features and deployment targets still constrain availability.
+
+| Feature | Historical Phase tier | OpenWarp implementation |
 |---|---|---|
 | Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
 | Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
@@ -114,10 +118,7 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
 secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
 Phase features.
-Deferred by design: CLI parity (separate effort), a Kubernetes operator (the
-Helm chart's External Secrets Operator bridge covers controller-driven delivery,
-see [Kubernetes](KUBERNETES.md)), SDKs, AWS-IAM dynamic secrets, Phase
-billing/licence code (never copied).
+The repository includes language clients; see the [client inventory](CLIENTS.md) for their locations and limits. It does not provide a dedicated Kubernetes operator: the Helm chart's External Secrets Operator bridge covers controller-driven delivery (see [Kubernetes](KUBERNETES.md)). CLI behavior is documented independently in the [CLI reference](CLI.md). Phase billing and licence code is not copied.
 
 ## Additional sync adapters (2026-11-06)
 

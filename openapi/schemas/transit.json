@@ -1,0 +1,7 @@
+{
+ "TransitKey":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"current_version":{"type":"integer"}}},
+ "TransitVersion":{"type":"object","properties":{"id":{"type":"string"},"current_version":{"type":"integer"}}},
+ "TransitOperation":{"type":"object","required":["context"],"properties":{"context":{"type":"string","description":"At most 1024 UTF-8 bytes; exact context required for decryption."},"plaintext":{"type":"string","maxLength":1398104,"description":"Required for encrypt, base64 encoding of at most 1048576 bytes."},"ciphertext":{"type":"string","maxLength":2000000,"description":"Required for decrypt and rewrap; canonical owt1 envelope."}}},
+ "TransitPlaintext":{"type":"object","required":["plaintext","version"],"properties":{"plaintext":{"type":"string","description":"Base64 encoded plaintext."},"version":{"type":"integer"}}},
+ "TransitCiphertext":{"type":"object","required":["ciphertext","version"],"properties":{"ciphertext":{"type":"string"},"version":{"type":"integer"}}}
+}

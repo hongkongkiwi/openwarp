@@ -1,0 +1,271 @@
+{
+  "ChangeRequest": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "author": {
+        "type": "string"
+      },
+      "revision": {
+        "type": "integer"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "approved",
+          "applied",
+          "rejected"
+        ]
+      },
+      "approved_by": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      }
+    }
+  },
+  "ChangeRequestInput": {
+    "type": "object",
+    "required": [
+      "title",
+      "changes"
+    ],
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "1-200 UTF-8 bytes."
+      },
+      "revision": {
+        "type": "integer",
+        "description": "Required for PUT; must equal current revision."
+      },
+      "changes": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "required": [
+            "env_id"
+          ],
+          "properties": {
+            "env_id": {
+              "type": "string"
+            },
+            "secrets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeSecretInput"
+              }
+            },
+            "deletes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "key"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "description": "Unique environments and logical secrets only. Between 1 and 500 total writes/deletes. Keys are trimmed and uppercased. Targets must be accessible SSE environments in the same workspace."
+  },
+  "ChangeSecretInput": {
+    "type": "object",
+    "required": [
+      "key",
+      "value"
+    ],
+    "properties": {
+      "key": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+      },
+      "value": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string",
+        "default": "/"
+      },
+      "comment": {
+        "type": "string"
+      },
+      "tags": {
+        "type": "string"
+      },
+      "type": {
+        "type": "string",
+        "enum": [
+          "secret",
+          "sealed",
+          "ssh_key",
+          "config"
+        ]
+      }
+    }
+  },
+  "ChangeRequestResult": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "revision": {
+        "type": "integer"
+      },
+      "status": {
+        "type": "string"
+      },
+      "sync_errors": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": "Present for actions, keyed by environment on apply; empty for approve/reject."
+      }
+    }
+  },
+  "ChangeRequestDetail": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/ChangeRequest"
+      },
+      {
+        "type": "object",
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "env_id": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "key": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "before": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/components/schemas/Secret"
+                          },
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "object",
+                            "description": "The value is redacted when either side of the change is sealed.",
+                            "properties": {
+                              "key": {
+                                "type": "string"
+                              },
+                              "path": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "type": "null"
+                              },
+                              "comment": {
+                                "type": "string"
+                              },
+                              "tags": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "secret",
+                                  "sealed",
+                                  "ssh_key",
+                                  "config"
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      "after": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/components/schemas/ChangeSecretInput"
+                          },
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "object",
+                            "description": "The value is redacted when either side of the change is sealed.",
+                            "properties": {
+                              "key": {
+                                "type": "string"
+                              },
+                              "path": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "type": "null"
+                              },
+                              "comment": {
+                                "type": "string"
+                              },
+                              "tags": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "secret",
+                                  "sealed",
+                                  "ssh_key",
+                                  "config"
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

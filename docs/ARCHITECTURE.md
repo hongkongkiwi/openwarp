@@ -6,26 +6,35 @@ OpenWarp is a Rust workspace with a server, CLI, and cryptographic library. The 
 
 | Path | Responsibility |
 | --- | --- |
-| [`crates/server/src/main.rs`](../crates/server/src/main.rs) | HTTP routing, authentication, authorisation, secret operations, and background work |
-| [`crates/server/src/db.rs`](../crates/server/src/db.rs) | SQLite/PostgreSQL adapter and schema setup |
+| [`crates/server/src/main.rs`](../crates/server/src/main.rs) | Native executable entry point |
+| [`crates/server/src/app.rs`](../crates/server/src/app.rs) | Shared HTTP routing, authentication, authorisation, secret operations and background work |
+| [`crates/server/src/worker.rs`](../crates/server/src/worker.rs) | Cloudflare Worker entry point and Durable Object adapter |
+| [`crates/server/src/db.rs`](../crates/server/src/db.rs) | SQLite, PostgreSQL, MySQL/MariaDB and Worker storage abstraction; schema migrations |
 | [`crates/server/src/ui.rs`](../crates/server/src/ui.rs) | Embedded browser console |
 | [`crates/server/src/e2e.js`](../crates/server/src/e2e.js) | Browser E2E cryptography |
 | [`crates/server/src/integrations.rs`](../crates/server/src/integrations.rs) | Provider sync implementations |
 | [`crates/cli/src/main.rs`](../crates/cli/src/main.rs) | CLI commands, OAuth login, credential storage, local E2E operations |
 | [`crates/crypto/src/lib.rs`](../crates/crypto/src/lib.rs) | Encryption, key wrapping, and related primitives |
 | [`crates/server/tests`](../crates/server/tests) | HTTP, authorisation, account, integration, and UI tests |
-| [`scripts/backup.sh`](../scripts/backup.sh) | Database backup and retention helper |
+| [`crates/eso`](../crates/eso) | External Secrets Operator webhook bridge |
+| [`sdk`](../sdk) | TypeScript, Python, Go and Rust convenience clients |
+| [`sdks`](../sdks) | Additional TypeScript and Python contract clients |
+| [`action`](../action) | GitHub Actions export client |
+| [`terraform-provider`](../terraform-provider) / [`terraform-provider-openwarp`](../terraform-provider-openwarp) | Separate Terraform provider trees; see the client inventory before choosing one |
+| [`deploy`](../deploy) | Deployment configuration, including the Caddy edge |
+| [`openapi.json`](../openapi.json) | Machine-readable API contract |
+| [`scripts`](../scripts) | Backup, contract checks, smoke tests and worktree helpers |
 
 ## Request and storage flow
 
 ```mermaid
 flowchart TD
-    Browser[Browser console] --> HTTP[Axum HTTP server]
+    Browser[Browser console] --> HTTP[Shared Axum application]
     CLI[CLI] --> HTTP
     Automation[REST / OAuth / MCP / SCIM clients] --> HTTP
     HTTP --> Auth[Identity, scope, role, and environment checks]
     Auth --> Operations[Secret and workspace operations]
-    Operations --> Storage[(SQLite or PostgreSQL)]
+    Operations --> Storage[(Native database or Durable Object SQLite)]
     Auth -. optional session cache .-> Redis[(Redis)]
     Operations --> Sync[Provider sync]
     Sync --> Remote[External destinations]
@@ -85,9 +94,17 @@ The console is embedded HTML, CSS, and JavaScript served by the Rust binary. Sta
 
 The CLI uses HTTP APIs rather than direct database access. User credentials and per-project defaults are separate: user configuration and OS credential storage hold login state, while `.openwarp.json` selects a host, application, and environment for a directory.
 
+## Native and Workers targets
+
+The native executable and Cloudflare Worker share the application module through `lib.rs`. Native deployments use the configured SQLite, PostgreSQL or MySQL/MariaDB adapter. The Worker forwards requests to one SQLite-backed Durable Object and uses target-specific transport adapters.
+
+A Worker build requires its runtime bindings and build tooling, not just disabled default Cargo features. Some protocols and operations remain native-only; consult [deployment limits](DEPLOY.md#cloudflare-workers) rather than assuming feature parity. The native Redis session-cache option is not the Worker's storage model.
+
+See [clients and automation](CLIENTS.md) for the separate SDK and Terraform trees. They are not all members of the root Cargo workspace.
+
 ## Boundaries
 
-- The server needs operating-system networking and a database driver; it is not a drop-in Workers/WASM service.
+- Native database URLs and operating-system transports do not carry over unchanged to Workers.
 - Database persistence does not imply that every background task has distributed leader election or a delivery guarantee.
 - Protocol endpoints do not establish full compatibility with every external client or provider version.
 - Cryptographic primitives and automated tests do not substitute for an independent audit.

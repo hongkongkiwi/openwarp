@@ -1,47 +1,70 @@
 # OpenWarp documentation
 
-OpenWarp is a self-hosted secrets manager with a browser console, a Rust CLI, and an HTTP API. Start with a local instance, then choose the guides for your role.
+Run a local instance, choose an encryption boundary, then connect the workloads that need your secrets.
 
-## Start here
+[Project overview](../README.md) · [Local walkthrough](GETTING_STARTED.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
-| Goal | Guide |
+## Choose a reading path
+
+| You want to… | Read in this order |
 | --- | --- |
-| Run OpenWarp and save your first secret | [Getting started](GETTING_STARTED.md) |
-| Manage workspaces, applications, and environments | [Console guide](CONSOLE.md) |
-| Inject secrets into a process or automate a deployment | [CLI reference](CLI.md) |
-| See what is implemented and where the limits are | [Feature reference](FEATURES.md) |
+| Evaluate OpenWarp | [Getting started](GETTING_STARTED.md) → [Core concepts](CONCEPTS.md) → [Console](CONSOLE.md) |
+| Connect an application | [CLI](CLI.md) → [API](API.md) → [Clients and automation](CLIENTS.md) |
+| Run an instance | [Security](SECURITY.md) → [Deployment](DEPLOY.md) → [Configuration](CONFIGURATION.md) → [Backup and restore](BACKUP.md) |
+| Review key custody | [Encryption](ENCRYPTION.md) → [Authentication protocol](AUTH-PROTOCOL.md) → [Architecture](ARCHITECTURE.md) |
+| Contribute a change | [Architecture](ARCHITECTURE.md) → [Development](DEVELOPMENT.md) → [Repository rules](../AGENTS.md) |
 
-## Operate an instance
+## Learn and use
 
-| Goal | Guide |
+| Guide | What it covers |
 | --- | --- |
-| Deploy behind HTTPS and configure sign-in | [Deployment](DEPLOY.md) |
-| Look up environment variables and defaults | [Configuration](CONFIGURATION.md) |
-| Understand encryption, access control, and trust boundaries | [Security model](SECURITY.md) |
-| Compare SSE, delegated and E2E key custody | [Encryption and key custody](ENCRYPTION.md) |
-| Back up data and rehearse a restore | [Backup and restore](BACKUP.md) |
+| [Getting started](GETTING_STARTED.md) | Local SQLite setup, account verification, first secret and process injection |
+| [Core concepts](CONCEPTS.md) | Workspaces, environments, identities, drafts, encryption and recovery |
+| [Console](CONSOLE.md) | Browser-based administration and secret editing |
+| [CLI](CLI.md) | Login, project defaults, imports, exports, injection and specialised commands |
+| [Feature reference](FEATURES.md) | Detailed implemented behavior and limits |
+| [Troubleshooting](TROUBLESHOOTING.md) | Login, denied access, missing values, sync, storage and runtime failures |
 
-## Connect and extend
+## Connect and automate
 
-| Goal | Guide |
+| Guide | What it covers |
 | --- | --- |
-| Push secrets to another platform | [Integrations](INTEGRATIONS.md) |
-| Review secret changes across environments | [Batched change requests](CHANGE-REQUESTS.md) |
-| Exchange workload JWTs for scoped access | [Workload identity](WORKLOAD-IDENTITY.md) |
-| Encrypt application data with workspace keys | [Transit encryption](TRANSIT.md) |
-| Inject secrets into Kubernetes pods or worker nodes | [Kubernetes](KUBERNETES.md) |
-| See the HTTP routes, auth methods, and limits | [Feature reference](FEATURES.md) |
-| Understand the crates and data flow | [Architecture](ARCHITECTURE.md) |
-| Build, test, and contribute changes | [Development](DEVELOPMENT.md) |
+| [HTTP API](API.md) | Bearer authentication, resource discovery, export, errors and contract boundaries |
+| [Clients and automation](CLIENTS.md) | SDK directory inventory, Terraform, GitHub Actions and client differences |
+| [Integrations](INTEGRATIONS.md) | Provider configuration, sync options and destination-specific behavior |
+| [Kubernetes](KUBERNETES.md) | Workload consumption and the External Secrets Operator webhook bridge |
+| [Batched change requests](CHANGE-REQUESTS.md) | Review and apply changes across environments |
+| [Workload identity](WORKLOAD-IDENTITY.md) | Exchange trusted workload JWTs for scoped access |
+| [Transit encryption](TRANSIT.md) | Encrypt application data using versioned workspace keys |
+
+## Operate and secure
+
+| Guide | What it covers |
+| --- | --- |
+| [Deployment](DEPLOY.md) | Native, Compose and Workers targets; bootstrap, proxies, migrations and upgrades |
+| [Configuration](CONFIGURATION.md) | Environment variables and defaults |
+| [Backup and restore](BACKUP.md) | Database backups, key preservation and recovery rehearsal |
+| [Security model](SECURITY.md) | Trust boundaries, authorisation, credentials and operational controls |
+| [Encryption and key custody](ENCRYPTION.md) | SSE, delegated and E2E modes; KMS bridge and runner boundaries |
+| [Authentication protocol](AUTH-PROTOCOL.md) | Client-derived authentication and its limitations |
+
+## Build and maintain
+
+| Guide | What it covers |
+| --- | --- |
+| [Architecture](ARCHITECTURE.md) | Source map, storage, request flow and native/Worker separation |
+| [Development](DEVELOPMENT.md) | Prerequisites, serial checks, browser verification and contribution rules |
+| [Testing](TESTING.md) | Test layers, commands, fixtures, per-feature coverage matrix and acceptance scenarios |
+| [OpenAPI document](../openapi.json) | Machine-readable contract for the operations it describes |
 
 ## Reading conventions
 
 - Commands run from the repository root unless a guide says otherwise.
 - Uppercase placeholders such as `ENV_ID` mean an identifier returned by your instance, not an environment's display name.
-- Examples use dummy secret values. Never paste production credentials into an issue, screenshot, or shell history.
 - The console calls an organisation a workspace. API routes and CLI commands use `org` for the same object.
-- Server-side encryption (SSE) and end-to-end encryption (E2E) have different capabilities. Read the [security model](SECURITY.md) before choosing either.
+- Examples use dummy values. Tokens, recovery kits, verification links and exported secrets must not enter issues, screenshots or shared logs.
+- Server-side encryption (SSE), delegated encryption and end-to-end encryption (E2E) have different key-custody and automation boundaries.
+- Native and Workers deployments have different protocol support. A listed feature is not a claim of availability on every build.
+- An implemented adapter or endpoint is not evidence of live-provider verification. Follow each component's verification notes and test the paths you depend on.
 
-This documentation describes the implementation in this repository. It does not claim complete compatibility with another secrets platform or replace an independent security review.
-
-[Back to the project](../README.md)
+These guides describe the implementation in this checkout. They do not claim complete compatibility with another secrets platform or replace an independent security review.

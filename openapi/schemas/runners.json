@@ -1,0 +1,6 @@
+{
+ "Runner":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"pubkey":{"type":"string"},"created_at":{"type":"integer"}}},
+ "RunnerCreated":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"public_key":{"type":"string"},"token":{"type":"string"},"note":{"type":"string"}}},
+ "RunnerJob":{"type":"object","properties":{"id":{"type":"string"},"claim":{"type":"string"},"env_id":{"type":"string"},"integration_id":{"type":"string"},"job_kind":{"type":"string"},"kind":{"type":"string"},"config_enc":{"type":"string"},"wrapped_key":{"type":"string"},"previous":{"type":"array","items":{"type":"string"}},"secrets":{"type":"array","items":{"type":"object","properties":{"key_enc":{"type":"string"},"value_enc":{"type":"string"},"key_hash":{"type":"string"},"path":{"type":"string"}}}}}},
+ "RunnerJobResult":{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"},"detail":{"type":"string","default":""},"claim":{"type":"string","default":"","description":"Must match the active claim returned by jobs."},"managed":{"type":"array","items":{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"value_hash":{"type":"string","default":""}}}}}}
+}

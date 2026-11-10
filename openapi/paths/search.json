@@ -1,0 +1,68 @@
+{
+  "/api/search": {
+    "get": {
+      "description": "Requires authentication. Environment-scoped tokens cannot call search. Only organisations with secrets:read permission and accessible environments contribute results. Matching is an uppercase substring search; values are not returned.",
+      "parameters": [
+        {
+          "in": "query",
+          "name": "q",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchResult"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Search secret keys across accessible environments",
+      "tags": [
+        "search"
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "ChainedAuditEntry": {
+    "allOf": [
+      {"$ref": "#/components/schemas/AuditEntry"},
+      {"type": "object", "properties": {"seq": {"type": "integer"}, "prev_hash": {"type": "string"}, "hash": {"type": "string"}}}
+    ],
+    "description": "Audit database row. Emergency-locked workspaces return empty detail and omit hash and prev_hash. Legacy unchained rows have seq=0."
+  },
+  "AuditVerification": {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}, "checked": {"type": "integer"}, "first_bad": {"type": ["integer", "null"]}, "unchained": {"type": "integer"}, "head_seq": {"type": "integer"}, "head_matches": {"type": "boolean"}}
+  },
+  "LogStream": {
+    "type": "object",
+    "properties": {"id": {"type": "string"}, "org_id": {"type": "string"}, "name": {"type": "string"}, "url": {"type": "string"}, "created_at": {"type": "integer"}}
+  },
+  "LogStreamDelivery": {
+    "type": "object",
+    "properties": {"id": {"type": "string"}, "stream_id": {"type": "string"}, "event": {"type": "string"}, "status": {"type": "string"}, "attempts": {"type": "integer"}, "created_at": {"type": "integer"}}
+  }
+}

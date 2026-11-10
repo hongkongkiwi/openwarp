@@ -1,0 +1,1129 @@
+{
+  "App": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "readme": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "AuditEntry": {
+    "properties": {
+      "action": {
+        "type": "string"
+      },
+      "actor": {
+        "type": "string"
+      },
+      "app_id": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "detail": {
+        "type": "string"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "CloneRequest": {
+    "properties": {
+      "overwrite": {
+        "type": "boolean"
+      },
+      "target_env_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "target_env_id"
+    ],
+    "type": "object"
+  },
+  "CloneResult": {
+    "properties": {
+      "cloned": {
+        "type": "integer"
+      },
+      "skipped": {
+        "type": "integer"
+      },
+      "sync_errors": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "CompareResult": {
+    "properties": {
+      "changed": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "only_in_source": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "only_in_target": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "same": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "Deleted": {
+    "properties": {
+      "deleted": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "DeployRequest": {
+    "properties": {
+      "secrets": {
+        "items": {
+          "$ref": "#/components/schemas/SecretInput"
+        },
+        "type": "array"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "DeployResult": {
+    "properties": {
+      "deployed": {
+        "type": "integer"
+      },
+      "sync_errors": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "EmailRequest": {
+    "properties": {
+      "email": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "email"
+    ],
+    "type": "object"
+  },
+  "Env": {
+    "properties": {
+      "app_id": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "mode": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "require_approval": {
+        "type": "integer"
+      },
+      "restricted": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "EnvPolicy": {
+    "properties": {
+      "require_approval": {
+        "type": "boolean"
+      },
+      "restricted": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "Error": {
+    "properties": {
+      "error": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "error"
+    ],
+    "type": "object"
+  },
+  "ExportResult": {
+    "properties": {
+      "secrets": {
+        "items": {
+          "$ref": "#/components/schemas/Secret"
+        },
+        "type": "array"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Health": {
+    "properties": {
+      "ok": {
+        "type": "boolean"
+      },
+      "service": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Id": {
+    "properties": {
+      "id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Identity": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "IdentityCreate": {
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "IdentityCreated": {
+    "properties": {
+      "client_id": {
+        "type": "string"
+      },
+      "client_secret": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "ImportRequest": {
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "InstanceInfo": {
+    "properties": {
+      "github": {
+        "type": "boolean"
+      },
+      "google": {
+        "type": "boolean"
+      },
+      "instance_owner": {
+        "type": "boolean"
+      },
+      "signups_env_locked": {
+        "type": "boolean"
+      },
+      "signups_open": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "Integration": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "IntegrationCreate": {
+    "properties": {
+      "config": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "config"
+    ],
+    "type": "object"
+  },
+  "IntegrationUpdate": {
+    "properties": {
+      "config": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "InviteRequest": {
+    "properties": {
+      "password": {
+        "minLength": 8,
+        "type": "string"
+      },
+      "token": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "token",
+      "password"
+    ],
+    "type": "object"
+  },
+  "InviteResult": {
+    "properties": {
+      "added": {
+        "type": "boolean"
+      },
+      "expires_at": {
+        "type": "integer"
+      },
+      "invite_token": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "Lease": {
+    "properties": {
+      "expires_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "type": {
+        "type": "string"
+      },
+      "username": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LeaseCreate": {
+    "properties": {
+      "config": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": {
+        "type": "string"
+      },
+      "ttl_secs": {
+        "type": "integer"
+      },
+      "type": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LeaseRenew": {
+    "properties": {
+      "ttl_secs": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "LockboxCreate": {
+    "properties": {
+      "secrets": {
+        "items": {
+          "$ref": "#/components/schemas/SecretInput"
+        },
+        "type": "array"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LockboxCreated": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "key": {
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LockboxValue": {
+    "properties": {
+      "value": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LoginRequest": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "password": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "email",
+      "password"
+    ],
+    "type": "object"
+  },
+  "LoginResult": {
+    "properties": {
+      "mfa_required": {
+        "type": "boolean"
+      },
+      "mfa_token": {
+        "type": "string"
+      },
+      "public_key": {
+        "type": "string"
+      },
+      "token": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "MachineLogin": {
+    "properties": {
+      "accessToken": {
+        "type": "string"
+      },
+      "expiresIn": {
+        "type": "integer"
+      },
+      "identity_id": {
+        "type": "string"
+      },
+      "tokenType": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "MachineLoginRequest": {
+    "properties": {
+      "client_id": {
+        "type": "string"
+      },
+      "client_secret": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "client_id",
+      "client_secret"
+    ],
+    "type": "object"
+  },
+  "Me": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "pubkey": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Member": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "email": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "MemberInvite": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "email"
+    ],
+    "type": "object"
+  },
+  "MfaRequest": {
+    "properties": {
+      "code": {
+        "type": "string"
+      },
+      "mfa_token": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mfa_token",
+      "code"
+    ],
+    "type": "object"
+  },
+  "NameRequest": {
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "readme": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "Ok": {
+    "properties": {
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "Org": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "ip_allowlist": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "OrgSettings": {
+    "properties": {
+      "audit_webhook": {
+        "type": "string"
+      },
+      "ip_allowlist": {
+        "type": "string"
+      },
+      "oidc_client_id": {
+        "type": "string"
+      },
+      "oidc_client_secret": {
+        "type": "string"
+      },
+      "oidc_issuer": {
+        "type": "string"
+      },
+      "oidc_redirect_uri": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Providers": {
+    "properties": {
+      "github": {
+        "type": "boolean"
+      },
+      "google": {
+        "type": "boolean"
+      },
+      "password": {
+        "type": "boolean"
+      },
+      "signups": {
+        "enum": [
+          "open",
+          "invite"
+        ],
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "RegisterRequest": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "password": {
+        "minLength": 8,
+        "type": "string"
+      }
+    },
+    "required": [
+      "email",
+      "password"
+    ],
+    "type": "object"
+  },
+  "RegisterResult": {
+    "properties": {
+      "org_id": {
+        "type": "string"
+      },
+      "public_key": {
+        "type": "string"
+      },
+      "recovery_kit": {
+        "type": "string"
+      },
+      "token": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      },
+      "verification_required": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "ResetRequest": {
+    "properties": {
+      "discard_e2e_key": {
+        "type": "boolean"
+      },
+      "password": {
+        "minLength": 8,
+        "type": "string"
+      },
+      "recovery_kit": {
+        "type": "string"
+      },
+      "token": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "token",
+      "password"
+    ],
+    "type": "object"
+  },
+  "RestorePointRequest": {
+    "properties": {
+      "timestamp": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "RestorePointResult": {
+    "properties": {
+      "restored": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "Role": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "managed": {
+        "type": "boolean"
+      },
+      "name": {
+        "type": "string"
+      },
+      "permissions": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "RoleCreate": {
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "permissions": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "RoleRequest": {
+    "properties": {
+      "role": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "role"
+    ],
+    "type": "object"
+  },
+  "RotateRequest": {
+    "properties": {
+      "key": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "key"
+    ],
+    "type": "object"
+  },
+  "RotateResult": {
+    "properties": {
+      "key": {
+        "type": "string"
+      },
+      "secret_id": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Rotation": {
+    "properties": {
+      "enabled": {
+        "type": "integer"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "interval_secs": {
+        "type": "integer"
+      },
+      "key_name": {
+        "type": "string"
+      },
+      "next_run": {
+        "type": "integer"
+      },
+      "path": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "RotationCreate": {
+    "properties": {
+      "interval_secs": {
+        "minimum": 60,
+        "type": "integer"
+      },
+      "key": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "key",
+      "interval_secs"
+    ],
+    "type": "object"
+  },
+  "SearchResult": {
+    "properties": {
+      "results": {
+        "items": {
+          "properties": {
+            "app": {
+              "type": "string"
+            },
+            "env": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "Secret": {
+    "properties": {
+      "comment": {
+        "type": "string"
+      },
+      "decrypt_error": {
+        "type": "boolean"
+      },
+      "id": {
+        "type": "string"
+      },
+      "key": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "tags": {
+        "type": "string"
+      },
+      "type": {
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      },
+      "value": {
+        "nullable": true,
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "SecretInput": {
+    "properties": {
+      "comment": {
+        "type": "string"
+      },
+      "key": {
+        "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "tags": {
+        "type": "string"
+      },
+      "type": {
+        "enum": [
+          "secret",
+          "sealed",
+          "config"
+        ],
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "key",
+      "value"
+    ],
+    "type": "object"
+  },
+  "SecretVersion": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "created_by": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "tags": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "SecretsResult": {
+    "properties": {
+      "secrets": {
+        "items": {
+          "$ref": "#/components/schemas/Secret"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "ServiceToken": {
+    "properties": {
+      "app_id": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "created_by": {
+        "type": "string"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Session": {
+    "properties": {
+      "token": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SignupsRequest": {
+    "properties": {
+      "open": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "open"
+    ],
+    "type": "object"
+  },
+  "SyncResult": {
+    "properties": {
+      "detail": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "TokenCreate": {
+    "properties": {
+      "env_id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "TokenCreated": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "token": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "TransferRequest": {
+    "properties": {
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "user_id"
+    ],
+    "type": "object"
+  },
+  "VersionResult": {
+    "properties": {
+      "ok": {
+        "type": "boolean"
+      },
+      "version": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  }
+}

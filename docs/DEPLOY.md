@@ -1,6 +1,6 @@
 # Deployment
 
-The repository includes a Compose stack with OpenWarp, PostgreSQL 17, and Redis 7. You can also run the native server against SQLite or PostgreSQL. Start with [getting started](GETTING_STARTED.md) for local evaluation; this guide covers a deployed instance.
+The repository includes a Compose stack with OpenWarp, PostgreSQL 17, Redis 7 and a Caddy edge. The native server supports SQLite, PostgreSQL and MySQL/MariaDB. A separate Cloudflare Workers target uses SQLite-backed Durable Object storage. Start with [getting started](GETTING_STARTED.md) for local evaluation; this guide covers a deployed instance.
 
 ## Deployment checklist
 
@@ -228,7 +228,7 @@ ADDR=127.0.0.1:8080 \
 
 This assumes `OPENWARP_MASTER_KEY` is already set securely. For PostgreSQL or MySQL/MariaDB, set `DATABASE_URL` to your database connection string instead (`mysql://` or `mariadb://`). Redis is optional through `REDIS_URL`. Run as an unprivileged account with only the filesystem and network access it needs.
 
-OpenWarp is a native service. Cloudflare Workers cannot run this binary as-is; the storage and networking layers would need a separate port.
+The native executable cannot run directly on Cloudflare Workers. Use the repository's separate [Workers build](#cloudflare-workers), which shares the application handlers but uses different storage and transport adapters.
 
 Cloudflare as a proxy in front of the native server is supported. Orange-cloud the hostname, set `OPENWARP_TRUST_PROXY=1`, and set `OPENWARP_TRUSTED_PROXIES` to the addresses your origin actually sees, which are Cloudflare's egress ranges rather than the visitor's address. The server reads `X-Forwarded-For` only from a peer in that list, so an IP allowlist still sees the visitor. WebSockets pass through Cloudflare, and `/api/live` sends a ping every 30 seconds so the edge's idle timeout does not close a quiet console. A dropped socket reconnects with `?since=<id>`. This does not make the server run on Workers.
 
@@ -302,15 +302,9 @@ and is not available under `wrangler dev`; see [BACKUP.md](BACKUP.md).
 
 ## Platform limits
 
-OpenWarp is a native service. A Cloudflare Workers or other WASM port, which is
-not part of this repository, cannot open raw TCP/TLS sockets and cannot offer
-LDAP. The `ldap` cargo feature carries the directory client, its routes and its
-console entry: building with `--no-default-features` produces a binary with no
-LDAP code at all, `/api/auth/providers` reports `ldap: false`, and the console
-hides the directory card and sign-in button. The rest of the server still needs
-its database driver and OS networking, so that build is not a Workers
-deployment by itself. Directories that publish OIDC (Entra ID, Keycloak,
-Authentik, Dex) remain reachable through the OIDC flow on any target.
+The native and Workers targets share application code, but differ in storage, networking and protocol support. Use the [Workers support list](#cloudflare-workers) when deciding whether that target fits your deployment. Disabling default Cargo features alone does not turn a native binary into a Worker; the Worker build and runtime bindings are also required.
+
+The `ldap` Cargo feature carries the directory client, routes and console entry. Builds without it report `ldap: false` from `/api/auth/providers` and hide the directory settings and sign-in button. Directories that publish OIDC can instead use the OIDC flow, subject to the configured issuer and egress policy.
 
 On a native deployment the directory is usually on a private network. Add its
 CA to the host trust store, or paste the CA PEM into the directory settings.

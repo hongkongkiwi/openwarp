@@ -1,0 +1,232 @@
+{
+  "AccessDecision": {
+    "properties": {
+      "status": {
+        "enum": [
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "E2eGrant": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "pubkey": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "E2eGrantRequest": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "wrapped_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "email",
+      "wrapped_key"
+    ],
+    "type": "object"
+  },
+  "E2eRevoked": {
+    "properties": {
+      "rekey_required": {
+        "type": "boolean"
+      },
+      "revoked": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "EnvironmentAccessRecord": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "decided_by": {
+        "type": "string"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "EnvironmentAccessRequest": {
+    "properties": {
+      "reason": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "PendingRequest": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/Id"
+      },
+      {
+        "properties": {
+          "status": {
+            "const": "pending",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "ProposalDecision": {
+    "properties": {
+      "applied": {
+        "description": "Present on approval.",
+        "type": "integer"
+      },
+      "status": {
+        "enum": [
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "sync_errors": {
+        "description": "Present on approval.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "SecretProposal": {
+    "properties": {
+      "author": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "decided_by": {
+        "type": "string"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SecretUnwrapped": {
+    "properties": {
+      "env": {
+        "type": "string"
+      },
+      "secrets": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "type": "object"
+      }
+    },
+    "type": "object"
+  },
+  "SecretWrapMeta": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "created_by": {
+        "type": "string"
+      },
+      "env_id": {
+        "type": "string"
+      },
+      "expires_at": {
+        "type": "integer"
+      },
+      "used": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "SecretWrapRequest": {
+    "properties": {
+      "keys": {
+        "description": "Optional key names or path-qualified names, trimmed and uppercased.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "ttl_secs": {
+        "default": 300,
+        "description": "Clamped to 60-86400 seconds.",
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "SecretWrapped": {
+    "properties": {
+      "expires_at": {
+        "type": "integer"
+      },
+      "note": {
+        "type": "string"
+      },
+      "single_use": {
+        "type": "boolean"
+      },
+      "token": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SharedUser": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "pubkey": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  }
+}

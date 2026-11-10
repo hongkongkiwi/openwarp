@@ -1,0 +1,53 @@
+{
+  "AppDetails": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/App"
+      },
+      {
+        "properties": {
+          "reuse_check": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "AppEmergencyRequest": {
+    "properties": {
+      "locked": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "locked"
+    ],
+    "type": "object"
+  },
+  "AppEmergencyState": {
+    "properties": {
+      "direct_locked": {
+        "type": "boolean"
+      },
+      "locked": {
+        "type": "boolean"
+      },
+      "workspace_locked": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "AppSettings": {
+    "properties": {
+      "reuse_check": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "reuse_check"
+    ],
+    "type": "object"
+  }
+}

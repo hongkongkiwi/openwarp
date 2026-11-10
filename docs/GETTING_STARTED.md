@@ -19,9 +19,9 @@ DATABASE_URL=sqlite://openwarp.db ADDR=127.0.0.1:8080 \
   cargo run -p openwarp-server
 ```
 
-Leave that terminal running. Open [http://127.0.0.1:8080](http://127.0.0.1:8080) and register with an email address and a password of at least eight characters. On an instance with email verification enabled, complete verification before signing in.
+Leave that terminal running. Open [http://127.0.0.1:8080](http://127.0.0.1:8080) and register with an email address and a password of at least eight characters. Complete email verification before signing in. For this non-production local setup, if no mail provider is configured, the server prints the rendered verification message and link in its terminal. Open that link privately. Production requires working mail delivery instead.
 
-Save the recovery kit in a private offline location or a secure password manager. It contains your private key. Do not paste it into an issue or commit it to the repository. The first account is the instance owner.
+Save the recovery kit in a private offline location or a secure password manager. It contains your private key. Do not paste it into an issue or commit it to the repository. The first verified account becomes the instance owner.
 
 This command binds only to loopback. Without an external master key, development mode generates a key and stores it in the database. Do not treat this as a production deployment.
 
