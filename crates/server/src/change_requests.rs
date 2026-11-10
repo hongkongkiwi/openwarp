@@ -76,8 +76,8 @@ pub(super) async fn create(State(st): State<S>, h: HeaderMap, Path(org): Path<St
     st.require_feature(&org,"change-requests").await?;
     let pid = id(); let mut statements = snapshot(&st,&h,&uid,&org,&pid,1,&body).await?;
     statements.insert(0,("INSERT INTO change_requests(id,org_id,title,author,revision,status,created_at) VALUES(?,?,?,?,1,'pending',?)".into(),vec![json!(pid),json!(org),body["title"].clone(),json!(uid),json!(now())],Some(1)));
-    st.db.checked_batch(&statements,false).await.map_err(tx_error)?;
-    st.audit(&org,"","",&uid,"change_request.create",&pid).await;
+    let (pairs,checked)=crate::checked_pairs(statements,false);
+    st.audited_batch(&pairs,&checked,[&org,"","",&uid,"change_request.create",&pid]).await.map_err(tx_error)?;
     Ok(j(json!({"id":pid,"revision":1,"status":"pending"})))
 }
 pub(super) async fn edit(State(st): State<S>, h: HeaderMap, Path(pid): Path<String>, Json(body): Json<Value>) -> Res {
@@ -91,8 +91,8 @@ pub(super) async fn edit(State(st): State<S>, h: HeaderMap, Path(pid): Path<Stri
     let mut statements = snapshot(&st,&h,&uid,&org,&pid,next,&body).await?;
     statements.insert(0,("DELETE FROM change_request_envs WHERE request_id=?".into(),vec![json!(pid)],None));
     statements.insert(0,("UPDATE change_requests SET title=?,revision=?,status='pending',approved_by='' WHERE id=? AND author=? AND revision=? AND (status='pending' OR status='approved')".into(),vec![body["title"].clone(),json!(next),json!(pid),json!(uid),json!(revision)],Some(1)));
-    st.db.checked_batch(&statements,false).await.map_err(tx_error)?;
-    st.audit(&org,"","",&uid,"change_request.edit",&pid).await;
+    let (pairs,checked)=crate::checked_pairs(statements,false);
+    st.audited_batch(&pairs,&checked,[&org,"","",&uid,"change_request.edit",&pid]).await.map_err(tx_error)?;
     Ok(j(json!({"id":pid,"revision":next,"status":"pending"})))
 }
 pub(super) async fn list(State(st): State<S>, h: HeaderMap, Path(org): Path<String>) -> Res {
@@ -191,9 +191,18 @@ pub(super) async fn action(State(st): State<S>, h: HeaderMap, Path((pid,action))
         }
         statements.extend(mutations);
     }
-    st.db.checked_batch(&statements,action=="apply").await.map_err(tx_error)?;
+    if action=="apply" {
+        // Apply keeps checked_batch's original semantics exactly: per-statement
+        // expected counts (retention pruning deletes many rows) plus the
+        // secret-table lock; its audit stays observational because audited_batch
+        // cannot express the lock. Known composition gap, disclosed in the PR.
+        st.db.checked_batch(&statements,true).await.map_err(tx_error)?;
+        st.audit(&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)).await;
+    } else {
+        let (pairs,checked)=crate::checked_pairs(statements,false);
+        st.audited_batch(&pairs,&checked,[&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)]).await.map_err(tx_error)?;
+    }
     let mut sync_errors = serde_json::Map::new();
     if action=="apply" { for (eid,_,_) in &payloads { sync_errors.insert(eid.clone(),json!(trigger_sync(&st,eid,&uid).await)); } }
-    st.audit(&org,"","",&uid,&format!("change_request.{}",action),&format!("{} revision={}",pid,revision)).await;
     Ok(j(json!({"id":pid,"revision":revision,"status":next,"sync_errors":sync_errors})))
 }

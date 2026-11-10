@@ -67,7 +67,7 @@ func (e *APIError) Error() string {
 
 var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
-func (c *Client) request(ctx context.Context, method, path string, body, out any) error {
+func (c *Client) request(ctx context.Context, method, path string, body, out any, stepUp ...string) error {
 	var data io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -82,6 +82,7 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Accept", "application/json")
+	if len(stepUp) == 1 { req.Header.Set("X-OpenWarp-Step-Up", stepUp[0]) }
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -123,6 +124,50 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 		return &APIError{Status: resp.StatusCode, Message: "Invalid JSON response", Body: string(raw)}
 	}
 	return nil
+}
+
+// API calls a route relative to /api; query values never become path components.
+func (c *Client) API(ctx context.Context, method string, segments []string, body any, query url.Values, stepUp ...string) (json.RawMessage, error) {
+	if len(stepUp) > 1 { return nil, fmt.Errorf("at most one step-up grant is supported") }
+	if len(stepUp) == 1 {
+		if len(stepUp[0]) == 0 || len(stepUp[0]) > 512 || strings.ContainsFunc(stepUp[0], func(r rune) bool { return r < 32 || r > 126 }) { return nil, fmt.Errorf("invalid step-up grant") }
+	}
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
+	default:
+		return nil, fmt.Errorf("unsupported API method")
+	}
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || strings.ContainsAny(c.BaseURL, "?#") {
+		return nil, fmt.Errorf("invalid API base URL")
+	}
+	path := "/api"
+	for _, segment := range segments {
+		decoded := segment
+		for {
+			if strings.Contains(decoded, "\\") || strings.Contains(decoded, "://") || strings.HasPrefix(decoded, "//") || strings.ContainsFunc(decoded, func(r rune) bool { return r < 32 || r == 127 }) {
+				return nil, fmt.Errorf("unsafe API path segment")
+			}
+			for _, component := range strings.Split(decoded, "/") {
+				if component == "." || component == ".." { return nil, fmt.Errorf("unsafe API path segment") }
+			}
+			if !strings.Contains(decoded, "%") { break }
+			next, err := url.PathUnescape(decoded)
+			if err != nil { return nil, fmt.Errorf("malformed API path encoding") }
+			decoded = next
+		}
+		path += "/" + url.PathEscape(segment)
+	}
+	if len(query) != 0 { path += "?" + query.Encode() }
+	httpClient := c.HTTPClient
+	if httpClient == nil { httpClient = defaultHTTPClient }
+	clone := *httpClient
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	copy := *c
+	copy.HTTPClient = &clone
+	var out json.RawMessage
+	err = copy.request(ctx, method, path, body, &out, stepUp...)
+	return out, err
 }
 
 func (c *Client) Me(ctx context.Context) (map[string]any, error) {

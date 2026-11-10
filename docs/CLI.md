@@ -46,6 +46,28 @@ User configuration lives at `~/.openwarp/config.json`, or the path in `OPENWARP_
 
 If the credential store is unavailable or rejects storage, the file can contain tokens. `OPENWARP_NO_KEYRING=1` forces file storage. The CLI sets the containing directory to 0700 and the file to 0600 on Unix; those permissions are not a cross-platform guarantee. Choose a dedicated directory if overriding the configuration path.
 
+## Management requests
+
+Use `api` for JSON management endpoints that do not have a named CLI command. The command uses the current credential and all server permission checks. It accepts a path under `/api`, not an arbitrary URL, and refuses redirects.
+
+```bash
+openwarp api-routes
+openwarp api GET /api/orgs
+openwarp api GET /api/envs/ENV_ID/integrations
+openwarp api PATCH /api/integrations/INTEGRATION_ID --json @integration.json
+openwarp api GET /api/orgs/ORG_ID/audit --query limit=25 --query offset=0
+```
+
+`--json @FILE` reads a JSON file; `--json -` reads standard input. An inline JSON value is also accepted. Prefer a protected file or standard input for credentials rather than a command argument. Repeat `--query key=value` to send multiple values. `--step-up GRANT` sends an existing verification grant without bypassing verification requirements. Empty successful responses print nothing. Failures return a nonzero exit code with the HTTP status and response body; response bodies can contain secrets.
+
+Browser login keeps the existing default scopes. Workspace administration requires explicit consent to `org:admin` as well as the relevant workspace role:
+
+```bash
+openwarp login --scope 'secrets:read secrets:write org:admin'
+```
+
+The CLI discovers and requests the server's issuer OAuth audience for REST operations. A hosted MCP access token has a different audience and is not interchangeable. Credentials saved by an older CLI that requested the MCP audience need a new browser login; refreshing the old token retains its old audience. Generic JSON requests do not replace browser sign-in, local encryption or protocol endpoints outside `/api`.
+
 ## Project selection
 
 ```bash

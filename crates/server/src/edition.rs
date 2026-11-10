@@ -95,15 +95,18 @@ impl LicenseState {
     /// Pure resolution used by tests. `raw` is the configured value, not the
     /// environment itself, so unit tests do not race on process state.
     pub fn resolve(raw: Option<&str>, production: bool, debug: bool) -> Self {
+        let _ = debug;
         let value = raw.map(str::trim).unwrap_or("");
         if value.is_empty() || value.eq_ignore_ascii_case("none") {
             return Self::self_hosted();
         }
         if value.eq_ignore_ascii_case("development") {
-            if debug && !production {
+            // Non-production deployments (staging, smoke workers) may unlock
+            // with the development licence; production always refuses it.
+            if !production {
                 return Self::enterprise("development".into(), 0, true);
             }
-            return Self::with_warning("the development licence is ignored by release and production builds".into());
+            return Self::with_warning("the development licence is ignored by production builds".into());
         }
         match verify(value) {
             Ok(claims) => Self::enterprise(claims.customer, claims.exp, false),
@@ -254,9 +257,10 @@ HJskdQKZt9FYTaecNMk5RI19UoRO5ifHi3ut27X2wx/mtBlIcT+m5LJP
     }
 
     #[test]
-    fn development_licenses_are_debug_only() {
+    fn development_licenses_are_non_production_only() {
         assert_eq!(LicenseState::resolve(Some("development"), false, true).tier(), Tier::Enterprise);
         assert_eq!(LicenseState::resolve(Some("development"), true, true).tier(), Tier::SelfHosted);
-        assert_eq!(LicenseState::resolve(Some("development"), false, false).tier(), Tier::SelfHosted);
+        // Non-production release builds (staging, smoke workers) also accept it.
+        assert_eq!(LicenseState::resolve(Some("development"), false, false).tier(), Tier::Enterprise);
     }
 }

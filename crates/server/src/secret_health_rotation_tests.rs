@@ -2,6 +2,7 @@ use super::*;
 use std::{future::Future, task::{Context, Poll, Waker}};
 
 fn assert_waiting<F: Future>(future: std::pin::Pin<&mut F>) {
+    // A no-op waker: the polled operation must stay pending without progress.
     let waker = Waker::noop();
     assert!(matches!(future.poll(&mut Context::from_waker(waker)), Poll::Pending), "operation crossed the held credential gate");
 }

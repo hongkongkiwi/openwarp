@@ -121,10 +121,11 @@ async function exercise(base, account) {
       ensure(typeof id === 'string' && !!id, 'workspace must return id'); return id;
     };
     const org = await createOrg(owner.cookie), foreign = await createOrg(outsider.cookie);
-    // Posting a member issues a pending invitation; the recipient redeems it
-    // before the membership (and its live fanout) exists.
-    const invite = ok(await call(base, `/api/orgs/${org}/members`, { method: 'POST', cookie: owner.cookie, json: { email: member.email, role: 'developer' } }), 'member addition').data.invite_token;
-    ok(await call(base, '/api/auth/accept-invite', { method: 'POST', cookie: member.cookie, json: { token: invite } }), 'invitation redemption');
+    // Issuing an invite never adds membership; the member accepts explicitly.
+    const invite = ok(await call(base, `/api/orgs/${org}/members`, { method: 'POST', cookie: owner.cookie, json: { email: member.email, role: 'developer' } }), 'member invitation');
+    const inviteToken = invite.data.invite_token;
+    ensure(typeof inviteToken === 'string' && !!inviteToken, 'member invitation must include a share token');
+    ok(await call(base, '/api/auth/accept-invite', { method: 'POST', cookie: member.cookie, json: { token: inviteToken, password: member.password } }), 'member invitation acceptance');
     const control = await open(owner.cookie), memberSocket = await open(member.cookie), otherSocket = await open(outsider.cookie);
     const rename = async (cookie, id, marker) => ok(await call(base, `/api/orgs/${id}`, { method: 'PATCH', cookie, json: { name: marker } }), 'workspace rename');
     const marker = crypto.randomUUID();

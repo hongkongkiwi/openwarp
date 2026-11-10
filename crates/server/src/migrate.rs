@@ -72,6 +72,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 30, name: "ai_assistant", sql: include_str!("../migrations/0030_ai_assistant.sql"), tolerant: false },
     Migration { version: 31, name: "feature_grants", sql: include_str!("../migrations/0031_feature_grants.sql"), tolerant: true },
     Migration { version: 32, name: "session_ids", sql: include_str!("../migrations/0032_session_ids.sql"), tolerant: true },
+    Migration { version: 33, name: "webhooks", sql: include_str!("../migrations/0033_webhooks.sql"), tolerant: true },
 ];
 
 /// SQL profile used when splitting migration statements.

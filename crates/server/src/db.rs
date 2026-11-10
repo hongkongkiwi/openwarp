@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use mysql_async::prelude::Queryable;
 
 pub type Row = HashMap<String, Value>;
+#[path = "db_webhooks.rs"]
+mod webhooks;
+pub use webhooks::WebhookTx;
 
 #[path = "migration_session.rs"]
 mod migration_session;
@@ -827,7 +830,7 @@ mod tests {
         assert_eq!(db.version().await.unwrap(), crate::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 32, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 33, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }
@@ -850,5 +853,25 @@ mod tests {
         assert_eq!(mysql_sql("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)"), "INSERT INTO saml_replay(`key`,expires_at) VALUES(?,?)");
         assert_eq!(mysql_sql("SELECT count FROM rate_limits WHERE key=?"), "SELECT count FROM rate_limits WHERE `key`=?");
         assert_eq!(mysql_sql("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)"), "INSERT INTO rate_limits(`key`,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test] fn mysql_ddl_promotes_inline_unique_columns() {
+        // The shipped receipt DDL, read from the migration files so the test
+        // drifts with the shipped schema instead of a hand-written copy.
+        let receipt = crate::migrate::MIGRATIONS.iter()
+            .find(|m| m.sql.contains("CREATE TABLE IF NOT EXISTS webhook_receipts("))
+            .map(|m| m.sql.split(';').map(str::trim).find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS webhook_receipts(")).expect("the webhook migration defines webhook_receipts"))
+            .expect("the webhook migration defines webhook_receipts");
+        let ddl = mysql_sql(receipt);
+        assert!(ddl.contains("`message_id` VARCHAR(255) NOT NULL"), "an inline UNIQUE column must be promoted to an indexable type: {}", ddl);
+        assert!(ddl.contains("`webhook_id` VARCHAR(255) NOT NULL"), "{}", ddl);
+        assert!(ddl.contains("UNIQUE(webhook_id,message_id)"), "the receipt uniqueness constraint must survive the rewrite: {}", ddl);
+        // A generic table-level UNIQUE(a,b) promotes both TEXT columns, while an
+        // unrelated payload column stays unbounded TEXT.
+        let generic = mysql_sql("CREATE TABLE IF NOT EXISTS pair_dedup(id TEXT PRIMARY KEY,a TEXT NOT NULL,b TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(a,b))");
+        assert!(generic.contains("`a` VARCHAR(255) NOT NULL"), "first inline UNIQUE column must be promoted: {}", generic);
+        assert!(generic.contains("`b` VARCHAR(255) NOT NULL"), "second inline UNIQUE column must be promoted: {}", generic);
+        assert!(generic.contains("`payload` TEXT NOT NULL"), "unbounded columns must stay TEXT: {}", generic);
+        assert!(generic.contains("UNIQUE(a,b)"), "the uniqueness constraint must be preserved: {}", generic);
     }
 }

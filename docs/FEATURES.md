@@ -27,7 +27,9 @@
 | Network policies | Pro | `PUT /api/orgs/:id/settings {ip_allowlist}` stored per org |
 | Point-in-time recovery | Pro | `POST /api/envs/:id/restore-point {timestamp}` |
 | Automated rotation | Pro | `POST /api/envs/:id/rotate {key}` (new random or given value) |
-| Audit logs + forwarding | Pro/Ent | per-org audit table with a hash chain and `GET /api/orgs/:id/audit/verify`, webhook forwarding via settings |
+| Audit logs + forwarding | Pro/Ent | per-org audit hash chain with `GET /api/orgs/:id/audit/verify`; native signed workspace/app event subscriptions, retry and attempt history; legacy settings forwarding disabled (see [Webhooks](WEBHOOKS.md)) |
+| Incoming sync triggers | n/a | signed fixed-integration triggers for server-encrypted environments, persistent receipts with encrypted payload capture, console inspection, receipt replay, replay protection and source-policy checks; native runtime only |
+| Management clients | n/a | generic JSON management requests in CLI and four SDKs; hosted MCP route discovery and internal API requests preserve caller permissions |
 | Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default); expiry revokes the remote credential |
 | OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, `id_token` verified against provider JWKS with RS/PS/ES signatures and iss/aud/exp/nonce checks, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. Instance-level sign-in with any OIDC provider is configured by `OPENWARP_OIDC_*` (PKCE, optional client secret, discovery or explicit endpoints; see [configuration](CONFIGURATION.md)). SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
 | LDAP directory sign-in | Enterprise | **Per-org LDAPS directory**: admin `GET/PUT/DELETE /api/orgs/:id/ldap` stores the URL, service bind DN and encrypted password, base DN, user filter, attribute names and group map; `POST /api/auth/ldap {org_id, username, password}` searches with the service account (RFC 4515 escaping), then binds as the found entry. Only `ldaps://` is accepted, so no password crosses the wire unencrypted. Invite or auto-provision plus allowed-domain gating, `Group=role` mapping, TOTP parity and audit entries. Absent from builds without the `ldap` cargo feature (Workers/WASM) |
@@ -153,8 +155,7 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 - Lease renew, plus a rotation scheduler (30s tick) with per-key schedules
   (`/api/envs/:id/rotations`) and optional OpenAI, OpenRouter or Resend
   provider adapters; E2E envs are skipped by the scheduler.
-- Log streams with persisted delivery history and 3-attempt HMAC-signed
-  retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
+- Legacy log-stream configuration and history remain readable, but dispatch is disabled. Signed event subscriptions use the webhook queue, attempt history and bounded retries described in [Webhooks](WEBHOOKS.md).
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
 - Machine identities with Universal Auth, secret-change proposals with
   admin approval, access requests, dynamic database leases (real PostgreSQL
@@ -162,12 +163,8 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
   (CA, issue, revoke) came from the Infisical feature set.
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
-secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
-Phase features.
-Deferred by design: CLI parity (separate effort), a Kubernetes operator (the
-Helm chart's External Secrets Operator bridge covers controller-driven delivery,
-see [Kubernetes](KUBERNETES.md)), SDKs, AWS-IAM dynamic secrets, Phase
-billing/licence code (never copied).
+secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not Phase features.
+The CLI and four SDKs provide generic JSON management requests; browser and client-crypto workflows retain their own requirements. A dedicated Kubernetes operator remains deferred (the Helm chart's External Secrets Operator bridge covers controller-driven delivery; see [Kubernetes](KUBERNETES.md)). Phase billing and licence code is never copied.
 
 ## Additional sync adapters (2026-11-06)
 

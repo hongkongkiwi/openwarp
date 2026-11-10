@@ -112,6 +112,39 @@ impl Client {
         Ok(serde_json::from_str(if text.is_empty() { "null" } else { &text })?)
     }
 
+    pub async fn api<T: DeserializeOwned>(&self, method: Method, segments: &[&str], body: Option<Value>, query: &[(String, String)]) -> Result<T, Error> {
+        self.management_request(method, segments, body, query, None).await
+    }
+
+    pub async fn api_with_step_up<T: DeserializeOwned>(&self, method: Method, segments: &[&str], body: Option<Value>, query: &[(String, String)], step_up: &str) -> Result<T, Error> {
+        if step_up.is_empty() || step_up.len() > 512 || !step_up.bytes().all(|b| (32..=126).contains(&b)) {
+            return Err(Error::InvalidUrl("invalid step-up grant".into()));
+        }
+        self.management_request(method, segments, body, query, Some(step_up)).await
+    }
+
+    async fn management_request<T: DeserializeOwned>(&self, method: Method, segments: &[&str], body: Option<Value>, query: &[(String, String)], step_up: Option<&str>) -> Result<T, Error> {
+        if !matches!(method, Method::GET | Method::POST | Method::PUT | Method::PATCH | Method::DELETE | Method::HEAD | Method::OPTIONS) {
+            return Err(Error::InvalidUrl("unsupported API method".into()));
+        }
+        for segment in segments { validate_api_segment(segment).map_err(Error::InvalidUrl)?; }
+        let mut url = self.url(segments)?;
+        if !query.is_empty() { url.query_pairs_mut().extend_pairs(query.iter().map(|(k,v)| (k,v))); }
+        let mut request = self.http.request(method, url).bearer_auth(&self.token).header("Accept", "application/json");
+        if let Some(grant) = step_up { request = request.header("X-OpenWarp-Step-Up", grant); }
+        if let Some(body) = body { request = request.json(&body); }
+        let response = request.send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text));
+            let message = body.get("error").or_else(|| body.get("message")).and_then(Value::as_str)
+                .unwrap_or(status.canonical_reason().unwrap_or("API error")).to_string();
+            return Err(Error::Api { status: status.as_u16(), message, body });
+        }
+        Ok(serde_json::from_str(if text.is_empty() { "null" } else { &text })?)
+    }
+
     pub async fn me(&self) -> Result<Value, Error> { self.request(Method::GET, &["me"], None).await }
     pub async fn orgs(&self) -> Result<Vec<Org>, Error> { self.request(Method::GET, &["orgs"], None).await }
     pub async fn apps(&self, org: &str) -> Result<Vec<App>, Error> { self.request(Method::GET, &["orgs", org, "apps"], None).await }
@@ -145,6 +178,27 @@ impl Client {
         self.request(Method::POST, &["envs", env, "dynamic"], Some(serde_json::to_value(input)?)).await
     }
     pub async fn audit(&self, org: &str) -> Result<Vec<Value>, Error> { self.request(Method::GET, &["orgs", org, "audit"], None).await }
+}
+
+fn validate_api_segment(segment: &str) -> Result<(), String> {
+    let mut decoded = segment.to_string();
+    loop {
+        if decoded.chars().any(|c| c.is_control()) || decoded.contains('\\') || decoded.contains("://") || decoded.starts_with("//")
+            || decoded.split('/').any(|s| s == "." || s == "..") { return Err("unsafe API path segment".into()); }
+        if !decoded.contains('%') { return Ok(()); }
+        let bytes = decoded.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let pair = bytes.get(i+1..i+3).ok_or("malformed API path encoding")?;
+                let hex = std::str::from_utf8(pair).map_err(|_| "malformed API path encoding")?;
+                out.push(u8::from_str_radix(hex, 16).map_err(|_| "malformed API path encoding")?);
+                i += 3;
+            } else { out.push(bytes[i]); i += 1; }
+        }
+        decoded = String::from_utf8(out).map_err(|_| "invalid API path encoding")?;
+    }
 }
 
 #[cfg(test)]

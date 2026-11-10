@@ -9,10 +9,10 @@ The browser console is served by OpenWarp at the instance root. It uses the same
 | Apps | Create applications, select environments, manage secrets |
 | Members & access | Invite members, manage roles and teams, review access and proposals, configure machine identities and tokens |
 | Integrations | Manage sync destinations, dynamic leases, rotations, and sharing tools |
+| Webhooks | Configure event subscriptions and incoming hooks, inspect deliveries and receipts |
 | Audit log | Inspect workspace activity, sync outcomes, and log-stream delivery attempts |
 | Assistant | Search permitted metadata, ask contextual questions, preview folders and integration drafts |
 | Security insights | Inspect rule-based findings, evidence, acknowledgments, and expiring exceptions |
-| Audit log | Inspect workspace activity |
 | Settings | Workspace configuration, sign-in settings, MFA, and instance policy where permitted |
 
 Available actions depend on your role and selected workspace. The first registered account is the instance owner; workspace ownership does not automatically confer that instance-level authority. An unknown hash route renders a Not found screen with links back to Apps and Members & access instead of leaving a blank view.
@@ -191,6 +191,16 @@ Each integration row can Edit it, open its sync History, run a sync, or delete i
 Only supported providers understand dry-run and mirror options. Mirror can delete previously managed remote names. Review the [integration guide](INTEGRATIONS.md) before using it.
 
 Lockbox provides a one-time sharing flow. The complete link is sensitive, including its fragment. Share it only with the intended recipient and avoid preview services that might consume it.
+
+## Webhooks
+
+The Webhooks area manages signed outgoing event subscriptions for the selected workspace. Choose the entire workspace or one application, select event types, and set an HTTPS destination. Workspace administration is required. Creating or rotating a signing key displays it once; closing the dialog removes it from the page. Store it in the receiver's secret configuration.
+
+Delivery history shows status, attempt count, HTTP status, timing and safe failure codes. Attempts opens the recorded delivery metadata. Retrying a failed delivery can repeat an event the receiver already processed, so the console asks for confirmation. Enqueue failures appear beside the subscription when the server could record them.
+
+Incoming hooks belong to an existing integration. Select its app and environment, open Integrations, then choose Incoming hooks. Create, pause, rotate or delete a trigger there and inspect its receipts. Reauthorize explicitly binds a trigger to your current authorized credential while preserving its URL and signing key; pending sync requests are cancelled. Expired or revoked creator credentials do not renew automatically. The body cannot supply a destination or credentials. Current incoming dispatch requires a server-encrypted environment; delegated and E2E environments are rejected. The file-based `ssh` integration is also rejected until its blocking execution supports cancellation; cloud SSH-key API integrations are distinct. Webhook dispatch requires the native runtime.
+
+Legacy audit log streams no longer send. Their old delivery history remains readable under Audit log. Configure replacement subscriptions under Webhooks. See the [webhook reference](WEBHOOKS.md) for signing, retries, authorization and runtime limits.
 
 ## End-to-end environments
 

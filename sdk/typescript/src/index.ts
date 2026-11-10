@@ -41,19 +41,37 @@ export class OpenWarpClient {
 
   constructor(baseUrl: string, private readonly token: string, private readonly fetchImpl: typeof fetch = fetch) {
     const url = new URL(baseUrl);
-    if (!["http:", "https:"].includes(url.protocol) || url.search || url.hash || url.username || url.password) {
+    if (!["http:", "https:"].includes(url.protocol) || baseUrl.includes("?") || baseUrl.includes("#") || url.username || url.password) {
       throw new TypeError("baseUrl must be an HTTP(S) URL without credentials, query, or fragment");
     }
     this.baseUrl = url.toString().replace(/\/+$/, "");
   }
 
-  private async request<T>(method: string, segments: string[], body?: unknown): Promise<T> {
+  api<T = unknown>(method: string, segments: string[], body?: unknown, query?: Record<string, string>, stepUp?: string): Promise<T> {
+    if (stepUp !== undefined && (typeof stepUp !== "string" || !stepUp.length || stepUp.length > 512 || /[^\x20-\x7e]/.test(stepUp))) throw new TypeError("Invalid step-up grant");
+    if (!["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method)) throw new TypeError("Unsupported HTTP method");
+    if (!Array.isArray(segments) || !segments.length) throw new TypeError("Expected non-empty path segments");
+    for (const segment of segments) {
+      if (typeof segment !== "string" || !segment) throw new TypeError("Expected non-empty path segments");
+      let decoded = segment;
+      for (let depth = 0; depth <= segment.length; depth++) {
+        if (decoded.split("/").some(part => part === "." || part === "..") || /[\\\\\x00-\x1f\x7f]/.test(decoded) || decoded.includes("://") || decoded.startsWith("//")) throw new TypeError("Unsafe path segment");
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      }
+    }
+    return this.request(method, segments, body, query, stepUp);
+  }
+
+  private async request<T>(method: string, segments: string[], body?: unknown, query?: Record<string, string>, stepUp?: string): Promise<T> {
     // Dot segments are normalized by URL parsers even when percent-encoded.
     if (segments.some(s => s === "." || s === "..")) throw new TypeError("Dot path segments are not supported");
-    const response = await this.fetchImpl(`${this.baseUrl}/api/${segments.map(encodeURIComponent).join("/")}`, {
+    const search = query ? new URLSearchParams(query).toString() : "";
+    const response = await this.fetchImpl(`${this.baseUrl}/api/${segments.map(encodeURIComponent).join("/")}${search ? "?" + search : ""}`, {
       method,
       redirect: "error",
-      headers: { Authorization: `Bearer ${this.token}`, Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      headers: { Authorization: `Bearer ${this.token}`, Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(stepUp === undefined ? {} : { "X-OpenWarp-Step-Up": stepUp }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();

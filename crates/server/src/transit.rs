@@ -22,17 +22,17 @@ pub(super) fn fence(expected: &str, master: &[u8;32]) -> Statement {
     ("UPDATE meta SET v=? WHERE k=? AND v=?".into(),vec![json!(generation(master)),json!(ROOT),json!(expected)],Some(1))
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) async fn rotation(st: &S, old: &[u8;32], new: &[u8;32], expected: &str) -> Result<Vec<Statement>, (StatusCode, Json<Value>)> {
-    let rows = st.db.query("SELECT key_id,org_id,version,key_enc FROM transit_versions", &[]).await.map_err(|e| bad(&e))?;
-    let mut statements = vec![fence(expected,new)];
-    for r in rows {
-        let org = db::s(&r,"org_id"); let kid = db::s(&r,"key_id"); let version = db::n(&r,"version"); let wrapped = db::s(&r,"key_enc");
-        let aad = wrap_aad(&org,&kid,version);
-        let raw = oc::decrypt_symmetric_aad(old,&aad,&wrapped).map_err(|_| bad("transit key cannot be unwrapped; refusing master rotation"))?;
-        if raw.len()!=32 { return Err(bad("invalid transit key; refusing master rotation")); }
-        statements.push(("UPDATE transit_versions SET key_enc=? WHERE key_id=? AND org_id=? AND version=? AND key_enc=?".into(),vec![json!(oc::encrypt_symmetric_aad(new,&aad,&raw)),json!(kid),json!(org),json!(version),json!(wrapped)],Some(1)));
+pub(super) fn rotation_tx(tx: &db::WebhookTx<'_>, old: &[u8;32], new: &[u8;32], expected: &str) -> Result<(), String> {
+    let (sql, params, required) = fence(expected,new);
+    if Some(tx.exec(&sql,&params)?) != required { return Err("transit root changed during rotation".into()); }
+    for r in tx.query("SELECT key_id,org_id,version,key_enc FROM transit_versions", &[])? {
+        let org=db::s(&r,"org_id"); let kid=db::s(&r,"key_id"); let version=db::n(&r,"version"); let wrapped=db::s(&r,"key_enc");
+        let aad=wrap_aad(&org,&kid,version);
+        let raw=oc::decrypt_symmetric_aad(old,&aad,&wrapped).map_err(|_| "transit key cannot be unwrapped; refusing master rotation")?;
+        if raw.len()!=32 { return Err("invalid transit key; refusing master rotation".into()); }
+        if tx.exec("UPDATE transit_versions SET key_enc=? WHERE key_id=? AND org_id=? AND version=? AND key_enc=?", &[json!(oc::encrypt_symmetric_aad(new,&aad,&raw)),json!(kid),json!(org),json!(version),json!(wrapped)])? != 1 { return Err("transit key changed during rotation".into()); }
     }
-    Ok(statements)
+    Ok(())
 }
 async fn authorize(st: &S, h: &HeaderMap, org: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
@@ -68,14 +68,16 @@ pub(super) async fn list(State(st): State<S>, h: HeaderMap, Path(org): Path<Stri
 }
 pub(super) async fn create(State(st): State<S>, h: HeaderMap, Path(org): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = authorize(&st,&h,&org,"transit:manage").await?;
+    // Master-dependent writes: a replica on an old key fails closed with epoch_stale.
+    st.epoch_ok().await?;
     let name = body["name"].as_str().unwrap_or(""); if !valid_secret_key(name) { return Err(bad("name must be 1-128 ASCII letters, digits, underscore, hyphen or dot")); }
     let _lifecycle = st.transit_lifecycle.read().await; let master = st.master(); let expected = root(&st,&master).await?;
     let kid = id(); let key = oc::random_key();
     let statements = vec![fence(&expected,&master),
         ("INSERT INTO transit_keys(id,org_id,name,current_version) VALUES(?,?,?,1)".into(),vec![json!(kid),json!(org),json!(name)],Some(1)),
         ("INSERT INTO transit_versions(key_id,org_id,version,key_enc) VALUES(?,?,1,?)".into(),vec![json!(kid),json!(org),json!(oc::encrypt_symmetric_aad(&master,&wrap_aad(&org,&kid,1),&key))],Some(1))];
-    st.db.checked_batch(&statements,false).await.map_err(tx_error)?;
-    st.audit(&org,"","",&uid,"transit.create",&format!("{} version=1",kid)).await;
+    let (pairs,checked)=crate::checked_pairs(statements,false);
+    st.audited_batch(&pairs,&checked,[&org,"","",&uid,"transit.create",&format!("{} version=1",kid)]).await.map_err(tx_error)?;
     Ok(j(json!({"id":kid,"name":name,"current_version":1})))
 }
 async fn metadata(st: &S, org: &str, kid: &str) -> Result<Row, (StatusCode, Json<Value>)> {
@@ -87,13 +89,15 @@ async fn key(st: &S, master: &[u8;32], org: &str, kid: &str, version: i64) -> Re
 }
 pub(super) async fn rotate(State(st): State<S>, h: HeaderMap, Path((org,kid)): Path<(String,String)>) -> Res {
     let uid = authorize(&st,&h,&org,"transit:manage").await?;
+    // Master-dependent writes: a replica on an old key fails closed with epoch_stale.
+    st.epoch_ok().await?;
     let _lifecycle = st.transit_lifecycle.read().await; let master = st.master(); let expected = root(&st,&master).await?;
     let row = metadata(&st,&org,&kid).await?; let old = db::n(&row,"current_version"); let version = old.checked_add(1).ok_or_else(conflict)?;
     let statements = vec![fence(&expected,&master),
         ("UPDATE transit_keys SET current_version=? WHERE id=? AND org_id=? AND current_version=?".into(),vec![json!(version),json!(kid),json!(org),json!(old)],Some(1)),
         ("INSERT INTO transit_versions(key_id,org_id,version,key_enc) VALUES(?,?,?,?)".into(),vec![json!(kid),json!(org),json!(version),json!(oc::encrypt_symmetric_aad(&master,&wrap_aad(&org,&kid,version),&oc::random_key()))],Some(1))];
-    st.db.checked_batch(&statements,false).await.map_err(tx_error)?;
-    st.audit(&org,"","",&uid,"transit.rotate",&format!("{} version={}",kid,version)).await;
+    let (pairs,checked)=crate::checked_pairs(statements,false);
+    st.audited_batch(&pairs,&checked,[&org,"","",&uid,"transit.rotate",&format!("{} version={}",kid,version)]).await.map_err(tx_error)?;
     Ok(j(json!({"id":kid,"current_version":version})))
 }
 #[derive(serde::Serialize,Deserialize)]
