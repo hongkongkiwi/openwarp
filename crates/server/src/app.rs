@@ -1482,7 +1482,7 @@ async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> 
 async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(String, i64)>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     st.check_scope(&h, &eid).await?; st.check_secret_path(&sid, &uid, "write").await?;
-    // An E2E environment has no server-side key; restoring its ciphertext
+    require_approval_for_write(&st, &eid, &org, &uid).await?;
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
@@ -1960,6 +1960,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
 }
 
 async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
+    require_approval_for_write(&st, &eid, &org, &uid).await?;
     let key = st.env_key(&eid).await.ok();
     let ts = body.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(now);
     // Restore the whole environment as it stood at ts: a secret created later
@@ -2098,6 +2099,7 @@ async fn fire_rotation_hook(st: &S, org: &str, env: &str, key: &str, value: &str
     if !secret.is_empty() { let sig = hmac_hex(secret.as_bytes(), format!("{}.{}", signed_at, body).as_bytes()); req = req.header("X-OpenWarp-Timestamp", signed_at.to_string()).header("X-OpenWarp-Signature", format!("t={},v1={}", signed_at, sig)); }
     match req.send().await { Ok(r) if r.status().is_success() => None, Ok(r) => Some(format!("rotation hook returned HTTP {}", r.status())), Err(e) => Some(e.to_string()) } }
 async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org,app)=st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
+    require_approval_for_write(&st, &eid, &org, &uid).await?;
     let key_name = body.get("key").and_then(|v|v.as_str()).unwrap_or("");
     let path = body.get("path").and_then(|v|v.as_str()).unwrap_or("/");
     let new_val = body.get("value").and_then(|v|v.as_str()).map(|s|s.to_string()).unwrap_or_else(|| oc::random_token("rot"));
@@ -2242,6 +2244,7 @@ async fn e2e_meta(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) ->
     Ok(j(json!({"mode": db::s(&env, "mode"), "runner": runner, "rekey_required": meta_get(&st, &format!("rekey_required:{}", eid)).await == "1"}))) }
 async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
+    require_approval_for_write(&st, &eid, &org, &uid).await?;
     let env = st.db.one("SELECT mode,runner_id FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("env not found"))?;
     let mode = db::s(&env, "mode");
     if mode != "e2e" && mode != "delegated" { return Err(bad("only client-encrypted environments can be rekeyed")); }
@@ -5834,8 +5837,20 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
             return st.db.one("SELECT org_id FROM pki_cas WHERE id=?", &[json!(db::s(&r, "ca_id"))]).await.ok().flatten().map(|r| db::s(&r, "org_id"));
         }
     }
-    if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "org_id").map(|(_, v)| v.to_string()); }
+    // SCIM names its workspace in a query parameter, so the value the policy
+    // layer reads must be the decoded one the handler will use; a percent-encoded
+    // id would otherwise resolve to no row and skip the allowlist.
+    if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "org_id").and_then(|(_, v)| pct_decode(v)); }
     None }
+fn pct_decode(s: &str) -> Option<String> {
+    let raw = s.as_bytes(); let mut out = Vec::new(); let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' => { if i + 2 >= raw.len() { return None; } let part = std::str::from_utf8(&raw[i+1..i+3]).ok()?; out.push(u8::from_str_radix(part, 16).ok()?); i += 3; }
+            b'+' => { out.push(b' '); i += 1; }
+            b => { out.push(b); i += 1; }
+        } }
+    String::from_utf8(out).ok() }
 fn canonical_policy_path(path: &str) -> Result<String, ()> {
     let mut out=Vec::new();
     for component in path.split('/') { let mut bytes=Vec::new(); let raw=component.as_bytes(); let mut i=0;
@@ -5870,15 +5885,22 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
     let allowed = if client_ip.is_empty() { false } else { match request_org(&st, &path, &query).await {
         Some(oid) => { let list = st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(oid)]).await.ok().flatten().map(|r| db::s(&r, "ip_allowlist")).unwrap_or_default();
             list.trim().is_empty() || list.split(',').any(|c| ip_in_cidr(&client_ip, c)) }
-        None => { let uid = uid.clone().unwrap_or_default();
-            let mut lists: Vec<String> = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect();
-            if lists.is_empty() { lists = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN identities i ON i.org_id=o.id WHERE i.id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect(); }
-            // Runner and machine-identity credentials do not resolve through
-            // token_user, so their organisation allowlist is enforced from the
-            // credential hash; with none configured the request passes through.
-            if lists.is_empty() { let hash = oc::hash_token(&bearer_token(&headers));
-                lists = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN runners r ON r.org_id=o.id WHERE r.token_hash=?", &[json!(&hash)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect();
-                if lists.is_empty() { lists = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN identities i ON i.org_id=o.id JOIN tokens t ON t.created_by=i.id WHERE t.token_hash=?", &[json!(&hash)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect(); } }
+        None => {
+            // User and machine-identity credentials resolve through token_user and
+            // keep the membership/identity lookups. Runner tokens do not, so their
+            // organisation allowlist is resolved from the credential hash and a
+            // lookup failure denies the request instead of passing it.
+            let lists = if let Some(uid) = uid.clone() {
+                let mut lists: Vec<String> = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN org_members m ON m.org_id=o.id WHERE m.user_id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect();
+                if lists.is_empty() { lists = st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN identities i ON i.org_id=o.id WHERE i.id=?", &[json!(&uid)]).await.unwrap_or_default().iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect(); }
+                lists
+            } else {
+                let hash = oc::hash_token(&bearer_token(&headers));
+                match st.db.query("SELECT o.ip_allowlist AS ip_allowlist FROM orgs o JOIN runners r ON r.org_id=o.id WHERE r.token_hash=?", &[json!(&hash)]).await {
+                    Ok(rows) => rows.iter().map(|r| db::s(r, "ip_allowlist")).filter(|s| !s.trim().is_empty()).collect(),
+                    Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "credential allowlist unavailable").into_response(),
+                }
+            };
             lists.is_empty() || lists.iter().all(|l| l.split(',').any(|c| ip_in_cidr(&client_ip, c))) } } };
     if !allowed { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("source IP {} not in organisation allowlist", client_ip)}))).into_response(); }
     next.run(req).await }

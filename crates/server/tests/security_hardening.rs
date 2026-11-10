@@ -199,6 +199,74 @@ async fn clone_checks_target_environment_scope() { scoped_secondary_target(true)
 async fn compare_checks_other_environment_scope() { scoped_secondary_target(false).await; }
 
 #[tokio::test]
+async fn clone_source_environment_obeys_token_scope() {
+    let s = Server::start().await;
+    let u = s.user("owner@test.invalid").await;
+    let ot = u["token"].as_str().unwrap();
+    let (app, envs) = s.app(&u).await;
+    s.secret(ot, &envs[0], "target").await;
+    s.secret(ot, &envs[1], "source").await;
+    let pat = s.pat(&app, ot, &envs[0], "*").await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/clone", envs[1]), &pat, Some(json!({"target_env_id": envs[0], "overwrite": true}))).await;
+    assert_eq!(r.status, 403, "the source environment must obey the credential scope, not only the target");
+    let after = s.ok(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), ot, None).await;
+    assert_eq!(after["secrets"][0]["value"], "target", "denied clone must not overwrite the target");
+}
+
+#[tokio::test]
+async fn approval_required_env_blocks_every_direct_write_path() {
+    let s = Server::start().await;
+    let u = s.user("owner@test.invalid").await;
+    let member = s.member(&u, "developer").await;
+    let ot = u["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let (_, envs) = s.app(&u).await;
+    s.secret(ot, &envs[0], "v1").await;
+    let sid = {
+        s.ok(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), ot, Some(json!({"secrets": [{"key": "SECOND", "value": "v2"}]}))).await;
+        let listed = s.ok(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), ot, None).await;
+        listed["secrets"][0]["id"].as_str().unwrap().to_string()
+    };
+    s.ok(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), ot, Some(json!({"require_approval": true}))).await;
+    let rotate = s.call(Method::POST, &format!("/api/envs/{}/rotate", envs[0]), mt, Some(json!({"key": "PINNED", "value": "rotated"}))).await;
+    let restore = s.call(Method::POST, &format!("/api/secrets/{}/restore/1", sid), mt, None).await;
+    let pitr = s.call(Method::POST, &format!("/api/envs/{}/restore-point", envs[0]), mt, Some(json!({"timestamp": 0}))).await;
+    assert_eq!((rotate.status, restore.status, pitr.status), (403, 403, 403), "the approval policy must gate rotate, restore and point-in-time restore");
+    let after = s.ok(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), ot, None).await;
+    let values: Vec<&str> = after["secrets"].as_array().unwrap().iter().filter_map(|s| s["value"].as_str()).collect();
+    assert_eq!(values.len(), 2, "denied writes must not remove secrets");
+    assert!(!values.contains(&"rotated"), "denied rotation must not change the value");
+    // Tombstoning stays deliberately open (the undelete gate covers reversal);
+    // undeleting around the policy must still be denied.
+    let undelete = s.call(Method::POST, &format!("/api/secrets/{}/undelete", sid), mt, None).await;
+    assert_eq!(undelete.status, 403, "a developer must not undelete around the approval policy");
+    s.ok(Method::DELETE, &format!("/api/secrets/{}", sid), mt, None).await;
+    s.ok(Method::POST, &format!("/api/secrets/{}/undelete", sid), ot, None).await;
+}
+
+#[tokio::test]
+async fn e2e_rekey_needs_approval() {
+    let s = Server::start().await;
+    let u = s.user("owner@test.invalid").await;
+    let member = s.member(&u, "developer").await;
+    let ot = u["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let (app, _) = s.app(&u).await;
+    let key = oc::random_key();
+    let env = s.ok(Method::POST, &format!("/api/apps/{}/envs/e2e", app), ot, Some(json!({"name": "encrypted", "wrapped_key": oc::encrypt_to(u["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
+    let eid = env["id"].as_str().unwrap();
+    s.ok(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), ot, Some(json!({"email": "member@test.invalid", "wrapped_key": oc::encrypt_to(member["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
+    let path = format!("/api/envs/{}/e2e/secrets", eid);
+    let body = json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
+    s.ok(Method::PUT, &path, mt, Some(body.clone())).await;
+    s.ok(Method::PUT, &format!("/api/envs/{}/policy", eid), ot, Some(json!({"require_approval": true}))).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", eid), mt, Some(json!({"secrets": body["secrets"], "grants": [{"user_id": member["user_id"], "wrapped_key": "x"}]}))).await;
+    assert_eq!(r.status, 403, "rekeying must obey the approval policy like any other write");
+    let after = s.ok(Method::GET, &path, mt, None).await;
+    assert_eq!(after["secrets"][0]["value_enc"], body["secrets"][0]["value_enc"], "denied rekey must preserve ciphertext");
+}
+
+#[tokio::test]
 async fn clone_respects_target_approval_policy() {
     let s = Server::start().await;
     let u = s.user("owner@test.invalid").await;
