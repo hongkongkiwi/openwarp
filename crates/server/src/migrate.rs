@@ -130,8 +130,26 @@ impl Target for Db {
 #[cfg(target_arch = "wasm32")]
 impl Target for worker::D1Database {
     // D1's `exec` splits its input on newlines, which mangles a multi-line
-    // statement. `prepare().run()` executes exactly one statement as written.
-    async fn exec(&self, sql: &str) -> Result<(), String> { self.prepare(sql).run().await.map(|_| ()).map_err(|e| e.to_string()) }
+    // statement. `prepare().run()` executes exactly one statement as written,
+    // driven through js_sys so every JS rejection surfaces as Err: the worker
+    // crate's own binding is not `catch`-marked, and a throw would abort the
+    // module before exec_tolerant could apply convergence tolerance to
+    // lineage migrations that re-add columns the squashed baseline carries.
+    async fn exec(&self, sql: &str) -> Result<(), String> {
+        use worker::wasm_bindgen::{JsCast, JsValue};
+        use wasm_bindgen_futures::JsFuture;
+        let raw: &JsValue = self.as_ref();
+        let prepare = js_sys::Reflect::get(raw, &JsValue::from_str("prepare")).map_err(|e| worker::Error::from(e).to_string())?
+            .dyn_into::<js_sys::Function>().map_err(|_| "D1 prepare is unavailable".to_string())?;
+        let request = prepare.call1(raw, &JsValue::from_str(sql)).map_err(|e| worker::Error::from(e).to_string())?;
+        let all = js_sys::Reflect::get(&request, &JsValue::from_str("all")).map_err(|e| worker::Error::from(e).to_string())?
+            .dyn_into::<js_sys::Function>().map_err(|_| "D1 all is unavailable".to_string())?;
+        let promise = all.call0(&request).map_err(|e| worker::Error::from(e).to_string())?
+            .dyn_into::<js_sys::Promise>().map_err(|_| "D1 all did not return a promise".to_string())?;
+        // A rejected promise becomes Err here, so lineage migrations whose
+        // columns already exist are classified by exec_tolerant as converged.
+        JsFuture::from(promise).await.map(|_| ()).map_err(|e| { let e = js_sys::Error::try_from(e).ok(); e.and_then(|e| e.message().try_into().ok()).unwrap_or_else(|| "D1 statement failed".into()) })
+    }
     async fn query(&self, sql: &str) -> Result<Vec<Row>, String> {
         let result = self.prepare(sql).all().await.map_err(|e| e.to_string())?;
         let rows: Vec<HashMap<String, serde_json::Value>> = result.results().map_err(|e| e.to_string())?;

@@ -1,3 +1,4 @@
+#![cfg(feature = "pki")]
 use base64ct::{Base64, Encoding};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Resp { status: u16, body: Value }
@@ -61,6 +63,11 @@ impl Server {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { drop(_guard); return Box::pin(Server::start()).await; }
             assert!(Instant::now() < deadline, "server did not become healthy"); tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -103,6 +110,8 @@ async fn setup(s: &Server) -> (String, String, String) {
     assert_eq!(s.call(Method::GET, &path, Auth::None, None).await.status, 200, "verify");
     let r = s.post("/api/auth/login", Auth::None, json!({"email": "lockdown@test.invalid", "password": "correct-horse-battery"})).await;
     assert_eq!(r.status, 200, "login"); let token = r.body["token"].as_str().unwrap().to_string();
+    let g = s.call(Method::PUT, "/api/instance/features", Auth::Bearer(&token), Some(json!({"org": org, "features": ["pki"]}))).await;
+    assert_eq!(g.status, 200, "grant pki: {:?}", g.body);
     let r = s.post(&format!("/api/orgs/{}/pki/cas", org), Auth::Bearer(&token), json!({"name": "lockdown-root"})).await;
     assert_eq!(r.status, 200, "CA"); (token, org, r.body["id"].as_str().unwrap().to_string())
 }

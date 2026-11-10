@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 const OWNER: &str = "health-lockdown-owner-session-fixture";
 const OTHER: &str = "health-lockdown-other-session-fixture";
 const RELAYS: [&str; 2] = ["/api/me/secret-health/enzoic/accounts", "/api/me/secret-health/enzoic/credentials"];
@@ -44,6 +45,11 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
 

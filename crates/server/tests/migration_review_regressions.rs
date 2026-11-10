@@ -187,6 +187,11 @@ async fn repair_latest_interrupted_migration_can_be_removed_and_reapplied() {
     let db = fresh(&scratch).await;
     let latest = MIGRATIONS.last().unwrap().version;
     db.exec("UPDATE schema_migrations SET success=0 WHERE version=?", &[json!(latest)]).await.unwrap();
+    // Repair --remove replays the migration from scratch, and migration 32 is
+    // unguarded; drop what the first application created so the retry sees the
+    // pre-32 schema a genuinely interrupted run would leave.
+    db.exec("DROP INDEX IF EXISTS idx_sessions_id", &[]).await.unwrap();
+    db.exec("ALTER TABLE sessions DROP COLUMN id", &[]).await.unwrap();
     let earlier = db.query("SELECT * FROM schema_migrations WHERE version<? ORDER BY version", &[json!(latest)]).await.unwrap();
 
     migrate::repair(&db, MIGRATIONS, Repair::Remove(latest)).await.expect("latest interrupted migration can be retried");

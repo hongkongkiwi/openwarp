@@ -11,6 +11,9 @@
 use reqwest::{redirect::Policy, Client, Method};
 use serde_json::{json, Value};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -81,6 +84,11 @@ impl Server {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
@@ -230,12 +238,14 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "provider-invite-test-password";
 const EMAIL: &str = "invitee@test.invalid";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
 fn url_b64(bytes: &[u8]) -> String { oc::b64(bytes).trim_end_matches('=').replace('+', "-").replace('/', "_") }
 
@@ -305,6 +315,7 @@ impl Server {
         std::fs::create_dir(&dir).unwrap();
         let mut cmd=Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
         cmd.env_clear().env("DATABASE_URL",format!("sqlite://{}/test.db",dir.display())).env("ADDR",addr.to_string())
+            .env("OPENWARP_LICENSE","development")
             .env("OPENWARP_PUBLIC_URL",&base).env("TOKIO_WORKER_THREADS","1")
             .env("OPENWARP_EMAIL_PROVIDER","webhook").env("OPENWARP_EMAIL_WEBHOOK",format!("{}/mail",idp.base))
             .env("OPENWARP_ALLOW_PRIVATE_EGRESS","1").stdout(Stdio::null()).stderr(Stdio::null());
@@ -315,6 +326,11 @@ impl Server {
             if let Ok(r)=s.client.get(format!("{}/health",s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("fixture server did not become healthy");
     }
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Reply {
@@ -364,6 +380,14 @@ impl Server {
 enum Provider { Oidc, Saml(Box<risaml::Saml<risaml::Idp>>), Ldap(Directory) }
 impl Provider {
     async fn configure(kind: Kind, s: &Server, owner: &str, org: &str, auto: bool, domains: &str) -> Self {
+        // The provider being configured must hold its workspace grant; the
+        // build compiles it (the module is feature-gated), the license unlocks
+        // it, and this is the per-workspace third gate.
+        // Per-org OIDC is not a gated surface; SAML and LDAP hold workspace grants.
+        let feature = match kind { Kind::Saml => Some("saml"), Kind::Ldap => Some("ldap"), Kind::Oidc => None };
+        if let Some(feature) = feature {
+            s.call(Method::PUT,"/api/instance/features",Some(owner),Some(json!({"org":org,"features":[feature]}))).await.expect(200,"grant the provider surface");
+        }
         match kind {
             Kind::Oidc => {
                 s.call(Method::PUT,&format!("/api/orgs/{}/settings",org),Some(owner),Some(json!({
@@ -503,12 +527,18 @@ const USER_DN: &str="uid=invitee,dc=test,dc=invalid";
 struct Directory { port:u16, ca_pem:String }
 impl Directory {
     fn start() -> Self {
-        use rcgen::{BasicConstraints,CertificateParams,IsCa,KeyPair};
+        use rcgen::{BasicConstraints,CertificateParams,DnType,IsCa,KeyPair};
         use rustls::pki_types::{PrivateKeyDer,PrivatePkcs8KeyDer};
+        // OpenSSL (native-tls on Linux) rejects an empty-DN issuer during chain
+        // verification, so both certificates carry explicit CommonNames.
         let ca_key=KeyPair::generate().unwrap(); let mut params=CertificateParams::new(Vec::new()).unwrap();
-        params.is_ca=IsCa::Ca(BasicConstraints::Unconstrained); let ca=params.self_signed(&ca_key).unwrap();
+        params.is_ca=IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName,"OpenWarp workspace CA");
+        let ca=params.self_signed(&ca_key).unwrap();
         let leaf_key=KeyPair::generate().unwrap();
-        let leaf=CertificateParams::new(vec!["127.0.0.1".into()]).unwrap().signed_by(&leaf_key,&ca,&ca_key).unwrap();
+        let mut leaf=CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        leaf.distinguished_name.push(DnType::CommonName,"127.0.0.1");
+        let leaf=leaf.signed_by(&leaf_key,&ca,&ca_key).unwrap();
         let _=rustls::crypto::ring::default_provider().install_default();
         let config=Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![leaf.der().clone()],PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()))).unwrap());
         let listener=TcpListener::bind("127.0.0.1:0").unwrap(); let port=listener.local_addr().unwrap().port();

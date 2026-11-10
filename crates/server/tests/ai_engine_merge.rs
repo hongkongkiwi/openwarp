@@ -161,10 +161,13 @@ fn released_engine_sql_1_through_29_is_immutable() {
 }
 
 #[tokio::test]
-async fn fresh_engine_reaches_30_with_exact_ai_schema() {
-    assert_eq!(MIGRATIONS.last().expect("manifest").version, 30, "the merged engine must append the AI assistant schema as migration 30");
+async fn fresh_engine_applies_ai_schema_at_30() {
+    // The AI schema is canonically migration 30; later migrations may extend
+    // the manifest, so pin version 30 itself instead of the tip.
+    assert_eq!(MIGRATIONS[29].version, 30, "the merged engine must keep the AI assistant schema as migration 30");
+    let tip = MIGRATIONS.last().expect("manifest").version;
     let db = Db::open_memory().await.unwrap();
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, tip).await;
     assert_ai_tables_exact(&db).await;
     let ledger = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
@@ -188,9 +191,10 @@ async fn engine29_upgrade_appends_migration_30_and_preserves_data() {
     let ledger29 = db.query("SELECT * FROM schema_migrations ORDER BY version", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("the merged engine upgrades an engine-29 database");
-    assert_eq!(report.applied, vec![30], "the AI schema must land as exactly migration 30 on an engine-29 database");
+    let tip = MIGRATIONS.last().expect("manifest").version;
+    assert_eq!(report.applied, (30..=tip).collect::<Vec<_>>(), "the upgrade must apply migration 30 first and then the remaining manifest in order");
     assert!(!report.squashed);
-    assert_clean_engine(&db, 30).await;
+    assert_clean_engine(&db, tip).await;
     assert_preserved(&db, &before).await;
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=29 ORDER BY version", &[]).await.unwrap(), ledger29, "engine history 1..29 must survive the upgrade untouched");
     let row = &db.query("SELECT name,checksum,success FROM schema_migrations WHERE version=30", &[]).await.unwrap()[0];
@@ -237,6 +241,9 @@ impl Fixture {
         let (live, _) = tokio::sync::broadcast::channel(16);
         let state = new_state(db, database.url.clone(), "ai-engine-merge".into(), "https://openwarp.test.invalid".into(), master, live,
             #[cfg(feature = "redis-cache")] None);
+        // Boot persists the verifier row that rotation re-encrypts in its
+        // checked batch; the direct state construction skips that path.
+        state.db().insert_if_absent("master_key_check", &oc::encrypt_symmetric(&master, b"openwarp-master-key-v1")).await.expect("seed master verifier");
         Self { app: router(state.clone()), state }
     }
     async fn sql(&self, sql: &str, params: &[Value]) { self.state.db().exec(sql, params).await.expect("fixture SQL"); }

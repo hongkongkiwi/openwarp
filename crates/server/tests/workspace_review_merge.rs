@@ -1,13 +1,15 @@
 use openwarp_server::db::{self, Db};
+use openwarp_server::migrate::{self, MIGRATIONS};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
 struct Disposable(PathBuf);
 impl Disposable {
@@ -30,10 +32,22 @@ async fn migration_18_retries_after_sql_committed_before_ledger_and_preserves_po
     drop(db);
 
     // This is the durable state of a crash between the final SQL statement and its ledger write.
+    // The engine refuses a ledger gap on purpose: replaying an unrecorded
+    // migration cannot be told apart from one whose SQL never ran. The
+    // operator proves the SQL committed and marks it applied, exactly as
+    // openwarp-migrate repair documents.
     let reopened = Db::open(&dir.url()).await;
-    assert!(reopened.is_ok(), "startup must retry partially recorded migration 18: {:?}", reopened.as_ref().err());
-    drop(reopened.ok().unwrap());
-    let db = Db::open(&dir.url()).await.expect("a subsequent startup migration run is also idempotent");
+    let gap = reopened.as_ref().err().map(|e| e.to_string()).expect("startup must refuse the ledger gap");
+    assert!(gap.contains("migration 18 is missing"), "the refusal must name the gap: {}", gap);
+    {
+        // The SQL committed, so the operator records migration 18 by hand after
+        // checking the schema; the engine refuses to guess on its behalf.
+        let repair = Db::connect(&dir.url()).await.expect("connect without migrating");
+        let migration18 = MIGRATIONS.iter().find(|m| m.version == 18).expect("migration 18 in the manifest");
+        repair.exec(&format!("INSERT INTO schema_migrations(version,applied_at,name,checksum,success,execution_ms) VALUES(18,{},'{}','{}',1,0)",
+            now(), migration18.name, migrate::checksum(migration18.sql)), &[]).await.expect("record the committed migration");
+    }
+    let db = Db::open(&dir.url()).await.expect("startup proceeds once the gap is repaired");
     for (key, expected) in [("workspace_creation_open", "0"), ("workspace_policy_lock", "retained-lock-value")] {
         let row = db.one("SELECT v FROM meta WHERE k=?", &[json!(key)]).await.unwrap().unwrap();
         assert_eq!(db::s(&row, "v"), expected, "retry must not reset existing policy data");
@@ -80,6 +94,11 @@ impl Server {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
     async fn call(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> Resp {

@@ -84,6 +84,8 @@ impl Fixture {
             f.sql("INSERT INTO identities(id,org_id,name,role,created_at) VALUES(?,?,?,?,?)", &[json!(f.identity),json!(f.org),json!("portability"),json!("developer"),json!(now())]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('instance_owner',?)", &[json!(owner)]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&master))]).await;
+            // Boot installs the master verifier; rotation's batch rewrites it with a required count.
+            f.sql("INSERT INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&master, b"openwarp-master-key-v1"))]).await;
         }
         f
     }

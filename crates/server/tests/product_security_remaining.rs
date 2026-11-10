@@ -94,6 +94,10 @@ impl RemainingMysql {
             f.sql("INSERT INTO apps(id,org_id,name,created_at) VALUES('app-a','org-a','remaining',?)", &[json!(now())]).await;
             for env in ["dev", "prod"] { f.sql("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,created_at) VALUES(?,'app-a',?,?,'sse',?)", &[json!(env),json!(env),json!(oc::encrypt_symmetric(&master, &[11;32])),json!(now())]).await; }
             f.sql("INSERT INTO identities(id,org_id,name,role,created_at) VALUES('identity-a','org-a','remaining','developer',?)", &[json!(now())]).await;
+            // The fixture workspace holds every grant: these suites test the
+            // gated surfaces themselves, and the grant gate has its own test.
+            let held = ["change-requests", "transit", "workload-identity", "pki", "ssh-ca", "saml", "scim", "ldap"].join(" ");
+            f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES('org-a',?,'fixture',?)", &[json!(held), json!(now())]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&master))]).await;
         }
@@ -201,6 +205,9 @@ async fn remaining_postgres_retention_policy_change_during_apply_cannot_use_stal
         #[cfg(feature = "redis-cache")] None);
     let f = Fixture { app: router(st.clone()), st };
     f.sql("INSERT INTO orgs(id,name,created_at) VALUES('org-a','policy race',?)", &[json!(now())]).await;
+    // The fixture workspace holds the change-requests grant: the suite tests
+    // the gated surface itself, and the grant gate has its own test.
+    f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES('org-a','change-requests','fixture',?)", &[json!(now())]).await;
     for (uid, token, role) in [("owner",OWNER,"owner"),("admin",ADMIN,"admin")] {
         f.sql("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,active,email_verified) VALUES(?,?,?,'','',?,1,1)", &[json!(uid),json!(format!("{uid}@test.invalid")),json!("unused-password-hash"),json!(now())]).await;
         f.sql("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(token)),json!(uid),json!(now())]).await;

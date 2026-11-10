@@ -150,6 +150,10 @@ async fn sqlite_upgrades_a_legacy_ledger_without_data() {
     // the binary is behind the current one.
     db.exec("UPDATE schema_migrations SET checksum='', name=''", &[]).await.unwrap();
     db.exec("DELETE FROM schema_migrations WHERE version > 9", &[]).await.unwrap();
+    // Migration 32 creates its index without IF NOT EXISTS, so the rewound
+    // database must look like a real v9 schema: drop what 32 later added.
+    db.exec("DROP INDEX IF EXISTS idx_sessions_id", &[]).await.unwrap();
+    db.exec("ALTER TABLE sessions DROP COLUMN id", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
     assert_eq!(report.applied, (10i64..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>());

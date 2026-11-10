@@ -127,7 +127,7 @@ function initialization(source = read('worker.rs'), items = all) {
   assert.ok(body.indexOf('load_master') < body.indexOf('initialize_master') && body.indexOf('load_master') < body.indexOf('install_kms'),
     'verified master loading must precede publishing the key and KMS');
   const load = selected(items, 'load_master', true);
-  contains(load, /verify_master\s*\([^;]+\)\s*\.await\s*\?/, 'master loading must verify persisted identity and propagate validation failure');
+  contains(load, /verify_master(?:_full)?\s*\([^;]+\)\s*\.await\s*\?/, 'master loading must verify persisted identity and propagate validation failure');
   return reach(body, items);
 }
 function liveContract(appSource = read('app.rs'), workerSource = read('worker.rs')) {
@@ -175,7 +175,7 @@ test('initialization gate rejects missing KMS validation and missing persisted-k
   assert.throws(() => initialization(source.replace('crate::kms::Kms::from_env()?', 'Ok(None)?')),
     /validate the configured KMS bridge/);
   const withoutVerifier = all.map(fn => fn.name === 'load_master'
-    ? { ...fn, text: fn.text.replace(/verify_master\(db, &key\)\.await\?;/g, '') } : fn);
+    ? { ...fn, text: fn.text.replace(/verify_master(?:_full)?\([^;]+\)\s*\.await\s*\?;/g, '') } : fn);
   assert.throws(() => initialization(source, withoutVerifier), /verify persisted identity/);
 });
 
@@ -226,8 +226,11 @@ test('Workers KMS bridge performs asynchronous wrapping and unwrapping with HTTP
   }
   contains(source, /owkms:/, 'KMS ciphertext must retain its key-id-bearing envelope');
   const request = reach(source, fns);
-  contains(request, /\.send\s*\(\s*\)\s*\.await/, 'Workers KMS must await a real HTTP request');
-  contains(request, /is_success\s*\(|\.status\s*\(/, 'KMS HTTP failure must not be treated as usable key material');
+  contains(request, /crate::http::provider_post_bounded\s*\([^)]*\)\s*\.await/,
+    'Workers KMS must await a real HTTP request through the shared bounded provider');
+  const provider = selected(functions(read('http.rs'), true), 'provider_post_bounded', true);
+  contains(provider, /worker::Fetch::Request\s*\(|send_with_signal\s*\(/, 'the Workers KMS provider must issue a real awaited fetch');
+  contains(provider, /status_code\s*\(\s*\)/, 'KMS HTTP failure must not be treated as usable key material');
   assert.ok(!/reqwest::blocking|std::thread::spawn/.test(mask(source)), 'Workers KMS cannot use native blocking threads');
 });
 
@@ -243,7 +246,7 @@ test('master rotation preserves client-auth keys, pending TOTP, and LDAP credent
 
 test('master rotation commits encrypted records atomically before publishing the new key', () => {
   const rotation = reach(native('rotate_master'), nativeAll);
-  contains(rotation, /\.batch\s*\(/, 'master rotation must use the shared atomic database batch, not individually committed ciphertext updates');
+  contains(rotation, /\.checked_batch\s*\(\s*&statements/, 'master rotation must use the shared atomic database batch, not individually committed ciphertext updates');
   contains(rotation, /decrypt_symmetric/, 'master rotation must preflight existing encrypted values');
   contains(rotation, /only the instance owner/, 'master rotation must retain instance-owner authorization');
   contains(rotation, /owkms:/, 'master rotation must recognize externally wrapped environment keys');
@@ -267,11 +270,22 @@ test('Workers SAML reuses validation and replay boundaries with a portable clock
   for (const name of ['saml_metadata', 'saml_start', 'get_saml_config', 'put_saml_config']) portable(name);
 });
 
-test('Workers OCSP and CRL retain real protocol paths and portable time', () => {
-  const ocsp = portable('ocsp_respond'), crl = portable('ca_crl');
+test('Workers OCSP and CRL fail closed while native paths stay real and clock-portable', () => {
+  for (const name of ['ocsp_respond', 'ca_crl']) {
+    const stub = worker(name);
+    assert.ok(/NOT_IMPLEMENTED|requires the native server/.test(stub), `${name} must fail closed with an explicit unsupported error on Workers`);
+    assert.ok(!/ocsp-response|pkix-crl|sign\s*\(/i.test(mask(stub)), `the ${name} stub must never synthesize protocol output`);
+  }
+  const ocsp = native('ocsp_respond'), crl = native('ca_crl');
   contains(ocsp, /application\/ocsp-response/, 'OCSP must emit a real protocol response');
   contains(crl, /application\/pkix-crl/, 'CRL must emit a real revocation list');
-  assert.ok(!/OffsetDateTime::now_utc\s*\(|SystemTime::now\s*\(/.test(mask(ocsp + crl)), 'revocation protocols must use the shared runtime clock');
+  // Wall-clock calls are native-only by design (certificate validity windows);
+  // the Workers stubs must never touch a clock that panics on wasm, and the
+  // native OCSP response must be built through the shared runtime clock.
+  for (const name of ['ocsp_respond', 'ca_crl']) {
+    assert.ok(!/OffsetDateTime::now_utc\s*\(|SystemTime::now\s*\(/.test(mask(worker(name))), `${name} Workers stub must not call unsupported wall-clock functions`);
+  }
+  contains(ocsp, /clock::system_time\s*\(/, 'native OCSP must sign through the shared runtime clock');
 });
 
 test('Workers live and passkey gaps remain explicit and never issue an unverified session', () => {
