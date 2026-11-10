@@ -89,7 +89,7 @@ await put(prod, [{ key: 'TARGET', value: 'before-prod' }]);
 // grant (the fixture account is the instance owner). Transit-on-Worker is a
 // follow-up: its startup interaction with the KMS outage path is under
 // investigation, so this build compiles without it and the section skips.
-const grants = await expect('PUT', '/api/instance/features', token, { org, features: ['workload-identity'] });
+const grants = await expect('PUT', '/api/instance/features', token, { org, features: ['workload-identity', 'change-requests'] });
 assert.equal(grants.org_id, org, `feature grants seeded: ${JSON.stringify(grants).slice(0, 160)}`);
 const identity = id(await expect('POST', `/api/orgs/${org}/identities`, token, { name: 'worker-product', role: 'developer' }));
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
