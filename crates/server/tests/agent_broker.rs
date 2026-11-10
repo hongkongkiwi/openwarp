@@ -127,9 +127,9 @@ async fn broker_policy_rejects_destination_schema_and_credential_escapes() {
     let kp=openwarp_crypto::Keypair::generate();
     let runner=f.s.call(Method::POST,&format!("/api/orgs/{}/runners",f.org),&f.owner,Some(json!({"name":"broker-runner","public_key":kp.public}))).await; assert_eq!(runner.status,200);
     for mode in ["e2e","delegated"] {
-        let (path,body)=if mode == "e2e" { (format!("/api/apps/{}/envs/e2e",f.app),json!({"name":"broker-e2e","wrapped_key":"client-owned-fixture"})) } else { (format!("/api/apps/{}/envs",f.app),json!({"name":"broker-delegated","mode":"delegated","runner_id":runner.body["id"],"wrapped_key":"client-owned-fixture","runner_wrapped_key":"runner-owned-fixture"})) };
+        let (path,body)=if mode == "e2e" { (format!("/api/apps/{}/envs/e2e",f.app),json!({"name":"broker-e2e","wrapped_key":openwarp_crypto::b64(&[8u8; 64])})) } else { (format!("/api/apps/{}/envs",f.app),json!({"name":"broker-delegated","mode":"delegated","runner_id":runner.body["id"],"wrapped_key":openwarp_crypto::b64(&[8u8; 64]),"runner_wrapped_key":openwarp_crypto::b64(&[9u8; 64])})) };
         let r=f.s.call(Method::POST,&path,&f.owner,Some(body)).await; assert_eq!(r.status,200); let env=id(&r.body,"id");
-        let r=f.s.call(Method::PUT,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,Some(json!({"secrets":[{"key_enc":"ciphertext-key","key_hash":"fixture-key-hash","value_enc":"ciphertext-value"}]}))).await; assert_eq!(r.status,200);
+        let r=f.s.call(Method::PUT,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,Some(json!({"secrets":[{"key_enc":"ciphertext-key","key_hash":"fixture-key-hash","value_enc":"ciphertext-value"}]}))).await; assert_eq!(r.status,200,"{} -> {}", r.status, r.text);
         let r=f.s.call(Method::GET,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,None).await; assert_eq!(r.status,200);
         let mut v=f.service(); v["env_id"]=json!(env); v["credential_secret_id"]=r.body["secrets"][0]["id"].clone(); denied(&f.s.call(Method::POST,&f.path("services"),&f.owner,Some(v)).await,409);
     }
