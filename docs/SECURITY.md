@@ -169,8 +169,11 @@ The console calls an organisation a workspace. Workspace membership is the outer
 | Restricted environment | Explicit application or environment access is required, with owner/admin exceptions |
 | Approval-required environment | Non-admin direct writes are restricted; use proposals |
 | Environment-scoped token | Cannot be used as an unrestricted cross-environment token |
+| Workspace member lock | Owner-only flag on one membership: the account signs in and uses other workspaces, but every workspace-data route returns 403 `workspace_locked` |
 
 Review custom roles against the actions callers need. An approved access request and the `restricted` flag are separate concepts; granting temporary access does not by itself make an otherwise open environment exclusive.
+
+Only a workspace owner can lock another member. The lock is stored on that membership, so the same account keeps its other workspaces and can still sign in. A locked member sees the workspace in `GET /api/orgs` with `locked: true`, but cannot read its apps, environments, secrets, members, settings or audit, and service tokens created by that member are rejected the same way. The member can leave the workspace. Unlocking restores access without changing secrets, grants or tokens. Owners cannot be locked, and a locked member cannot be promoted to owner or receive ownership; unlock them first. `member.lock` and `member.unlock` are audited. Account-level console settings such as TOTP remain available while the selected workspace is locked.
 
 SCIM requests require workspace context through `org_id` and administrative authority. Deactivation removes membership in that workspace rather than treating a tenant administrator as an instance-wide account administrator.
 

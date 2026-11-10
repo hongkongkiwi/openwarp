@@ -1748,3 +1748,81 @@ test('the workspace menu keeps workspace actions apart from account actions', as
   await ui.invoke('toggleOrgMenu()');
   assert.match(ui.el('orgmenu').textContent, /✓\s*Second org/, 'the open menu marks the selected workspace');
 });
+
+// ---------- workspace member locks ----------
+test('a locked workspace shows the owner contact message without fetching workspace data', async () => {
+  const ui = await consoleUI([saved], [], {
+    manualBoot: true,
+    responses: {
+      '/api/orgs': [{ id: 'org-locked', name: 'Locked org', role: 'member', members: 1, locked: true }],
+      '/api/orgs/org-locked/emergency': { locked: false },
+    },
+  });
+  await ui.invoke('enterApp()');
+  const view = ui.el('view');
+  assert.match(view.textContent, /locked/i, 'the locked workspace must say it is locked');
+  assert.match(view.textContent, /workspace owner/, 'the member must be told to contact the workspace owner');
+  assert.equal(ui.el('pagetitle').textContent, 'Workspace access locked');
+  assert.match(ui.el('orgmenu').textContent, /locked/i, 'the workspace menu must mark the locked workspace');
+  assert.ok(!ui.calls.some(c => c.url === '/api/orgs/org-locked/apps'),
+    'a locked workspace must not fetch workspace data such as apps');
+});
+
+test('an owner can lock a member from the members list', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
+    '/api/orgs/org-a/members': [{ id: 'owner-a', email: 'owner@example.invalid', role: 'owner' }, { id: 'member-a', email: 'member@example.invalid', role: 'developer' }],
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
+    '/api/orgs/org-a/features': { compiled: [], granted: [] },
+    'POST /api/orgs/org-a/members/member-a/lock': { ok: true, locked: true },
+  } });
+  await ui.invoke("nav('access')");
+  const lock = ui.button(ui.el('view'), /^Lock$/);
+  assert.ok(lock, 'an owner must see a Lock control for a non-owner member');
+  ui.confirm = true;
+  await ui.click(lock);
+  assert.ok(ui.calls.some(c => c.method === 'POST' && c.url === '/api/orgs/org-a/members/member-a/lock'),
+    'locking must POST the member lock route');
+});
+
+test('an owner can unlock a member from the members list', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
+    '/api/orgs/org-a/members': [{ id: 'owner-a', email: 'owner@example.invalid', role: 'owner' }, { id: 'member-a', email: 'member@example.invalid', role: 'developer', locked: true }],
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
+    '/api/orgs/org-a/features': { compiled: [], granted: [] },
+    'POST /api/orgs/org-a/members/member-a/unlock': { ok: true, locked: false },
+  } });
+  await ui.invoke("nav('access')");
+  const unlock = ui.button(ui.el('view'), /^Unlock$/);
+  assert.ok(unlock, 'an owner must see an Unlock control for a locked member');
+  await ui.click(unlock);
+  assert.ok(ui.calls.some(c => c.method === 'POST' && c.url === '/api/orgs/org-a/members/member-a/unlock'),
+    'unlocking must POST the member unlock route');
+});
+
+test('the console preserves the workspace_locked error code', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    'GET /api/orgs/org-a/audit': { status: 403, body: { error: 'Your account is locked in this workspace; contact the workspace owner.', code: 'workspace_locked' } },
+  } });
+  await assert.rejects(ui.run("api('GET','/api/orgs/org-a/audit')"), error => error.code === 'workspace_locked');
+});
+
+test('a locked workspace keeps account settings available and hides workspace settings', async () => {
+  const ui = await consoleUI([saved], [], {
+    manualBoot: true,
+    responses: {
+      '/api/orgs': [{ id: 'org-locked', name: 'Locked org', role: 'member', members: 1, locked: true }],
+      '/api/orgs/org-locked/emergency': { locked: false },
+    },
+  });
+  await ui.invoke('enterApp()');
+  ui.calls.length = 0;
+  await ui.invoke("nav('settings')");
+  assert.ok(!ui.calls.some(c => c.url === '/api/orgs/org-locked/settings'),
+    'a locked workspace must not fetch workspace settings');
+  assert.ok(!ui.calls.some(c => c.url.includes('/saml') || c.url.includes('/ldap')),
+    'a locked workspace must not fetch SSO or directory settings');
+  assert.match(ui.el('view').textContent, /locked/i, 'the settings view must explain why workspace settings are unavailable');
+  assert.ok(!ui.el('view').textContent.includes('Organisation security'), 'workspace security settings must be hidden');
+});
