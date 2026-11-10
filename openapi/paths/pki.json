@@ -1,5 +1,76 @@
 {
   "/api/orgs/{oid}/pki/cas": {
+    "get": {
+      "summary": "List X.509 CAs",
+      "description": "Lists the workspace's X.509 CAs with certificate PEM, serial, revocation state, rotation-hook presence and attestation policy. Requires pki:read.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "properties": {
+                    "attest_issuer": { "type": "string" },
+                    "attest_required": { "type": "boolean" },
+                    "certificate": { "type": "string" },
+                    "created_at": { "type": "integer" },
+                    "hook_set": { "type": "boolean" },
+                    "id": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "name": { "type": "string" },
+                    "parent_id": { "type": "string" },
+                    "revoked": { "type": "boolean" },
+                    "revoked_at": { "type": "integer" },
+                    "serial": { "type": "string" }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "X.509 CAs in the workspace"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not permitted"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ]
+    },
     "post": {
       "summary": "Create an X.509 CA",
       "description": "Requires org:admin. Generates the CA private key on the server and stores it encrypted; returns the PEM certificate in JSON. Empty name uses OpenWarp CA as common name.",

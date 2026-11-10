@@ -76,7 +76,7 @@ pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request,
     let method=req.method().as_str();
     let allowed=matches!((method,route),
         ("POST","/mcp") | ("GET","/api/me") | ("POST","/api/auth/logout") |
-        ("GET","/api/orgs") | ("GET","/api/orgs/{oid}/apps") | ("GET","/api/apps/{aid}/envs") |
+        ("GET","/api/orgs") | ("POST","/api/orgs/{oid}/leave") | ("GET","/api/orgs/{oid}/apps") | ("GET","/api/apps/{aid}/envs") |
         ("GET","/api/envs/{eid}/meta") | ("GET","/api/envs/{eid}/secrets") | ("PUT","/api/envs/{eid}/secrets") |
         ("POST","/api/envs/{eid}/import") | ("GET","/api/envs/{eid}/export") | ("GET","/api/envs/{eid}/scan") |
         ("POST","/api/envs/{eid}/secrets/reuse-check") | ("GET","/api/search") |
