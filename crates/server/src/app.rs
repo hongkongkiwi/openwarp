@@ -6239,6 +6239,9 @@ async fn emergency_transition(st: &S, oid: &str, app: Option<&str>, locked: bool
         for table in ["oidc_states", "saml_pending"] { statements.push((format!("DELETE FROM {} WHERE org_id=?", table), vec![json!(&oid)])); }
         // Reset only the halted target's claims, fencing late results after restoration.
         statements.push((format!("UPDATE sync_jobs SET status='pending',claim_id='',claimed_at=0 WHERE status='claimed' AND env_id IN (SELECT e.id FROM envs e JOIN apps a ON a.id=e.app_id WHERE {}=?)", if app.is_some() { "a.id" } else { "a.org_id" }), vec![json!(app.unwrap_or(oid))]));
+        // Delegated agent credentials die with the lockdown: restoring the
+        // workspace must not reactivate sessions issued before the incident.
+        if let Some(stmt) = broker::lockdown_statement(st, oid, app).await { statements.push(stmt); }
     }
     st.audited_batch(&statements, &[], audit).await.map_err(|e| bad(&e))?;
     Ok(()) }

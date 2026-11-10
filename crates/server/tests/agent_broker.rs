@@ -202,3 +202,42 @@ async fn broker_arguments_and_audit_never_become_secret_exfiltration_paths() {
     let r = f.s.client.post(format!("{}/api/broker/http",f.s.base)).bearer_auth(&token).header("content-type","application/json").body("{").send().await.unwrap(); assert_eq!(r.status().as_u16(),400);
     let r = f.s.call(Method::GET,&f.path("audit"),&f.owner,None).await; assert_eq!(r.status,200); assert!(!r.text.contains(CREDENTIAL)); assert!(!r.text.contains(&token)); assert!(!r.text.contains("attacker.example")); assert!(!r.text.contains("stolen"));
 }
+
+#[tokio::test]
+async fn broker_emergency_lockdown_revokes_live_agent_sessions() {
+    let f = Fixture::new().await; let service = f.create(f.service()).await; let sid = id(&service,"id");
+    let issued = f.issue(&sid,&f.uid,900).await; assert_eq!(issued.status,201,"{}: {}",issued.status,issued.text);
+    let token = id(&issued.body,"token");
+    assert_eq!(f.ping(&token).await.status,200,"healthy delegation must execute");
+    // The emergency endpoints take the owner's cookie session, not a bearer token.
+    let lock = f.s.client.put(format!("{}/api/orgs/{}/emergency",f.s.base,f.org)).header("cookie",format!("ow_session={}",f.owner)).json(&json!({"locked":true})).send().await.unwrap();
+    assert_eq!(lock.status().as_u16(),200,"{}: {}",lock.status(),lock.text().await.unwrap_or_default());
+    let during = f.ping(&token).await.status;
+    assert_ne!(during,200,"a locked workspace must not execute agent operations");
+    let restore = f.s.client.put(format!("{}/api/orgs/{}/emergency",f.s.base,f.org)).header("cookie",format!("ow_session={}",f.owner)).json(&json!({"locked":false})).send().await.unwrap();
+    assert_eq!(restore.status().as_u16(),200,"{}: {}",restore.status(),restore.text().await.unwrap_or_default());
+    denied(&f.ping(&token).await,401);
+}
+
+#[tokio::test]
+async fn broker_sessions_stop_when_the_issuer_becomes_path_restricted() {
+    let f = Fixture::new().await;
+    let admin = f.s.register("broker-admin@test.invalid").await;
+    let at = id(&admin,"token"); let auid = id(&admin,"user_id");
+    let inv = f.s.call(Method::POST,&format!("/api/orgs/{}/members",f.org),&f.owner,Some(json!({"email":"broker-admin@test.invalid","role":"admin"}))).await;
+    assert_eq!(inv.status,200,"{}: {}",inv.status,inv.text);
+    let acc = f.s.call(Method::POST,"/api/auth/accept-invite",&at,Some(json!({"token":inv.body["invite_token"]}))).await;
+    assert_eq!(acc.status,200,"{}: {}",acc.status,acc.text);
+    let mut v = f.service(); v["policy"]["allowed_member_ids"] = json!([auid]);
+    let service = f.create(v).await; let sid = id(&service,"id");
+    let issued = f.issue(&sid,&auid,900).await; assert_eq!(issued.status,201,"{}: {}",issued.status,issued.text);
+    let token = id(&issued.body,"token");
+    assert_eq!(f.ping(&token).await.status,200,"a healthy admin delegation must execute");
+    let rules = json!({"rules":[{"prefix":"/public/","capabilities":["read"]}]});
+    let pol = f.s.call(Method::PUT,&format!("/api/envs/{}/path-policy/admin",f.env),&f.owner,Some(rules)).await;
+    assert_eq!(pol.status,200,"{}: {}",pol.status,pol.text);
+    let pr = f.ping(&token).await;
+    denied(&pr,403); assert_eq!(pr.body["error"], json!("forbidden"), "{}", pr.text);
+    let r = f.s.call(Method::POST,&f.path("sessions"),&at,Some(json!({"service_id":sid,"subject_user_id":auid,"capabilities":["lookup"],"approved_privileged_capabilities":[],"ttl_seconds":300}))).await;
+    assert_eq!(r.status,403,"{}: {}",r.status,r.text);
+}

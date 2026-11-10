@@ -109,8 +109,20 @@ fn service_view(r: &Row, s: &Service) -> Value { let mut v=serde_json::to_value(
 async fn payload(req: Request, limit: usize) -> Result<Value> {
     if req.headers().get("content-type").and_then(|v| v.to_str().ok()).is_none_or(|s| s.split(';').next()!=Some("application/json")) { return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE); }
     let bytes=to_bytes(req.into_body(),limit).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?; serde_json::from_slice(&bytes).map_err(|_| invalid()) }
-pub(super) fn routes() -> Router<S> {
-    Router::new().route("/api/orgs/{oid}/broker/services",get(services).post(create_service))
+// The service config JSON is not portable SQL, so the env-to-app mapping is
+// resolved here and the returned statement dies inside the emergency batch.
+pub(super) async fn lockdown_statement(st:&S,oid:&str,app:Option<&str>) -> Option<(String,Vec<Value>)> {
+    let rows=st.db.query("SELECT id,config FROM broker_services WHERE org_id=?",&[json!(&oid)]).await.ok()?;
+    let mut sids=Vec::new();
+    for r in &rows {
+        let env=serde_json::from_str::<Value>(&db::s(r,"config")).ok().and_then(|v| v["env_id"].as_str().map(|s| s.to_string())).unwrap_or_default();
+        if env.is_empty() { continue; }
+        let hit=st.db.one(&format!("SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=? AND {}=?",if app.is_some() { "a.id" } else { "a.org_id" }),&[json!(&env),json!(app.unwrap_or(oid))]).await.ok().flatten();
+        if hit.is_some() { sids.push(db::s(r,"id")); } }
+    if sids.is_empty() { return None; }
+    let mut args:Vec<Value>=sids.iter().map(|s| json!(s)).collect(); args.insert(0,json!(&oid));
+    Some((format!("DELETE FROM broker_sessions WHERE org_id=? AND service_id IN ({})",vec!["?";sids.len()].join(",")),args)) }
+pub(super) fn routes() -> Router<S> {    Router::new().route("/api/orgs/{oid}/broker/services",get(services).post(create_service))
         .route("/api/orgs/{oid}/broker/services/{sid}",put(update_service).delete(delete_service))
         .route("/api/orgs/{oid}/broker/sessions",get(sessions).post(issue))
         .route("/api/orgs/{oid}/broker/sessions/{sid}",delete(revoke))
@@ -220,7 +232,11 @@ mod native {
         let oid=db::s(&row,"org_id"); let (r,s)=load_service(st,&oid,&db::s(&row,"service_id")).await.map_err(|e| if e==StatusCode::NOT_FOUND { StatusCode::UNAUTHORIZED } else { e })?;
         if !s.enabled || db::n(&r,"revision")!=db::n(&row,"revision") { return Err(StatusCode::UNAUTHORIZED); }
         let issuer=db::s(&row,"issuer_user_id"); if st.db.one("SELECT id FROM users WHERE id=? AND active=1 AND email_verified=1",&[json!(&issuer)]).await.map_err(unavailable)?.is_none() { return Err(StatusCode::FORBIDDEN); }
-        authority(st,&oid,&issuer,Some(&s.env_id)).await?; subject(st,&oid,&s,&db::s(&row,"subject_user_id")).await?; ip_allowed(st,&oid,h,peer).await?; credential_row(st,&s).await?;
+        authority(st,&oid,&issuer,Some(&s.env_id)).await?;
+        // A live delegation carries the issuer's authority: once the issuer
+        // becomes path-restricted, outstanding sessions must stop executing.
+        if st.restricted_principal(&issuer).await.map_err(|e| e.0)? { return Err(StatusCode::FORBIDDEN); }
+        subject(st,&oid,&s,&db::s(&row,"subject_user_id")).await?; ip_allowed(st,&oid,h,peer).await?; credential_row(st,&s).await?;
         let caps=serde_json::from_str(&db::s(&row,"capabilities")).map_err(unavailable)?; let approvals=serde_json::from_str(&db::s(&row,"approvals")).map_err(unavailable)?;
         Ok(Session {row,service:s,caps,approvals})
     }
