@@ -225,8 +225,10 @@ async fn approval_required_env_blocks_every_direct_write_path() {
     let sid = {
         s.ok(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), ot, Some(json!({"secrets": [{"key": "SECOND", "value": "v2"}]}))).await;
         let listed = s.ok(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), ot, None).await;
-        listed["secrets"][0]["id"].as_str().unwrap().to_string()
+        listed["secrets"].as_array().unwrap().iter().find(|x| x["key"] == "PINNED").unwrap()["id"].as_str().unwrap().to_string()
     };
+    // Give the pinned secret a second version so restore has a prior value to roll back to.
+    s.ok(Method::PUT, &format!("/api/envs/{}/secrets", envs[0]), ot, Some(json!({"secrets": [{"key": "PINNED", "value": "v2"}]}))).await;
     s.ok(Method::PUT, &format!("/api/envs/{}/policy", envs[0]), ot, Some(json!({"require_approval": true}))).await;
     let rotate = s.call(Method::POST, &format!("/api/envs/{}/rotate", envs[0]), mt, Some(json!({"key": "PINNED", "value": "rotated"}))).await;
     let restore = s.call(Method::POST, &format!("/api/secrets/{}/restore/1", sid), mt, None).await;
@@ -236,6 +238,7 @@ async fn approval_required_env_blocks_every_direct_write_path() {
     let values: Vec<&str> = after["secrets"].as_array().unwrap().iter().filter_map(|s| s["value"].as_str()).collect();
     assert_eq!(values.len(), 2, "denied writes must not remove secrets");
     assert!(!values.contains(&"rotated"), "denied rotation must not change the value");
+    assert!(values.contains(&"v2"), "denied restore must not roll the value back to v1");
     // Tombstoning stays deliberately open (the undelete gate covers reversal);
     // undeleting around the policy must still be denied.
     let undelete = s.call(Method::POST, &format!("/api/secrets/{}/undelete", sid), mt, None).await;
@@ -260,8 +263,8 @@ async fn e2e_rekey_needs_approval() {
     let body = json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
     s.ok(Method::PUT, &path, mt, Some(body.clone())).await;
     s.ok(Method::PUT, &format!("/api/envs/{}/policy", eid), ot, Some(json!({"require_approval": true}))).await;
-    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", eid), mt, Some(json!({"secrets": body["secrets"], "grants": [{"user_id": member["user_id"], "wrapped_key": "x"}]}))).await;
-    assert_eq!(r.status, 403, "rekeying must obey the approval policy like any other write");
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", eid), mt, Some(json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": "x", "value_enc": "attacker-replacement", "path_enc": "x"}], "grants": [{"user_id": member["user_id"], "wrapped_key": "x"}]}))).await;
+    assert_eq!(r.status, 403, "rekeying must obey the approval policy like any other write, got {}", r.body);
     let after = s.ok(Method::GET, &path, mt, None).await;
     assert_eq!(after["secrets"][0]["value_enc"], body["secrets"][0]["value_enc"], "denied rekey must preserve ciphertext");
 }

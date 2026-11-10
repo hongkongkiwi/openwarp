@@ -1483,6 +1483,7 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     st.check_scope(&h, &eid).await?; st.check_secret_path(&sid, &uid, "write").await?;
     require_approval_for_write(&st, &eid, &org, &uid).await?;
+    // An E2E environment has no server-side key; restoring its ciphertext
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
@@ -5838,19 +5839,21 @@ async fn request_org(st: &S, path: &str, query: &str) -> Option<String> {
         }
     }
     // SCIM names its workspace in a query parameter, so the value the policy
-    // layer reads must be the decoded one the handler will use; a percent-encoded
-    // id would otherwise resolve to no row and skip the allowlist.
-    if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "org_id").and_then(|(_, v)| pct_decode(v)); }
+    // layer reads must match what the handler's Query extractor sees: decode
+    // names and values the same lenient way and keep the LAST occurrence.
+    if path.starts_with("/scim/") { return query.split('&').filter_map(|kv| kv.split_once('=')).filter(|(k, _)| pct_decode(k) == "org_id").map(|(_, v)| pct_decode(v)).next_back(); }
     None }
-fn pct_decode(s: &str) -> Option<String> {
+// Lenient percent-decoding matching the form decoder the handlers use: an
+// invalid escape is kept literally rather than rejecting the pair.
+fn pct_decode(s: &str) -> String {
     let raw = s.as_bytes(); let mut out = Vec::new(); let mut i = 0;
     while i < raw.len() {
         match raw[i] {
-            b'%' => { if i + 2 >= raw.len() { return None; } let part = std::str::from_utf8(&raw[i+1..i+3]).ok()?; out.push(u8::from_str_radix(part, 16).ok()?); i += 3; }
+            b'%' if i + 2 < raw.len() && std::str::from_utf8(&raw[i+1..i+3]).ok().and_then(|p| u8::from_str_radix(p, 16).ok()).is_some() => { out.push(u8::from_str_radix(std::str::from_utf8(&raw[i+1..i+3]).unwrap_or(""), 16).unwrap_or(b'%')); i += 3; }
             b'+' => { out.push(b' '); i += 1; }
             b => { out.push(b); i += 1; }
         } }
-    String::from_utf8(out).ok() }
+    String::from_utf8_lossy(&out).into_owned() }
 fn canonical_policy_path(path: &str) -> Result<String, ()> {
     let mut out=Vec::new();
     for component in path.split('/') { let mut bytes=Vec::new(); let raw=component.as_bytes(); let mut i=0;
