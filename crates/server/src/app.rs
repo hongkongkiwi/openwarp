@@ -4143,11 +4143,38 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let users = st.db.query("SELECT id,auth_key_enc FROM users WHERE auth_key_enc<>''", &[]).await.map_err(|e| bad(&e))?;
     let mut auth_updates = Vec::new();
     for r in users { let uid = db::s(&r, "id"); let aad = auth_key_aad(&uid); let plain = oc::decrypt_symmetric_aad(&old, &aad, &db::s(&r, "auth_key_enc")).map_err(|_| bad("authentication key unavailable; refusing root rotation"))?; auth_updates.push((uid, oc::encrypt_symmetric_aad(&new, &aad, &plain))); }
+    // Webhook signing keys and the serialization epoch live outside the
+    // generic sweeps: rewrap them and advance the fence so post-rotation
+    // reads pass the epoch check instead of answering 503 epoch_stale.
+    let mut webhook_key_updates = Vec::new();
+    for table in ["webhook_subscriptions", "incoming_webhooks"] {
+        for r in st.db.query(&format!("SELECT id,secret_enc FROM {} WHERE secret_enc<>''", table), &[]).await.map_err(|e| bad(&e))? {
+            let wid = db::s(&r, "id"); let aad = format!("webhook:{}", wid);
+            let plain = oc::decrypt_symmetric_aad(&old, aad.as_bytes(), &db::s(&r, "secret_enc")).map_err(|_| bad("a webhook signing key cannot be decrypted with the current master key; refusing rotation"))?;
+            webhook_key_updates.push((table.to_string(), wid, oc::encrypt_symmetric_aad(&new, aad.as_bytes(), &plain)));
+        }
+    }
+    let mut sign_updates = Vec::new();
+    for r in st.db.query("SELECT id,sign_key_enc FROM webhook_subscriptions WHERE sign_key_enc<>''", &[]).await.map_err(|e| bad(&e))? {
+        let wid = db::s(&r, "id"); let aad = format!("webhook-sign:{}", wid);
+        let plain = oc::decrypt_symmetric_aad(&old, aad.as_bytes(), &db::s(&r, "sign_key_enc")).map_err(|_| bad("a webhook signing seed cannot be decrypted with the current master key; refusing rotation"))?;
+        sign_updates.push((wid, oc::encrypt_symmetric_aad(&new, aad.as_bytes(), &plain)));
+    }
     let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
+    let old_master_hash = oc::hash_token(&oc::b64(&old));
+    let new_master_hash = oc::hash_token(&oc::b64(&new));
     let mut statements: Vec<(String, Vec<Value>, Option<u64>)> = Vec::new();
+    // The epoch fence advances first: a stale replica's concurrent rotation
+    // leaves the CAS at zero rows and aborts this batch.
+    statements.push(("UPDATE webhook_serialization SET epoch=epoch+1,master_hash=? WHERE id=1 AND (master_hash='' OR master_hash=?)".into(), vec![json!(new_master_hash), json!(old_master_hash)], Some(1)));
     for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(id)], Some(1))); }
     for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value), json!(k)], Some(1))); }
     for (uid, value) in &auth_updates { statements.push(("UPDATE users SET auth_key_enc=? WHERE id=?".into(), vec![json!(value), json!(uid)], Some(1))); }
+    for (table, wid, wrapped) in &webhook_key_updates { statements.push((format!("UPDATE {} SET secret_enc=? WHERE id=?", table), vec![json!(wrapped), json!(wid)], Some(1))); }
+    for (wid, wrapped) in &sign_updates { statements.push(("UPDATE webhook_subscriptions SET sign_key_enc=? WHERE id=?".into(), vec![json!(wrapped), json!(wid)], Some(1))); }
+    // Captured incoming payloads are transient debug data sealed with the old
+    // master; rotation erases them rather than rewrapping.
+    statements.push(("UPDATE webhook_receipts SET body_enc=''".into(), vec![], None));
     statements.push(("DELETE FROM email_codes".into(), vec![], None));
     if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
     statements.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))], Some(1)));
