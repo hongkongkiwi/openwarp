@@ -233,6 +233,12 @@ approval workflows that inspect plaintext, and server-side search require the
 server to read or create the secret. They stay in `sse` mode. A zero-knowledge
 deployment gives those up or moves them into a client.
 
+The [agent credential broker](AGENT_BROKER.md) also requires managed SSE
+credentials. It authenticates approved upstream operations without returning the
+credential to the agent. The server and approved upstream still see plaintext.
+E2E and delegated environments are rejected; the sync runner does not currently
+provide an agent-broker transport.
+
 ## Offline encrypted files and transit
 
 The CLI's [encrypted-file commands](CLI.md#encrypted-files) use a separate file data key wrapped to explicit X25519 recipients. Files do not depend on an instance master key or environment grant. The JSON envelope authenticates the complete encrypted payload and recipient metadata. Rekey changes recipient wrappers without re-encrypting the payload; old saved envelopes remain readable to their old recipients.

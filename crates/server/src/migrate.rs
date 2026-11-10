@@ -76,6 +76,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 34, name: "workspace_member_locks", sql: include_str!("../migrations/0034_workspace_member_locks.sql"), tolerant: true },
     Migration { version: 35, name: "private_workers", sql: include_str!("../migrations/0035_private_workers.sql"), tolerant: true },
     Migration { version: 36, name: "identity_linking", sql: include_str!("../migrations/0036_identity_linking.sql"), tolerant: true },
+    Migration { version: 37, name: "agent_broker", sql: include_str!("../migrations/0037_agent_broker.sql"), tolerant: false },
 ];
 
 /// SQL profile used when splitting migration statements.

@@ -287,7 +287,17 @@ stateless server). Unauthenticated calls get 401 with
 `list_secrets`, `get_secret`, `search_secrets` (scope `secrets:read`) and
 `set_secret`, `delete_secret`, `create_lease`, `sync_integration` (scope
 `secrets:write`, RBAC still applies). Every tool call is audit-logged.
-Resources: `openwarp://env/{env_id}`.
+Resources: `openwarp://env/{env_id}`. This secret-management interface can return
+plaintext values. It is not the model-blind credential broker.
+
+The separate [agent credential broker](AGENT_BROKER.md) uses expiring `owb_`
+sessions at `/api/broker/http` and `/api/broker/mcp`. A human administrator
+configures fixed HTTPS destinations, exact capabilities and scalar output
+projections. Agents cannot use broker sessions to read secrets, change policies
+or issue sessions. Remote MCP support is JSON-response Streamable HTTP with
+structured results only. Native SSE execution is supported; E2E/delegated
+credential sources and Workers execution are rejected. Session-level privileged
+approval is not per-invocation confirmation.
 
 CLI (`openwarp` binary in the same monorepo) logs in three ways: browser
 OAuth with PKCE and a loopback redirect (`login`), `login --token`, and

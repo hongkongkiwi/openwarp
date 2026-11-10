@@ -66,6 +66,8 @@ cargo test -p openwarp-server --test security -- --test-threads=2
 cargo test -p openwarp-server --test authorization -- --test-threads=2
 cargo test -p openwarp-server --test accounts -- --test-threads=2
 cargo test -p openwarp-server --test migrations -- --test-threads=1
+cargo test -p openwarp-server --test agent_broker -- --test-threads=1
+cargo test -p openwarp-server --lib broker -- --test-threads=2
 node --test crates/server/tests/ui.test.cjs
 ```
 
@@ -76,6 +78,7 @@ node --test crates/server/tests/ui.test.cjs
 | `authorization.rs` | Roles, administrative gates, environment policy, and related regressions |
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
 | `migrations.rs` | Runner failure modes, legacy catch-up, and live PostgreSQL/MariaDB applies |
+| `agent_broker.rs` and broker library tests | Restricted agent sessions, policy boundaries and local trusted-HTTPS upstream fixtures |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
 The coverage matrix, acceptance scenarios and rollout plan for every feature area live in [testing](TESTING.md).

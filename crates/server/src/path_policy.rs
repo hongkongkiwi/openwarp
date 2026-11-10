@@ -66,8 +66,8 @@ pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request,
     if matches!((req.method().as_str(),route),
         ("GET","/api/auth/providers" | "/api/auth/kdf" | "/api/auth/verify" | "/api/auth/social/{provider}/start" | "/api/auth/social/{provider}/callback" | "/api/auth/oidc/{oid}/start" | "/api/auth/oidc/callback" | "/api/auth/saml/{oid}/metadata" | "/api/auth/saml/{oid}/start") |
         ("POST","/api/auth/register" | "/api/auth/register-v2" | "/api/auth/login" | "/api/auth/login-v2" | "/api/auth/challenge" | "/api/auth/forgot" | "/api/auth/reset" | "/api/auth/reset-v2" | "/api/auth/reset-info" | "/api/auth/resend-verification" | "/api/auth/accept-invite" | "/api/auth/accept-invite-v2" | "/api/auth/social/{provider}/callback" | "/api/auth/saml/{oid}/acs" | "/api/auth/ldap" | "/api/auth/mfa" | "/api/auth/mfa/options" | "/api/auth/mfa/email/send" | "/api/auth/mfa/passkey/start" | "/api/auth/mfa/passkey/finish" | "/api/auth/logout" | "/api/v1/machine/auth/workload/login" | "/api/v1/machine/auth/universal/login")) { return next.run(req).await; }
-    // Runner and wrapping credentials have separate authenticators.
-    if matches!((req.method().as_str(),route),("GET","/api/runner/jobs")|("POST","/api/runner/jobs/{jid}/result")|("GET","/api/unwrap")|("POST","/api/unwrap")) { return next.run(req).await; }
+    // Runner, wrapping and broker credentials have separate authenticators.
+    if matches!((req.method().as_str(),route),("GET","/api/runner/jobs")|("POST","/api/runner/jobs/{jid}/result")|("GET","/api/unwrap")|("POST","/api/unwrap" | "/api/broker/http" | "/api/broker/mcp")) { return next.run(req).await; }
     if !path.starts_with("/api/") && !path.starts_with("/scim/") && path!="/mcp" { return next.run(req).await; }
     let uid=match st.token_user(req.headers()).await { Ok(u)=>u,Err(e)=> { if bearer_token(req.headers()).is_empty() && cookie_val(req.headers(),"ow_session").is_empty() { return next.run(req).await; } return e.into_response(); } };
     let restricted=match st.restricted_principal(&uid).await { Ok(v)=>v,Err(e)=>return e.into_response() };
