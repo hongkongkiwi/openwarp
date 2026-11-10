@@ -45,6 +45,15 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     E2eGrant { #[arg(long, default_value = "")] env: String, #[arg(long)] email: String, #[arg(long, env = "OPENWARP_PRIVKEY")] privkey: String },
     /// Print shell completions: openwarp completion bash|zsh|fish
     Completion { shell: String },
+    /// Dial the server from inside a private network and run one bound target.
+    /// The server never connects to this host.
+    Worker { #[command(subcommand)] cmd: WorkerCmd },
+}
+#[derive(Subcommand)] enum WorkerCmd {
+    /// Exchange a one-time enrollment token for an OpenSSH certificate.
+    Enroll { #[arg(long)] token: String, #[arg(long, default_value = "")] key_file: String },
+    /// Poll for one job at a time and run it against the local network.
+    Run { #[arg(long, default_value = "")] key_file: String, #[arg(long, default_value = "5")] interval: u64 },
 }
 
 #[derive(Subcommand)] enum SshCmd {
@@ -498,6 +507,7 @@ fn main() {
             let env = pick(env, &local, "env_id", "--env");
             if let Err(e) = agent::run(&host, &token, &env, template, out, *interval_secs, *cache_ttl_secs, *once) { eprintln!("{}", e); std::process::exit(1); }
         }
+        Cmd::Worker { cmd } => worker_main(&client, &host, cmd),
         Cmd::Ssh { cmd } => match cmd {
             SshCmd::Cert { ca, principal, key, ttl, out, print, quiet } => {
                 let (key_path, default_cert) = ssh_key_paths(key);
@@ -564,4 +574,87 @@ fn main() {
             let d: Value = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
         Cmd::Completion { shell } => { use clap::CommandFactory; let mut cmd = Cli::command(); let sh = match shell.as_str() { "zsh" => clap_complete::Shell::Zsh, "fish" => clap_complete::Shell::Fish, "powershell" => clap_complete::Shell::PowerShell, _ => clap_complete::Shell::Bash }; clap_complete::generate(sh, &mut cmd, "openwarp", &mut std::io::stdout()); }
     }
+}
+
+// ---------- private-network worker ----------
+fn worker_key_path(explicit: &str) -> std::path::PathBuf {
+    if !explicit.is_empty() { return std::path::PathBuf::from(explicit); }
+    config_path().parent().unwrap_or(std::path::Path::new(".")).join("worker_ed25519")
+}
+fn load_or_make_key(path: &std::path::Path) -> ssh_key::PrivateKey {
+    if let Ok(text) = std::fs::read_to_string(path) { if let Ok(key) = ssh_key::PrivateKey::from_openssh(&text) { return key; } }
+    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).expect("ed25519 key");
+    let pem = key.to_openssh(ssh_key::LineEnding::LF).expect("encode key").to_string();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).expect("write worker key");
+        f.write_all(pem.as_bytes()).expect("write worker key");
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))] { std::fs::write(path, &pem).expect("write worker key"); }
+    key
+}
+fn worker_state_path() -> std::path::PathBuf { config_path().parent().unwrap_or(std::path::Path::new(".")).join("worker.json") }
+fn worker_main(client: &reqwest::blocking::Client, host: &str, cmd: &WorkerCmd) {
+    match cmd {
+        WorkerCmd::Enroll { token, key_file } => {
+            let path = worker_key_path(key_file);
+            let key = load_or_make_key(&path);
+            let public = key.public_key().to_openssh().expect("public key");
+            let d: Value = client.post(format!("{}/api/worker/enroll", host)).json(&json!({"enrollment_token": token, "public_key": public})).send().expect("enroll").json().expect("json");
+            if d.get("certificate").and_then(|v| v.as_str()).is_none() { eprintln!("enrollment failed: {}", d); std::process::exit(1); }
+            let state = json!({"host": host, "worker_id": d["worker_id"], "certificate": d["certificate"], "ca_public_key": d["ca_public_key"], "key_file": path.display().to_string()});
+            std::fs::write(worker_state_path(), serde_json::to_string_pretty(&state).unwrap()).expect("save worker state");
+            println!("enrolled worker {} (key {})", d["worker_id"].as_str().unwrap_or(""), path.display());
+            println!("certificate expires in {}s; `openwarp worker run` renews it", d["expires_in"].as_i64().unwrap_or(0));
+        }
+        WorkerCmd::Run { key_file, interval } => {
+            let text = std::fs::read_to_string(worker_state_path()).unwrap_or_else(|_| { eprintln!("not enrolled; run `openwarp worker enroll`"); std::process::exit(1); });
+            let mut state: Value = serde_json::from_str(&text).expect("worker state");
+            let _ = key_file;
+            let pause = (*interval).clamp(1, 300);
+            loop {
+                let cert = state["certificate"].as_str().unwrap_or("").to_string();
+                let claimed = client.post(format!("{}/api/worker/jobs/claim", host)).header("x-openwarp-cert", &cert).send();
+                let response = match claimed { Ok(r) => r, Err(e) => { eprintln!("claim failed: {}", e); std::thread::sleep(std::time::Duration::from_secs(pause)); continue; } };
+                if response.status().as_u16() == 401 {
+                    let renewed: Value = client.post(format!("{}/api/worker/certificate", host)).header("x-openwarp-cert", &cert).send().and_then(|r| r.json()).unwrap_or(Value::Null);
+                    if let Some(next) = renewed["certificate"].as_str() { state["certificate"] = json!(next); let _ = std::fs::write(worker_state_path(), serde_json::to_string_pretty(&state).unwrap()); continue; }
+                    eprintln!("certificate rejected and renewal failed: {}", renewed);
+                    std::process::exit(1);
+                }
+                let body: Value = response.json().unwrap_or(Value::Null);
+                let job = &body["job"];
+                if job.is_null() { std::thread::sleep(std::time::Duration::from_secs(pause)); continue; }
+                let id = job["id"].as_str().unwrap_or("").to_string();
+                let outcome = run_worker_job(job);
+                let (ok, detail) = match &outcome { Ok(()) => (true, String::new()), Err(e) => (false, e.clone()) };
+                let _ = client.post(format!("{}/api/worker/jobs/{}", host, id)).header("x-openwarp-cert", &cert).json(&json!({"ok": ok, "detail": detail})).send();
+                if let Err(e) = outcome { eprintln!("job {} failed: {}", id, e); }
+            }
+        }
+    }
+}
+fn quote_ident(name: &str) -> Result<String, String> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return Err("role name has characters postgres would need quoting for".into()); }
+    Ok(name.to_string())
+}
+fn run_worker_job(job: &Value) -> Result<(), String> {
+    let kind = job["kind"].as_str().unwrap_or("");
+    let payload = &job["payload"];
+    if kind != "postgres.create" && kind != "postgres.drop" { return Err(format!("unsupported job {}", kind)); }
+    let conn = payload["connection"].as_str().unwrap_or("");
+    let username = quote_ident(payload["username"].as_str().unwrap_or(""))?;
+    let statement = payload["statement"].as_str().unwrap_or("");
+    let sql = if statement == "create" {
+        let password = payload["password"].as_str().unwrap_or("");
+        if password.is_empty() || password.contains('\'') { return Err("refusing a password that cannot be passed as a literal".into()); }
+        format!("CREATE ROLE \"{}\" LOGIN PASSWORD '{}'", username, password)
+    } else if statement == "drop" {
+        format!("DROP ROLE IF EXISTS \"{}\"", username)
+    } else { return Err("postgres job has no statement".into()); };
+    let mut cl = postgres::Client::connect(conn, postgres::NoTls).map_err(|e| e.to_string())?;
+    cl.execute(&sql, &[]).map_err(|e| e.to_string())?;
+    Ok(())
 }

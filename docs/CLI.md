@@ -228,6 +228,25 @@ The CA is selected with `--ca` or `OPENWARP_SSH_CA`. `--key` defaults to `~/.ssh
 
 A certificate is a short-lived credential, not a stored key. Revoking one takes effect on a host only after that host refreshes its `RevokedKeys` file; otherwise it stops working when it expires.
 
+## Private-network workers
+
+A worker is a process you run inside a private network. It dials the server, receives one PostgreSQL lease job at a time, and creates or drops the role against a target only it can reach. The server never connects to the worker or to that target.
+
+```bash
+openwarp worker enroll --token ENROLLMENT_TOKEN
+openwarp worker run --interval 5
+```
+
+`enroll` exchanges the one-time token shown when the worker was created for an OpenSSH certificate signed by the instance CA; the private key is generated at `worker_ed25519` beside the CLI config (mode 0600) and never sent. `run` polls for jobs and renews the certificate on a 401, writing `worker.json` beside the config. Enrollment tokens and certificates expire after ten minutes, and a certificate names one worker, so one worker cannot claim another's job.
+
+Requesting a worker-delivered lease passes `worker_id` in the dynamic-lease body:
+
+```bash
+openwarp api POST /api/envs/ENV_ID/dynamic --json '{"name":"reporting","type":"postgres","worker_id":"WORKER_ID","config":{"connection":"postgres://user:pass@db.internal:5432/app"}}'
+```
+
+The response carries `delivery: "worker"` and a `job_id`; the credential exists once the worker has run the job. `OPENWARP_ALLOWED_DB_HOSTS` still gates the target, because the feature is an egress boundary even when the connection is made from the worker's network. A revoke queues a drop job; if the worker has not dialled in for 90 seconds the request fails rather than leaving the role behind silently.
+
 ## Completion
 
 ```bash

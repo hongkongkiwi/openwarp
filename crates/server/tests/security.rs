@@ -2,6 +2,7 @@
 // spawning the server binary. Each test owns a private database and port.
 
 use hmac::Mac;
+use rand_core::OsRng;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
@@ -78,6 +79,9 @@ impl Server {
             .env("OPENWARP_PUBLIC_URL", &public)
             .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
             .env("OPENWARP_LICENSE", "development")
+            // The worker test queues a lease for an address only the worker can
+            // reach; the allowlist still gates it.
+            .env("OPENWARP_ALLOWED_DB_HOSTS", "10.1.1.5:5432")
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -1077,4 +1081,68 @@ async fn oidc_new_users_need_org_auto_provisioning() {
     let state = params.get("state").cloned().expect("state");
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
     assert_eq!(r.status, 403, "an org without auto-provisioning must not admit a new SSO user, got {} {}", r.status, r.text);
+}
+
+fn worker_subject() -> (String, String) {
+    let key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).expect("key");
+    let public = key.public_key().to_openssh().expect("public");
+    (public, key.to_openssh(ssh_key::LineEnding::LF).expect("pem").to_string())
+}
+
+#[tokio::test]
+async fn a_worker_can_only_claim_its_own_job_and_a_silent_worker_is_not_dialled() {
+    let s = Server::start().await;
+    let u = register(&s, "worker@test.invalid").await;
+    let token = u["token"].as_str().unwrap();
+    let org = u["org_id"].as_str().unwrap();
+    let (_, envs) = app_with_envs(&s, token, org).await;
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/workers", envs[0]), Some(token), Some(json!({"name": "pg", "target": "postgres"}))).await;
+    assert_eq!(r.status, 200, "create worker: {}", r.text);
+    let enroll = r.body["enrollment_token"].as_str().unwrap().to_string();
+    let wid = r.body["id"].as_str().unwrap().to_string();
+
+    let (public, _) = worker_subject();
+    let r = s.call(Method::POST, "/api/worker/enroll", None, Some(json!({"enrollment_token": enroll, "public_key": public}))).await;
+    assert_eq!(r.status, 200, "enroll: {}", r.text);
+    let cert = r.body["certificate"].as_str().unwrap().to_string();
+    let again = s.call(Method::POST, "/api/worker/enroll", None, Some(json!({"enrollment_token": enroll, "public_key": public}))).await;
+    assert_eq!(again.status, 401, "an enrollment token is single use, got {} {}", again.status, again.text);
+
+    let (other_public, _) = worker_subject();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/workers", envs[1]), Some(token), Some(json!({"name": "other", "target": "postgres"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let other_enroll = r.body["enrollment_token"].as_str().unwrap();
+    let r = s.call(Method::POST, "/api/worker/enroll", None, Some(json!({"enrollment_token": other_enroll, "public_key": other_public}))).await;
+    assert_eq!(r.status, 200, "second enroll: {}", r.text);
+    let other_cert = r.body["certificate"].as_str().unwrap().to_string();
+
+    // The worker has not claimed anything yet, so a lease must not make the
+    // server open a database connection of its own.
+    let r = s.call(Method::POST, &format!("/api/envs/{}/dynamic", envs[0]), Some(token), Some(json!({"name": "pg", "type": "postgres", "worker_id": wid, "config": {"connection": "postgres://u:p@10.1.1.5:5432/db"}}))).await;
+    assert_eq!(r.status, 503, "a worker that has not dialled in must not fall back to a server connection, got {} {}", r.status, r.text);
+
+    let req = s.client.post(s.url("/api/worker/jobs/claim")).header("x-openwarp-cert", &cert);
+    let seen = finish(req.send().await).await;
+    assert_eq!(seen.status, 200, "claim registers the dial-in: {}", seen.text);
+
+    let r = s.call(Method::POST, &format!("/api/envs/{}/dynamic", envs[0]), Some(token), Some(json!({"name": "pg", "type": "postgres", "worker_id": wid, "config": {"connection": "postgres://u:p@10.1.1.5:5432/db"}}))).await;
+    assert_eq!(r.status, 200, "queued lease: {}", r.text);
+    assert_eq!(r.body["delivery"], json!("worker"));
+    assert_eq!(r.body["status"], json!("queued"));
+    let job_id = r.body["job_id"].as_str().unwrap().to_string();
+
+    let stolen = finish(s.client.post(s.url("/api/worker/jobs/claim")).header("x-openwarp-cert", &other_cert).send().await).await;
+    assert!(stolen.body["job"].is_null(), "another environment's worker took the job: {}", stolen.text);
+    let claimed = finish(s.client.post(s.url("/api/worker/jobs/claim")).header("x-openwarp-cert", &cert).send().await).await;
+    assert_eq!(claimed.body["job"]["id"], json!(job_id), "owner did not receive its job: {}", claimed.text);
+    assert_eq!(claimed.body["job"]["payload"]["connection"], json!("postgres://u:p@10.1.1.5:5432/db"));
+
+    let forged = finish(s.client.post(s.url("/api/worker/jobs/claim")).header("x-openwarp-cert", "ssh-ed25519-cert-v01@openssh.com AAAA").send().await).await;
+    assert_eq!(forged.status, 401, "a forged certificate must be rejected, got {} {}", forged.status, forged.text);
+    let finished = finish(s.client.post(s.url(&format!("/api/worker/jobs/{}", job_id))).header("x-openwarp-cert", &other_cert).json(&json!({"ok": true})).send().await).await;
+    assert_eq!(finished.status, 404, "the other worker must not finish this job, got {} {}", finished.status, finished.text);
+    let done = finish(s.client.post(s.url(&format!("/api/worker/jobs/{}", job_id))).header("x-openwarp-cert", &cert).json(&json!({"ok": true, "detail": ""})).send().await).await;
+    assert_eq!(done.status, 200, "finish: {}", done.text);
+    assert_eq!(done.body["status"], json!("done"));
 }

@@ -16,6 +16,8 @@ pub mod mailer;
 pub mod migrate;
 pub mod mysqllease;
 pub mod pglease;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pgworker;
 #[cfg(feature = "pki")]
 pub mod pki;
 pub mod tpm_attestation;

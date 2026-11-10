@@ -4539,6 +4539,26 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         let conn = body.get("config").and_then(|c| c.get("connection")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if conn.is_empty() { return Err(bad("postgres dynamic secret requires config.connection")); }
         if db_target_allowed(&conn).map_err(|e| bad(&e))? != "postgres" { return Err(bad("postgres dynamic secret requires a postgres:// connection")); }
+        // A worker-delivered lease is created by the worker inside the private
+        // network; the server only queues the job and records the credential.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let worker_id = body.get("worker_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !worker_id.is_empty() {
+                let bound = worker_for_target(&st, &eid, &worker_id, "postgres").await?;
+                if db::n(&bound, "last_seen") + 90 < now() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "worker has not dialled in; the server will not connect to the database itself")); }
+                let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
+                let password = oc::random_token("dyn");
+                reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+                let payload = json!({"connection": conn, "username": username, "password": password, "statement": "create"});
+                let jid = match queue_worker_job(&st, &worker_id, &eid, "postgres.create", &key, &payload, &lid).await {
+                    Ok(jid) => jid,
+                    Err(e) => { let _ = st.db.exec("DELETE FROM leases WHERE id=? AND value_enc='' AND revoked=0", &[json!(&lid)]).await; return Err(e); },
+                };
+                let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"connection":conn,"type":"postgres","worker_id":worker_id,"delivery":"worker"}).to_string().as_bytes());
+                complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), password.as_bytes()), &username, &config_enc).await?;
+                return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"postgres", "delivery":"worker", "job_id": jid, "status":"queued"}))); }
+        }
         let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
         let password = oc::random_token("dyn");
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
@@ -4668,8 +4688,21 @@ async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>) -
     if db::s(&row,"value_enc").is_empty() { return Err(err(StatusCode::CONFLICT, "lease issuance is unresolved; operator reconciliation required before revocation")); }
     if !db::s(&row,"config_enc").is_empty() { let plain = oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, lid, "config"), &db::s(&row,"config_enc")).map_err(|_| bad("lease config could not be decrypted"))?; let cfg: Value = serde_json::from_slice(&plain).map_err(|_| bad("invalid lease config"))?;
         match cfg.get("type").and_then(|v| v.as_str()) {
-            Some("postgres") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
-                crate::pglease::drop_role(&conn, &username).await.map_err(|_| bad("Postgres lease revocation failed"))?; }
+            Some("postgres") => {
+                // A worker-delivered role is dropped by the worker that created it,
+                // inside the private network the server cannot reach.
+                #[cfg(not(target_arch = "wasm32"))]
+                let queued = if cfg.get("delivery").and_then(|v| v.as_str()) == Some("worker") {
+                    let wid = cfg.get("worker_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let bound = worker_for_target(st, &eid, &wid, "postgres").await?;
+                    if db::n(&bound, "last_seen") + 90 < now() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "worker has not dialled in; the role was not dropped")); }
+                    queue_worker_job(st, &wid, &eid, "postgres.drop", &key, &json!({"connection": cfg.get("connection").and_then(|v| v.as_str()).unwrap_or(""), "username": db::s(&row,"username"), "statement": "drop"}), lid).await?;
+                    true
+                } else { false };
+                #[cfg(target_arch = "wasm32")]
+                let queued = false;
+                if !queued { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
+                    crate::pglease::drop_role(&conn, &username).await.map_err(|_| bad("Postgres lease revocation failed"))?; } }
             Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
                 crate::mysqllease::drop_account(&conn, &username).await.map_err(|_| bad("MySQL lease revocation failed"))?; }
             Some("planetscale") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -6051,6 +6084,141 @@ async fn revoke_token(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>
     st.db.exec("DELETE FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": tid}))) }
 
 
+// ---------- private-network workers ----------
+// A worker is bound to one environment and one target. Its OpenSSH certificate
+// is signed by the instance CA and names only that worker. The server never
+// opens a connection to the worker or to the worker's private target.
+#[cfg(not(target_arch = "wasm32"))]
+async fn worker_ca(st: &S) -> Result<ssh_key::PrivateKey, (StatusCode, Json<Value>)> {
+    let existing = meta_get(st, "worker_ca").await;
+    let (key, fresh) = crate::pgworker::ensure_ca(&existing).map_err(|e| bad(&e))?;
+    if let Some(pem) = fresh { meta_set(st, "worker_ca", &pem).await; }
+    Ok(key)
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn worker_for_target(st: &S, env_id: &str, worker_id: &str, target: &str) -> Result<db::Row, (StatusCode, Json<Value>)> {
+    let row = st.db.one("SELECT * FROM workers WHERE id=? AND env_id=? AND target=?", &[json!(worker_id), json!(env_id), json!(target)]).await.map_err(|e| bad(&e))?;
+    row.ok_or_else(|| err(StatusCode::NOT_FOUND, "no worker bound to this environment and target"))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn queue_worker_job(st: &S, worker_id: &str, env_id: &str, kind: &str, key: &[u8;32], payload: &Value, lease_id: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let jid = id();
+    let enc = oc::encrypt_symmetric_aad(key, format!("ow-worker:v1|{}|{}", env_id, jid).as_bytes(), payload.to_string().as_bytes());
+    st.db.exec("INSERT INTO worker_jobs(id,worker_id,env_id,kind,payload_enc,lease_id,created_at) VALUES(?,?,?,?,?,?,?)", &[json!(&jid), json!(worker_id), json!(env_id), json!(&kind), json!(enc), json!(lease_id), json!(now())]).await.map_err(|e| bad(&e))?;
+    Ok(jid)
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn presented_worker(st: &S, h: &HeaderMap) -> Result<db::Row, (StatusCode, Json<Value>)> {
+    let cert = h.get("x-openwarp-cert").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+    if cert.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing worker certificate")); }
+    let ca = worker_ca(st).await?;
+    let worker_id = crate::pgworker::verify_worker(ca.public_key(), &cert, now() as u64).map_err(|e| err(StatusCode::UNAUTHORIZED, &e))?;
+    let row = st.db.one("SELECT * FROM workers WHERE id=?", &[json!(&worker_id)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "worker certificate names an unknown worker"))?;
+    st.db.exec("UPDATE workers SET last_seen=? WHERE id=?", &[json!(now()), json!(&worker_id)]).await.map_err(|e| bad(&e))?;
+    Ok(row)
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn create_worker(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
+    let (org, app) = st.require_env(&eid, &uid).await?; st.check_admin(&org, &uid).await?;
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if name.is_empty() || name.len() > 64 { return Err(bad("worker name is required")); }
+    if target != "postgres" { return Err(bad("target must be postgres")); }
+    let wid = id(); let enroll = oc::random_token("wen");
+    st.db.exec("INSERT INTO workers(id,org_id,env_id,name,target,pubkey,created_at) VALUES(?,?,?,?,?,'',?)", &[json!(&wid), json!(&org), json!(&eid), json!(&name), json!(&target), json!(now())]).await.map_err(|e| bad(&e))?;
+    st.db.exec("INSERT INTO worker_enrollments(token_hash,worker_id,expires_at) VALUES(?,?,?)", &[json!(oc::hash_token(&enroll)), json!(&wid), json!(now() + 600)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, &app, &eid, &uid, "worker.create", &wid).await;
+    Ok(j(json!({"id": wid, "name": name, "target": target, "enrollment_token": enroll, "expires_in": 600, "note": "the token is shown once; the worker dials this server and the server never dials the worker"})))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn list_workers(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let rows = st.db.query("SELECT id,name,target,last_seen,created_at FROM workers WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>())))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn delete_worker(State(st): State<S>, h: HeaderMap, Path(wid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
+    let row = st.db.one("SELECT org_id,env_id FROM workers WHERE id=?", &[json!(&wid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "worker not found"))?;
+    let org = db::s(&row, "org_id"); st.check_admin(&org, &uid).await?;
+    st.db.exec("DELETE FROM worker_jobs WHERE worker_id=?", &[json!(&wid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("DELETE FROM worker_enrollments WHERE worker_id=?", &[json!(&wid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("DELETE FROM workers WHERE id=?", &[json!(&wid)]).await.map_err(|e| bad(&e))?;
+    st.audit(&org, "", &db::s(&row, "env_id"), &uid, "worker.delete", &wid).await;
+    Ok(j(json!({"deleted": wid})))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn enroll_worker(State(st): State<S>, Json(body): Json<Value>) -> Res {
+    let token = body.get("enrollment_token").and_then(|v| v.as_str()).unwrap_or("");
+    let pubkey = body.get("public_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if token.is_empty() || pubkey.is_empty() { return Err(bad("enrollment_token and public_key are required")); }
+    crate::pgworker::parse_public(&pubkey).map_err(|_| bad("public_key must be an OpenSSH ed25519 key"))?;
+    let hash = oc::hash_token(token);
+    let row = st.db.one("SELECT worker_id,expires_at,used FROM worker_enrollments WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "unknown enrollment token"))?;
+    if db::n(&row, "used") != 0 || db::n(&row, "expires_at") < now() { return Err(err(StatusCode::UNAUTHORIZED, "enrollment token is spent or expired")); }
+    let wid = db::s(&row, "worker_id");
+    let worker_row = st.db.one("SELECT pubkey FROM workers WHERE id=?", &[json!(&wid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "worker not found"))?;
+    if !db::s(&worker_row, "pubkey").is_empty() { return Err(bad("worker is already enrolled")); }
+    let ca = worker_ca(&st).await?;
+    let subject = crate::pgworker::parse_public(&pubkey).map_err(|e| bad(&e))?;
+    let serial = crate::pgworker::fresh_serial();
+    let cert = crate::pgworker::sign_worker(&ca, &subject, &wid, serial, now() as u64).map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE workers SET pubkey=?,cert_serial=? WHERE id=?", &[json!(&pubkey), json!(serial.to_string()), json!(&wid)]).await.map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE worker_enrollments SET used=1 WHERE token_hash=?", &[json!(&hash)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!({"worker_id": wid, "certificate": cert, "ca_public_key": crate::pgworker::public_openssh(&ca).map_err(|e| bad(&e))?, "expires_in": 600})))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn renew_worker_cert(State(st): State<S>, h: HeaderMap) -> Res {
+    let row = presented_worker(&st, &h).await?;
+    let wid = db::s(&row, "id");
+    let pubkey = db::s(&row, "pubkey");
+    let ca = worker_ca(&st).await?;
+    let subject = crate::pgworker::parse_public(&pubkey).map_err(|e| bad(&e))?;
+    let serial = crate::pgworker::fresh_serial();
+    let cert = crate::pgworker::sign_worker(&ca, &subject, &wid, serial, now() as u64).map_err(|e| bad(&e))?;
+    st.db.exec("UPDATE workers SET cert_serial=? WHERE id=?", &[json!(serial.to_string()), json!(&wid)]).await.map_err(|e| bad(&e))?;
+    Ok(j(json!({"worker_id": wid, "certificate": cert, "expires_in": 600})))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn claim_worker_job(State(st): State<S>, h: HeaderMap) -> Res {
+    let row = presented_worker(&st, &h).await?;
+    let wid = db::s(&row, "id"); let eid = db::s(&row, "env_id");
+    let key = st.env_key(&eid).await?;
+    // A claim that sat unacknowledged goes back to the queue. Two callers can
+    // both observe it; the conditional update lets only one of them take it.
+    let _ = st.db.exec("UPDATE worker_jobs SET status='queued',claimed_at=0 WHERE worker_id=? AND status='claimed' AND claimed_at<?", &[json!(&wid), json!(now() - 60)]).await;
+    let job = st.db.one("SELECT id,kind,payload_enc FROM worker_jobs WHERE worker_id=? AND status='queued' ORDER BY created_at LIMIT 1", &[json!(&wid)]).await.map_err(|e| bad(&e))?;
+    let Some(job) = job else { return Ok(j(json!({"job": Value::Null}))); };
+    let jid = db::s(&job, "id");
+    let won = st.db.exec("UPDATE worker_jobs SET status='claimed',claimed_at=? WHERE id=? AND status='queued'", &[json!(now()), json!(&jid)]).await.map_err(|e| bad(&e))?;
+    if won != 1 { return Ok(j(json!({"job": Value::Null}))); }
+    let plain = oc::decrypt_symmetric_aad(&key, format!("ow-worker:v1|{}|{}", eid, jid).as_bytes(), &db::s(&job, "payload_enc")).map_err(|e| bad(&e))?;
+    let payload: Value = serde_json::from_slice(&plain).map_err(|e| bad(&e.to_string()))?;
+    Ok(j(json!({"job": {"id": jid, "kind": db::s(&job, "kind"), "payload": payload}})))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn finish_worker_job(State(st): State<S>, h: HeaderMap, Path(jid): Path<String>, Json(body): Json<Value>) -> Res {
+    let row = presented_worker(&st, &h).await?;
+    let wid = db::s(&row, "id"); let eid = db::s(&row, "env_id");
+    let job = st.db.one("SELECT status FROM worker_jobs WHERE id=? AND worker_id=?", &[json!(&jid), json!(&wid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "job not found"))?;
+    if db::s(&job, "status") != "claimed" { return Err(bad("job is not claimed by this worker")); }
+    let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let detail = body.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(300).collect::<String>();
+    let key = st.env_key(&eid).await?;
+    let enc = oc::encrypt_symmetric_aad(&key, format!("ow-worker-result:v1|{}|{}", eid, jid).as_bytes(), json!({"ok": ok, "detail": detail}).to_string().as_bytes());
+    let status = if ok { "done" } else { "failed" };
+    let wrote = st.db.exec("UPDATE worker_jobs SET status=?,result_enc=?,finished_at=? WHERE id=? AND worker_id=? AND status='claimed'", &[json!(status), json!(enc), json!(now()), json!(&jid), json!(&wid)]).await.map_err(|e| bad(&e))?;
+    if wrote != 1 { return Err(bad("job was no longer claimed")); }
+    Ok(j(json!({"id": jid, "status": status})))
+}
+pub fn worker_routes() -> Router<S> {
+    #[cfg(not(target_arch = "wasm32"))]
+    { Router::new()
+        .route("/api/envs/{eid}/workers", get(list_workers).post(create_worker)).route("/api/workers/{wid}", delete(delete_worker))
+        .route("/api/worker/enroll", post(enroll_worker)).route("/api/worker/certificate", post(renew_worker_cert)).route("/api/worker/jobs/claim", post(claim_worker_job)).route("/api/worker/jobs/{jid}", post(finish_worker_job)) }
+    #[cfg(target_arch = "wasm32")]
+    { Router::new() }
+}
+
 // ---------- custom RBAC roles (T07) ----------
 async fn create_role(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid,&uid).await?;
@@ -7275,6 +7443,7 @@ fn api_router(state: S) -> Router {
     let app = Router::new()
         .route("/api/capabilities", get(api_capabilities))
         .merge(webhooks::routes())
+        .merge(worker_routes())
         .route("/api/rotations/{rid}/run", post(static_rotation::run))
         .route("/api/orgs/{oid}/identities/{iid}/workload", get(workloads::manage).put(workloads::manage).delete(workloads::manage))
         .route("/api/v1/machine/auth/workload/login", post(workload_login).layer(axum::extract::DefaultBodyLimit::max(40*1024)))

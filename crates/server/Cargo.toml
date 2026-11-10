@@ -36,7 +36,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 x509-cert = { version = "0.2.5", features = ["builder", "pem"], optional = true }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"], optional = true }
 rsa = { version = "0.9", features = ["pem"] }
-ssh-key = { version = "0.6", features = ["ed25519", "rsa"], optional = true }
+ssh-key = { version = "0.6", features = ["ed25519", "rsa"] }
 webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -89,7 +89,7 @@ ldap = ["dep:ldap3", "dep:native-tls"]
 saml = ["dep:risaml", "dep:rcgen", "pki"]
 scim = []
 pki = ["dep:x509-cert", "dep:p256", "dep:keystore-ocsp", "dep:keystore-pki", "dep:rcgen"]
-ssh-ca = ["dep:ssh-key"]
+ssh-ca = []
 transit = []
 workload-identity = []
 change-requests = []

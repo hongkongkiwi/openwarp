@@ -3180,10 +3180,13 @@ dependencies = [
  "clap",
  "clap_complete",
  "openwarp-crypto",
+ "postgres",
+ "rand_core 0.6.4",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "ssh-key",
  "x25519-dalek 2.0.1",
  "zeroize",
 ]
@@ -3614,6 +3617,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "postgres"
+version = "0.19.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ad20e0aa0b24f5a394eab4f78c781d248982b22b25cecc7e3aa46a681605bd"
+dependencies = [
+ "bytes",
+ "fallible-iterator 0.2.0",
+ "futures-util",
+ "log",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

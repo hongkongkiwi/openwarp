@@ -165,7 +165,9 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
 - Machine identities with Universal Auth, secret-change proposals with
   admin approval, access requests, dynamic database leases (real PostgreSQL
-  roles, MySQL and MariaDB accounts, dropped on revoke), and a basic PKI
+  roles, MySQL and MariaDB accounts, dropped on revoke), outbound private-network
+  workers that create and drop those PostgreSQL roles from inside a network the
+  server cannot dial, and a basic PKI
   (CA, issue, revoke) came from the Infisical feature set.
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
