@@ -527,12 +527,18 @@ const USER_DN: &str="uid=invitee,dc=test,dc=invalid";
 struct Directory { port:u16, ca_pem:String }
 impl Directory {
     fn start() -> Self {
-        use rcgen::{BasicConstraints,CertificateParams,IsCa,KeyPair};
+        use rcgen::{BasicConstraints,CertificateParams,DnType,IsCa,KeyPair};
         use rustls::pki_types::{PrivateKeyDer,PrivatePkcs8KeyDer};
+        // OpenSSL (native-tls on Linux) rejects an empty-DN issuer during chain
+        // verification, so both certificates carry explicit CommonNames.
         let ca_key=KeyPair::generate().unwrap(); let mut params=CertificateParams::new(Vec::new()).unwrap();
-        params.is_ca=IsCa::Ca(BasicConstraints::Unconstrained); let ca=params.self_signed(&ca_key).unwrap();
+        params.is_ca=IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName,"OpenWarp workspace CA");
+        let ca=params.self_signed(&ca_key).unwrap();
         let leaf_key=KeyPair::generate().unwrap();
-        let leaf=CertificateParams::new(vec!["127.0.0.1".into()]).unwrap().signed_by(&leaf_key,&ca,&ca_key).unwrap();
+        let mut leaf=CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        leaf.distinguished_name.push(DnType::CommonName,"127.0.0.1");
+        let leaf=leaf.signed_by(&leaf_key,&ca,&ca_key).unwrap();
         let _=rustls::crypto::ring::default_provider().install_default();
         let config=Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![leaf.der().clone()],PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()))).unwrap());
         let listener=TcpListener::bind("127.0.0.1:0").unwrap(); let port=listener.local_addr().unwrap().port();
