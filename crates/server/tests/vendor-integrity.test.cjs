@@ -9,6 +9,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const expected = {
+  'hash-wasm.js': 'b43a59e36eafcb2f744eb23badd590ca23c7dad54fb0395522cec6fb85a6582c',
+  'LICENSE.hash-wasm': 'c14dea172f72f2714284a0ac2ab1b00b5352a01409d58255a46227ffc541debd',
+  'zxcvbn.js': '6677fc15d245f397f52d5d0998f3a86f9aae752ae7b3ca4b3d9eaa91dffe174a',
+  'LICENSE.zxcvbn': '8fd6c9ffe44291acd207a4d3cf7d6db5ac05f585ee1cf45db9fc6b153b08990f',
   'libsodium.js': '9d9731995989ac2d7c73ba4fb6717e43cd2a4a4299c442b710c2d9e5065b14d1',
   'libsodium-wrappers.js': 'd015a93315140974698318d94274ff63c6d22530d8b0e3f3770d9bfeadc7eb60',
 };
@@ -18,6 +22,13 @@ for (const [file, digest] of Object.entries(expected)) {
     assert.equal(crypto.createHash('sha256').update(body).digest('hex'), digest);
   });
 }
+test('the console pins the hash-wasm build with matching SRI', () => {
+  const body = fs.readFileSync(path.join(__dirname, '../src/vendor/hash-wasm.js'));
+  const sri = 'sha384-' + crypto.createHash('sha384').update(body).digest('base64');
+  const ui = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  assert.ok(ui.includes(`<script src="/hash-wasm.js" integrity="${sri}"></script>`));
+  assert.ok(ui.indexOf('src="/hash-wasm.js"') < ui.indexOf('src="/enzoic-pairs.js"'));
+});
 test('the libsodium licence is present', () => {
   assert.match(fs.readFileSync(path.join(__dirname, '../src/vendor/LICENSE.libsodium'), 'utf8'), /ISC|Permission to use/i);
 });
@@ -29,4 +40,18 @@ test('the console policy permits the libsodium WebAssembly build', () => {
   assert.ok(start > 0 && end > start, 'the index handler must be findable');
   assert.match(app.slice(start, end), /wasm-unsafe-eval/,
     'the console CSP must allow the WASM build, or the browser E2E editor cannot load libsodium');
+});
+
+// A stale SRI attribute fails closed in a browser: the console script never
+// loads and the Node suite still passes, because it reads ui.rs directly.
+test('every pinned subresource digest matches the file it loads', () => {
+  const ui = fs.readFileSync(path.join(__dirname, '../src/ui.rs'), 'utf8');
+  const pins = [...ui.matchAll(/<script src="\/([^"]+)" integrity="sha384-([A-Za-z0-9+/=]+)"/g)];
+  assert.ok(pins.length >= 3, 'the console pins its script dependencies');
+  for (const [, src, digest] of pins) {
+    const file = ['../src', '../src/vendor'].map(dir => path.join(__dirname, dir, src)).find(candidate => fs.existsSync(candidate));
+    assert.ok(file, `pinned script has no file: ${src}`);
+    assert.equal(crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64'), digest,
+      `${src} changed; update its integrity attribute in ui.rs`);
+  }
 });

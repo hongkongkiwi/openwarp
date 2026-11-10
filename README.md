@@ -32,6 +32,8 @@ SQLite keeps local setup small. Native deployments can use PostgreSQL or MySQL/M
 
 OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets or branding. This checkout has no licence checks or paid feature gates; build options and deployment targets still affect availability.
 
+There are no licence checks, paid feature gates, or configured seat and environment tiers. The enterprise surfaces (SAML, SCIM, X.509 PKI, SSH certificates, transit, workload identity, change requests and LDAP) are opt-in twice: a default build compiles them out, and a workspace needs a grant before it can use one. OpenWarp is an independent implementation inspired by the public [Phase Console documentation](https://docs.phase.dev/console). It does not use Phase enterprise code, assets, or branding. See the [feature reference](docs/FEATURES.md) for supported behavior and limits.
+
 > [!IMPORTANT]
 > Obtain an independent security and cryptography review before relying on OpenWarp in production. Server-side encryption trusts the server with plaintext. Client-held encryption has different recovery and automation requirements, and browser clients still trust the code served by the instance. Read the [security model](docs/SECURITY.md).
 
@@ -148,4 +150,11 @@ cargo test --workspace -- --test-threads=2
 node --test crates/server/tests/ui.test.cjs
 ```
 
-These commands cover static checks, Rust tests and console-source tests. They do not establish live-provider compatibility or replace a browser check, a restore rehearsal or an independent security review. Never include database files, tokens, recovery kits or plaintext exports in contributions.
+These commands cover static checks, Rust tests and console-source tests. They do not establish live-provider compatibility or replace a browser check, a restore rehearsal or an independent security review. Never include database files, tokens, recovery kits or plaintext exports in contributions. The [development guide](docs/DEVELOPMENT.md) lists prerequisites and commands.
+
+
+## Project boundaries
+
+OpenWarp runs as a native Rust service or as a Cloudflare Worker with Durable Object storage. Platform-specific features and deployment limits are listed in the [deployment guide](docs/DEPLOY.md). Provider sync is server-side and sends plaintext to the configured destination; use destinations you trust. A recovery kit is private key material, not a replacement for a database backup.
+
+The [documentation index](docs/README.md) links every guide. Start with [security](docs/SECURITY.md) and [backup and restore](docs/BACKUP.md) before storing secrets you cannot afford to lose.

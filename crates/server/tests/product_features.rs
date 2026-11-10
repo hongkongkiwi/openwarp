@@ -6,6 +6,11 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// These suites exercise surfaces that are compiled out by default. Returning
+/// early keeps a core-only build green instead of failing on a missing route;
+/// the all-features job is what actually exercises them.
+fn suite_gated() -> bool { cfg!(all(feature = "change-requests", feature = "workload-identity", feature = "transit")) }
+
 const OWNER: &str = "fixture-owner-session";
 const ADMIN: &str = "fixture-admin-session";
 const DEVELOPER: &str = "fixture-developer-session";
@@ -29,6 +34,11 @@ impl Fixture {
         let f = Self { app: router(st.clone()), st };
         for org in ["org-a", "org-b"] {
             f.sql("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(org), json!(org), json!(now())]).await;
+            // The fixture workspaces hold every grant: these suites test the
+            // gated surfaces themselves, and the grant gate has its own test.
+            let held = ["change-requests", "transit", "workload-identity", "pki", "ssh-ca", "saml", "scim", "ldap"].join(" ");
+            f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,'fixture',?)",
+                &[json!(org), json!(&held), json!(now())]).await;
         }
         for (uid, token, org, role) in [
             ("owner", OWNER, "org-a", "owner"), ("admin", ADMIN, "org-a", "admin"),
@@ -59,6 +69,8 @@ impl Fixture {
         }
         f.sql("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await;
         f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&[7; 32]))]).await;
+        // Boot installs the master verifier; rotation's batch rewrites it with a required count.
+        f.sql("INSERT INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&[7; 32], b"openwarp-master-key-v1"))]).await;
         f.expect(Method::GET, "/api/envs/dev/secrets", Some(OWNER), None, 200).await;
         f
     }
@@ -128,6 +140,7 @@ fn secret<'a>(items: &'a Value, key: &str, path: &str) -> &'a Value {
 
 #[tokio::test]
 async fn change_request_approval_is_separate_from_atomic_cross_environment_apply() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     f.put("dev", json!([{"key":"API_KEY","value":"old-dev","path":"/service"}])).await;
     f.put("prod", json!([{"key":"API_KEY","value":"old-prod"},{"key":"OBSOLETE","value":"old"}])).await;
@@ -154,6 +167,7 @@ async fn change_request_approval_is_separate_from_atomic_cross_environment_apply
 
 #[tokio::test]
 async fn editing_a_change_request_cas_clears_approval_and_rebases_the_snapshot() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     f.put("prod", json!([{"key":"OBSOLETE","value":"old"}])).await;
     let id = f.create_change(batch(), OWNER).await;
@@ -181,6 +195,7 @@ async fn editing_a_change_request_cas_clears_approval_and_rebases_the_snapshot()
 
 #[tokio::test]
 async fn stale_change_targets_and_new_key_collisions_never_partially_apply() {
+    if !suite_gated() { return; }
     for mutation in ["update", "delete", "recreate", "absent"] {
         let f = Fixture::new().await;
         f.put("dev", json!([{"key":"FIRST","value":"untouched"}])).await;
@@ -213,6 +228,7 @@ async fn stale_change_targets_and_new_key_collisions_never_partially_apply() {
 
 #[tokio::test]
 async fn change_review_is_tenant_authorized_redacted_and_server_readable_only() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     f.put("dev", json!([{"key":"NORMAL","value":"visible-before"},{"key":"SEALED","value":"sealed-before-fixture","type":"sealed"}])).await;
     let stored = f.st.db().query("SELECT value_enc FROM secrets WHERE env_id='dev'", &[]).await.unwrap();
@@ -295,6 +311,7 @@ fn access_token(v: &Value) -> &str {
 
 #[tokio::test]
 async fn workload_exchange_scopes_tokens_and_revocation_is_immediate() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     f.put("dev", json!([{"key":"CONSUME","value":"workload-value"}])).await;
     let trust = f.trust(trust_body(), OWNER).await;
@@ -325,6 +342,7 @@ async fn workload_exchange_scopes_tokens_and_revocation_is_immediate() {
 
 #[tokio::test]
 async fn workload_jwt_proofs_require_exact_claims_times_and_asymmetric_signatures() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let trust = f.trust(trust_body(), OWNER).await;
     access_token(&f.exchange(&trust, &signed(&claims("control")), 200).await);
@@ -360,6 +378,7 @@ async fn workload_jwt_proofs_require_exact_claims_times_and_asymmetric_signature
 
 #[tokio::test]
 async fn workload_trust_configuration_checks_tenants_roles_public_keys_and_scope() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let trust = f.trust(trust_body(), ADMIN).await;
     access_token(&f.exchange(&trust, &signed(&claims("configuration-control")), 200).await);
@@ -393,6 +412,7 @@ async fn workload_trust_configuration_checks_tenants_roles_public_keys_and_scope
 
 #[tokio::test]
 async fn workload_replay_spans_trusts_and_live_identity_and_peer_policy_are_enforced() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let first = f.trust(trust_body(), OWNER).await;
     let mut second_policy = trust_body(); second_policy["subject"] = json!("repo:fixture:environment:staging");
@@ -416,6 +436,7 @@ async fn workload_replay_spans_trusts_and_live_identity_and_peer_policy_are_enfo
 
 #[tokio::test]
 async fn transit_versions_rewrap_without_plaintext_and_survive_master_rotation() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let key = f.transit_key("payments.primary", "org-a", OWNER).await;
     let plain = oc::b64(b"transit fixture payload\0with binary");
@@ -452,6 +473,7 @@ async fn transit_versions_rewrap_without_plaintext_and_survive_master_rotation()
 
 #[tokio::test]
 async fn transit_permissions_are_independent_and_env_tokens_cannot_escape_scope() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let key = f.transit_key("permissions", "org-a", OWNER).await;
     let input = json!({"plaintext":oc::b64(b"permission fixture"),"context":""});
@@ -487,6 +509,7 @@ async fn transit_permissions_are_independent_and_env_tokens_cannot_escape_scope(
 
 #[tokio::test]
 async fn transit_authenticates_context_key_and_tenant_and_rejects_malformed_inputs() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     let key = f.transit_key("bound-key", "org-a", OWNER).await;
     let other = f.transit_key("other-key", "org-a", OWNER).await;

@@ -1,3 +1,4 @@
+#![cfg(all(feature = "change-requests", feature = "workload-identity", feature = "transit"))]
 use axum::{body::{to_bytes, Body}, http::{Method, Request}, Router};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use openwarp_crypto as oc;
@@ -66,6 +67,10 @@ impl Fixture {
         if seed {
             let owner = format!("{namespace}-owner"); let admin = format!("{namespace}-admin"); let app = format!("{namespace}-app");
             f.sql("INSERT INTO orgs(id,name,created_at) VALUES(?,?,?)", &[json!(f.org),json!("portability"),json!(now())]).await;
+            // This suite covers the gated surfaces, so the fixture workspace
+            // holds every grant.
+            f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES(?,?,'fixture',?)",
+                &[json!(f.org), json!("change-requests transit workload-identity pki ssh-ca saml scim ldap"), json!(now())]).await;
             for (uid, token, role) in [(&owner, OWNER, "owner"), (&admin, ADMIN, "admin")] {
                 f.sql("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,active,email_verified) VALUES(?,?,?,'','',?,1,1)",
                     &[json!(uid),json!(format!("{uid}@test.invalid")),json!("unused-password-hash"),json!(now())]).await;
@@ -79,6 +84,8 @@ impl Fixture {
             f.sql("INSERT INTO identities(id,org_id,name,role,created_at) VALUES(?,?,?,?,?)", &[json!(f.identity),json!(f.org),json!("portability"),json!("developer"),json!(now())]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('instance_owner',?)", &[json!(owner)]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&master))]).await;
+            // Boot installs the master verifier; rotation's batch rewrites it with a required count.
+            f.sql("INSERT INTO meta(k,v) VALUES('master_key_check',?)", &[json!(oc::encrypt_symmetric(&master, b"openwarp-master-key-v1"))]).await;
         }
         f
     }
@@ -168,6 +175,15 @@ async fn transit_lifecycle(database: &Database, f: Fixture, other: Fixture, name
     let old = json!({"ciphertext":original["ciphertext"],"context":"portable-context"});
     let new = json!({"ciphertext":latest["ciphertext"],"context":"portable-context"});
     assert_eq!(f.transit(&key, "decrypt", old.clone()).await["plaintext"], plain);
+    if database.schema.is_some() {
+        f.expect(Method::POST, "/api/instance/rotate-master", OWNER, Some(json!({"new_key":oc::b64(&[9;32])})), 409).await;
+        assert_eq!(f.transit(&key, "decrypt", old.clone()).await["plaintext"], plain);
+        drop(f); drop(other);
+        let restarted = Fixture::open(database, [7;32], false, namespace).await;
+        assert_eq!(restarted.transit(&key, "decrypt", old).await["plaintext"], plain, "refused rotation preserves the original root across restart");
+        assert_eq!(restarted.transit(&key, "decrypt", new).await["plaintext"], plain);
+        return;
+    }
     f.expect(Method::POST, "/api/instance/rotate-master", OWNER, Some(json!({"new_key":oc::b64(&[9;32])})), 200).await;
     drop(f); drop(other);
     let restarted = Fixture::open(database, [9;32], false, namespace).await;

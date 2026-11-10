@@ -1,7 +1,8 @@
 //! Second factors for an account: TOTP, WebAuthn passkeys and emailed codes.
 //! Every factor is optional, but at least one enabled factor makes the second
 //! step mandatory on every sign-in path, including social and OIDC.
-use crate::app::{b64url, bad, err, hmac_hex, id, j, make_session, meta_get, meta_set, now, send_email_result, session_cookie, totp_code, PeerAddr, Res, S};
+use crate::app::{bad, err, hmac_hex, j, meta_get, meta_set, now, send_email_result, totp_code, PeerAddr, Res, S};
+use crate::app::{b64url, id, make_session, session_cookie};
 use crate::db;
 use crate::mailer;
 use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, Json};
@@ -39,62 +40,84 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+fn factor_meta(entries: &[(String,String)]) -> Vec<(String,Vec<Value>)> {
+    entries.iter().flat_map(|(k,v)| [("DELETE FROM meta WHERE k=?".into(),vec![json!(k)]),("INSERT INTO meta(k,v) VALUES(?,?)".into(),vec![json!(k),json!(v)])]).collect()
+}
+fn recovery_material(uid: &str) -> (Vec<String>,Vec<(String,Vec<Value>)>) {
+    let codes: Vec<String>=(0..8).map(|_|oc::random_token("rc")).collect();
+    let hashes: Vec<String>=codes.iter().map(|c|oc::hash_token(c)).collect();
+    let statements=factor_meta(&[(format!("totp_recovery:{}",uid),hashes.join(","))]);
+    (codes,statements)
+}
 pub async fn issue_recovery_codes(st: &S, uid: &str) -> Vec<String> {
     let codes: Vec<String> = (0..8).map(|_| oc::random_token("rc")).collect();
     let hashed: Vec<String> = codes.iter().map(|c| oc::hash_token(c)).collect();
     meta_set(st, &format!("totp_recovery:{}", uid), &hashed.join(",")).await;
     codes
 }
-async fn ensure_recovery_codes(st: &S, uid: &str) -> Option<Vec<String>> {
-    if recovery_count(st, uid).await == 0 { Some(issue_recovery_codes(st, uid).await) } else { None }
-}
 
 /// Activate a pending TOTP secret. The setup code stays usable for the first
 /// sign-in; replay protection starts at the first login that consumes a code.
-pub async fn confirm_totp(st: &S, uid: &str, code: &str) -> bool {
+fn epoch_failure(e:(StatusCode,Json<Value>))->String {
+    if e.1.0.get("code").and_then(Value::as_str)==Some("epoch_stale") {"epoch_stale".into()} else {"instance key epoch check failed".into()}
+}
+pub async fn confirm_totp(st: &S, uid: &str, code: &str) -> Result<bool, String> {
+    if let Err(e)=st.epoch_ok().await { return Err(epoch_failure(e)); }
     let pending = meta_get(st, &format!("totp_pending:{}", uid)).await;
     let stored = meta_get(st, &format!("totp_secret:{}", uid)).await;
     let enc = if pending.is_empty() { stored } else { pending };
-    let Ok(secret) = oc::decrypt_symmetric(&st.master(), &enc) else { return false };
+    if enc.is_empty() { return Ok(false) }
+    let master = st.master();
+    let secret = oc::decrypt_symmetric(&master, &enc).map_err(|_| "stored TOTP secret is unavailable".to_string())?;
     let counter = (now() / 30) as u64;
     for c in [counter.wrapping_sub(1), counter, counter + 1] {
         if ct_eq(&totp_code(&secret, c), code) {
             // Promote only after proof. A failed or abandoned re-enrolment keeps
             // the previous secret active, so the account never silently loses
             // its only factor.
-            meta_set(st, &format!("totp_secret:{}", uid), &enc).await;
-            meta_set(st, &format!("totp_enabled:{}", uid), "1").await;
-            meta_set(st, &format!("totp_pending:{}", uid), "").await;
-            meta_set(st, &format!("totp_last:{}", uid), "0").await;
-            return true;
+            let statements = factor_meta(&[(format!("totp_secret:{}",uid),enc.clone()),(format!("totp_enabled:{}",uid),"1".into()),(format!("totp_pending:{}",uid),String::new()),(format!("totp_last:{}",uid),"0".into())]);
+            st.audited_batch_master(&statements,&[],["","","",uid,"auth.totp_enabled",""],master).await
+                .map_err(|e| if e=="epoch_stale" {"epoch_stale".into()} else {format!("TOTP enrollment could not be persisted: {}", e)})?;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
-async fn totp_ok(st: &S, uid: &str, code: &str) -> bool {
-    if !totp_enabled(st, uid).await || code.is_empty() { return false; }
-    let Ok(secret) = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await) else { return false };
+pub(crate) async fn totp_ok(st: &S, uid: &str, code: &str) -> Result<bool,String> {
+    if let Err(e)=st.epoch_ok().await { return Err(epoch_failure(e)); }
+    if !totp_enabled(st, uid).await || code.is_empty() { return Ok(false); }
+    let secret = oc::decrypt_symmetric(&st.master(), &meta_get(st, &format!("totp_secret:{}", uid)).await)
+        .map_err(|_| "stored TOTP secret is unavailable".to_string())?;
     let counter = (now() / 30) as u64;
     for c in [counter.wrapping_sub(1), counter, counter + 1] {
         if ct_eq(&totp_code(&secret, c), code) {
-            let last = meta_get(st, &format!("totp_last:{}", uid)).await.parse::<u64>().unwrap_or(0);
-            if c <= last { return false; }
-            meta_set(st, &format!("totp_last:{}", uid), &c.to_string()).await;
-            return true;
+            let key = format!("totp_last:{}", uid);
+            let stored = meta_get(st, &key).await;
+            let last = stored.parse::<u64>().unwrap_or(0);
+            if c <= last { return Ok(false); }
+            // Compare-and-set the counter so two concurrent verifications
+            // cannot both accept the same code.
+            return Ok(st.db.exec("UPDATE meta SET v=? WHERE k=? AND v=?", &[json!(c.to_string()), json!(key), json!(stored)]).await == Ok(1));
         }
     }
-    false
+    Ok(false)
 }
-async fn recovery_ok(st: &S, uid: &str, code: &str) -> bool {
-    if code.is_empty() { return false; }
-    let stored = meta_get(st, &format!("totp_recovery:{}", uid)).await;
-    if stored.is_empty() { return false; }
+pub(crate) async fn recovery_ok(st: &S, uid: &str, code: &str) -> Result<bool,String> {
+    if code.is_empty() { return Ok(false); }
+    let stored = st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("totp_recovery:{}", uid))]).await.map_err(|e| format!("recovery lookup failed: {}", e))?
+        .map(|r| db::s(&r, "v")).unwrap_or_default();
+    if stored.is_empty() { return Ok(false); }
     let hash = oc::hash_token(code);
     let mut list: Vec<String> = stored.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
     match list.iter().position(|x| ct_eq(x, &hash)) {
-        Some(pos) => { list.remove(pos); meta_set(st, &format!("totp_recovery:{}", uid), &list.join(",")).await; true }
-        None => false,
+        Some(pos) => {
+            list.remove(pos);
+            // The compare-and-set delete keeps a replayed code from winning a
+            // race against the first use.
+            Ok(st.db.exec("UPDATE meta SET v=? WHERE k=? AND v=?", &[json!(list.join(",")), json!(format!("totp_recovery:{}", uid)), json!(stored)]).await == Ok(1))
+        }
+        None => Ok(false),
     }
 }
 
@@ -116,27 +139,24 @@ async fn store_email_code(st: &S, uid: &str, purpose: &str, code: &str) {
     let _ = st.db.exec("INSERT INTO email_codes(user_id,purpose,code_hash,created_at,expires_at,attempts) VALUES(?,?,?,?,?,0)",
         &[json!(uid), json!(purpose), json!(code_hash(st, code)), json!(current), json!(current + CODE_TTL)]).await;
 }
-async fn email_code_ok(st: &S, uid: &str, code: &str, purpose: &str) -> bool {
-    if code.is_empty() { return false; }
-    let row = match st.db.one("SELECT code_hash,expires_at,attempts FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await {
-        Ok(Some(r)) => r, _ => return false };
-    let attempts = db::n(&row, "attempts");
-    if db::n(&row, "expires_at") < now() || attempts >= MAX_CODE_ATTEMPTS {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-        return false;
-    }
+async fn email_code_ok(st: &S, uid: &str, code: &str, purpose: &str) -> Result<bool,String> {
+    if code.is_empty() { return Ok(false); }
+    let row = match st.db.one("SELECT code_hash,created_at,expires_at,attempts FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await {
+        Ok(Some(r)) => r, Ok(None) => return Ok(false), Err(e) => return Err(format!("email code lookup failed: {}", e)) };
+    let current = now();
+    if db::n(&row, "expires_at") < current || db::n(&row, "attempts") >= MAX_CODE_ATTEMPTS { return Ok(false); }
+    let params = [json!(uid), json!(purpose), json!(db::s(&row, "code_hash")), json!(db::n(&row, "created_at")), json!(db::n(&row, "expires_at")), json!(current), json!(MAX_CODE_ATTEMPTS)];
     if ct_eq(&db::s(&row, "code_hash"), &code_hash(st, code)) {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-        return true;
+        // Deleting with the full snapshot is compare-and-set: a concurrently
+        // issued replacement code is never consumed by an old attempt.
+        return Ok(st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=? AND code_hash=? AND created_at=? AND expires_at=? AND expires_at>=? AND attempts<?", &params).await == Ok(1));
     }
-    if attempts + 1 >= MAX_CODE_ATTEMPTS {
-        let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-    } else {
-        let _ = st.db.exec("UPDATE email_codes SET attempts=attempts+1 WHERE user_id=? AND purpose=?", &[json!(uid), json!(purpose)]).await;
-    }
-    false
+    // Increment atomically without deleting a concurrently issued replacement.
+    let _ = st.db.exec("UPDATE email_codes SET attempts=attempts+1 WHERE user_id=? AND purpose=? AND code_hash=? AND created_at=? AND expires_at=? AND expires_at>=? AND attempts<?", &params).await;
+    Ok(false)
 }
 async fn send_code(st: &S, uid: &str, purpose: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    st.epoch_ok().await?;
     if !email_available() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "email delivery is not configured on this instance")); }
     let email = st.db.one("SELECT email FROM users WHERE id=?", &[json!(uid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "email")).unwrap_or_default();
     if email.is_empty() { return Err(bad("account has no email address")); }
@@ -156,16 +176,18 @@ async fn send_code(st: &S, uid: &str, purpose: &str) -> Result<(), (StatusCode, 
 
 /// True when any enabled factor accepted the code. Recovery codes and emailed
 /// codes are consumed; TOTP counters advance so a code cannot be replayed.
-pub async fn second_factor_ok(st: &S, uid: &str, code: &str) -> bool {
-    if !required(st, uid).await { return true; }
-    if code.is_empty() { return false; }
-    if totp_ok(st, uid, code).await { return true; }
-    if recovery_ok(st, uid, code).await { return true; }
-    if email_enabled(st, uid).await && email_code_ok(st, uid, code, "login").await { return true; }
-    false
+pub async fn second_factor_ok(st: &S, uid: &str, code: &str) -> Result<bool,String> {
+    if let Err(e)=st.epoch_ok().await { return Err(epoch_failure(e)); }
+    if !required(st, uid).await { return Ok(true); }
+    if code.is_empty() { return Ok(false); }
+    if totp_ok(st, uid, code).await? { return Ok(true); }
+    if recovery_ok(st, uid, code).await? { return Ok(true); }
+    if email_enabled(st, uid).await && email_code_ok(st, uid, code, "login").await? { return Ok(true); }
+    Ok(false)
 }
 
 pub async fn new_challenge(st: &S, uid: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    st.epoch_ok().await?;
     let _ = st.db.exec("DELETE FROM mfa_challenges WHERE created_at<?", &[json!(now() - 3600)]).await;
     let token = oc::random_token("mfa");
     st.db.exec("INSERT INTO mfa_challenges(token,user_id,created_at) VALUES(?,?,?)",
@@ -178,8 +200,8 @@ pub async fn challenge_user(st: &S, token: &str) -> Option<String> {
     if db::n(&row, "created_at") + CHALLENGE_TTL < now() { return None; }
     Some(db::s(&row, "user_id"))
 }
-pub async fn consume_challenge(st: &S, token: &str) {
-    let _ = st.db.exec("DELETE FROM mfa_challenges WHERE token=?", &[json!(oc::hash_token(token))]).await;
+pub async fn consume_challenge(st: &S, token: &str) -> bool {
+    st.db.exec("DELETE FROM mfa_challenges WHERE token=? AND created_at>=?", &[json!(oc::hash_token(token)), json!(now() - CHALLENGE_TTL)]).await == Ok(1)
 }
 
 async fn password_known(st: &S, uid: &str) -> bool { meta_get(st, &format!("password_known:{}", uid)).await == "1" }
@@ -213,7 +235,7 @@ fn loopback_host(host: &str) -> bool {
 fn public_origin(st: &S, h: &HeaderMap) -> Option<String> {
     // WebAuthn's origin and RP ID decide whether a credential may sign in, so
     // production pins them. Only a loopback Host is trusted for local dev.
-    let raw = std::env::var("OPENWARP_RP_ORIGIN").ok().filter(|v| !v.trim().is_empty())
+    let raw = crate::envcfg::var("OPENWARP_RP_ORIGIN").ok().filter(|v| !v.trim().is_empty())
         .or_else(|| Some(st.pub_url.clone()).filter(|v| !v.is_empty()))
         .or_else(|| h.get("host").and_then(|v| v.to_str().ok()).filter(|host| loopback_host(host)).map(|host| format!("http://{}", host)))?;
     let url = Url::parse(raw.trim()).ok()?;
@@ -224,7 +246,7 @@ fn public_origin(st: &S, h: &HeaderMap) -> Option<String> {
 fn webauthn(st: &S, h: &HeaderMap) -> Result<Webauthn, (StatusCode, Json<Value>)> {
     let origin = public_origin(st, h).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "passkeys need OPENWARP_PUBLIC_URL or a Host header"))?;
     let url = Url::parse(&origin).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the public origin is not a valid URL"))?;
-    let rp_id = std::env::var("OPENWARP_RP_ID").ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty())
+    let rp_id = crate::envcfg::var("OPENWARP_RP_ID").ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty())
         .or_else(|| url.host_str().map(str::to_string)).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the public origin has no host"))?;
     WebauthnBuilder::new(&rp_id, &url)
         .and_then(|b| b.rp_name("OpenWarp").build())
@@ -262,20 +284,17 @@ pub async fn status(State(st): State<S>, h: HeaderMap) -> Res {
 pub async fn recovery_regenerate(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     reauth_remove(&st, &uid, &body).await?;
-    let codes = issue_recovery_codes(&st, &uid).await;
-    st.audit("", "", "", &uid, "auth.recovery_codes_regenerated", "").await;
+    let (codes,statements)=recovery_material(&uid);
+    st.audited_batch(&statements,&[],["","","",&uid,"auth.recovery_codes_regenerated",""]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"recovery_codes": codes}))) }
 
 pub async fn totp_disable(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     reauth_remove(&st, &uid, &body).await?;
     if !totp_enabled(&st, &uid).await { return Err(bad("TOTP is not enabled")); }
-    meta_set(&st, &format!("totp_enabled:{}", uid), "0").await;
-    meta_set(&st, &format!("totp_secret:{}", uid), "").await;
-    meta_set(&st, &format!("totp_pending:{}", uid), "").await;
-    meta_set(&st, &format!("totp_last:{}", uid), "0").await;
-    if methods(&st, &uid).await.is_empty() { meta_set(&st, &format!("totp_recovery:{}", uid), "").await; }
-    st.audit("", "", "", &uid, "auth.totp_disabled", "").await;
+    let mut statements=factor_meta(&[(format!("totp_enabled:{}",uid),"0".into()),(format!("totp_secret:{}",uid),String::new()),(format!("totp_pending:{}",uid),String::new()),(format!("totp_last:{}",uid),"0".into())]);
+    if !email_enabled(&st,&uid).await && passkey_count(&st,&uid).await==0 {statements.extend(factor_meta(&[(format!("totp_recovery:{}",uid),String::new())]));}
+    st.audited_batch(&statements,&[],["","","",&uid,"auth.totp_disabled",""]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"totp": false}))) }
 
 pub async fn email_enroll_start(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
@@ -289,26 +308,28 @@ pub async fn email_enroll_start(State(st): State<S>, h: HeaderMap, Json(body): J
     Ok(j(json!({"sent": true}))) }
 pub async fn email_enroll_verify(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
+    st.epoch_ok().await?;
     let key = format!("email-enroll-verify:{}", uid);
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many failed code attempts; try again later")); }
     let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    if !email_code_ok(&st, &uid, code, "enroll").await {
-        st.rate_fail(&key, 900).await;
-        return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired email code"));
+    match email_code_ok(&st, &uid, code, "enroll").await {
+        Ok(true) => {},
+        Ok(false) => { st.rate_fail(&key, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "invalid or expired email code")); },
+        Err(e) => return Err(crate::app::mfa_failure(e)),
     }
     st.rate_clear(&key).await;
-    meta_set(&st, &format!("email_mfa_enabled:{}", uid), "1").await;
-    let codes = ensure_recovery_codes(&st, &uid).await;
-    st.audit("", "", "", &uid, "auth.email_code_enabled", "").await;
+    let mut statements=factor_meta(&[(format!("email_mfa_enabled:{}",uid),"1".into())]);
+    let codes=if recovery_count(&st,&uid).await==0 {let (codes,recovery)=recovery_material(&uid); statements.extend(recovery); Some(codes)} else {None};
+    st.audited_batch(&statements,&[],["","","",&uid,"auth.email_code_enabled",""]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"email": true, "recovery_codes": codes}))) }
 pub async fn email_disable(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     reauth_remove(&st, &uid, &body).await?;
     if !email_enabled(&st, &uid).await { return Err(bad("email codes are not enabled")); }
-    meta_set(&st, &format!("email_mfa_enabled:{}", uid), "0").await;
-    let _ = st.db.exec("DELETE FROM email_codes WHERE user_id=?", &[json!(uid)]).await;
-    if methods(&st, &uid).await.is_empty() { meta_set(&st, &format!("totp_recovery:{}", uid), "").await; }
-    st.audit("", "", "", &uid, "auth.email_code_disabled", "").await;
+    let mut statements=factor_meta(&[(format!("email_mfa_enabled:{}",uid),"0".into())]);
+    statements.push(("DELETE FROM email_codes WHERE user_id=?".into(),vec![json!(uid)]));
+    if !totp_enabled(&st,&uid).await && passkey_count(&st,&uid).await==0 {statements.extend(factor_meta(&[(format!("totp_recovery:{}",uid),String::new())]));}
+    st.audited_batch(&statements,&[],["","","",&uid,"auth.email_code_disabled",""]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"email": false}))) }
 
 pub async fn passkey_register_start(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
@@ -346,19 +367,17 @@ pub async fn passkey_register_finish(State(st): State<S>, h: HeaderMap, Json(r):
     let credential_json = serde_json::to_string(&passkey).map_err(|e| bad(&e.to_string()))?;
     if st.db.one("SELECT user_id FROM passkeys WHERE credential_id=?", &[json!(&credential_id)]).await.map_err(|e| bad(&e))?.is_some() {
         return Err(err(StatusCode::CONFLICT, "this passkey is already registered to an account")); }
-    st.db.exec("INSERT INTO passkeys(id,user_id,name,credential_id,credential_json,sign_count,created_at) VALUES(?,?,?,?,?,0,?)",
-        &[json!(pid), json!(uid), json!(name), json!(credential_id), json!(credential_json), json!(now())]).await.map_err(|_| err(StatusCode::CONFLICT, "this passkey is already registered to an account"))?;
-    let codes = ensure_recovery_codes(&st, &uid).await;
-    st.audit("", "", "", &uid, "auth.passkey_added", &name).await;
+    let mut statements=vec![("INSERT INTO passkeys(id,user_id,name,credential_id,credential_json,sign_count,created_at) VALUES(?,?,?,?,?,0,?)".into(),vec![json!(pid),json!(uid),json!(name),json!(credential_id),json!(credential_json),json!(now())])];
+    let codes=if recovery_count(&st,&uid).await==0 {let (codes,recovery)=recovery_material(&uid); statements.extend(recovery); Some(codes)} else {None};
+    st.audited_batch(&statements,&[0],["","","",&uid,"auth.passkey_added",&name]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"id": pid, "name": name, "recovery_codes": codes}))) }
 
 pub async fn passkey_delete(State(st): State<S>, h: HeaderMap, Path(pid): Path<String>, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     reauth_remove(&st, &uid, &body).await?;
-    let deleted = st.db.exec("DELETE FROM passkeys WHERE id=? AND user_id=?", &[json!(pid), json!(uid)]).await.map_err(|e| bad(&e))?;
-    if deleted == 0 { return Err(err(StatusCode::NOT_FOUND, "passkey not found")); }
-    if methods(&st, &uid).await.is_empty() { meta_set(&st, &format!("totp_recovery:{}", uid), "").await; }
-    st.audit("", "", "", &uid, "auth.passkey_removed", &pid).await;
+    let mut statements=vec![("DELETE FROM passkeys WHERE id=? AND user_id=?".into(),vec![json!(pid),json!(uid)])];
+    if !totp_enabled(&st,&uid).await && !email_enabled(&st,&uid).await && passkey_count(&st,&uid).await==1 {statements.extend(factor_meta(&[(format!("totp_recovery:{}",uid),String::new())]));}
+    st.audited_batch(&statements,&[0],["","","",&uid,"auth.passkey_removed",&pid]).await.map_err(|e|if e.contains("version conflict") {err(StatusCode::NOT_FOUND,"passkey not found")} else {err(StatusCode::SERVICE_UNAVAILABLE,&e)})?;
     Ok(j(json!({"deleted": pid}))) }
 
 #[derive(Deserialize)]
@@ -407,7 +426,8 @@ pub async fn passkey_login_finish(State(st): State<S>, PeerAddr(addr): PeerAddr,
     let key = oc::hash_token(&r.mfa_token);
     let row = st.db.one("SELECT user_id,state_json,created_at FROM mfa_passkey_states WHERE mfa_token=?", &[json!(&key)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again"))?;
-    let _ = st.db.exec("DELETE FROM mfa_passkey_states WHERE mfa_token=?", &[json!(&key)]).await;
+    let consumed = st.db.exec("DELETE FROM mfa_passkey_states WHERE mfa_token=? AND state_json=? AND created_at=?", &[json!(&key), json!(db::s(&row, "state_json")), json!(db::n(&row, "created_at"))]).await.map_err(|e| bad(&e))?;
+    if consumed != 1 { return Err(err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again")); }
     if db::s(&row, "user_id") != uid || db::n(&row, "created_at") + CHALLENGE_TTL < now() {
         return Err(err(StatusCode::UNAUTHORIZED, "passkey sign-in expired; start again")); }
     let state: PasskeyAuthentication = serde_json::from_str(&db::s(&row, "state_json")).map_err(|_| bad("passkey sign-in failed"))?;
@@ -433,15 +453,16 @@ pub async fn passkey_login_finish(State(st): State<S>, PeerAddr(addr): PeerAddr,
         let updated = serde_json::to_string(&passkey).map_err(|e| bad(&e.to_string()))?;
         // The session may only follow a durable counter update; otherwise the
         // next assertion could replay the same counter.
-        st.db.exec("UPDATE passkeys SET credential_json=?,sign_count=?,last_used_at=? WHERE id=?",
-            &[json!(updated), json!(i64::from(result.counter())), json!(now()), json!(db::s(row, "id"))])
+        let changed = st.db.exec("UPDATE passkeys SET credential_json=?,sign_count=?,last_used_at=? WHERE id=? AND sign_count=? AND credential_json=?",
+            &[json!(updated), json!(i64::from(result.counter())), json!(now()), json!(db::s(row, "id")), json!(stored), json!(db::s(row, "credential_json"))])
             .await.map_err(|e| bad(&format!("passkey state could not be saved: {}", e)))?;
+        if changed != 1 { return Err(err(StatusCode::UNAUTHORIZED, "passkey state changed; start again")); }
         matched = true;
         break;
     }
     if !matched { st.rate_fail(&rl, 900).await; return Err(err(StatusCode::UNAUTHORIZED, "passkey does not belong to this account")); }
     st.rate_clear(&rl).await;
-    consume_challenge(&st, &r.mfa_token).await;
+    if !consume_challenge(&st, &r.mfa_token).await { return Err(err(StatusCode::UNAUTHORIZED, "MFA challenge expired or invalid")); }
     st.audit("", "", "", &uid, "auth.mfa_passkey", "").await;
     let session = make_session(&st, &uid).await?;
     let mut hdr = HeaderMap::new();

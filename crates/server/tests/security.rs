@@ -10,6 +10,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,20 +51,11 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    // Parallel test binaries must not hand the same port to two servers.
-    let base = 20000 + (std::process::id() % 30000) as u16;
-    for offset in 0..500u16 {
-        let port = base.saturating_add(offset);
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            drop(listener);
-            return port;
-        }
-    }
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    // True ephemeral: the OS never hands out a port that is still bound, so
+    // parallel test binaries cannot converge the way a PID-derived scan
+    // does. The only residual hazard is the gap between dropping this
+    // listener and the child binding it, which the startup retry covers.
+    TcpListener::bind("127.0.0.1:0").expect("ephemeral port").local_addr().expect("local addr").port()
 }
 
 impl Server {
@@ -85,6 +77,7 @@ impl Server {
             .env("ADDR", format!("127.0.0.1:{}", port))
             .env("OPENWARP_PUBLIC_URL", &public)
             .env("OPENWARP_EMAIL_WEBHOOK", &inbox_url)
+            .env("OPENWARP_LICENSE", "development")
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY")
             .env_remove("REDIS_URL")
@@ -110,6 +103,10 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A port probed before the child binds, or a host under load, can leave
+        // no server to talk to. Try again with a fresh database and port instead
+        // of failing a suite that has nothing to do with the cause.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { drop(_start); return Box::pin(Server::start()).await; }
         panic!("server did not become healthy at {}", server.base);
     }
 
@@ -317,6 +314,12 @@ fn parse_query(location: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
+#[cfg(feature = "scim")]
+async fn grant_scim(s: &Server, token: &str, org: &str) {
+    let r = s.call(Method::PUT, "/api/instance/features", Some(token), Some(json!({"org": org, "features": ["scim"]}))).await;
+    assert_eq!(r.status, 200, "scim grant failed: {}", r.text);
+}
+
 async fn set_secret(s: &Server, token: &str, env: &str, key: &str, value: &str) {
     let r = s
         .call(
@@ -329,6 +332,7 @@ async fn set_secret(s: &Server, token: &str, env: &str, key: &str, value: &str) 
     assert_eq!(r.status, 200, "set secret failed: {}", r.text);
 }
 
+#[cfg(feature = "scim")]
 #[tokio::test]
 async fn scim_is_scoped_to_the_callers_organisation() {
     let s = Server::start().await;
@@ -340,6 +344,12 @@ async fn scim_is_scoped_to_the_callers_organisation() {
         victim["user_id"].as_str().unwrap(),
     );
     let (at, ao) = (attacker["token"].as_str().unwrap(), attacker["org_id"].as_str().unwrap());
+    // Both workspaces hold the grant, so a cross-org denial is tenancy, not a
+    // missing feature.
+    // The instance owner holds grant authority over every workspace, so the
+    // victim's token grants both; the attacker can never grant its own.
+    grant_scim(&s, vt, vo).await;
+    grant_scim(&s, vt, ao).await;
 
     let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}", vo), Some(at), None).await;
     assert_eq!(r.status, 403, "cross-org SCIM user list must be denied, got {} {}", r.status, r.text);
@@ -531,6 +541,8 @@ async fn identity_role_cannot_exceed_the_creating_admin() {
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "reader"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept reader invitation failed: {}", accepted.text);
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/identities", org), Some(mt), Some(json!({"name": "sneaky", "role": "owner"}))).await;
     assert_eq!(r.status, 403, "custom-role member must not create a privileged identity, got {} {}", r.status, r.text);
@@ -554,6 +566,8 @@ async fn mcp_write_tools_respect_custom_role_permissions() {
     assert_eq!(r.status, 200, "role create failed: {}", r.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "editor"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept editor invitation failed: {}", accepted.text);
 
     let (oat, _) = oauth_token(&s, mt, "secrets:read secrets:write", &format!("{}/mcp", s.base)).await;
     let r = s
@@ -589,6 +603,8 @@ async fn members_can_be_listed_and_removed() {
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "member@test.invalid", "role": "developer"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(member["token"].as_str().unwrap()), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept member invitation failed: {}", accepted.text);
 
     let r = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
     assert_eq!(r.status, 200, "member listing failed: {}", r.text);
@@ -714,6 +730,7 @@ async fn mcp_rejects_tokens_with_an_empty_audience() {
     assert_eq!(r.status, 401, "empty-audience token must not reach MCP, got {} {}", r.status, r.text);
 }
 
+#[cfg(feature = "scim")]
 #[tokio::test]
 async fn scim_cannot_remove_the_last_owner() {
     let s = Server::start().await;
@@ -724,9 +741,12 @@ async fn scim_cannot_remove_the_last_owner() {
     let ou = owner["user_id"].as_str().unwrap();
     let at = admin["token"].as_str().unwrap();
     let au = admin["user_id"].as_str().unwrap();
+    grant_scim(&s, ot, org).await;
 
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(at), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept admin invitation failed: {}", accepted.text);
 
     let r = s.call(Method::DELETE, &format!("/scim/v2/Users/{}?org_id={}", ou, org), Some(at), None).await;
     assert_eq!(r.status, 403, "an admin must not remove an owner over SCIM, got {} {}", r.status, r.text);
@@ -749,6 +769,8 @@ async fn admin_cannot_invite_an_owner() {
     let at = admin["token"].as_str().unwrap();
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "admin@test.invalid", "role": "admin"}))).await;
     assert_eq!(r.status, 200, "invite failed: {}", r.text);
+    let accepted = s.call(Method::POST, "/api/auth/accept-invite", Some(at), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(accepted.status, 200, "accept admin invitation failed: {}", accepted.text);
     let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(at), Some(json!({"email": "third@test.invalid", "role": "owner"}))).await;
     assert_eq!(r.status, 403, "an admin must not grant ownership, got {} {}", r.status, r.text);
 }

@@ -240,6 +240,7 @@ pub fn validate_rotation_config(config: &Value) -> Result<(), String> {
     if config.as_object().map(|o| o.is_empty()).unwrap_or(true) { return Ok(()); }
     let kind = cfg(config, "kind");
     match kind {
+        "postgres-static" => { if cfg!(target_arch="wasm32") { return Err("static PostgreSQL rotation requires the native server".into()); } crate::pglease::validate_static(cfg(config,"connection"),cfg(config,"username"))?; }
         "" | "webhook" => {
             let url = cfg(config, "rotation_url");
             if url.is_empty() { return Err("rotation config requires kind or rotation_url".into()); }
@@ -2503,7 +2504,7 @@ pub async fn keeper_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- OCI Vault ----------
-fn unix_now() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+fn unix_now() -> i64 { crate::clock::now() }
 fn http_date() -> String {
     let secs = unix_now(); let days = secs.div_euclid(86400); let rem = secs.rem_euclid(86400);
     let (y, mo, d) = civil(days);
@@ -2511,12 +2512,10 @@ fn http_date() -> String {
     let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT", day_names[((days + 4).rem_euclid(7)) as usize], d, month_names[(mo - 1) as usize], y, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn iso_after(days: i64) -> String {
     let secs = unix_now() + days * 86400; let d = secs.div_euclid(86400); let rem = secs.rem_euclid(86400); let (y, mo, day) = civil(d);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, day, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_endpoint(config: &Value) -> Result<String, String> {
     let endpoint = cfg(config, "endpoint").trim_end_matches('/');
     if !endpoint.is_empty() { return Ok(endpoint.to_string()); }
@@ -2524,14 +2523,11 @@ fn oci_endpoint(config: &Value) -> Result<String, String> {
     if region.is_empty() { return Err("OCI Vault requires region or endpoint".into()); }
     Ok(format!("https://vaults.{}.oraclecloud.com", region))
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_key_id(config: &Value) -> Result<String, String> {
     let (tenancy, user, fingerprint) = (cfg(config, "tenancy_ocid"), cfg(config, "user_ocid"), cfg(config, "fingerprint"));
     if tenancy.is_empty() || user.is_empty() || fingerprint.is_empty() { return Err("OCI Vault requires tenancy_ocid, user_ocid and fingerprint".into()); }
     Ok(format!("{}/{}/{}", tenancy, user, fingerprint))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -2544,8 +2540,6 @@ fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     let signature = signing_key.sign(canonical.as_bytes());
     Ok(openwarp_crypto::b64(&signature.to_bytes()))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_request(client: &crate::http::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
     let base = oci_endpoint(config)?; let url = format!("{}{}", base, path_query);
     let parsed = reqwest::Url::parse(&url).map_err(|e| format!("OCI endpoint is invalid: {}", e))?;
@@ -2563,37 +2557,28 @@ async fn oci_request(client: &crate::http::Client, config: &Value, method: &str,
         .header("date", &date).header("host", &host).header("authorization", auth);
     if let (Some(text), Some(sha)) = (&body_text, &content_sha) { request = request.header("content-type", "application/json").header("x-content-sha256", sha).header("content-length", text.len()).body(text.clone()); }
     let response = request.send().await.map_err(|e| format!("OCI Vault request failed: {}", e))?;
-    let status = response.status(); let text = response.text().await.unwrap_or_default();
+    let status = response.status(); let text = response.text().await.map_err(|e| format!("OCI Vault response body failed: {}", e))?;
     if !status.is_success() { return Err(format!("OCI Vault request failed: HTTP {}: {}", status, text.chars().take(400).collect::<String>())); }
     if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("OCI Vault invalid response: {}", e)) }
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_config_ready(config: &Value) -> Result<(String, String), String> {
     let compartment = cfg(config, "compartment_id"); let vault = cfg(config, "vault_id");
     if compartment.is_empty() || vault.is_empty() { return Err("OCI Vault requires compartment_id and vault_id".into()); }
     Ok((compartment.to_string(), vault.to_string()))
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_name_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (compartment, vault) = oci_config_ready(config)?;
     let value = oci_request(client, config, "GET", &format!("/20180608/secrets?compartmentId={}&vaultId={}&lifecycleState=ACTIVE&limit=1000", enc(&compartment), enc(&vault)), None).await?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 async fn oci_bundle(client: &crate::http::Client, config: &Value, id: &str) -> Result<String, String> {
     let value = oci_request(client, config, "GET", &format!("/20180608/secretBundles/{}", enc(id)), None).await?;
     let content = value.get("secretBundleContent").and_then(|c| c.get("content")).and_then(Value::as_str).unwrap_or("");
     let bytes = openwarp_crypto::unb64(content).map_err(|e| format!("OCI secret content is invalid: {}", e))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn oci_content(value: &str) -> Value { json!({"content": openwarp_crypto::b64(value.as_bytes()), "contentType": "BASE64"}) }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let (compartment, vault) = oci_config_ready(config)?; let key_id = cfg(config, "key_id");
     let mode = sync_mode(config, "oci_vault")?; let dry = is_dry(config);
@@ -2622,8 +2607,6 @@ pub async fn oci_vault_sync(config: &Value, secrets: &[(String, String)], previo
     let managed = desired.iter().map(|(n, _)| n.clone()).collect();
     Ok((format!("OCI Vault sync{}: created={} updated={} deleted={} (deletions are scheduled 7 days out)", if dry { " (dry-run)" } else { "" }, created, updated, deleted), managed))
 }
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn oci_vault_test(config: &Value) -> Result<String, String> {
     let list = oci_list(&http_client(), config).await?;
     Ok(format!("OCI Vault connection OK: {} active secret(s) visible", list.len()))
@@ -2782,87 +2765,143 @@ fn ssh_parse(format: &str, text: &str) -> Result<BTreeMap<String, String>, Strin
 #[cfg(not(target_arch = "wasm32"))]
 fn ssh_binary() -> String { std::env::var("OPENWARP_SSH_BIN").unwrap_or_else(|_| "ssh".to_string()) }
 #[cfg(not(target_arch = "wasm32"))]
-fn ssh_cleanup(key: &Option<std::path::PathBuf>, hosts: &Option<std::path::PathBuf>) { for path in [key, hosts].into_iter().flatten() { let _ = std::fs::remove_file(path); } }
+struct SshStaging(std::path::PathBuf);
 #[cfg(not(target_arch = "wasm32"))]
-fn ssh_stage_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("openwarp-ssh-{}-{:?}", std::process::id(), std::thread::current().id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-// hash_token is base64, and a slash in a filename silently becomes a directory.
-#[cfg(not(target_arch = "wasm32"))]
-fn ssh_stage_name(prefix: &str, value: &str) -> String {
-    format!("{}-{}", prefix, openwarp_crypto::hash_token(value).replace(['/', '+'], "-").chars().take(12).collect::<String>()) }
-#[cfg(not(target_arch = "wasm32"))]
-fn wait_bounded(child: std::process::Child, budget: std::time::Duration) -> std::io::Result<std::process::Output> {
-    let started = std::time::Instant::now();
-    let mut child = child;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new(); let mut stderr = Vec::new();
-            use std::io::Read;
-            if let Some(mut out) = child.stdout.take() { let _ = out.read_to_end(&mut stdout); }
-            if let Some(mut err) = child.stderr.take() { let _ = err.read_to_end(&mut stderr); }
-            return Ok(std::process::Output { status, stdout, stderr });
+impl SshStaging {
+    fn new() -> Result<Self, String> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let n = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("openwarp-ssh-{}-{}", std::process::id(), n));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("ssh could not create credential staging: {}", e)),
+            }
         }
-        if started.elapsed() > budget { let _ = child.kill(); let _ = child.wait(); return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("ssh produced no result within {}s; the host may be unreachable or the command stalled", budget.as_secs()))); }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+        use std::io::Write;
+        let path = self.0.join(name);
+        let mut options = std::fs::OpenOptions::new(); options.write(true).create_new(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let mut file = options.open(&path).map_err(|e| format!("ssh could not stage {}: {}", name, e))?;
+        file.write_all(bytes).map_err(|e| format!("ssh could not stage {}: {}", name, e))?;
+        Ok(path)
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SshStaging { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SshProcess { child: tokio::process::Child, group: Option<u32> }
+#[cfg(not(target_arch = "wasm32"))]
+impl SshProcess {
+    #[cfg(unix)]
+    async fn exited(&self) -> Result<(), String> {
+        let id = self.group.expect("SSH process group is live");
+        loop {
+            // WNOWAIT retains the leader's PID until stop has signalled its group.
+            {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe { libc::waitid(libc::P_PID, id as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+                if result == 0 && unsafe { info.si_pid() } != 0 { return Ok(()); }
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted { return Err(format!("ssh exit observation failed: {}", error)); }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    fn stop(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.group.take() {
+            // The id comes only from our child, launched in its own process group.
+            unsafe { libc::kill(-(id as libc::pid_t), libc::SIGKILL); }
+        }
+        let _ = self.child.start_kill();
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SshProcess { fn drop(&mut self) { self.stop(); } }
+
+// Each output pipe is capped at 1 MiB; rendered stdin is capped at 16 MiB.
+#[cfg(not(target_arch = "wasm32"))]
+async fn ssh_read_bounded(mut pipe: impl tokio::io::AsyncRead + Unpin, label: &str) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new(); let mut buffer = [0u8; 8192];
+    loop {
+        let n = pipe.read(&mut buffer).await.map_err(|e| format!("ssh {} read failed: {}", label, e))?;
+        if n == 0 { return Ok(out); }
+        if out.len() + n > 1024 * 1024 { return Err(format!("ssh {} exceeds 1 MiB limit", label)); }
+        out.extend_from_slice(&buffer[..n]);
     }
 }
 /// Run one remote command. stdout is the file; a non-zero exit is an error
 /// carrying stderr, so a refused host key never looks like an empty file.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
-fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<String, String> {
-    let mut cmd = std::process::Command::new(ssh_binary());
+async fn ssh_exec(target: &SshTarget, command: &str, stdin: Option<&[u8]>) -> Result<String, String> {
+    if stdin.is_some_and(|bytes| bytes.len() > 16 * 1024 * 1024) { return Err("ssh stdin exceeds 16 MiB limit".into()); }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(target.timeout.saturating_mul(4));
+    let staging = SshStaging::new()?;
+    let mut cmd = tokio::process::Command::new(ssh_binary());
     cmd.arg("-p").arg(target.port.to_string()).arg("-o").arg(format!("ConnectTimeout={}", target.timeout)).arg("-o").arg("StrictHostKeyChecking=yes").arg("-o").arg("IdentitiesOnly=yes");
     // Password auth speaks through sshpass; a key cannot, so BatchMode would reject it.
     if target.password.is_empty() { cmd.arg("-o").arg("BatchMode=yes"); }
-    let mut owned_key = None;
-    let mut owned_hosts = None;
     if !target.identity.is_empty() { cmd.arg("-i").arg(&target.identity).arg("-o").arg("IdentitiesOnly=yes"); }
     if !target.askpass.is_empty() {
-        let path = ssh_stage_dir().join(ssh_stage_name(&format!("key-{}", std::process::id()), &target.askpass));
         let mut pem = target.askpass.clone(); if !pem.ends_with('\n') { pem.push('\n'); }
-        std::fs::write(&path, pem.as_bytes()).map_err(|e| format!("ssh could not stage the private key: {}", e))?;
-        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)); }
+        let path = staging.write("key-private", pem.as_bytes())?;
         cmd.arg("-i").arg(&path);
-        owned_key = Some(path);
     }
     // A path is only a path when it has no key material. A key always contains whitespace.
     if target.known_hosts.starts_with('/') && !target.known_hosts.contains(' ') { cmd.arg("-o").arg(format!("UserKnownHostsFile={}", target.known_hosts)); }
     else {
-        let path = ssh_stage_dir().join(ssh_stage_name("hosts", &target.known_hosts));
         let line = if target.known_hosts.contains(' ') { target.known_hosts.clone() } else { format!("{} {}", target.host, target.known_hosts) };
-        std::fs::write(&path, format!("{}\n", line.trim())).map_err(|e| format!("ssh could not stage known_hosts: {}", e))?;
+        let path = staging.write("hosts-known", format!("{}\n", line.trim()).as_bytes())?;
         cmd.arg("-o").arg(format!("UserKnownHostsFile={}", path.display()));
-        owned_hosts = Some(path);
     }
-    let mut launch: std::process::Command = if target.password.is_empty() { cmd }
+    let mut launch = if target.password.is_empty() { cmd }
     else {
-        if std::process::Command::new("sshpass").arg("-V").output().is_err() {
-            ssh_cleanup(&owned_key, &owned_hosts);
-            return Err("ssh password auth needs sshpass installed, or use identity_file / private_key".into());
-        }
-        let mut wrapped = std::process::Command::new("sshpass");
+        let mut wrapped = tokio::process::Command::new("sshpass");
         wrapped.arg("-e").arg(ssh_binary());
-        wrapped.args(cmd.get_args());
-        for (key, value) in cmd.get_envs() { match value { Some(v) => { wrapped.env(key, v); } None => { wrapped.env_remove(key); } } }
+        wrapped.args(cmd.as_std().get_args());
         wrapped.env("SSHPASS", &target.password);
         wrapped
     };
     launch.arg(format!("{}@{}", target.user, target.host)).arg("--").arg(command);
-    launch.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    let spawned = launch.spawn().map_err(|e| format!("ssh could not be started (is OpenSSH installed?): {}", e));
-    let mut child = match spawned { Ok(child) => child, Err(e) => { ssh_cleanup(&owned_key, &owned_hosts); return Err(e); } };
-    let sent = if let Some(bytes) = stdin { use std::io::Write; child.stdin.take().map(|mut input| input.write_all(bytes)).transpose().map_err(|e| format!("ssh could not send the file: {}", e)) } else { Ok(None) };
-    let budget = std::time::Duration::from_secs(target.timeout.saturating_mul(4).max(target.timeout));
-    let finished = if sent.is_ok() { Some(wait_bounded(child, budget)) } else { let _ = child.kill(); let _ = child.wait(); None };
-    ssh_cleanup(&owned_key, &owned_hosts);
-    sent?;
-    let finished = finished.unwrap().map_err(|e| format!("ssh wait failed: {}", e))?;
-    if !finished.status.success() { return Err(format!("ssh command failed ({}): {}", finished.status, String::from_utf8_lossy(&finished.stderr).chars().take(400).collect::<String>())); }
-    Ok(String::from_utf8_lossy(&finished.stdout).into_owned())
+    launch.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; launch.as_std_mut().process_group(0); }
+    let child = launch.spawn().map_err(|e| if target.password.is_empty() { format!("ssh could not be started (is OpenSSH installed?): {}", e) } else { format!("ssh password auth needs sshpass installed, or use identity_file / private_key: {}", e) })?;
+    let mut process = SshProcess { group: child.id(), child };
+    let mut input = process.child.stdin.take().unwrap();
+    let stdout = process.child.stdout.take().unwrap(); let stderr = process.child.stderr.take().unwrap();
+    // These futures are owned here, not spawned: cancellation drops all pipe IO.
+    let result = tokio::time::timeout_at(deadline, async {
+        let send = async {
+            use tokio::io::AsyncWriteExt;
+            let result = input.write_all(stdin.unwrap_or_default()).await.map_err(|e| format!("ssh could not send the file: {}", e));
+            drop(input);
+            result
+        };
+        #[cfg(unix)]
+        let (_, stdout, stderr, ()) = tokio::try_join!(send, ssh_read_bounded(stdout, "stdout"), ssh_read_bounded(stderr, "stderr"), process.exited())?;
+        #[cfg(not(unix))]
+        let (_, stdout, stderr) = tokio::try_join!(send, ssh_read_bounded(stdout, "stdout"), ssh_read_bounded(stderr, "stderr"))?;
+        #[cfg(unix)] process.stop();
+        let status = process.child.wait().await.map_err(|e| format!("ssh wait failed: {}", e))?;
+        Ok::<_, String>((stdout, stderr, status))
+    }).await;
+    process.stop();
+    let reaped = process.child.wait().await.map_err(|e| format!("ssh reap failed: {}", e));
+    let (stdout, stderr, status) = result.map_err(|_| "ssh command exceeded its total deadline".to_string())??;
+    reaped?;
+    if !status.success() { return Err(format!("ssh command failed ({}): {}", status, String::from_utf8_lossy(&stderr).chars().take(400).collect::<String>())); }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 #[cfg(not(target_arch = "wasm32"))]
 type SshPlan = Vec<(SshFile, BTreeMap<String, String>)>;
@@ -2899,20 +2938,14 @@ pub fn ssh_owned_names(config: &Value, secrets: &[(String, String, String, Strin
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_sync(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
-    let config = config.clone(); let secrets = secrets.to_vec(); let previous_managed = previous_managed.to_vec();
-    tokio::task::spawn_blocking(move || ssh_file_sync_blocking(&config, &secrets, &previous_managed)).await.map_err(|e| format!("ssh sync task failed: {}", e))?
-}
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, String)], previous_managed: &[String]) -> Result<(String, Vec<String>), String> {
     let target = ssh_target(config)?; let mode = sync_mode(config, "ssh")?; let dry = is_dry(config);
     let plans = ssh_plan(config, secrets)?;
     let mut managed = Vec::new(); let mut reports = Vec::new();
     for (file, desired) in &plans {
         let quoted = ssh_shell_quote(&file.path);
-        let probe = ssh_exec(&target, &format!("if [ -e {} ]; then echo present; else echo missing; fi", quoted), None)?;
+        let probe = ssh_exec(&target, &format!("if [ -e {} ]; then echo present; else echo missing; fi", quoted), None).await?;
         let missing = probe.trim() == "missing";
-        let current_text = if missing { String::new() } else { ssh_exec(&target, &format!("cat {}", quoted), None)? };
+        let current_text = if missing { String::new() } else { ssh_exec(&target, &format!("cat {}", quoted), None).await? };
         let current = if missing { BTreeMap::new() } else { ssh_parse(&file.format, &current_text)? };
         let current_map: HashMap<String, String> = current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let desired_pairs: Vec<(String, String)> = desired.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2932,7 +2965,7 @@ fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, St
             let mut command = format!("mkdir -p {} && cat > {} && mv {} {} || {{ rm -f {}; exit 1; }}", ssh_shell_quote(dir), ssh_shell_quote(&staged), ssh_shell_quote(&staged), quoted, ssh_shell_quote(&staged));
             if !file.mode.is_empty() { command.push_str(&format!(" && chmod {} {}", file.mode, quoted)); }
             if !file.owner.is_empty() { command.push_str(&format!(" && chown {} {}", file.owner, quoted)); }
-            ssh_exec(&target, &command, Some(rendered.as_bytes()))?;
+            ssh_exec(&target, &command, Some(rendered.as_bytes())).await?;
         }
         if !dry { for name in desired.keys() { managed.push(format!("{}|{}", file.path, name)); } }
         reports.push(format!("{}: created={} updated={} unchanged={} deleted={}", file.path, created, updated, unchanged, deleted));
@@ -2942,22 +2975,16 @@ fn ssh_file_sync_blocking(config: &Value, secrets: &[(String, String, String, St
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_test(config: &Value) -> Result<String, String> {
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || { let target = ssh_target(&config)?; let who = ssh_exec(&target, "whoami", None)?; Ok(format!("SSH connection OK: {}@{}:{} as {}", target.user, target.host, target.port, who.trim())) }).await.map_err(|e| format!("ssh test task failed: {}", e))?
+    let target = ssh_target(config)?; let who = ssh_exec(&target, "whoami", None).await?;
+    Ok(format!("SSH connection OK: {}@{}:{} as {}", target.user, target.host, target.port, who.trim()))
 }
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn ssh_file_pull(config: &Value) -> Result<Vec<(String, String)>, String> {
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || ssh_file_pull_blocking(&config)).await.map_err(|e| format!("ssh import task failed: {}", e))?
-}
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-fn ssh_file_pull_blocking(config: &Value) -> Result<Vec<(String, String)>, String> {
     let target = ssh_target(config)?; let files = ssh_files(config)?;
     let mut out = Vec::new();
     for file in &files {
-        let text = ssh_exec(&target, &format!("cat {}", ssh_shell_quote(&file.path)), None)?;
+        let text = ssh_exec(&target, &format!("cat {}", ssh_shell_quote(&file.path)), None).await?;
         for (k, v) in ssh_parse(&file.format, &text)? { out.push((strip_remote_prefix(config, &k, ""), v)); }
     }
     Ok(out)
@@ -3313,7 +3340,6 @@ pub async fn pull(kind: &str, config: &Value) -> Result<Vec<(String, String)>, S
             let list = huggingface_space_list(&http_client(), &base_url, &token, &path).await?;
             Ok(list.into_iter().filter_map(|(k, v)| Some((strip_remote_prefix(config, &k, ""), v?))).collect())
         }
-        #[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => {
             let client = http_client(); let list = oci_list(&client, config).await?;
             let mut out = Vec::new();
@@ -3391,10 +3417,7 @@ pub async fn sync_managed_with_tags(kind: &str, config: &Value, secrets: &[(Stri
         "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_sync(config, pairs, previous_managed).await,
         "keeper" => keeper_sync(config, pairs, previous_managed).await,
-#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_sync(config, pairs, previous_managed).await,
-        #[cfg(target_arch = "wasm32")]
-        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_sync(config, pairs, previous_managed).await,
         _ => return None,
     };
@@ -3450,10 +3473,7 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "ssh" => Err("SSH file sync needs the native server: a Worker cannot run ssh".into()),
         "ovh_kms" => ovh_kms_test(config).await,
         "keeper" => keeper_test(config).await,
-#[cfg(not(target_arch = "wasm32"))]
         "oci_vault" => oci_vault_test(config).await,
-        #[cfg(target_arch = "wasm32")]
-        "oci_vault" => Err("OCI Vault needs RSA request signing, which requires the native server".into()),
         "huggingface" => huggingface_test(config).await,
         _ => Err(format!("connection test is not implemented for kind {}", kind)),
     }
@@ -3799,6 +3819,36 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ssh_staging_cleans_up_after_partial_failure() {
+        let path;
+        {
+            let staging = SshStaging::new().unwrap(); path = staging.0.clone();
+            staging.write("key-private", b"test-key").unwrap();
+            std::fs::create_dir(path.join("hosts-known")).unwrap();
+            assert!(staging.write("hosts-known", b"test-host").is_err());
+            assert!(path.join("key-private").exists());
+        }
+        assert!(!path.exists());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn ssh_stdin_limit_rejects_before_launch() {
+        let target = ssh_target(&json!({"host":"unused", "identity_file":"/unused", "known_hosts":"/unused"})).unwrap();
+        let bytes = vec![b'x'; 16 * 1024 * 1024 + 1];
+        assert_eq!(ssh_exec(&target, "unused", Some(&bytes)).await.unwrap_err(), "ssh stdin exceeds 16 MiB limit");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn ssh_stderr_limit_rejects_without_waiting_for_eof() {
+        let pipe = tokio::io::repeat(b'x');
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), ssh_read_bounded(pipe, "stderr")).await.unwrap();
+        assert_eq!(result.unwrap_err(), "ssh stderr exceeds 1 MiB limit");
+    }
 
     type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
     type FullCalls = Arc<Mutex<Vec<(String, String, String, String)>>>;
@@ -5477,14 +5527,6 @@ mod tests {
     }
 
 }
-#[cfg(target_arch = "wasm32")]
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn oci_vault_sync(_config: &Value, _secrets: &[(String, String)], _previous: &[String]) -> Result<(String, Vec<String>), String> { Err("OCI Vault sync needs RSA request signing, which requires the native server".into()) }
-#[cfg(target_arch = "wasm32")]
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn oci_vault_test(_config: &Value) -> Result<String, String> { Err("OCI Vault needs RSA request signing, which requires the native server".into()) }
 #[cfg(target_arch = "wasm32")]
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]

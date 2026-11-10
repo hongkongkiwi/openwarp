@@ -22,20 +22,30 @@ Run a local instance, choose an encryption boundary, then connect the workloads 
 | [Core concepts](CONCEPTS.md) | Workspaces, environments, identities, drafts, encryption and recovery |
 | [Console](CONSOLE.md) | Browser-based administration and secret editing |
 | [CLI](CLI.md) | Login, project defaults, imports, exports, injection and specialised commands |
-| [Feature reference](FEATURES.md) | Detailed implemented behavior and limits |
 | [Troubleshooting](TROUBLESHOOTING.md) | Login, denied access, missing values, sync, storage and runtime failures |
+| Deploy behind HTTPS and configure sign-in | [Deployment](DEPLOY.md) |
+| Look up environment variables and defaults | [Configuration](CONFIGURATION.md) |
+| Understand the self-hosted and enterprise plans | [Editions and licensing](EDITIONS.md) |
+| Upgrade a database across releases, inspect the ledger, repair a failed run | [Schema migrations](MIGRATIONS.md) |
+| Understand encryption, access control, and trust boundaries | [Security model](SECURITY.md) |
+| Compare SSE, delegated and E2E key custody | [Encryption and key custody](ENCRYPTION.md) |
+| Back up data and rehearse a restore | [Backup and restore](BACKUP.md) |
 
 ## Connect and automate
 
 | Guide | What it covers |
 | --- | --- |
-| [HTTP API](API.md) | Bearer authentication, resource discovery, export, errors and contract boundaries |
+| [HTTP API](API.md) | Bearer authentication, resource discovery, export, errors and contract boundaries, plus workload, path-policy, rotation and transit endpoints |
 | [Clients and automation](CLIENTS.md) | SDK directory inventory, Terraform, GitHub Actions and client differences |
 | [Integrations](INTEGRATIONS.md) | Provider configuration, sync options and destination-specific behavior |
+| [Webhooks](WEBHOOKS.md) | Signed outgoing subscriptions and incoming integration triggers |
+| [Webhook source review](WEBHOOK_REVIEW.md) | Inspected upstream webhook practices and limits |
 | [Kubernetes](KUBERNETES.md) | Workload consumption and the External Secrets Operator webhook bridge |
 | [Batched change requests](CHANGE-REQUESTS.md) | Review and apply changes across environments |
 | [Workload identity](WORKLOAD-IDENTITY.md) | Exchange trusted workload JWTs for scoped access |
+| [Workload access](WORKLOADS.md) | Configure workload JWT identity and folder restrictions |
 | [Transit encryption](TRANSIT.md) | Encrypt application data using versioned workspace keys |
+| [Assistant and security insights](AI.md) | Configure BYOK assistance and investigate security findings |
 
 ## Operate and secure
 

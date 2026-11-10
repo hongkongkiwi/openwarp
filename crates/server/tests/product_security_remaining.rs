@@ -1,3 +1,5 @@
+#![cfg(feature = "change-requests")]
+
 include!("product_features.rs");
 
 async fn remaining_history(f: &Fixture, sid: &str) -> Value {
@@ -11,6 +13,7 @@ async fn remaining_retention(f: &Fixture, env: &str, limit: i64) {
 
 #[tokio::test]
 async fn remaining_batch_apply_obeys_retention_and_preserves_unlimited_history() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     remaining_retention(&f, "dev", 1).await;
     remaining_retention(&f, "prod", 0).await;
@@ -36,6 +39,7 @@ async fn remaining_batch_apply_obeys_retention_and_preserves_unlimited_history()
 
 #[tokio::test]
 async fn remaining_rejected_batch_preserves_retained_history_and_current_values() {
+    if !suite_gated() { return; }
     let f = Fixture::new().await;
     remaining_retention(&f, "dev", 1).await;
     for env in ["dev", "prod"] { f.put(env, json!([{"key":"TARGET","value":"retained-before"}])).await; }
@@ -90,6 +94,10 @@ impl RemainingMysql {
             f.sql("INSERT INTO apps(id,org_id,name,created_at) VALUES('app-a','org-a','remaining',?)", &[json!(now())]).await;
             for env in ["dev", "prod"] { f.sql("INSERT INTO envs(id,app_id,name,env_key_wrapped,mode,created_at) VALUES(?,'app-a',?,?,'sse',?)", &[json!(env),json!(env),json!(oc::encrypt_symmetric(&master, &[11;32])),json!(now())]).await; }
             f.sql("INSERT INTO identities(id,org_id,name,role,created_at) VALUES('identity-a','org-a','remaining','developer',?)", &[json!(now())]).await;
+            // The fixture workspace holds every grant: these suites test the
+            // gated surfaces themselves, and the grant gate has its own test.
+            let held = ["change-requests", "transit", "workload-identity", "pki", "ssh-ca", "saml", "scim", "ldap"].join(" ");
+            f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES('org-a',?,'fixture',?)", &[json!(held), json!(now())]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('instance_owner','owner')", &[]).await;
             f.sql("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&master))]).await;
         }
@@ -114,6 +122,7 @@ impl Drop for RemainingMysql {
 
 #[tokio::test]
 async fn remaining_mysql_valid_signed_workload_exchange_is_not_rate_limited() {
+    if !suite_gated() { return; }
     let Some(database) = RemainingMysql::new().await else { return; };
     let f = database.fixture([7;32], true).await;
     let trust = f.trust(trust_body(), OWNER).await;
@@ -129,6 +138,7 @@ async fn remaining_mysql_valid_signed_workload_exchange_is_not_rate_limited() {
 
 #[tokio::test]
 async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext() {
+    if !suite_gated() { return; }
     let Some(database) = RemainingMysql::new().await else { return; };
     let f = database.fixture([7;32], true).await;
     let key = f.transit_key("remaining", "org-a", OWNER).await;
@@ -138,9 +148,13 @@ async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext(
     f.transit(&key, "rotate", OWNER, json!({}), 200).await;
     let latest = f.transit(&key, "encrypt", OWNER, json!({"plaintext":plain,"context":"remaining"}), 200).await;
     assert_eq!(latest["version"], 2);
-    f.expect(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(json!({"new_key":oc::b64(&[9;32])})), 200).await;
+    f.expect(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(json!({"new_key":oc::b64(&[9;32])})), 409).await;
+    for encrypted in [&original, &latest] {
+        let input = json!({"ciphertext":encrypted["ciphertext"],"context":"remaining"});
+        assert_eq!(f.transit(&key, "decrypt", OWNER, input, 200).await["plaintext"], plain, "refused rotation must preserve existing ciphertext");
+    }
     drop(f);
-    let reopened = database.fixture([9;32], false).await;
+    let reopened = database.fixture([7;32], false).await;
     for encrypted in [&original, &latest] {
         let input = json!({"ciphertext":encrypted["ciphertext"],"context":"remaining"});
         assert_eq!(reopened.transit(&key, "decrypt", OWNER, input, 200).await["plaintext"], plain, "fresh state must decrypt every transit version after master rotation");
@@ -151,6 +165,7 @@ async fn remaining_mysql_transit_create_and_master_rotation_preserve_ciphertext(
 
 #[tokio::test]
 async fn remaining_postgres_retention_policy_change_during_apply_cannot_use_stale_limit() {
+    if !suite_gated() { return; }
     let admin_url = match std::env::var("OPENWARP_TEST_POSTGRES_URL") {
         Ok(url) => { assert!(!url.trim().is_empty(), "provided OPENWARP_TEST_POSTGRES_URL must not be empty"); url },
         Err(std::env::VarError::NotPresent) => { eprintln!("SKIP PostgreSQL policy race: OPENWARP_TEST_POSTGRES_URL is absent"); return; },
@@ -190,6 +205,9 @@ async fn remaining_postgres_retention_policy_change_during_apply_cannot_use_stal
         #[cfg(feature = "redis-cache")] None);
     let f = Fixture { app: router(st.clone()), st };
     f.sql("INSERT INTO orgs(id,name,created_at) VALUES('org-a','policy race',?)", &[json!(now())]).await;
+    // The fixture workspace holds the change-requests grant: the suite tests
+    // the gated surface itself, and the grant gate has its own test.
+    f.sql("INSERT INTO feature_grants(org_id,features,updated_by,updated_at) VALUES('org-a','change-requests','fixture',?)", &[json!(now())]).await;
     for (uid, token, role) in [("owner",OWNER,"owner"),("admin",ADMIN,"admin")] {
         f.sql("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at,active,email_verified) VALUES(?,?,?,'','',?,1,1)", &[json!(uid),json!(format!("{uid}@test.invalid")),json!("unused-password-hash"),json!(now())]).await;
         f.sql("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", &[json!(oc::hash_token(token)),json!(uid),json!(now())]).await;

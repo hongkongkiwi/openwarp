@@ -6,7 +6,8 @@ The comparison column records the upstream tier labels used when this matrix was
 
 | Feature | Historical Phase tier | OpenWarp implementation |
 |---|---|---|
-| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings |
+| Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings; explicit invitation consent, public preview and scoped pending list/revoke/resend with rotated seven-day tokens |
+| Workspace creation policy | n/a | instance-owner `PUT /api/instance/workspaces`, separate from signup; `OPENWARP_WORKSPACE_CREATION` override; no personal workspace when disabled, zero-workspace console recovery and last-workspace deletion protection |
 | Account and workspace lifecycle | n/a | session-only `DELETE /api/me`, credential warning and query confirmation; workspace ownership blocks deletion even for co-owners; owner-only cascading workspace deletion and active, verified ownership handover |
 | OAuth API administration | n/a | `org:admin` is separate from secret scopes; API issuer and `/mcp` audiences remain bound across refresh; CLI requests the API audience |
 | Apps + readme | Free | yes |
@@ -18,7 +19,7 @@ The comparison column records the upstream tier labels used when this matrix was
 | Personal overrides | Free | `POST /api/secrets/:id/override`, merged on read |
 | Password reuse warning | n/a | workspace and app switches (default on), keyed HMAC-SHA256 fingerprint, console preflight via `POST /api/envs/:id/secrets/reuse-check` |
 | Sign-in methods and second factors | n/a | password, ten social providers, workspace OIDC/SAML and LDAP; TOTP, WebAuthn passkeys and emailed codes; instance switches with `OPENWARP_AUTH_PROVIDERS` |
-| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console still uses v1 |
+| Client-derived authentication | n/a | PBKDF2-derived auth and wrapping keys, single-use challenge proofs; v2 register/login/reset/invite and OAuth consent; console uses v2 for new invited accounts and detects v2 login, while normal console registration/reset retain v1 |
 | Encryption modes and KMS | n/a | SSE per-environment keys, external KMS bridge, client-held keys for delegated and E2E environments, `ow2` record-bound ciphertext |
 | Customer-run sync runner | n/a | outbound job queue, runner-sealed provider configs, claim fencing and stale-job recovery |
 | Global search | Free | `GET /api/search?q=` across orgs/apps/envs |
@@ -30,12 +31,63 @@ The comparison column records the upstream tier labels used when this matrix was
 | Network policies | Pro | `PUT /api/orgs/:id/settings {ip_allowlist}` stored per org |
 | Point-in-time recovery | Pro | `POST /api/envs/:id/restore-point {timestamp}` |
 | Automated rotation | Pro | `POST /api/envs/:id/rotate {key}` (new random or given value) |
-| Audit logs + forwarding | Pro/Ent | per-org audit table with a hash chain and `GET /api/orgs/:id/audit/verify`, webhook forwarding via settings |
+| Audit logs + forwarding | Pro/Ent | per-org audit hash chain with `GET /api/orgs/:id/audit/verify`; native signed workspace/app event subscriptions, retry and attempt history; legacy settings forwarding disabled (see [Webhooks](WEBHOOKS.md)) |
+| Incoming sync triggers | n/a | signed fixed-integration triggers for server-encrypted environments, persistent receipts with encrypted payload capture, console inspection, receipt replay, replay protection and source-policy checks; native runtime only |
+| Management clients | n/a | generic JSON management requests in CLI and four SDKs; hosted MCP route discovery and internal API requests preserve caller permissions |
 | Dynamic secrets | Enterprise | TTL leases `GET/POST /api/envs/:id/dynamic` (1h default); expiry revokes the remote credential |
 | OIDC SSO / SCIM provisioning | Enterprise | **Full OIDC authorization-code flow per org**: `GET /api/auth/oidc/:org/start` (discovery, state), `GET /api/auth/oidc/callback` (code exchange, `id_token` verified against provider JWKS with RS/PS/ES signatures and iss/aud/exp/nonce checks, user auto-provisioned as org developer, session issued). Configure via `PUT /api/orgs/:id/settings` with `oidc_issuer, oidc_client_id, oidc_client_secret (encrypted at rest), oidc_redirect_uri`. Instance-level sign-in with any OIDC provider is configured by `OPENWARP_OIDC_*` (PKCE, optional client secret, discovery or explicit endpoints; see [configuration](CONFIGURATION.md)). SCIM 2.0: Users `POST/GET/PUT/PATCH/DELETE` (deactivation kills sessions and memberships, login returns 401) and Groups `POST/GET/PUT/PATCH/DELETE` mapped to Teams with member sync |
 | LDAP directory sign-in | Enterprise | **Per-org LDAPS directory**: admin `GET/PUT/DELETE /api/orgs/:id/ldap` stores the URL, service bind DN and encrypted password, base DN, user filter, attribute names and group map; `POST /api/auth/ldap {org_id, username, password}` searches with the service account (RFC 4515 escaping), then binds as the found entry. Only `ldaps://` is accepted, so no password crosses the wire unencrypted. Invite or auto-provision plus allowed-domain gating, `Group=role` mapping, TOTP parity and audit entries. Absent from builds without the `ldap` cargo feature (Workers/WASM) |
-| External KMS | Enterprise | master key via `OPENWARP_MASTER_KEY` (BYO KMS/HSM wrapper point) |
-| Licence checks / seat limits | n/a | **none, by design** |
+| External KMS | Enterprise | native KMS bridge can auto-unseal the persisted instance root without `OPENWARP_MASTER_KEY`; Workers still require that binding; see [encryption](ENCRYPTION.md) |
+| Workload JWT / Kubernetes identity | n/a | native signed-JWT exchange with owner-configured issuer/JWKS/audience/subject, single-use assertions and tokens lasting at most 300 seconds; Workers exchange returns 501; see [workloads](WORKLOADS.md) |
+| Role path policies | n/a | owner-managed SSE folder-prefix read/write/delete rules; narrow role/token authority and globally deny unmediated administrative operations for restricted principals; see [workloads](WORKLOADS.md#restrict-secret-paths) |
+| Static PostgreSQL role rotation | n/a | rotate an existing remote login and store its password in an SSE secret; encrypted pending candidate supports retries after uncertain outcomes; see [integrations](INTEGRATIONS.md#static-postgresql-password-rotation) |
+| Transit encryption | n/a | workspace payload encryption, version rotation and rewrap with distinct transit permissions; no key export; see [API](API.md#transit) |
+| CLI template agent | n/a | literal secret placeholders, bounded in-memory cache and atomic output; no disk cache or offline fallback; see [CLI](CLI.md) |
+| Licence checks / seat limits | n/a | two plans: self-hosted needs no key and keeps every core feature; an offline ES256 enterprise licence unlocks workspace SAML/OIDC, LDAP, SCIM and audit streaming. No seat counts; see [editions](EDITIONS.md) |
+
+## Enterprise surfaces: build features and workspace grants
+
+Eight surfaces are opt-in twice, and both gates must pass: the binary must be
+built with the Cargo feature, and the workspace must hold a grant.
+
+| Feature | Surface |
+|---|---|
+| `saml` | SAML 2.0 service provider, per-workspace IdP configuration |
+| `scim` | SCIM 2.0 Users and Groups provisioning under `/scim/v2` |
+| `pki` | X.509 certificate authorities, issuance, CRL and OCSP |
+| `ssh-ca` | SSH user and host certificates, KRL and RevokedKeys |
+| `transit` | Workspace transit keys (`/api/orgs/:id/transit/keys`) |
+| `workload-identity` | Workload trust records and JWT exchange |
+| `change-requests` | Batched multi-environment change requests |
+| `ldap` | Per-workspace LDAPS directory sign-in |
+
+The default build compiles none of them. `cargo build --features enterprise`
+enables all eight, and `enterprise` expands to the individual names, so a
+narrower build such as `--features ssh-ca` is possible. The container image
+builds with `enterprise,redis-cache` unless
+`--build-arg OPENWARP_FEATURES=` overrides it.
+
+Grants are per workspace and only the instance owner changes them:
+
+```
+GET  /api/instance/features        # compiled names plus every workspace's grants
+PUT  /api/instance/features        # {"org": "ORG_ID", "features": ["saml"]}
+GET  /api/orgs/:id/features        # any member: {"compiled": [...], "granted": [...]}
+```
+
+A surface compiled out has no route at all, so requests get 404. A surface that
+is compiled in but not granted answers 403 with a message naming the feature.
+OCSP is the one exception: it stays reachable without a grant, because a client
+checking a certificate must still learn that it was revoked after a workspace
+loses the grant. Elsewhere authentication and workspace membership run before
+the grant check, so an ungranted request never reveals whether an object
+exists; the SAML metadata and start endpoints are unauthenticated by design and
+return no object data.
+The `PUT` body is the full set the workspace should hold, and an empty array
+revokes everything. Grant rows survive a build that omits the feature, so
+rebuilding with it restores the previous choice. The console hides a settings
+card unless both gates pass, and the instance owner gets a feature matrix in
+Settings.
 
 ## Integrations (`POST /api/envs/:id/integrations`, auto-sync on deploy, manual `POST /api/integrations/:id/sync`)
 
@@ -107,8 +159,7 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
 - Lease renew, plus a rotation scheduler (30s tick) with per-key schedules
   (`/api/envs/:id/rotations`) and optional OpenAI, OpenRouter or Resend
   provider adapters; E2E envs are skipped by the scheduler.
-- Log streams with persisted delivery history and 3-attempt HMAC-signed
-  retries (`/api/orgs/:id/log-streams`, `.../deliveries`).
+- Legacy log-stream configuration and history remain readable, but dispatch is disabled. Signed event subscriptions use the webhook queue, attempt history and bounded retries described in [Webhooks](WEBHOOKS.md).
 - Extra sync kinds: Supabase, Nomad, Coolify, Cloudflare Pages.
 - Machine identities with Universal Auth, secret-change proposals with
   admin approval, access requests, dynamic database leases (real PostgreSQL
@@ -119,6 +170,8 @@ Kept from OpenWarp where it already exceeds both: point-in-time recovery,
 secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
 Phase features.
 The repository includes language clients; see the [client inventory](CLIENTS.md) for their locations and limits. It does not provide a dedicated Kubernetes operator: the Helm chart's External Secrets Operator bridge covers controller-driven delivery (see [Kubernetes](KUBERNETES.md)). CLI behavior is documented independently in the [CLI reference](CLI.md). Phase billing and licence code is not copied.
+secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not Phase features.
+The CLI and four SDKs provide generic JSON management requests; browser and client-crypto workflows retain their own requirements. A dedicated Kubernetes operator remains deferred (the Helm chart's External Secrets Operator bridge covers controller-driven delivery; see [Kubernetes](KUBERNETES.md)). Phase billing and licence code is never copied.
 
 ## Additional sync adapters (2026-11-06)
 
@@ -455,12 +508,118 @@ without returning the encrypted config. The OpenAI/OpenRouter/Resend adapters
 are covered by mock-provider tests; the schedule endpoint has an HTTP
 integration test.
 
-### PKI, AWS leases and HA
+### Device certificates
 
 `GET /api/pki/cas/:id/crl` returns a signed PEM CRL containing every revoked
-certificate, with the issuer reconstructed from the stored serial.
+certificate, with the issuer reconstructed from the stored serial. The CRL is
+public: a broker fetches it without a workspace token, and the CA signature is
+what proves integrity. `POST /api/pki/cas/:id/ocsp` answers OCSP requests the
+same way and is also public.
 
-#### SSH certificate authority
+Certificates are issued from a workspace-owned CA. Two issuance paths share it:
+
+- `POST /api/pki/cas/:id/issue` generates the keypair on the server and returns
+  `private_key` once. It requires workspace admin and serves services and devices
+  that cannot generate a CSR. With `device_id` the certificate is bound to a
+  device record and becomes its active certificate.
+- `POST /api/pki/enroll` takes a PKCS#10 CSR and returns only the certificate, so
+  the private key never leaves the device. It needs no workspace token and is
+  authorised by a single-use enrollment code.
+
+Device records live under a CA: `POST/GET /api/pki/cas/:id/devices`,
+`GET/PATCH/DELETE /api/pki/devices/:id`, `POST /api/pki/devices/:id/revoke` and
+`POST /api/pki/devices/:id/enrollment`. A record carries the CN, optional DNS and
+IP SANs, the model, hardware serial, tags and an app/environment binding. Device
+certificates are client-auth only, default to 90 days (`cert_days`, clamped to 1
+to 365), and their SANs come from the record, never from the CSR. Leaf validity is
+also capped at the issuing CA's expiry, and a CA outside its own validity window
+refuses leaf and intermediate issuance.
+
+Enrollment codes are 256-bit random values stored only as a SHA-256 hash, valid
+from five minutes to seven days, and consumed atomically on the first successful
+request. Revoking or deleting a device invalidates its outstanding codes, and an
+enrollment that races a revocation fails rather than attaching a certificate.
+`pki:write` grants device administration without full admin; owner and admin hold
+it through `*`, the managed developer role has `pki:read` but not `pki:write`,
+and custom roles can be granted either. Read endpoints require `pki:read`.
+OAuth access tokens and service tokens can request the `pki:read` and `pki:write`
+scopes. An
+environment-scoped token can create, list, enroll and revoke only devices whose
+`env_id` matches its own environment; the CA-wide issuance and certificate-list
+endpoints stay closed to it.
+
+`GET /api/orgs/:id/pki/expiring?days=30` lists unrevoked device certificates in
+the window with 7/14/30 day counts. A daily background job records a `pki.expiry`
+audit event for each workspace with certificates in that window. The configured
+mailer also sends one daily summary to each verified, active workspace owner and
+admin. Failed delivery stays retryable. An owner or admin can trigger pending
+mail with `POST /api/orgs/:id/pki/expiry-notify`; it returns sent and failed counts.
+`POST /api/pki/devices/:id/renew` mints a replacement enrollment code.
+
+Devices can renew without an administrator or an application mTLS listener:
+`POST /api/pki/renew/challenge` takes a device id and a new PEM CSR. It returns an
+exact challenge text and id, valid for five minutes. The device signs that text
+with its current active certificate's private key and submits the padded base64
+signature to `POST /api/pki/renew`. Supported proofs are P-256 ECDSA SHA-256,
+P-384 ECDSA SHA-384 (ASN.1 DER), Ed25519 and RSA PKCS1 SHA-256. The new CSR signature proves possession of the
+replacement key. Current hook and attestation policy still apply; use the
+challenge id as the attestation nonce. Challenge consumption, replacement
+issuance and old-certificate revocation share one transaction. Expired, revoked
+or superseded credentials cannot renew.
+
+Bulk operations: `POST /api/pki/cas/:id/devices/import` accepts up to 1000
+device objects and can mint one code per device, `POST
+/api/pki/cas/:id/devices/codes` mints codes for up to 500 existing devices, and
+`GET /api/pki/cas/:id/devices/export` returns CSV.
+
+Groups hold defaults for a set of devices: `POST/GET
+/api/pki/cas/:id/groups`, `PATCH/DELETE /api/pki/groups/:id` and `POST
+/api/pki/groups/:id/revoke`. A device created with `group_id` inherits the
+group's environment, SANs, `cert_days` and tags unless the request overrides
+them; a device cannot join a group in another environment. Group revoke clears
+the active pointer, invalidates codes and revokes every unrevoked certificate for
+the group.
+
+The optional pre-issuance hook (`PUT /api/pki/cas/:id/hook`) posts a JSON
+event, signed when a hook secret is configured, to an operator URL before a code is consumed. A response of
+`{"allow":true}` proceeds; a deny, a non-2xx response, a timeout or an egress
+policy rejection blocks enrollment and leaves the code usable.
+
+A CA can be a root or an intermediate: `POST /api/orgs/:id/pki/cas` accepts
+`parent_id` for a root in the same workspace, and the leaf responses carry
+`ca_chain` from the issuing CA to the root. `POST /api/pki/cas/:id/revoke` marks
+the CA, its immediate children, their devices and their certificates revoked, and
+the parent's CRL lists a revoked child's serial. An intermediate inherits its
+parent's validity window, so no certificate in the chain outlives the root.
+
+Hardware attestation is an optional per-CA JWT requirement (`PUT
+/api/pki/cas/:id/attestation`). The enrollment response includes a nonce; the
+device returns a compact JWS from the configured issuer with `aud: openwarp-pki`,
+`sub` equal to the device id, the nonce, `csr_sha256` over the submitted CSR and
+`hardware_backed: true`. ES256 and RS256 are supported. A required but missing or
+invalid assertion blocks enrollment without consuming the code, and an accepted
+assertion marks the device as hardware attested.
+
+For built-in TPM verification, set the CA attestation `mode` to `tpm2`. A managed
+workspace owner or admin provisions each device through
+`PUT /api/pki/devices/:id/tpm` with `ak_public` (padded base64 TPM2B_PUBLIC) and
+`pcr_digest` (hex SHA-256 of concatenated SHA-256 PCR values 0 through 7).
+The AK pin must come from an authenticated provisioning process; an AK supplied
+in evidence cannot establish its own trust. Enrollment or renewal then accepts
+`tpm_evidence` containing Certify and Quote attestations. The verifier supports
+RSA 2048/3072/4096, RSASSA SHA-256, SHA-256 object Names and precisely PCRs 0
+through 7. It checks that the certified TPM public key matches the CSR and that
+both signed attestations bind the enrollment nonce and CSR SPKI hash. See the
+[TPM protocol](SECURITY.md#built-in-tpm-profile) for byte encodings and limitations.
+
+A broker that trusts the CA validates the certificate directly. Register the CA
+certificate returned by `GET /api/orgs/:id/pki/cas` as its trust anchor (EMQX,
+HiveMQ and Mosquitto read a CA file; AWS IoT Core and Azure Device Provisioning
+accept a registered CA). Revocation reaches the broker through the public CRL or,
+more practically for fleets, through the short certificate lifetime.
+
+
+### SSH certificate authority
 
 A separate CA type mints OpenSSH *user* certificates, which is not the same
 thing as syncing an `ssh_key` secret. A synced key is a permanent public key; a
@@ -504,6 +663,8 @@ returns 428 until the caller completes an emailed second factor (plus TOTP when
 configured) and retries with `X-OpenWarp-Step-Up`. A machine identity has no
 second factor, so it cannot request a privileged principal at all; an admin
 signs those from a signed-in session.
+
+### AWS leases and HA
 
 Dynamic leases support `type: "aws_iam"`: OpenWarp calls STS AssumeRole with
 the supplied admin credentials, returns temporary credentials, and never stores

@@ -10,6 +10,14 @@ pub fn now() -> i64 {
 pub fn now() -> i64 { (js_sys::Date::now() / 1000.0) as i64 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn system_time() -> std::time::SystemTime { std::time::SystemTime::now() }
+
+#[cfg(target_arch = "wasm32")]
+pub fn system_time() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(js_sys::Date::now() as u64)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn sleep_ms(ms: u64) { tokio::time::sleep(std::time::Duration::from_millis(ms)).await; }
 
 // Workers has no Tokio timer; deferred work waits on the runtime's setTimeout.

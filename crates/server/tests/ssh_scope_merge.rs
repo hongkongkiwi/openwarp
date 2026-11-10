@@ -1,7 +1,12 @@
+#![cfg(feature = "ssh-ca")]
+
 use reqwest::{redirect::Policy, Client, Method};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -58,6 +63,11 @@ impl Server {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("server did not become healthy");
     }
     async fn response(response: reqwest::Response) -> Resp {
@@ -113,6 +123,9 @@ fn field(v: &Value, key: &str) -> String { v[key].as_str().expect(key).to_string
 
 async fn scope_contract(oauth: bool) {
     let s = Server::start().await; let owner = s.register().await;
+    // The workspace needs the ssh-ca grant before its routes answer at all.
+    let granted = s.call(Method::PUT, "/api/instance/features", &owner.session, Some(json!({"org": owner.org, "features": ["ssh-ca"]}))).await;
+    assert_eq!(granted.status, 200, "grant ssh-ca: {:?}", granted.body);
     let app = s.call(Method::POST, &format!("/api/orgs/{}/apps", owner.org), &owner.session, Some(json!({"name": "ssh-scopes"}))).await;
     assert_eq!(app.status, 200, "create token app"); let app = field(&app.body, "id");
     let mut tokens = Vec::new();

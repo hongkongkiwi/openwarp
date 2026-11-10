@@ -1,3 +1,4 @@
+mod agent;
 mod encrypted_file;
 mod references;
 
@@ -12,7 +13,11 @@ use std::process::Command;
 struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(long, env = "OPENWARP_TOKEN")] token: Option<String>, #[command(subcommand)] cmd: Cmd }
 #[derive(Subcommand)] enum Cmd {
     /// Login: browser OAuth (default), --token <TOKEN>, or --client-id/--client-secret for machines
-    Login { #[arg(long)] token: Option<String>, #[arg(long)] client_id: Option<String>, #[arg(long)] client_secret: Option<String> },
+    Login { #[arg(long)] token: Option<String>, #[arg(long)] client_id: Option<String>, #[arg(long)] client_secret: Option<String>, #[arg(long, default_value = "secrets:read secrets:write mcp")] scope: String },
+    /// Call a same-origin /api route with the current credential
+    Api { method: String, path: String, #[arg(long)] json: Option<String>, #[arg(long)] query: Vec<String>, #[arg(long)] step_up: Option<String> },
+    /// Discover public API route templates and methods
+    ApiRoutes,
     Logout,
     Whoami,
     /// Write .openwarp.json with app/env defaults for this directory
@@ -30,6 +35,8 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Run { #[arg(long, default_value = "")] env: String, #[arg(long)] refs_file: Option<String>, #[arg(long)] identity: Option<String>, #[arg(last = true)] command: Vec<String> },
     Inject { #[arg(long)] input: String, #[arg(long)] out: Option<String>, #[arg(long)] identity: Option<String> },
     File { #[command(subcommand)] cmd: encrypted_file::FileCmd },
+    /// Render a local template from base secrets with an in-memory cache
+    Agent { #[arg(long, default_value = "")] env: String, #[arg(long)] template: PathBuf, #[arg(long)] out: PathBuf, #[arg(long, default_value_t = 30)] interval_secs: u64, #[arg(long, default_value_t = 30)] cache_ttl_secs: u64, #[arg(long)] once: bool },
     /// SSH certificates: sign a public key, or mint one and run ssh with it
     Ssh { #[command(subcommand)] cmd: SshCmd },
     E2eCreate { #[arg(long, default_value = "")] app: String, #[arg(long)] name: String },
@@ -303,6 +310,61 @@ fn ssh_summary(signed: &Value, path: Option<&Path>) {
     println!("expires in:  {}m{}s", expires / 60, expires % 60);
     println!("ca:          {}", signed["ca_public_key"].as_str().unwrap_or("")); }
 
+fn management_path(path: &str) -> Result<(), String> {
+    if !path.starts_with("/api/") || path.contains('?') || path.contains('#') { return Err("expected an /api/ path without query or fragment".into()); }
+    let mut decoded = path.to_string();
+    loop {
+        if decoded.chars().any(char::is_control) || decoded.as_bytes().contains(&92) || decoded.contains("://")
+            || decoded.split('/').any(|s| s == "." || s == "..") { return Err("unsafe API path".into()); }
+        if !decoded.contains('%') { return Ok(()); }
+        let bytes = decoded.as_bytes(); let mut out = Vec::new(); let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let pair = bytes.get(i+1..i+3).ok_or("malformed API path encoding")?;
+                let hex = std::str::from_utf8(pair).map_err(|_| "malformed API path encoding")?;
+                out.push(u8::from_str_radix(hex, 16).map_err(|_| "malformed API path encoding")?); i += 3;
+            } else { out.push(bytes[i]); i += 1; }
+        }
+        decoded = String::from_utf8(out).map_err(|_| "invalid API path encoding")?;
+    }
+}
+
+fn management_api(host: &str, token: &str, method: &str, path: &str, body: Option<&str>, query: &[String], step_up: Option<&str>) -> Result<(), String> {
+    use std::io::Read;
+    if !["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"].contains(&method) { return Err("unsupported API method".into()); }
+    management_path(path)?;
+    let mut url = reqwest::Url::parse(host).map_err(|_| "invalid API host")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty()
+        || url.password().is_some() || url.query().is_some() || url.fragment().is_some() { return Err("invalid API host".into()); }
+    url.set_path(&format!("{}{}", url.path().trim_end_matches('/'), path));
+    for item in query {
+        let (key,value) = item.split_once('=').ok_or("query must be key=value")?;
+        url.query_pairs_mut().append_pair(key,value);
+    }
+    let body: Option<Value> = body.map(|input| {
+        let raw = if input == "-" { let mut raw = String::new(); std::io::stdin().read_to_string(&mut raw).map_err(|_| "cannot read JSON stdin")?; raw }
+            else if let Some(file) = input.strip_prefix('@') { std::fs::read_to_string(file).map_err(|_| "cannot read JSON file")? }
+            else { input.to_string() };
+        serde_json::from_str(&raw).map_err(|_| "invalid JSON input")
+    }).transpose().map_err(str::to_string)?;
+    let client = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30)).build().map_err(|_| "cannot create API client")?;
+    let mut request = client.request(reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "invalid method")?, url)
+        .bearer_auth(token).header("Accept", "application/json");
+    if let Some(body) = body { request = request.json(&body); }
+    if let Some(grant) = step_up { request = request.header("X-OpenWarp-Step-Up", grant); }
+    let response = request.send().map_err(|_| "API transport failed")?;
+    let status = response.status();
+    let text = response.text().map_err(|_| "cannot read API response")?;
+    if !status.is_success() {
+        let detail = if token.is_empty() { text } else { text.replace(token, "[redacted]") };
+        let detail = if let Some(grant) = step_up { if grant.is_empty() { detail } else { detail.replace(grant, "[redacted]") } } else { detail };
+        return Err(format!("HTTP {}: {}", status.as_u16(), detail));
+    }
+    if !text.is_empty() { println!("{}", text); }
+    Ok(())
+}
+
 fn reference_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client")
 }
@@ -318,7 +380,8 @@ fn main() {
     let host = cli.host.clone().or_else(|| cfg["host"].as_str().map(|s| s.to_string())).or_else(|| local["host"].as_str().map(|s| s.to_string())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let client = reqwest::blocking::Client::new();
     let saved_host = cfg["host"].as_str().map(|s| s.to_string());
-    if cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
+    let is_agent = matches!(&cli.cmd, Cmd::Agent { .. });
+    if !is_agent && cli.token.is_none() && saved_host.as_deref() == Some(host.as_str()) && token_expired(&cfg) {
         match refresh_lock() {
             Some(lock) => {
                 let fresh = load_config();
@@ -330,11 +393,19 @@ fn main() {
             None => { std::thread::sleep(std::time::Duration::from_millis(300)); if let Ok(s) = std::fs::read_to_string(config_path()) { if let Ok(v) = serde_json::from_str::<Value>(&s) { cfg = v; } } }
         }
     }
-    let token = cli.token.clone().or_else(|| cfg["access_token"].as_str().map(|s| s.to_string())).unwrap_or_default();
+    let token = cli.token.clone().or_else(|| {
+        if is_agent && saved_host.as_deref() != Some(host.as_str()) { None } else { cfg["access_token"].as_str().map(|s| s.to_string()) }
+    }).unwrap_or_default();
     let get = |url: &str| -> Value { client.get(url).bearer_auth(&token).send().expect("request").error_for_status().unwrap_or_else(|e| panic!("GET {} failed: {} (are you logged in? run: openwarp login)", url, e)).json().expect("json") };
     let post = |url: &str, body: Value| -> Value { client.post(url).bearer_auth(&token).json(&body).send().expect("request").json().expect("json") };
     match &cli.cmd {
-        Cmd::Login { token: t, client_id, client_secret } => {
+        Cmd::Api { method, path, json, query, step_up } => {
+            if let Err(error) = management_api(&host, &token, method, path, json.as_deref(), query, step_up.as_deref()) { eprintln!("{}", error); std::process::exit(1); }
+        }
+        Cmd::ApiRoutes => {
+            if let Err(error) = management_api(&host, &token, "GET", "/api/capabilities", None, &[], None) { eprintln!("{}", error); std::process::exit(1); }
+        }
+        Cmd::Login { token: t, client_id, client_secret, scope } => {
             if let Some(tok) = t { let mut c = cfg.clone(); c["host"] = json!(host); c["access_token"] = json!(tok); c["refresh_token"] = Value::Null; c["client_id"] = Value::Null; c["obtained_at"] = json!(now_secs()); save_config(&c); println!("Token saved to {}", config_path().display()); return; }
             if let (Some(cid), Some(sec)) = (client_id, client_secret) {
                 let d: Value = client.post(format!("{}/api/v1/machine/auth/universal/login", host)).json(&json!({"client_id": cid, "client_secret": sec})).send().expect("req").json().expect("json");
@@ -346,15 +417,16 @@ fn main() {
             let redirect = format!("http://127.0.0.1:{}/callback", port);
             let metadata: Value = client.get(format!("{}/.well-known/oauth-authorization-server", host)).send().expect("OAuth metadata").error_for_status().expect("OAuth metadata status").json().expect("OAuth metadata JSON");
             let resource = metadata["issuer"].as_str().expect("OAuth issuer").to_string();
-            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":"secrets:read secrets:write"})).send().expect("req").json().expect("json");
+            let reg: Value = client.post(format!("{}/oauth/register", host)).json(&json!({"client_name":"openwarp-cli","redirect_uris":[redirect],"token_endpoint_auth_method":"none","scope":scope})).send().expect("req").json().expect("json");
             let cid = reg["client_id"].as_str().expect("client_id").to_string();
             let verifier = openwarp_crypto::random_token("verifier");
             let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
             let state = openwarp_crypto::random_token("state");
             let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", host)).expect("OAuth authorization URL");
             url.query_pairs_mut().append_pair("response_type", "code").append_pair("client_id", &cid).append_pair("redirect_uri", &redirect)
-                .append_pair("scope", "secrets:read secrets:write").append_pair("state", &state).append_pair("code_challenge", &challenge)
+                .append_pair("scope", scope.as_str()).append_pair("state", &state).append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256").append_pair("resource", &resource);
+            let url = url.to_string();
             println!("Open this URL to sign in and approve:\n{}", url);
             let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url.as_str()).status();
             let (mut stream, _) = listener.accept().expect("callback");
@@ -422,6 +494,10 @@ fn main() {
                 if let (Some(k), Some(v)) = (s["key"].as_str(), s["value"].as_str()) { cmd.env(k, v); }
             }
             std::process::exit(cmd.status().expect("spawn").code().unwrap_or(1)); }
+        Cmd::Agent { env, template, out, interval_secs, cache_ttl_secs, once } => {
+            let env = pick(env, &local, "env_id", "--env");
+            if let Err(e) = agent::run(&host, &token, &env, template, out, *interval_secs, *cache_ttl_secs, *once) { eprintln!("{}", e); std::process::exit(1); }
+        }
         Cmd::Ssh { cmd } => match cmd {
             SshCmd::Cert { ca, principal, key, ttl, out, print, quiet } => {
                 let (key_path, default_cert) = ssh_key_paths(key);

@@ -15,8 +15,8 @@ pub async fn methods(_: &S, _: &str) -> Vec<&'static str> { Vec::new() }
 pub async fn required(_: &S, _: &str) -> bool { false }
 pub async fn recovery_count(_: &S, _: &str) -> usize { 0 }
 pub async fn issue_recovery_codes(_: &S, _: &str) -> Vec<String> { Vec::new() }
-pub async fn confirm_totp(_: &S, _: &str, _: &str) -> bool { false }
-pub async fn second_factor_ok(_: &S, _: &str, _: &str) -> bool { false }
+pub async fn confirm_totp(_: &S, _: &str, _: &str) -> Result<bool, String> { Ok(false) }
+pub async fn second_factor_ok(_: &S, _: &str, _: &str) -> Result<bool, String> { Ok(false) }
 pub async fn new_challenge(_: &S, _: &str) -> Result<String, (StatusCode, Json<Value>)> { Err(err(StatusCode::NOT_IMPLEMENTED, NATIVE_ONLY)) }
 pub async fn challenge_user(_: &S, _: &str) -> Option<String> { None }
 pub async fn consume_challenge(_: &S, _: &str) {}

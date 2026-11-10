@@ -4,6 +4,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static START_RETRIES: AtomicU32 = AtomicU32::new(0);
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -71,6 +74,11 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // A probed port can be taken before the child binds it, and the loser
+        // exits at once, so health never arrives. Retry with a fresh database
+        // and port; release the startup lock first so the next attempt can
+        // take it.
+        if START_RETRIES.fetch_add(1, Ordering::SeqCst) < 3 { return Box::pin(Server::start()).await; }
         panic!("test server did not become healthy");
     }
 
@@ -174,7 +182,10 @@ async fn audit_hashes_hidden_during_lockdown(project: bool) {
     let s = Server::start().await;
     let owner = s.register("owner@test.invalid").await; let ot = field(&owner, "token"); let org = field(&owner, "org_id");
     let member = s.register("member@test.invalid").await; let mt = field(&member, "token");
-    assert_eq!(s.call(Method::POST, &format!("/api/orgs/{org}/members"), Some(&ot), Some(json!({"email": "member@test.invalid", "role": "developer"}))).await.status, 200, "membership setup");
+    let invited = s.call(Method::POST, &format!("/api/orgs/{org}/members"), Some(&ot), Some(json!({"email": "member@test.invalid", "role": "developer"}))).await;
+    assert_eq!(invited.status, 200, "membership setup");
+    let invite = field(&invited.body, "invite_token");
+    assert_eq!(s.call(Method::POST, "/api/auth/accept-invite", Some(&mt), Some(json!({"token": invite}))).await.status, 200, "invitation redemption");
     let r = s.call(Method::POST, &format!("/api/orgs/{org}/apps"), Some(&ot), Some(json!({"name": "project"}))).await;
     assert_eq!(r.status, 200, "project setup"); let app = field(&r.body, "id");
     let url = "https://fixture-user:fixture-password@example.invalid/rotate?token=fixture-hook-secret";

@@ -19,6 +19,19 @@ Key lookup is case-insensitive. Missing keys return `undefined`; deleting a miss
 
 The optional third constructor argument is a Fetch-compatible function for testing or a custom transport.
 
+## Management requests
+
+`api<T>(method, segments, body?, query?, stepUp?)` calls JSON endpoints under `/api` using the same token and server authorization rules. Pass individual path segments, not a URL. Query parameters are encoded separately.
+
+```ts
+const integrations = await client.api("GET", ["envs", "env-id", "integrations"]);
+await client.api("PATCH", ["integrations", "integration-id"], { name: "deployment" });
+```
+
+Supported methods are `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` and `OPTIONS`. The method rejects decoded traversal, malformed percent escapes, backslashes, controls and URL-like segments. Redirects are refused. Empty successful responses return `undefined`. Administrative requests still require the caller's role, scopes and any applicable verification. This JSON interface does not replace browser sign-in or local encryption operations.
+
+Pass an existing verification grant as `stepUp` to send `X-OpenWarp-Step-Up` for that request only. The client accepts 1-512 printable ASCII characters, preserves the Bearer credential and does not complete or bypass verification. Obtain the grant through the instance's verification flow.
+
 ## Local checks
 
-With the declared TypeScript development dependency already available, `npm run build` emits JavaScript and declarations into `dist`; `npm test` builds and runs six offline mock-Fetch tests. No dependencies were installed, and neither command was run when creating this scaffold. Compilation and test results are unverified.
+With the declared TypeScript development dependency available, `npm run build` emits JavaScript and declarations into `dist`; `npm test` builds and runs the local test files. Management tests cover encoded paths and queries, HTTP errors, empty responses, redirect refusal and explicit verification grants. Local fixtures do not prove live provider behavior or deployed authorization policy.

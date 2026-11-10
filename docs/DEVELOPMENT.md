@@ -41,7 +41,22 @@ node --test crates/server/tests/ui.test.cjs
 cargo build --workspace
 ```
 
-The [CI workflow](../.github/workflows/ci.yml) runs Clippy, the workspace Rust tests with two test threads, the Node console test, and a separate container build/startup smoke test. `cargo check` and the final workspace build above are useful local checks, not additional claims about CI.
+The default feature set is core only. The enterprise surfaces (SAML, SCIM, PKI,
+SSH certificates, transit, workload identity, change requests, LDAP) are behind
+Cargo features, so anything that compiles or exercises them needs `--features
+enterprise` or `--all-features`:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=2
+```
+
+A feature build still answers 403 until the workspace holds a grant, which is
+why the suites that use one call `PUT /api/instance/features` first. CI runs
+both the core and the all-features pass; changing a gated path without the
+second run leaves it unchecked.
+
+The [CI workflow](../.github/workflows/ci.yml) runs Clippy and the workspace Rust tests twice, once for each feature set, then the Node console test, and a separate container build/startup smoke test. `cargo check` and the final workspace build above are useful local checks, not additional claims about CI.
 
 ### Targeted checks
 
@@ -50,6 +65,7 @@ cargo test -p openwarp-crypto
 cargo test -p openwarp-server --test security -- --test-threads=2
 cargo test -p openwarp-server --test authorization -- --test-threads=2
 cargo test -p openwarp-server --test accounts -- --test-threads=2
+cargo test -p openwarp-server --test migrations -- --test-threads=1
 node --test crates/server/tests/ui.test.cjs
 ```
 
@@ -59,11 +75,53 @@ node --test crates/server/tests/ui.test.cjs
 | `security.rs` | Tenant isolation, scopes, authentication, and protocol boundaries |
 | `authorization.rs` | Roles, administrative gates, environment policy, and related regressions |
 | `accounts.rs` | Account, invitation, signup, provider, and recovery behavior |
+| `migrations.rs` | Runner failure modes, legacy catch-up, and live PostgreSQL/MariaDB applies |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
 The coverage matrix, acceptance scenarios and rollout plan for every feature area live in [testing](TESTING.md).
 
+The PostgreSQL recovery regression target is opt-in because it changes login roles in an external database. Use a disposable PostgreSQL database and a test administrator, never deployment credentials:
+
+```bash
+OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
+  cargo test -p openwarp-server --features live-db-tests --test rotation_regressions -- --test-threads=1
+OPENWARP_TEST_STATIC_PG="$DISPOSABLE_POSTGRES_URL" \
+  cargo test -p openwarp-server --test static_rotation_live -- --test-threads=1
+```
+
+`rotation_regressions` is excluded from default workspace runs and fails if explicitly enabled without its database URL. `static_rotation_live` reports that live checks were not run when the URL is absent. A green default workspace run does not establish live PostgreSQL recovery coverage. Both live targets create uniquely named test roles and remove those roles after their cases.
+
 HTTP suites start real server processes against private databases. The Node suite is not a substitute for rendering the console in a real browser. UI changes need an appropriate browser check for layout, keyboard interaction, and errors.
+
+## Schema changes
+
+Schema changes are append-only. Add a numbered file under `crates/server/migrations/` and the matching entry in `crates/server/src/migrate.rs`; never edit a migration that a released binary has applied, because the runner stores a checksum and refuses to boot when it no longer matches. The [schema migrations](MIGRATIONS.md) guide covers the ledger, the consolidated baseline, the MySQL DDL rules, and the repair commands.
+
+`openwarp-migrate status`, `plan`, and `verify` inspect a database without changing it. `repair` modifies the migration ledger; follow the [repair guide](MIGRATIONS.md#operator-cli) before using it. Pass `OPENWARP_TEST_POSTGRES_URL` and `OPENWARP_TEST_MYSQL_URL` to the migration suite to apply the whole manifest against live engines. Run `WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh` to exercise the D1 driver against local workerd.
+
+### Device certificate checks
+
+Ordinary device enrollment and renewal need no TPM. Run the focused regression:
+
+```bash
+cargo test -p openwarp-server --test device_delivery default_device_lifecycle_does_not_require_a_tpm -- --test-threads=2
+cargo test -p openwarp-server --test device_remaining -- --test-threads=2
+cargo test -p openwarp-server --test tpm_interoperability -- --test-threads=2
+```
+
+`device_postgres` creates private databases when `OPENWARP_TEST_POSTGRES_URL`
+points to a local test administrator database. It exercises transaction
+cancellation, expiry after row-lock waits and concurrent policy changes. Without
+that variable, the live database checks do not run. TPM interoperability uses
+swtpm evidence, not a physical TPM; its public fixtures and generation recipe are
+in `crates/server/tests/fixtures/tpm` and `scripts/tpm-fixture.sh`.
+
+Device schema migrations ship as engine versions 24 through 28 under
+`crates/server/migrations/`; the [schema migrations](MIGRATIONS.md) guide covers
+the adoption paths. The protocol discriminator `pki_cas.kind` remains `x509` or
+`ssh`; X.509 hierarchy uses `ca_kind`. Version 28 converges every shipped
+lineage, including the earlier device branch's migration ledger, without
+rewriting published statements.
 
 ## Container validation
 
@@ -94,4 +152,4 @@ For documentation-only changes:
 
 Do not publish fake screenshots, invented usage metrics, or unverified compatibility claims. Distinguish an implemented endpoint from a tested integration with a live provider.
 
-[Architecture](ARCHITECTURE.md) · [API reference](API.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Architecture](ARCHITECTURE.md) · [API reference](API.md) · [Documentation index](README.md)

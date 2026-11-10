@@ -10,13 +10,20 @@ For Compose, explicitly add variables to `services.server.environment` or an `en
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite://openwarp.db` | SQLite file, PostgreSQL connection URL, or MySQL/MariaDB URL (`mysql://`, `mariadb://`) |
 | `ADDR` | `0.0.0.0:8080` | Listen IP and port; use loopback for private local development |
-| `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key and activates production-specific checks |
-| `OPENWARP_MASTER_KEY` | Generated/stored in development | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
+| `OPENWARP_ENV` | Unset | `production`, case-insensitive, requires an external master key or a configured KMS bridge and activates production-specific checks |
+| `OPENWARP_LICENSE` | Unset | Enterprise license token. `none` forces self-hosted; `development` is accepted by any non-production deployment (debug or release; smoke and staging use it) |
+| `OPENWARP_LICENSE_FILE` | Unset | Path to a file containing the license token; read once at startup |
+| `OPENWARP_MASTER_KEY` | Generated/stored in development without KMS | Base64 representing exactly 32 bytes; preserve the original value for an existing database |
+| `OPENWARP_KMS_URL` | Unset | Native server HTTP(S) bridge for root/key wrapping; permits production auto-unseal without a plaintext master-key variable. `http://` is accepted, so use HTTPS, loopback or a protected private network |
+| `OPENWARP_KMS_TOKEN` | Unset | Optional bearer credential for the configured KMS bridge |
+| `OPENWARP_KMS_KEY_ID` | `primary` | Bridge key identifier stored in wrapped payloads; preserve access to previous identifiers |
 | `REDIS_URL` | Unset | Optional session cache with the default `redis-cache` build feature |
 | `OPENWARP_PUBLIC_URL` | Derived from request context where needed | Canonical public origin for issuer metadata, redirects, and links; configure explicitly in deployed instances |
 | `OPENWARP_PG_POOL_SIZE` | `8` | Postgres connections per process, clamped to 1..64. Multiply by the replica count before sizing the database |
 | `OPENWARP_MYSQL_POOL_SIZE` | `8` | MySQL/MariaDB connections per process, clamped to 1..64 |
 | `OPENWARP_SECURE_COOKIES` | Unset | `1` forces Secure cookies; an HTTPS public URL also enables the flag |
+| `OPENWARP_REGION` | `global` | Jurisdiction label for this deployment, 1 to 32 characters of `a-z`, `0-9` or `-`. It describes the data in this deployment's own database and is not stored on tenant rows. An empty value is treated as unset |
+| `OPENWARP_REGIONS` | Unset | Optional `label=origin` list such as `global=https://global.example.com,eu=https://eu.example.com`. The sign-in card offers a hand-off to these origins. Origins must be HTTPS, or HTTP on a loopback host, carry no credentials, query or path, are published to the console in canonical `scheme://host[:port]` form, and startup fails unless the list names this deployment's own region |
 | `OPENWARP_METRICS_TOKEN` | Unset | Enables `/metrics`; callers must supply this bearer token |
 
 The SQLite path is relative to the process working directory unless absolute, for example `sqlite:///var/lib/openwarp/openwarp.db`. Create the parent directory and grant the service account access.
@@ -35,15 +42,22 @@ openssl rand -base64 32
 
 Store the result securely. A replacement value does not rotate existing ciphertext. Development promotion must preserve the database's existing generated key.
 
+Startup root precedence is explicit: `OPENWARP_MASTER_KEY` when set; otherwise, with `OPENWARP_KMS_URL` set, the KMS-wrapped `meta.kms_root` (on first boot it wraps an existing plaintext `meta.master`, or mints a root when none exists); outside production, a stored plaintext `meta.master` or a generated development key stored in the database. Production without an external master key or configured KMS bridge aborts before either development fallback. If a plaintext `meta.master` and the unwrapped KMS root disagree, startup stops and neither row is deleted, because either deletion would lose key material. Online instance-root rotation is limited to single-process SQLite; PostgreSQL and MySQL/MariaDB return a conflict and need a coordinated offline procedure.
+
+The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap responses carry plaintext root or environment keys over that unencrypted connection, and the bridge has no egress allowlist of its own. Use HTTPS, a loopback listener, or a protected private network, and give `OPENWARP_KMS_TOKEN` only to the adapter that terminates that trust boundary.
+
 ## Registration and email
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
 | `OPENWARP_SIGNUPS` | Stored instance policy; initially open | `open` or `closed` pins the policy and overrides the console toggle |
+| `OPENWARP_WORKSPACE_CREATION` | Stored instance policy; initially open | Pins workspace creation independently of signup. `closed`, `invite`, `invite_only`, `disabled`, `0` and `false` disable it (case-insensitive); other values enable it. Native environment and Worker bindings use the same setting. |
 | `OPENWARP_EMAIL_WEBHOOK` | Unset | HTTP relay receiving `{to,subject,text}` for account mail |
 | `OPENWARP_EMAIL_TOKEN` | Unset | Optional bearer authentication for the mail relay |
 
 Password signups always require a verified email address: registration issues no session until the link is opened, and the first verified account claims instance ownership. Emails asserted by a configured identity provider (Google, GitHub, Apple, OpenAI, workspace OIDC, SAML, an accepted invite or SCIM) are treated as verified and do not trigger a second round-trip. Without a mail provider the server still starts: outside production it writes verification and reset links to its log, while a production server refuses new password signups and leaves SSO sign-in available. Set the public URL before sending account links. Forgot-password responses are intentionally generic and do not prove message delivery.
+
+Without the override, the instance owner changes workspace creation in Settings or with `PUT /api/instance/workspaces` and `{"open":false}`. `GET /api/instance` reports `workspace_creation_open` and `workspace_creation_env_locked`; the public `GET /api/auth/providers` reports the effective creation policy. Closing creation suppresses personal workspaces for password and social registration, including the first account, but does not disable signup or invitation acceptance. Login never recreates a deleted workspace. The API refuses to close creation with no workspaces, or delete the last workspace while creation is closed. If an operator pins creation closed on an empty database, change the deployment setting to bootstrap a workspace.
 
 ## Social authentication
 
@@ -106,24 +120,33 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 | --- | --- | --- |
 | `OPENWARP_TRUST_PROXY` | Disabled | `1` enables forwarded client-IP handling from trusted peers |
 | `OPENWARP_TRUSTED_PROXIES` | `127.0.0.1/32,::1` | Comma-separated proxy IPs or CIDRs |
-| `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits private/loopback destinations for the production checks applied to OIDC, audit webhooks, and log streams |
+| `OPENWARP_ALLOW_PRIVATE_EGRESS` | Disabled | `1` permits trusted private/loopback destinations where egress checks apply; native event webhooks also use it to permit HTTP and private resolved addresses |
+| `OPENWARP_WEBHOOK_RETRY_BASE_SECS` | 5 | Base delay for native webhook delivery retries (clamped 0-3600); retries remain capped at eight attempts with exponential backoff and jitter |
 | `OPENWARP_ALLOWED_DB_HOSTS` | Empty | Comma-separated `host[:port]` allowlist for dynamic database leases (PostgreSQL, MySQL and MariaDB); empty disables that capability |
 
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.
 
 Private egress is an intentional exception, not a general recommendation. Do not assume one setting constrains every provider-specific request. Apply network-layer egress policy and give integrations only the credentials they need.
 
+## AI endpoints
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `OPENWARP_AI_ENDPOINTS` | Empty | JSON array of exact allowed chat-completion URLs. Workspace administrators can select only these destinations, including explicitly trusted private endpoints |
+
+AI is off per workspace until an administrator enables it. Provider keys are encrypted and write-only. Metadata disclosure, confirmed actions, and local value matching have separate switches. Native inference refuses redirects and ambient proxies; Workers inference is unavailable. BYOK does not imply local processing: the configured endpoint receives permitted context and the question. See [assistant and security insights](AI.md) for the disclosure policy and limits.
+
 ## Workspace settings
 
 Workspace administrators manage these through `GET`/`PUT /api/orgs/{org_id}/settings` rather than process variables:
 
-- IP allowlist and audit forwarding settings.
+- IP allowlist and legacy audit forwarding configuration (legacy dispatch is disabled; use the [webhook endpoints](WEBHOOKS.md) for active subscriptions).
 - OIDC issuer, client ID, encrypted client secret, and redirect URI.
 - OIDC automatic provisioning and allowed-domain policy.
 
 Changing an OIDC issuer without a replacement client secret clears the stored secret. Settings reads do not return the plaintext OIDC secret. Environment restriction and approval requirements have their own policy endpoint.
 
-See [API](API.md) and [console](CONSOLE.md) for the related operations.
+See the [feature reference](FEATURES.md) and [console guide](CONSOLE.md) for the related operations.
 
 ## CLI environment
 
@@ -161,9 +184,9 @@ The backup helper's database default differs from the server's local default. Al
 
 | Limit | Current value |
 | --- | --- |
-| Request body | 8 MiB |
+| Request body | 8 MiB; incoming integration webhooks are limited to 64 KiB |
 | HTTP handler timeout | 300 seconds |
-| Provider request timeout | 30 seconds |
+| Provider request timeout | 30 seconds; event webhook HTTP attempts use 10 seconds plus a 5-second DNS budget, and incoming sync execution has a 90-second overall limit |
 | Password session lifetime | 7 days |
 | Machine token lifetime | 1 hour |
 | Dynamic lease TTL | Default 1 hour, clamped between 60 seconds and 30 days |
@@ -173,4 +196,4 @@ The backup helper's database default differs from the server's local default. Al
 
 These are implementation constraints, not paid tiers. Provider-specific limits also apply.
 
-[Deployment](DEPLOY.md) · [Security](SECURITY.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Documentation index](README.md)
+[Deployment](DEPLOY.md) · [Security](SECURITY.md) · [Development checks](DEVELOPMENT.md) · [Documentation index](README.md)

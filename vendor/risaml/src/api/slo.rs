@@ -1,0 +1,602 @@
+use crate::browser::{BrowserInput, LogoutBinding, Outbound, PendingLogoutRequest, Started};
+use crate::config::{EntityId, IdpDescriptor, SpDescriptor};
+use crate::constants::Binding;
+use crate::entity::{capture_idp_issuance_window, now_iso8601, EntitySetting};
+use crate::error::SamlError as Error;
+use crate::flow::HttpRequest;
+use crate::logout::{
+    create_logout_request_with_session_indexes, create_logout_response, parse_logout_request_at,
+    parse_logout_response_at, LogoutRequestSessionIndexes, LogoutRequestValidation,
+};
+use crate::metadata::Metadata;
+use crate::model::{
+    LogoutCompleted, LogoutRequest, LogoutResponse, LogoutSubject, Received, ReplayKey,
+    SamlInstant, SamlValidationContext,
+};
+
+use super::raw_mapping::{
+    ensure_entity_id, ensure_relay_state, input_binding, raw_idp_descriptor, raw_sp_descriptor,
+    relay_state_from_input,
+};
+use super::{Idp, LogoutSigning, RespondSlo, Saml, SamlError, Sp, StartSlo};
+
+impl Saml<Sp> {
+    /// Start SP-initiated Single Logout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when relay state is invalid, IdP metadata cannot
+    /// be parsed, a compatible logout endpoint or signing key is missing, the
+    /// selected binding is unsupported, or logout request creation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{IdpDescriptor, LogoutSubject, Saml, StartSlo};
+    ///
+    /// # fn logout(
+    /// #     sp: &Saml<risaml::Sp>,
+    /// #     idp: &IdpDescriptor,
+    /// #     subject: LogoutSubject,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let started = sp.start_slo(idp, subject, StartSlo::post())?;
+    /// let form = started.outbound.post_form()?;
+    /// let snapshot = started.pending.snapshot();
+    /// # let _ = (form, snapshot);
+    /// # Ok(()) }
+    /// ```
+    pub fn start_slo(
+        &self,
+        idp: &IdpDescriptor,
+        subject: LogoutSubject,
+        options: StartSlo,
+    ) -> Result<Started<LogoutRequest>, SamlError> {
+        let raw_idp = raw_idp_descriptor(idp)?;
+        start_slo_impl(
+            &self.raw_service_provider().setting,
+            &self.raw_service_provider().metadata,
+            idp.entity_id(),
+            &raw_idp.metadata,
+            subject,
+            options,
+            StartSloRole::SessionParticipant,
+        )
+    }
+
+    /// Receive an IdP LogoutRequest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when the browser input or relay state is invalid,
+    /// the binding is unsupported for logout, IdP metadata cannot be parsed,
+    /// XML parsing or signature/trust validation fails, required
+    /// `IssueInstant` or optional `NotOnOrAfter` is not conformant,
+    /// `NotOnOrAfter` has expired under risaml's fail-closed policy, the
+    /// destination does not match local metadata, or replay validation detects
+    /// a duplicate or unusable expiration.
+    pub fn receive_slo(
+        &self,
+        idp: &IdpDescriptor,
+        input: BrowserInput<LogoutRequest>,
+        validation: SamlValidationContext<'_>,
+    ) -> Result<Received<LogoutRequest>, SamlError> {
+        let raw_idp = raw_idp_descriptor(idp)?;
+        receive_slo_impl(
+            &self.raw_service_provider().setting,
+            &self.raw_service_provider().metadata,
+            &raw_idp.metadata,
+            input,
+            validation,
+        )
+    }
+
+    /// Respond to a received IdP LogoutRequest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when IdP metadata cannot be parsed, relay state is
+    /// invalid, a compatible logout endpoint or signing key is missing, the
+    /// selected binding is unsupported, or logout response creation fails.
+    pub fn respond_slo(
+        &self,
+        idp: &IdpDescriptor,
+        request: &Received<LogoutRequest>,
+        options: RespondSlo,
+    ) -> Result<Outbound<LogoutResponse>, SamlError> {
+        let raw_idp = raw_idp_descriptor(idp)?;
+        respond_slo_impl(
+            &self.raw_service_provider().setting,
+            &self.raw_service_provider().metadata,
+            &raw_idp.metadata,
+            request,
+            options,
+        )
+    }
+
+    /// Finish SP-initiated Single Logout using stored pending LogoutRequest state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when the response does not match the pending
+    /// request, including issuer, binding, relay state, destination, or
+    /// `InResponseTo` mismatches; when IdP metadata cannot be parsed; when XML,
+    /// signature, trust, status, or time validation fails; or when replay
+    /// validation detects a duplicate or expired message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{
+    ///     BrowserInput, FormField, IdpDescriptor, LogoutResponse, PendingLogoutRequest,
+    ///     ReplayPolicy, Saml, SamlValidationContext,
+    /// };
+    /// use std::time::SystemTime;
+    ///
+    /// # fn finish(
+    /// #     sp: &Saml<risaml::Sp>,
+    /// #     idp: &IdpDescriptor,
+    /// #     pending: &PendingLogoutRequest,
+    /// #     fields: Vec<FormField>,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let validation = SamlValidationContext::new(
+    ///     SystemTime::now(),
+    ///     ReplayPolicy::DisabledForCompatibility,
+    /// );
+    /// let completed = sp.finish_slo(
+    ///     idp,
+    ///     pending,
+    ///     BrowserInput::<LogoutResponse>::post(fields),
+    ///     validation,
+    /// )?;
+    ///
+    /// let peer = completed.peer_entity_id().as_str();
+    /// # let _ = peer;
+    /// # Ok(()) }
+    /// ```
+    pub fn finish_slo(
+        &self,
+        idp: &IdpDescriptor,
+        pending: &PendingLogoutRequest,
+        input: BrowserInput<LogoutResponse>,
+        validation: SamlValidationContext<'_>,
+    ) -> Result<LogoutCompleted, SamlError> {
+        let raw_idp = raw_idp_descriptor(idp)?;
+        finish_slo_impl(
+            &self.raw_service_provider().setting,
+            &self.raw_service_provider().metadata,
+            idp.entity_id(),
+            &raw_idp.metadata,
+            pending,
+            input,
+            validation,
+        )
+    }
+}
+
+impl Saml<Idp> {
+    /// Start Session Authority Single Logout.
+    ///
+    /// The generated `LogoutRequest` always carries a UTC `NotOnOrAfter`
+    /// derived from the configured [`crate::IdpConfig::issuance_lifetime`] and
+    /// the same captured `IssueInstant`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when relay state is invalid, SP metadata cannot be
+    /// parsed, a compatible logout endpoint or signing key is missing, the
+    /// selected binding is unsupported, logout request creation fails, or the
+    /// configured issuance lifetime cannot be added to the current issue
+    /// instant.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{LogoutSubject, Saml, SpDescriptor, StartSlo};
+    ///
+    /// # fn logout(
+    /// #     idp: &Saml<risaml::Idp>,
+    /// #     sp: &SpDescriptor,
+    /// #     subject: LogoutSubject,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let started = idp.start_slo(sp, subject, StartSlo::post())?;
+    /// let form = started.outbound.post_form()?;
+    /// let snapshot = started.pending.snapshot();
+    /// # let _ = (form, snapshot);
+    /// # Ok(()) }
+    /// ```
+    pub fn start_slo(
+        &self,
+        sp: &SpDescriptor,
+        subject: LogoutSubject,
+        options: StartSlo,
+    ) -> Result<Started<LogoutRequest>, SamlError> {
+        let raw_sp = raw_sp_descriptor(sp)?;
+        start_slo_impl(
+            &self.raw_identity_provider().setting,
+            &self.raw_identity_provider().metadata,
+            sp.entity_id(),
+            &raw_sp.metadata,
+            subject,
+            options,
+            StartSloRole::SessionAuthority {
+                issuance_lifetime: self.0.issuance_lifetime,
+            },
+        )
+    }
+
+    /// Receive an SP LogoutRequest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when the browser input or relay state is invalid,
+    /// the binding is unsupported for logout, SP metadata cannot be parsed, XML
+    /// parsing or signature/trust validation fails, required `IssueInstant` or
+    /// optional `NotOnOrAfter` is not conformant, `NotOnOrAfter` has expired
+    /// under risaml's fail-closed policy, the destination does not match local
+    /// metadata, or replay validation detects a duplicate or unusable
+    /// expiration.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{
+    ///     BrowserInput, FormField, LogoutRequest, ReplayPolicy, RespondSlo, Saml,
+    ///     SamlValidationContext, SpDescriptor,
+    /// };
+    /// use std::time::SystemTime;
+    ///
+    /// # fn respond(
+    /// #     idp: &Saml<risaml::Idp>,
+    /// #     sp: &SpDescriptor,
+    /// #     fields: Vec<FormField>,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let validation = SamlValidationContext::new(
+    ///     SystemTime::now(),
+    ///     ReplayPolicy::DisabledForCompatibility,
+    /// );
+    /// let input = BrowserInput::<LogoutRequest>::post(fields);
+    /// let request = idp.receive_slo(sp, input, validation)?;
+    /// let response = idp.respond_slo(sp, &request, RespondSlo::post())?;
+    ///
+    /// let form = response.post_form()?;
+    /// # let _ = form;
+    /// # Ok(()) }
+    /// ```
+    pub fn receive_slo(
+        &self,
+        sp: &SpDescriptor,
+        input: BrowserInput<LogoutRequest>,
+        validation: SamlValidationContext<'_>,
+    ) -> Result<Received<LogoutRequest>, SamlError> {
+        let raw_sp = raw_sp_descriptor(sp)?;
+        receive_slo_impl(
+            &self.raw_identity_provider().setting,
+            &self.raw_identity_provider().metadata,
+            &raw_sp.metadata,
+            input,
+            validation,
+        )
+    }
+
+    /// Respond to a received SP LogoutRequest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when SP metadata cannot be parsed, relay state is
+    /// invalid, a compatible logout endpoint or signing key is missing, the
+    /// selected binding is unsupported, or logout response creation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{LogoutRequest, Received, RespondSlo, Saml, SpDescriptor};
+    ///
+    /// # fn respond(
+    /// #     idp: &Saml<risaml::Idp>,
+    /// #     sp: &SpDescriptor,
+    /// #     request: &Received<LogoutRequest>,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let response = idp.respond_slo(sp, request, RespondSlo::post())?;
+    /// let form = response.post_form()?;
+    /// # let _ = form;
+    /// # Ok(()) }
+    /// ```
+    pub fn respond_slo(
+        &self,
+        sp: &SpDescriptor,
+        request: &Received<LogoutRequest>,
+        options: RespondSlo,
+    ) -> Result<Outbound<LogoutResponse>, SamlError> {
+        let raw_sp = raw_sp_descriptor(sp)?;
+        respond_slo_impl(
+            &self.raw_identity_provider().setting,
+            &self.raw_identity_provider().metadata,
+            &raw_sp.metadata,
+            request,
+            options,
+        )
+    }
+
+    /// Finish IdP-initiated Single Logout using stored pending LogoutRequest state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamlError`] when the response does not match the pending
+    /// request, including issuer, binding, relay state, destination, or
+    /// `InResponseTo` mismatches; when SP metadata cannot be parsed; when XML,
+    /// signature, trust, status, or time validation fails; or when replay
+    /// validation detects a duplicate or expired message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use risaml::{
+    ///     BrowserInput, FormField, LogoutResponse, PendingLogoutRequest, ReplayPolicy,
+    ///     Saml, SamlValidationContext, SpDescriptor,
+    /// };
+    /// use std::time::SystemTime;
+    ///
+    /// # fn finish(
+    /// #     idp: &Saml<risaml::Idp>,
+    /// #     sp: &SpDescriptor,
+    /// #     pending: &PendingLogoutRequest,
+    /// #     fields: Vec<FormField>,
+    /// # ) -> Result<(), risaml::SamlError> {
+    /// let validation = SamlValidationContext::new(
+    ///     SystemTime::now(),
+    ///     ReplayPolicy::DisabledForCompatibility,
+    /// );
+    /// let completed = idp.finish_slo(
+    ///     sp,
+    ///     pending,
+    ///     BrowserInput::<LogoutResponse>::post(fields),
+    ///     validation,
+    /// )?;
+    ///
+    /// let peer = completed.peer_entity_id().as_str();
+    /// # let _ = peer;
+    /// # Ok(()) }
+    /// ```
+    pub fn finish_slo(
+        &self,
+        sp: &SpDescriptor,
+        pending: &PendingLogoutRequest,
+        input: BrowserInput<LogoutResponse>,
+        validation: SamlValidationContext<'_>,
+    ) -> Result<LogoutCompleted, SamlError> {
+        let raw_sp = raw_sp_descriptor(sp)?;
+        finish_slo_impl(
+            &self.raw_identity_provider().setting,
+            &self.raw_identity_provider().metadata,
+            sp.entity_id(),
+            &raw_sp.metadata,
+            pending,
+            input,
+            validation,
+        )
+    }
+}
+
+struct TypedLogoutSubject {
+    name_id: String,
+    session_indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StartSloRole {
+    SessionParticipant,
+    SessionAuthority { issuance_lifetime: time::Duration },
+}
+
+fn start_slo_impl(
+    local_setting: &EntitySetting,
+    local_metadata: &Metadata,
+    peer_entity_id: &EntityId,
+    peer_metadata: &Metadata,
+    subject: LogoutSubject,
+    options: StartSlo,
+    role: StartSloRole,
+) -> Result<Started<LogoutRequest>, SamlError> {
+    options.relay_state.validate()?;
+    let subject = typed_logout_subject(subject);
+    let (issue_instant, not_on_or_after, request_validation) = match role {
+        StartSloRole::SessionParticipant => {
+            (now_iso8601(), None, LogoutRequestValidation::Compatibility)
+        }
+        StartSloRole::SessionAuthority { issuance_lifetime } => {
+            let window = capture_idp_issuance_window(issuance_lifetime)?;
+            (
+                window.issue_instant,
+                Some(window.expiration),
+                LogoutRequestValidation::SessionAuthority,
+            )
+        }
+    };
+    let created = create_logout_request_with_session_indexes(LogoutRequestSessionIndexes {
+        init_setting: local_setting,
+        init_meta: local_metadata,
+        target_meta: peer_metadata,
+        binding: options.binding.as_binding(),
+        name_id: &subject.name_id,
+        session_indexes: &subject.session_indexes,
+        relay_state: options.relay_state.as_deref(),
+        want_signed: logout_request_signing(local_setting, options.signing),
+        issue_instant: &issue_instant,
+        not_on_or_after: not_on_or_after.as_deref(),
+        validation: request_validation,
+    })?;
+    let outbound = Outbound::<LogoutRequest>::try_from(created.context)?;
+    let mut pending = PendingLogoutRequest::try_new(
+        outbound.id().clone(),
+        options.relay_state,
+        options.binding,
+        peer_entity_id.clone(),
+    )?
+    .with_issue_instant(SamlInstant::try_new(created.issue_instant)?);
+    if matches!(role, StartSloRole::SessionAuthority { .. }) {
+        let expiration = created.not_on_or_after.ok_or_else(|| {
+            SamlError::Invalid(
+                "Session Authority LogoutRequest is missing its generated expiration".into(),
+            )
+        })?;
+        pending = pending.with_expiration(SamlInstant::try_new(expiration)?);
+    }
+    let lifetime = options.pending_lifetime.or_else(|| {
+        matches!(role, StartSloRole::SessionParticipant)
+            .then_some(std::time::Duration::from_secs(5 * 60))
+    });
+    if let Some(lifetime) = lifetime {
+        pending = pending.with_local_lifetime(crate::clock::system_time(), lifetime)?;
+    }
+    Ok(Started { pending, outbound })
+}
+
+fn receive_slo_impl(
+    local_setting: &EntitySetting,
+    local_metadata: &Metadata,
+    peer_metadata: &Metadata,
+    input: BrowserInput<LogoutRequest>,
+    mut validation: SamlValidationContext<'_>,
+) -> Result<Received<LogoutRequest>, SamlError> {
+    local_metadata.validate_at(validation.now())?;
+    let relay_state = relay_state_from_input(&input)?;
+    let binding = LogoutBinding::try_from(input_binding(&input))?;
+    let request = HttpRequest::try_from(input)?;
+    let flow = parse_logout_request_at(
+        local_setting,
+        peer_metadata,
+        binding.as_binding(),
+        &request,
+        validation.now(),
+        validation.clock_skew().as_millis(),
+    )?;
+    let replay_deadline = crate::validator::logout_request_not_on_or_after_deadline(
+        &flow.extract,
+        validation.now_offset()?,
+        validation.clock_skew().not_on_or_after_millis(),
+    )?;
+    let logout = LogoutRequest::try_from(flow)?;
+    ensure_logout_destination(local_metadata, binding, logout.destination())?;
+    validation.check_and_store_message_replay_until(
+        ReplayKey::LogoutRequestId(logout.id().clone()),
+        replay_deadline,
+    )?;
+    Ok(Received::new(logout).with_relay_state(relay_state))
+}
+
+fn respond_slo_impl(
+    local_setting: &EntitySetting,
+    local_metadata: &Metadata,
+    peer_metadata: &Metadata,
+    request: &Received<LogoutRequest>,
+    options: RespondSlo,
+) -> Result<Outbound<LogoutResponse>, SamlError> {
+    let relay_state = options
+        .relay_state
+        .unwrap_or_else(|| request.relay_state().clone());
+    relay_state.validate()?;
+    let context = create_logout_response(
+        local_setting,
+        local_metadata,
+        peer_metadata,
+        options.binding.as_binding(),
+        Some(request.message().id().as_str()),
+        relay_state.as_deref(),
+        // SAML Profiles 2.0 §§4.4.3.4 and 4.4.4.2 require front-channel
+        // LogoutResponses to authenticate the responder and protect integrity.
+        true,
+    )?;
+    Outbound::<LogoutResponse>::try_from(context)
+}
+
+fn finish_slo_impl(
+    local_setting: &EntitySetting,
+    local_metadata: &Metadata,
+    peer_entity_id: &EntityId,
+    peer_metadata: &Metadata,
+    pending: &PendingLogoutRequest,
+    input: BrowserInput<LogoutResponse>,
+    mut validation: SamlValidationContext<'_>,
+) -> Result<LogoutCompleted, SamlError> {
+    local_metadata.validate_at(validation.now())?;
+    pending.validate_at(validation.now())?;
+    validation.require_pending_expiration(pending.completion_deadline()?)?;
+    ensure_entity_id(pending.peer_entity_id(), peer_entity_id)?;
+    ensure_logout_response_binding(input_binding(&input), pending.response_binding())?;
+    ensure_relay_state(pending.relay_state(), &relay_state_from_input(&input)?)?;
+    let request = HttpRequest::try_from(input)?;
+    let flow = parse_logout_response_at(
+        local_setting,
+        peer_metadata,
+        pending.response_binding().as_binding(),
+        &request,
+        pending.id().as_str(),
+        validation.now(),
+        validation.clock_skew().as_millis(),
+    )?;
+    let response = LogoutResponse::try_from(flow)?;
+    ensure_logout_destination(
+        local_metadata,
+        pending.response_binding(),
+        response.destination(),
+    )?;
+    validation
+        .check_and_store_message_replay(ReplayKey::LogoutResponseId(response.id().clone()))?;
+    validation.check_and_store_message_replay_until(
+        ReplayKey::CompletedLogoutRequestId(pending.id().clone()),
+        pending.completion_deadline()?,
+    )?;
+    Ok(LogoutCompleted::from_response(
+        peer_entity_id.clone(),
+        response,
+    ))
+}
+
+fn logout_request_signing(setting: &EntitySetting, signing: LogoutSigning) -> bool {
+    match signing {
+        LogoutSigning::FollowLocalPolicy => setting.want_logout_request_signed,
+        LogoutSigning::Sign => true,
+        LogoutSigning::DoNotSignForCompatibility => false,
+    }
+}
+
+fn ensure_logout_response_binding(
+    actual: Binding,
+    expected: LogoutBinding,
+) -> Result<(), SamlError> {
+    if actual == expected.as_binding() {
+        return Ok(());
+    }
+    Err(Error::UnsupportedBinding { binding: actual })
+}
+
+fn ensure_logout_destination(
+    local_metadata: &Metadata,
+    binding: LogoutBinding,
+    actual: Option<&crate::model::EndpointUrl>,
+) -> Result<(), SamlError> {
+    let Some(actual) = actual else {
+        return Ok(());
+    };
+    let expected = local_metadata
+        .get_single_logout_service(binding.as_binding())
+        .ok_or_else(|| Error::MissingMetadata("SingleLogoutService".into()))?;
+    if actual.as_str() == expected {
+        return Ok(());
+    }
+    Err(Error::destination_mismatch(
+        &expected,
+        Some(actual.as_str()),
+    ))
+}
+
+fn typed_logout_subject(subject: LogoutSubject) -> TypedLogoutSubject {
+    TypedLogoutSubject {
+        name_id: subject.name_id().value().to_string(),
+        session_indexes: subject
+            .session_indexes()
+            .iter()
+            .map(|session_index| session_index.as_str().to_string())
+            .collect(),
+    }
+}

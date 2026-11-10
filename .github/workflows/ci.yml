@@ -37,6 +37,10 @@ jobs:
     env:
       OPENWARP_TEST_POSTGRES_URL: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
       OPENWARP_TEST_MYSQL_URL: mysql://root:openwarp@127.0.0.1:3306/mysql
+      # The static-rotation regressions drive a real PostgreSQL role lifecycle.
+      # sslmode=disable: the fixture connects with NoTls and the static-rotation
+      # validator only accepts explicit disable on a literal loopback address.
+      OPENWARP_TEST_STATIC_PG: postgres://openwarp:openwarp@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +52,11 @@ jobs:
           node-version: "24"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=2
-      - run: node --test crates/server/tests/ui.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs
+      # The default build is core only, so the enterprise surfaces and their
+      # tests need their own pass or they stop being compiled at all.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features -- --test-threads=2
+      - run: node --test --test-concurrency=1 crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs crates/server/tests/secret-health.test.cjs crates/server/tests/secret-health-ui.test.cjs crates/server/tests/secret-health-rotation.test.cjs crates/server/tests/secret-health-lockdown-ui.test.cjs tests/secret-health-enzoic.test.cjs tests/secret-health-providers.test.cjs tests/secret-health-enzoic-pairs.test.cjs tests/secret-health-enzoic-vectors.test.cjs crates/server/tests/workers-mfa.test.cjs crates/server/tests/workers-runtime.test.cjs crates/server/tests/workers-atomic.test.cjs crates/server/tests/workers-parity.test.cjs crates/server/tests/workers-protocol.test.cjs crates/server/tests/workers-live.test.cjs
       - run: python3 scripts/check-openapi.py
       # The SDK tests spawn the binary cargo test just built.
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
@@ -97,13 +105,21 @@ jobs:
         run: |
           cargo install worker-build --version 0.8.7
           cargo install wasm-bindgen-cli --version 0.2.130
-          cd crates/server && worker-build --release --no-default-features
+          cd crates/server && worker-build --release --no-default-features --features workload-identity,change-requests
       - name: Deployment configuration gate
         run: node --test scripts/tests/portable-runtime/worker-deployment.test.cjs
       - name: Workerd smoke test
         run: |
-          npm install --no-save wrangler@4.151.1
-          WRANGLER=node_modules/.bin/wrangler scripts/worker-smoke.sh
+          npm install --no-save wrangler@4.158.0
+          export WRANGLER="$PWD/node_modules/.bin/wrangler"
+          scripts/worker-smoke.sh
+          node scripts/worker-runtime-smoke.mjs
+          node scripts/worker-protocol-smoke.mjs
+          node scripts/worker-live-smoke.mjs
+          node scripts/worker-key-smoke.mjs
+          sh scripts/worker-saml-smoke.sh
+      - name: D1 migration driver
+        run: WRANGLER="$PWD/node_modules/.bin/wrangler" scripts/d1-migrate-smoke.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -127,6 +143,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8080/health
           docker exec openwarp-ci openwarp --help >/dev/null
+          docker exec openwarp-ci openwarp-migrate status >/dev/null
           docker stop openwarp-ci
 
   sdks-and-provider:

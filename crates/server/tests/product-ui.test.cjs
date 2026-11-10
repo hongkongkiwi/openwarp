@@ -112,7 +112,8 @@ function parse(markup, root) {
     const attrs = {};
     for (const [, name, , quoted, bare] of rest.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+)))?/g)) attrs[name] = decode(quoted ?? bare ?? '');
     const el = new Element(tag, root.ownerDocument, attrs); stack.at(-1).appendChild(el);
-    if (!/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
+    const selfClosing = /\/\s*>$/.test(token);
+    if (!selfClosing && !/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag)) stack.push(el);
   }
 }
 function visible(el) {
@@ -143,6 +144,7 @@ async function consoleUI(opts = {}) {
   const role = opts.role || 'admin', uid = opts.uid || 'reviewer-a';
   const routes = {
     '/api/auth/providers': {}, '/api/me': { id: uid, email: 'fixture@test.invalid' },
+    '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/orgs': [{ id: 'org-a', name: 'Workspace A', role }, { id: 'org-b', name: 'Workspace B', role }],
   };
   for (const org of ['org-a', 'org-b']) {
@@ -151,6 +153,7 @@ async function consoleUI(opts = {}) {
       [`/api/orgs/${org}/members`]: [{ id: uid, email: 'fixture@test.invalid', role }],
       [`/api/orgs/${org}/roles`]: [{ name: role, managed: true, permissions: role === 'admin' || role === 'owner' ? ['*'] : [] }],
       [`/api/orgs/${org}/teams`]: [],
+      [`/api/orgs/${org}/invites`]: [],
       [`/api/orgs/${org}/identities`]: [{ id: 'identity-a', org_id: org, name: opts.identityName || 'CI identity', role: 'developer' }],
       [`/api/orgs/${org}/emergency`]: { locked: false },
       [`/api/orgs/${org}/identities/identity-a/workload-trust`]: [clone(trust)],
@@ -161,7 +164,8 @@ async function consoleUI(opts = {}) {
   routes['/api/apps/app-b/envs'] = [{ id: 'env-other', name: 'Other environment', mode: 'sse' }];
   const context = vm.createContext({
     document, console, URL, TextDecoder, TextEncoder,
-    localStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
+    // The workspace-memory key is console chrome state from the picker, not a product value.
+    localStorage: { getItem: key => key.startsWith('ow.org.') ? 'org-a' : '', setItem: (...args) => { if (!String(args[0]).startsWith('ow.org.')) storage.push(args); }, removeItem() {} },
     sessionStorage: { getItem: () => '', setItem: (...args) => storage.push(args), removeItem() {} },
     navigator: { language: 'en', languages: ['en'], clipboard: { writeText: async text => clipboard.push(text) } },
     location: { origin: 'http://console.invalid', hash: '', pathname: '/', reload() {} },
