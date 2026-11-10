@@ -233,7 +233,7 @@ fn valid_email(e: &str) -> bool {
     let Some((local, domain)) = e.split_once('@') else { return false };
     !local.is_empty() && !domain.is_empty() && e.len() <= 254 && !e.contains(char::is_whitespace) && domain.contains('.') }
 #[derive(Deserialize, Default)] struct AuthReq { email: String, password: String }
-#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] readme: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64, #[serde(default)] scopes: String,
+#[derive(Deserialize, Default)] struct NameReq { #[serde(default)] name: String, #[serde(default)] email: String, #[serde(default)] role: String, #[serde(default)] env_id: String, #[serde(default)] expires_in: i64, #[serde(default)] scopes: String,
     // Delegated environments: the client generates the environment key and
     // supplies it wrapped to itself and to the customer-run sync runner.
     #[serde(default)] mode: String, #[serde(default)] runner_id: String, #[serde(default)] wrapped_key: String, #[serde(default)] runner_wrapped_key: String }

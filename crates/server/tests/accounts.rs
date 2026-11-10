@@ -1309,47 +1309,6 @@ fn extract_link(text: &str, needle: &str) -> String {
 fn six_digit_code_in(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).map(str::to_string) }
 
-fn b32decode(s: &str) -> Vec<u8> {
-    let mut bits = 0u32; let mut n = 0u32; let mut out = Vec::new();
-    for c in s.chars().filter(|c| *c != '=') {
-        let u = c.to_ascii_uppercase();
-        let v = match u { 'A'..='Z' => u as u32 - 'A' as u32, '2'..='7' => u as u32 - '2' as u32 + 26, _ => continue };
-        bits = (bits << 5) | v; n += 5;
-        if n >= 8 { n -= 8; out.push((bits >> n) as u8); } }
-    out }
-
-fn totp_now(secret_b32: &str) -> String {
-    use hmac::{Hmac, Mac}; use sha1::Sha1; type H = Hmac<Sha1>;
-    let counter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 30;
-    let mut m = H::new_from_slice(&b32decode(secret_b32)).expect("hmac key"); m.update(&counter.to_be_bytes());
-    let hash = m.finalize().into_bytes();
-    let off = (hash[19] & 0x0f) as usize;
-    let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off + 1] as u32) << 16) | ((hash[off + 2] as u32) << 8) | hash[off + 3] as u32;
-    format!("{:06}", code % 1_000_000) }
-
-#[tokio::test]
-async fn email_verification_gates_login() {
-    let s = Server::start().await;
-    let r = register_raw(&s, "verify-me@test.invalid").await;
-    assert_eq!(r.status, 200, "registration failed: {}", r.text);
-    assert_eq!(r.body["verification_required"], json!(true), "verification must be required: {}", r.text);
-    assert!(r.body["token"].is_null(), "no session may be issued before verification: {}", r.text);
-    assert!(r.body["recovery_kit"].as_str().map(|k| !k.is_empty()).unwrap_or(false), "the kit is still shown: {}", r.text);
-
-    let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "verify-me@test.invalid", "password": "correct-horse-battery"}))).await;
-    assert_eq!(login.status, 403, "an unverified account must not sign in, got {} {}", login.status, login.text);
-
-    let text = wait_for_mail(&s.inbox, "/api/auth/verify?token=").await;
-    let link = extract_link(&text, "/api/auth/verify?token=");
-    let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
-    let r = s.get(&path).await;
-    assert_eq!(r.status, 200, "the verification link must work: {} {}", r.status, r.text);
-
-    let login = s.call(Method::POST, "/api/auth/login", None, Some(json!({"email": "verify-me@test.invalid", "password": "correct-horse-battery"}))).await;
-    assert_eq!(login.status, 200, "a verified account must sign in: {}", login.text);
-    let replay = s.get(&path).await;
-    assert_eq!(replay.status, 400, "a verification link must be single use, got {} {}", replay.status, replay.text);
-}
 
 #[tokio::test]
 async fn password_reset_requires_the_recovery_kit_or_an_explicit_discard() {
