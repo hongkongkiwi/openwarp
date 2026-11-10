@@ -545,6 +545,17 @@ async fn ip_allowlist_covers_mcp_and_scim() {
 
     let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}", org), Some(&token), None).await;
     assert_eq!(r.status, 403, "SCIM bypassed the IP allowlist, got {} {}", r.status, r.text);
+
+    // The policy layer must resolve org_id exactly the way the handlers'
+    // Query extractor does: decoded, and last occurrence wins, or a crafted
+    // duplicate skips the allowlist while the handler authorizes the real org.
+    let encoded = format!("%{:02X}{}", org.as_bytes()[0], &org[1..]);
+    let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id={}", encoded), Some(&token), None).await;
+    assert_eq!(r.status, 403, "a percent-encoded org_id must resolve to the same workspace policy, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id=nonexistent&org_id={}", org), Some(&token), None).await;
+    assert_eq!(r.status, 403, "duplicate org_id parameters must not skip the allowlist, got {} {}", r.status, r.text);
+    let r = s.call(Method::GET, &format!("/scim/v2/Users?org_id=nonexistent&%6Frg_id={}", org), Some(&token), None).await;
+    assert_eq!(r.status, 403, "an encoded parameter name must not skip the allowlist, got {} {}", r.status, r.text);
 }
 
 #[tokio::test]
