@@ -1,0 +1,505 @@
+{
+  "/api/orgs/{oid}/pki/cas": {
+    "post": {
+      "summary": "Create an X.509 CA",
+      "description": "Requires org:admin. Generates the CA private key on the server and stores it encrypted; returns the PEM certificate in JSON. Empty name uses OpenWarp CA as common name.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "requestBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "default": ""
+                }
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "CA certificate",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PkiCaCreated"
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "Generation or storage failure",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "401": {
+          "description": "Invalid credential",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Not an administrator",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "/api/pki/cas/{caid}/issue": {
+    "post": {
+      "summary": "Issue an X.509 certificate",
+      "description": "Requires org:admin. Rejects SSH CAs. Generates a new subject private key on the server; PEM certificate and private key are returned in JSON. days is clamped to 1-3650.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "caid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "requestBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "cn": {
+                  "type": "string",
+                  "default": "service"
+                },
+                "days": {
+                  "type": "integer",
+                  "default": 365,
+                  "description": "Clamped to 1-3650."
+                },
+                "sans": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "Certificate and private key PEM strings",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PkiCertificateIssued"
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "SSH CA, invalid issuance or storage failure",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "401": {
+          "description": "Invalid credential",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Not an administrator",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "CA not found",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "/api/pki/cas/{caid}/certs": {
+    "get": {
+      "summary": "List X.509 certificates",
+      "description": "Requires workspace membership; rejects SSH CAs. Returns metadata, not certificate or private key PEM.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "caid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Certificates",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PkiCertificate"
+                }
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "SSH CA or storage failure",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "401": {
+          "description": "Invalid credential",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Not a workspace member",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "CA not found",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "/api/pki/cas/{caid}/crl": {
+    "get": {
+      "summary": "Download an X.509 CRL",
+      "description": "Requires org:admin and an X.509 CA. Returns PEM text under application/pkix-crl, with next_update seven days after generation. Native server only.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "caid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "PEM CRL",
+          "content": {
+            "application/pkix-crl": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "SSH CA, signing or storage failure",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "401": {
+          "description": "Invalid credential",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Not an administrator",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "CA not found",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "501": {
+          "description": "CRL generation requires native server",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "/api/pki/cas/{caid}/ocsp": {
+    "post": {
+      "summary": "Answer a DER OCSP request",
+      "description": "Unauthenticated native-server responder. Reads raw request bytes, not JSON. Reports good, revoked or unknown from stored certificate serials. SSH CAs are treated as missing. Raw request body is intentionally not modeled as a JSON requestBody. Workspace lockdown denies requests with 403 before the responder; supplied bearer credentials remain subject to scope and IP middleware.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "caid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "DER OCSP response",
+          "content": {
+            "application/ocsp-response": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid DER or signing material",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "CA not found or SSH CA",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "501": {
+          "description": "OCSP requires native server",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Workspace lockdown or supplied credential policy denial",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "/api/pki/certs/{cid}/revoke": {
+    "post": {
+      "summary": "Revoke an X.509 certificate",
+      "description": "Requires org:admin when the certificate's CA exists. Marks the certificate revoked; does not read a JSON body.",
+      "tags": [
+        "pki"
+      ],
+      "parameters": [
+        {
+          "in": "path",
+          "name": "cid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Revoked",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PkiRevoked"
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "SSH CA or storage failure",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "401": {
+          "description": "Invalid credential",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "Not an administrator",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "Certificate not found",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

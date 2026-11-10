@@ -1,0 +1,26 @@
+{
+  "InstanceAuth": {
+    "type": "object",
+    "properties": {
+      "password": {"type": "boolean"}, "google": {"type": "boolean"}, "microsoft": {"type": "boolean"}, "apple": {"type": "boolean"},
+      "github": {"type": "boolean"}, "okta": {"type": "boolean"}, "auth0": {"type": "boolean"}, "gitlab": {"type": "boolean"},
+      "atlassian": {"type": "boolean"}, "slack": {"type": "boolean"}, "salesforce": {"type": "boolean"}, "openai": {"type": "boolean"},
+      "x": {"type": "boolean"}, "oidc": {"type": "boolean"}, "discord": {"type": "boolean"}, "linkedin": {"type": "boolean"}, "workos": {"type": "boolean"},
+      "methods": {"type": "array", "items": {"type": "string"}}, "configured": {"type": "array", "items": {"type": "string"}}, "env_locked": {"type": "boolean"}
+    }
+  },
+  "Instance": {
+    "allOf": [
+      {"$ref": "#/components/schemas/InstanceAuth"},
+      {"type": "object", "properties": {"signups_open": {"type": "boolean"}, "signups_env_locked": {"type": "boolean"}, "instance_owner": {"type": "boolean"}, "mfa_email": {"type": "boolean"}}}
+    ],
+    "description": "Instance authentication settings and caller ownership flag. Provider boolean fields reflect credential configuration, while methods lists enabled authentication methods."
+  },
+  "InstanceSignups": {"type": "object", "properties": {"signups_open": {"type": "boolean"}}},
+  "InstanceOwnership": {"type": "object", "properties": {"ok": {"type": "boolean"}, "instance_owner": {"type": "string"}}},
+  "InstanceEmailTest": {"type": "object", "properties": {"ok": {"type": "boolean"}, "provider": {"type": "string"}}},
+  "InstanceRewrap": {"type": "object", "properties": {"rewrapped": {"type": "integer"}, "key_id": {"type": "string"}}},
+  "InstanceMetadataEncryption": {"type": "object", "properties": {"updated": {"type": "integer"}}},
+  "InstanceMasterRotation": {"type": "object", "properties": {"ok": {"type": "boolean"}, "note": {"type": "string"}, "rotated": {"type": "object", "properties": {"envs": {"type": "integer"}, "meta": {"type": "integer"}, "cas": {"type": "integer"}, "streams": {"type": "integer"}, "saml": {"type": "integer"}, "hooks": {"type": "integer"}}}}},
+  "HealthUnavailable": {"allOf": [{"$ref": "#/components/schemas/Health"}, {"type": "object", "properties": {"error": {"type": "string"}}}]}
+}

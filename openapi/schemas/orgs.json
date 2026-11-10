@@ -1,0 +1,229 @@
+{
+  "LdapConfig": {
+    "description": "When no LDAP configuration exists only configured=false is returned. group_roles is a semicolon-separated string of Group=role pairs, not a JSON map.",
+    "properties": {
+      "allowed_domains": {
+        "type": "string"
+      },
+      "auto_provision": {
+        "type": "boolean"
+      },
+      "base_dn": {
+        "type": "string"
+      },
+      "bind_dn": {
+        "type": "string"
+      },
+      "bind_password_set": {
+        "type": "boolean"
+      },
+      "ca_cert_pem": {
+        "type": "string"
+      },
+      "configured": {
+        "type": "boolean"
+      },
+      "default_role": {
+        "type": "string"
+      },
+      "email_attr": {
+        "type": "string"
+      },
+      "group_attr": {
+        "type": "string"
+      },
+      "group_roles": {
+        "type": "string"
+      },
+      "name_attr": {
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      },
+      "user_filter": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "OrgDeleted": {
+    "properties": {
+      "deleted": {
+        "type": "boolean"
+      },
+      "workspace": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "OrgEmergencyRequest": {
+    "properties": {
+      "locked": {
+        "description": "True locks the workspace; false restores it.",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "locked"
+    ],
+    "type": "object"
+  },
+  "OrgEmergencyState": {
+    "properties": {
+      "locked": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "OrgOwnership": {
+    "properties": {
+      "ok": {
+        "type": "boolean"
+      },
+      "owner": {
+        "type": "string"
+      },
+      "previous_owner_role": {
+        "const": "admin",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "OrgRole": {
+    "description": "Managed roles have managed=true and no id. Custom roles have an id and omit managed. Custom permissions are returned as stored JSON; the creation handler does not validate their shape.",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "managed": {
+        "type": "boolean"
+      },
+      "name": {
+        "type": "string"
+      },
+      "permissions": {}
+    },
+    "type": "object"
+  },
+  "OrgSecuritySettings": {
+    "description": "Admin-visible settings. During emergency lockdown only ip_allowlist and reuse_check are returned. The OIDC client secret is never returned.",
+    "properties": {
+      "audit_webhook": {
+        "type": "string"
+      },
+      "ip_allowlist": {
+        "type": "string"
+      },
+      "oidc_allowed_domains": {
+        "type": "string"
+      },
+      "oidc_auto_provision": {
+        "type": "boolean"
+      },
+      "oidc_client_id": {
+        "type": "string"
+      },
+      "oidc_client_secret_set": {
+        "type": "boolean"
+      },
+      "oidc_issuer": {
+        "type": "string"
+      },
+      "oidc_redirect_uri": {
+        "type": "string"
+      },
+      "reuse_check": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "RotationHook": {
+    "description": "When no hook exists only configured=false is returned.",
+    "properties": {
+      "configured": {
+        "type": "boolean"
+      },
+      "secret_set": {
+        "type": "boolean"
+      },
+      "url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SamlConfig": {
+    "properties": {
+      "acs_url": {
+        "type": "string"
+      },
+      "allow_unsigned_metadata": {
+        "type": "boolean"
+      },
+      "allowed_domains": {
+        "type": "string"
+      },
+      "auto_provision": {
+        "type": "boolean"
+      },
+      "configured": {
+        "const": true,
+        "type": "boolean"
+      },
+      "idp_entity_id": {
+        "type": "string"
+      },
+      "metadata_trusted_cert_set": {
+        "type": "boolean"
+      },
+      "metadata_xml": {
+        "type": "string"
+      },
+      "sp_metadata_url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SamlConfigured": {
+    "properties": {
+      "ok": {
+        "type": "boolean"
+      },
+      "sp_metadata_url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "Team": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "TeamMember": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "user_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  }
+}

@@ -1,6 +1,6 @@
 # Deployment
 
-The repository includes a Compose stack with OpenWarp, PostgreSQL 17, and Redis 7. You can also run the native server against SQLite or PostgreSQL. Start with [getting started](GETTING_STARTED.md) for local evaluation; this guide covers a deployed instance.
+The repository includes a Compose stack with OpenWarp, PostgreSQL 17, Redis 7 and a Caddy edge. The native server supports SQLite, PostgreSQL and MySQL/MariaDB. A separate Cloudflare Workers target uses SQLite-backed Durable Object storage. Start with [getting started](GETTING_STARTED.md) for local evaluation; this guide covers a deployed instance.
 
 ## Deployment checklist
 
@@ -346,10 +346,11 @@ recovery is separate from a native database backup; see [BACKUP.md](BACKUP.md).
 
 ## Platform limits
 
+The native and Workers targets share application code, but differ in storage, networking and protocol support. Use the [Workers support list](#cloudflare-workers) when deciding whether that target fits your deployment. Disabling default Cargo features alone does not turn a native binary into a Worker; the Worker build and runtime bindings are also required.
+
+The `ldap` Cargo feature carries the directory client, routes and console entry. Builds without it report `ldap: false` from `/api/auth/providers` and hide the directory settings and sign-in button. Directories that publish OIDC can instead use the OIDC flow, subject to the configured issuer and egress policy.
+
 The current Workers artifact excludes LDAP. The `ldap` Cargo feature carries
-the native directory client and routes. With it disabled,
-`/api/auth/providers` reports `ldap: false` and the console hides directory
-configuration and sign-in. Directories that publish OIDC, including Entra ID,
 Keycloak, Authentik and Dex, can use the shared OIDC flow instead.
 
 Workers supports outbound sockets, which the PostgreSQL lease adapter uses.

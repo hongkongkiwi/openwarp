@@ -1,0 +1,6 @@
+{
+ "PkiCaCreated":{"type":"object","properties":{"id":{"type":"string"},"certificate":{"type":"string","description":"PEM CA certificate."}}},
+ "PkiCertificateIssued":{"type":"object","properties":{"id":{"type":"string"},"certificate":{"type":"string"},"private_key":{"type":"string"},"ca_certificate":{"type":"string"}}},
+ "PkiCertificate":{"type":"object","properties":{"id":{"type":"string"},"ca_id":{"type":"string"},"cn":{"type":"string"},"serial":{"type":"string"},"revoked":{"type":"integer"},"expires_at":{"type":"integer"},"created_at":{"type":"integer"}}},
+ "PkiRevoked":{"type":"object","properties":{"revoked":{"type":"string"}}}
+}

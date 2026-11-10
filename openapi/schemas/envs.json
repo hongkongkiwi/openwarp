@@ -1,0 +1,175 @@
+{
+  "E2eEnvironmentCreate": {
+    "properties": {
+      "name": {
+        "pattern": "^[A-Za-z0-9_-]{1,32}$",
+        "type": "string"
+      },
+      "wrapped_key": {
+        "description": "Client-generated environment key wrapped for the caller. Omission or an empty string uses the server-generated compatibility path, which is not server-blind.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "E2eEnvironmentCreated": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/Id"
+      },
+      {
+        "properties": {
+          "mode": {
+            "const": "e2e",
+            "type": "string"
+          },
+          "server_generated": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "EnvironmentCreate": {
+    "description": "Delegated mode requires runner_id, wrapped_key and runner_wrapped_key, with a runner in the same organisation.",
+    "properties": {
+      "mode": {
+        "description": "delegated selects client encryption with a runner; other values use server-side encryption.",
+        "type": "string"
+      },
+      "name": {
+        "pattern": "^[A-Za-z0-9_-]{1,32}$",
+        "type": "string"
+      },
+      "runner_id": {
+        "type": "string"
+      },
+      "runner_wrapped_key": {
+        "type": "string"
+      },
+      "wrapped_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "EnvironmentCreated": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/Id"
+      },
+      {
+        "properties": {
+          "mode": {
+            "type": "string"
+          },
+          "runner_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "EnvironmentDetails": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/Env"
+      },
+      {
+        "properties": {
+          "runner_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "EnvironmentMeta": {
+    "properties": {
+      "app": {
+        "type": "string"
+      },
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "policy": {
+        "$ref": "#/components/schemas/EnvironmentPolicy"
+      },
+      "workspace": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "EnvironmentPolicy": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/EnvPolicy"
+      },
+      {
+        "properties": {
+          "max_versions": {
+            "description": "0 retains all versions.",
+            "maximum": 1000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    ],
+    "description": "Supply at least one of restricted, require_approval or max_versions."
+  },
+  "EnvironmentPolicyResult": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/Ok"
+      },
+      {
+        "properties": {
+          "policy": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "EnvironmentTeamGrant": {
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "team_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "EnvironmentTeamGrantRequest": {
+    "properties": {
+      "team_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "team_id"
+    ],
+    "type": "object"
+  }
+}

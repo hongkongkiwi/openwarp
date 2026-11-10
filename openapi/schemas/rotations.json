@@ -1,0 +1,5 @@
+{
+  "RotationScheduleRequest": { "type": "object", "required": ["key"], "properties": { "key": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$", "description": "Converted to uppercase." }, "path": { "type": "string", "default": "/" }, "interval_secs": { "type": "integer", "minimum": 60, "default": 86400 }, "config": { "type": "object", "additionalProperties": true, "description": "Empty means local random rotation. Adapters: webhook (rotation_url), resend (api_key), openrouter (management_key), openai (admin_key, project_id, service_account_id). Provider URLs pass egress validation." } } },
+  "RotationSchedule": { "allOf": [{ "$ref": "#/components/schemas/Rotation" }, { "type": "object", "properties": { "created_at": { "type": "integer" }, "provider_rotation": { "type": "integer", "enum": [0, 1] } } }] },
+  "RotationScheduled": { "allOf": [{ "$ref": "#/components/schemas/Id" }, { "type": "object", "properties": { "next_run": { "type": "integer" }, "provider_rotation": { "type": "boolean" }, "kind": { "type": "string" } } }] }
+}

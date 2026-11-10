@@ -78,6 +78,8 @@ node --test crates/server/tests/ui.test.cjs
 | `migrations.rs` | Runner failure modes, legacy catch-up, and live PostgreSQL/MariaDB applies |
 | `ui.test.cjs` | Embedded console source and behavior checks using Node |
 
+The coverage matrix, acceptance scenarios and rollout plan for every feature area live in [testing](TESTING.md).
+
 The PostgreSQL recovery regression target is opt-in because it changes login roles in an external database. Use a disposable PostgreSQL database and a test administrator, never deployment credentials:
 
 ```bash

@@ -1,0 +1,153 @@
+{
+  "/api/lockbox": {
+    "post": {
+      "description": "Requires authentication. Only the first secrets item value is selected, falling back to text if unavailable. Shares are not linked to a workspace. Environment-scoped tokens cannot use this route.",
+      "parameters": [],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/LockboxShareRequest"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LockboxShareCreated"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Create an expiring limited-view share",
+      "tags": [
+        "lockbox"
+      ]
+    }
+  },
+  "/api/lockbox/{lid}": {
+    "get": {
+      "description": "This handler requires only X-Lockbox-Key (base64, exactly 32 bytes), not bearer authentication, despite the common bearerAuth declaration. A successful read atomically claims one view. Missing/already-consumed shares return 404; expired or exhausted stored shares return 410.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "lid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "header",
+          "name": "X-Lockbox-Key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LockboxShareValue"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "410": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Expired"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Redeem a limited-view share",
+      "tags": [
+        "lockbox"
+      ]
+    }
+  }
+}

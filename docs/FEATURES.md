@@ -1,6 +1,10 @@
-# Feature matrix (Phase clone, everything unlocked)
+# Feature reference
 
-| Phase feature | Tier in Phase | OpenWarp |
+This page describes implemented features and their limits. Start with [core concepts](CONCEPTS.md) for terminology, or use the [documentation index](README.md) for task-oriented guides.
+
+The comparison column records the upstream tier labels used when this matrix was written. It is not a current upstream pricing reference or an OpenWarp licence requirement. This checkout has no paid feature gates; build features and deployment targets still constrain availability.
+
+| Feature | Historical Phase tier | OpenWarp implementation |
 |---|---|---|
 | Organisations, members, invite | Free | unlimited, roles owner/admin/developer + custom role strings; explicit invitation consent, public preview and scoped pending list/revoke/resend with rotated seven-day tokens |
 | Workspace creation policy | n/a | instance-owner `PUT /api/instance/workspaces`, separate from signup; `OPENWARP_WORKSPACE_CREATION` override; no personal workspace when disabled, zero-workspace console recovery and last-workspace deletion protection |
@@ -163,6 +167,9 @@ OpenWarp. Deduplicated implement-now list, all shipped server-side:
   (CA, issue, revoke) came from the Infisical feature set.
 
 Kept from OpenWarp where it already exceeds both: point-in-time recovery,
+secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not
+Phase features.
+The repository includes language clients; see the [client inventory](CLIENTS.md) for their locations and limits. It does not provide a dedicated Kubernetes operator: the Helm chart's External Secrets Operator bridge covers controller-driven delivery (see [Kubernetes](KUBERNETES.md)). CLI behavior is documented independently in the [CLI reference](CLI.md). Phase billing and licence code is not copied.
 secret-change proposals, and PostgreSQL or MySQL dynamic accounts are not Phase features.
 The CLI and four SDKs provide generic JSON management requests; browser and client-crypto workflows retain their own requirements. A dedicated Kubernetes operator remains deferred (the Helm chart's External Secrets Operator bridge covers controller-driven delivery; see [Kubernetes](KUBERNETES.md)). Phase billing and licence code is never copied.
 

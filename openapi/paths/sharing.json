@@ -1,0 +1,1093 @@
+{
+  "/api/access-requests/{rid}/{action}": {
+    "post": {
+      "description": "Requires environment access and org:admin permission. approve adds an environment member; every other action string rejects. Already-decided requests return 400. Environment-scoped tokens cannot use this route.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "rid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "action",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessDecision"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Decide a pending environment access request",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/access-requests": {
+    "get": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires environment access, not a separate secrets:read permission check in the handler.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/EnvironmentAccessRecord"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List environment access requests",
+      "tags": [
+        "sharing"
+      ]
+    },
+    "post": {
+      "description": "Requires organisation membership, but not existing environment access. Reason defaults to an empty string. Environment-scoped tokens may only target their own environment.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/EnvironmentAccessRequest"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PendingRequest"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Request environment access",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/e2e/grant": {
+    "post": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:write and an existing caller key grant. The key must be wrapped client-side for the target email; this handler does not grant organisation membership.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/E2eGrantRequest"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ok"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Grant a wrapped environment key",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/e2e/grants": {
+    "get": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:read.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/E2eGrant"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List environment key grantees",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/e2e/grants/{uid}": {
+    "delete": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:write. Marks rekey_required=true; a removed user may retain the old key until remaining ciphertext is rekeyed.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "uid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/E2eRevoked"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Revoke an environment key grant",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/proposals": {
+    "get": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:read; encrypted proposal payload is not returned.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/SecretProposal"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List secret change proposals",
+      "tags": [
+        "sharing"
+      ]
+    },
+    "post": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires proposals:write. Stores secrets array encrypted with the environment key; text and expected_version are not retained. Returns pending without deploying changes.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SecretDeployRequest"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PendingRequest"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Version conflict or client-encrypted environment has no server key"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Submit a secret change proposal",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/envs/{eid}/wrap": {
+    "post": {
+      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:read. Uses base shared values without personal overrides; excludes sealed and client-encrypted secrets. TTL is clamped to 60-86400 seconds. Redeem token as Bearer at /api/unwrap.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "eid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SecretWrapRequest"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretWrapped"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Version conflict or client-encrypted environment has no server key"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Wrap shared non-sealed secrets in a single-use token",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/proposals/{pid}/{action}": {
+    "post": {
+      "description": "Requires access to the proposal environment and org:admin permission. Only pending proposals can be decided; action must be approve or reject. Approval applies secrets and returns per-integration sync errors. The handler does not compare caller to author, so admin authors can decide their own proposal. Environment-scoped tokens cannot use this route.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "pid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "action",
+          "required": true,
+          "schema": {
+            "enum": [
+              "approve",
+              "reject"
+            ],
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposalDecision"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Version conflict or client-encrypted environment has no server key"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Approve or reject a secret change proposal",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/unwrap": {
+    "get": {
+      "description": "Bearer credential must be the wrapping token, not a session, service or OAuth token. Rejects expired tokens and halted environments.",
+      "parameters": [],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretWrapMeta"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "410": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Expired"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Inspect a wrapping token without consuming it",
+      "tags": [
+        "sharing"
+      ]
+    },
+    "post": {
+      "description": "Bearer credential must be the wrapping token. No request body is read. Atomically consumes one token and returns shared non-sealed values, without personal overrides. Rejects expired tokens and halted environments.",
+      "parameters": [],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretUnwrapped"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        },
+        "404": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not found"
+        },
+        "409": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Version conflict or client-encrypted environment has no server key"
+        },
+        "410": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Expired"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Consume a wrapping token once",
+      "tags": [
+        "sharing"
+      ]
+    }
+  },
+  "/api/users/lookup": {
+    "get": {
+      "description": "Requires authentication. Caller may look up themselves or another user sharing an organisation. Missing and non-shared users both return 403. Environment-scoped tokens cannot use this route.",
+      "parameters": [
+        {
+          "in": "query",
+          "name": "email",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedUser"
+              }
+            }
+          },
+          "description": "Success"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Invalid request or database error"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Authentication required"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Permission, environment access, lockdown or credential scope denied"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Look up a shared-organisation user public key",
+      "tags": [
+        "sharing"
+      ]
+    }
+  }
+}

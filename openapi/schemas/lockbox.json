@@ -1,0 +1,66 @@
+{
+  "LockboxShareCreated": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/LockboxCreated"
+      },
+      {
+        "properties": {
+          "expires_at": {
+            "type": "integer"
+          },
+          "max_views": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  },
+  "LockboxShareRequest": {
+    "description": "The selected value must be nonempty.",
+    "properties": {
+      "expires_in": {
+        "default": 86400,
+        "description": "Clamped to 60-604800 seconds.",
+        "type": "integer"
+      },
+      "max_views": {
+        "default": 1,
+        "description": "Clamped to 1-10 views.",
+        "type": "integer"
+      },
+      "secrets": {
+        "description": "Only the first item's value is used, taking precedence over text.",
+        "items": {
+          "properties": {
+            "value": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "LockboxShareValue": {
+    "allOf": [
+      {
+        "$ref": "#/components/schemas/LockboxValue"
+      },
+      {
+        "properties": {
+          "views_remaining": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    ]
+  }
+}
