@@ -928,3 +928,33 @@ async fn a_removed_member_cannot_sign_back_in_without_a_new_invite() {
     let again = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(again.status, 200, "re-invited member refused: {}", again.text);
 }
+
+#[tokio::test]
+async fn ldap_login_keeps_a_locked_membership_frozen() {
+    let s = Server::start().await;
+    let mut cara = user("cara", "cara@example.com");
+    cara.groups = vec!["CN=Admins,OU=Groups,DC=example,DC=com".to_string()];
+    let dir = start_directory(vec![cara]);
+    let (owner, org) = s.register("owner@example.com", "password123").await;
+    let saved = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin", "auto_provision": true, "allowed_domains": "example.com"})).await;
+    assert_eq!(saved.status, 200, "config failed: {}", saved.text);
+
+    let first = s.ldap_login(&org, "cara", "user-secret").await;
+    assert_eq!(first.status, 200, "initial ldap login failed: {}", first.text);
+    let uid = first.body["user_id"].as_str().expect("user id").to_string();
+
+    let lock = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/members/{}/lock", org, uid), Some(&owner), None).await;
+    assert_eq!(lock.status, 200, "locking the ldap member failed: {}", lock.text);
+    let remapped = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=owner", "auto_provision": true, "allowed_domains": "example.com"})).await;
+    assert_eq!(remapped.status, 200, "reconfig failed: {}", remapped.text);
+
+    // Sign-in stays open for the locked member, but the membership is frozen:
+    // no directory-driven promotion to owner, and the lock survives.
+    let second = s.ldap_login(&org, "cara", "user-secret").await;
+    assert_eq!(second.status, 200, "a locked member must still sign in: {}", second.text);
+    let token = second.body["token"].as_str().expect("token").to_string();
+    let orgs = s.call(reqwest::Method::GET, "/api/orgs", Some(&token), None).await;
+    let row = orgs.body.as_array().and_then(|a| a.iter().find(|o| o["id"] == json!(org))).expect("membership row").clone();
+    assert_eq!(row["role"], json!("admin"), "a locked member must not be promoted by the directory: {}", orgs.text);
+    assert_eq!(row["locked"], json!(true), "the lock must survive the sign-in: {}", orgs.text);
+}

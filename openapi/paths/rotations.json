@@ -1,6 +1,7 @@
 {
   "/api/envs/{eid}/rotations": {
     "get": {
+      "description": "Requires environment access and secrets:read. Returns schedule metadata and numeric provider_rotation, never provider credentials.",
       "parameters": [
         {
           "in": "path",
@@ -74,10 +75,10 @@
       "summary": "Rotation schedules",
       "tags": [
         "rotations"
-      ],
-      "description": "Requires environment access and secrets:read. Returns schedule metadata and numeric provider_rotation, never provider credentials."
+      ]
     },
     "post": {
+      "description": "Requires environment access and rotations:write. Uppercases key, validates path and requires interval_secs of at least 60. Empty config schedules local random rotation; provider configs are validated and encrypted.",
       "parameters": [
         {
           "in": "path",
@@ -158,12 +159,12 @@
       "summary": "Schedule a rotation",
       "tags": [
         "rotations"
-      ],
-      "description": "Requires environment access and rotations:write. Uppercases key, validates path and requires interval_secs of at least 60. Empty config schedules local random rotation; provider configs are validated and encrypted."
+      ]
     }
   },
   "/api/rotations/{rid}": {
     "delete": {
+      "description": "Requires environment access and rotations:write. Deletes the schedule without rotating the current secret.",
       "parameters": [
         {
           "in": "path",
@@ -234,8 +235,63 @@
       "summary": "Delete a rotation schedule",
       "tags": [
         "rotations"
+      ]
+    }
+  },
+  "/api/rotations/{rid}/run": {
+    "post": {
+      "description": "Runs a due rotation schedule immediately instead of waiting for its next_run time. Requires rotations:write on the schedule's environment and a non-expired schedule.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "rid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "description": "Requires environment access and rotations:write. Deletes the schedule without rotating the current secret."
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Rotation run result"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Rotation schedule not found"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Not permitted or credential scope mismatch"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Run a rotation schedule now",
+      "tags": [
+        "rotations"
+      ]
     }
   }
 }

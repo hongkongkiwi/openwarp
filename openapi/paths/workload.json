@@ -1,0 +1,200 @@
+{
+  "/api/orgs/{oid}/identities/{iid}/workload": {
+    "delete": {
+      "description": "Deletes the workload JWT binding; outstanding tokens stop working at their next exchange.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Deleted"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Identity not found"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Workspace owner required"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Delete a workload JWT binding",
+      "tags": [
+        "workload"
+      ]
+    },
+    "get": {
+      "description": "Returns the workload JWT trust binding for the identity, or null when none is set. Workspace owner required.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkloadBinding"
+              }
+            }
+          },
+          "description": "Binding or null"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Identity not found"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Workspace owner required"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Read a workload JWT binding",
+      "tags": [
+        "workload"
+      ]
+    },
+    "put": {
+      "description": "Creates or replaces the workload JWT binding: issuer, audience, subject, optional JWKS URL or inline JWKS, max TTL. Workspace owner required.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "iid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/WorkloadBinding"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Saved"
+        },
+        "400": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Identity not found or invalid binding"
+        },
+        "403": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Workspace owner required"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Create or replace a workload JWT binding",
+      "tags": [
+        "workload"
+      ]
+    }
+  }
+}

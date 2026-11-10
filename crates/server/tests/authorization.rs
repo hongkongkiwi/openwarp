@@ -2375,3 +2375,65 @@ async fn workspace_lock_blocks_admin_token_revocation() {
     let r = s.call(Method::DELETE, &format!("/api/tokens/{}", tid), Some(&ot), None).await;
     assert_eq!(r.status, 200, "the owner still revokes tokens: {}", r.text);
 }
+
+#[tokio::test]
+async fn racing_a_member_lock_and_ownership_transfer_never_commits_a_locked_owner() {
+    let s = Server::start().await;
+    let owner = register(&s, "race-owner@test.invalid").await;
+    let member = register(&s, "race-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    let mu = member["user_id"].as_str().unwrap();
+    invite(&s, ot, org, "race-member@test.invalid", "developer").await;
+
+    // Both preflight reads can observe the unlocked, un-promoted state; the
+    // writes carry the owner and lock exclusions, so at most one commits no
+    // matter how the server interleaves them. HTTP scheduling decides which
+    // order completes: if the transfer commits first, the lock legitimately
+    // fails with 403 (its caller is no longer an owner) instead of 409.
+    let transfer_path = format!("/api/orgs/{}/transfer", org);
+    let transfer_body = json!({"user_id": mu});
+    let (lock, transfer) = tokio::join!(
+        set_member_lock(&s, ot, org, mu, true),
+        s.call(Method::POST, &transfer_path, Some(ot), Some(transfer_body))
+    );
+    assert!((lock.status == 200) != (transfer.status == 200),
+        "exactly one racing operation must succeed: lock={} {} transfer={} {}",
+        lock.status, lock.text, transfer.status, transfer.text);
+    assert!(lock.status == 403 || lock.status == 409 || transfer.status == 409,
+        "the rejected operation must explain the ownership change: lock={} {} transfer={} {}",
+        lock.status, lock.text, transfer.status, transfer.text);
+    let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
+    let row = members.body.as_array().expect("member list").iter()
+        .find(|m| m["id"] == json!(&mu)).expect("raced member row").clone();
+    assert!(!(row["role"] == json!("owner") && row["locked"] == json!(true)),
+        "a locked owner must never be committed: {}", members.text);
+    let unlocked_owners = members.body.as_array().unwrap().iter()
+        .filter(|m| m["role"] == json!("owner") && m["locked"] == json!(false)).count();
+    assert!(unlocked_owners >= 1, "the workspace must keep an unlocked owner: {}", members.text);
+}
+
+#[tokio::test]
+async fn a_path_restricted_locked_member_can_still_leave_the_workspace() {
+    let s = Server::start().await;
+    let owner = register(&s, "path-leave-owner@test.invalid").await;
+    let member = register(&s, "path-leave-member@test.invalid").await;
+    let ot = owner["token"].as_str().unwrap();
+    let mt = member["token"].as_str().unwrap();
+    let mu = member["user_id"].as_str().unwrap();
+    let org = owner["org_id"].as_str().unwrap();
+    invite(&s, ot, org, "path-leave-member@test.invalid", "developer").await;
+    let (_, envs) = app_with_envs(&s, ot, org).await;
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/path-policy/developer", envs[0]), Some(ot), Some(json!({"rules": [{"prefix": "/", "capabilities": ["read"]}]}))).await;
+    assert_eq!(r.status, 200, "path policy setup failed: {}", r.text);
+
+    let r = set_member_lock(&s, ot, org, mu, true).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    // The path policy makes the member path-restricted; the escape hatch stays
+    // open anyway.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/leave", org), Some(mt), None).await;
+    assert_eq!(r.status, 200, "a locked, path-restricted member must be able to leave: {} {}", r.status, r.text);
+    let members = s.call(Method::GET, &format!("/api/orgs/{}/members", org), Some(ot), None).await;
+    assert!(!members.text.contains(&mu.to_string()), "the departed member must be gone: {}", members.text);
+}

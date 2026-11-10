@@ -1,0 +1,48 @@
+{
+  "/api/orgs/{oid}/features": {
+    "get": {
+      "description": "Returns the feature names compiled into this build and the ones granted to this workspace.",
+      "parameters": [
+        {
+          "in": "path",
+          "name": "oid",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrgFeatures"
+              }
+            }
+          },
+          "description": "Compiled and granted features"
+        },
+        "401": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Error"
+              }
+            }
+          },
+          "description": "Missing or invalid credential"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Read workspace feature grants",
+      "tags": [
+        "features"
+      ]
+    }
+  }
+}

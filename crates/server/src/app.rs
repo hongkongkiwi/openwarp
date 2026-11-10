@@ -1043,7 +1043,7 @@ async fn transfer_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     user_guarded_commit(&st, &[&uid, target], &[
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(target)]),
         ("UPDATE org_members SET role=role WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
-        ("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=?".into(), vec![json!(&oid), json!(target)]),
+        ("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=? AND locked=0".into(), vec![json!(&oid), json!(target)]),
         ("UPDATE org_members SET role='admin' WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
     ], &[0, 1, 2, 3], Some([&oid,"","",&uid,"org.transfer",target])).await?; Ok(j(json!({"ok":true, "owner":target, "previous_owner_role":"admin"}))) }
 async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?;
@@ -1065,7 +1065,7 @@ async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target
         user_guarded_commit(&st, &[&uid, &target], &[
             ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&target)]),
             ("UPDATE org_members SET role=role WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
-            ("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=?".into(), vec![json!(&oid), json!(&target)]),
+            ("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=? AND locked=0".into(), vec![json!(&oid), json!(&target)]),
         ], &[0, 1, 2], Some(audit)).await?;
     } else {
         st.audited_batch(&[("UPDATE org_members SET role=? WHERE org_id=? AND user_id=?".into(), vec![json!(new_role), json!(&oid), json!(&target)])], &[], audit).await.map_err(|e| bad(&e))?;
@@ -1079,7 +1079,13 @@ async fn set_member_lock(st: &S, h: &HeaderMap, oid: &str, target: &str, locked:
     // Owners keep the workspace administrable; transfer or demote first. An
     // existing locked owner may be unlocked so a workspace is never stranded.
     if target_role == "owner" && locked { return Err(err(StatusCode::CONFLICT, "workspace owners cannot be locked; change the member's role first")); }
-    st.audited_batch(&[("UPDATE org_members SET locked=? WHERE org_id=? AND user_id=?".into(), vec![json!(if locked { 1 } else { 0 }), json!(oid), json!(target)])], &[], [oid, "", "", &uid, if locked { "member.lock" } else { "member.unlock" }, target]).await.map_err(|e| bad(&e))?;
+    // The write repeats the owner exclusion so a lock that races an ownership
+    // change commits zero rows instead of stranding a locked owner.
+    if locked {
+        st.audited_batch(&[("UPDATE org_members SET locked=1 WHERE org_id=? AND user_id=? AND role<>'owner'".into(), vec![json!(oid), json!(target)])], &[0], [oid, "", "", &uid, "member.lock", target]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "workspace owners cannot be locked; change the member's role first") } else { bad(&e) })?;
+    } else {
+        st.audited_batch(&[("UPDATE org_members SET locked=0 WHERE org_id=? AND user_id=?".into(), vec![json!(oid), json!(target)])], &[], [oid, "", "", &uid, "member.unlock", target]).await.map_err(|e| bad(&e))?;
+    }
     Ok(j(json!({"ok": true, "locked": locked})))
 }
 async fn lock_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): Path<(String, String)>) -> Res { set_member_lock(&st, &h, &oid, &target, true).await }
@@ -3417,8 +3423,9 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
         }
     } else if !locked {
         let (current, member_locked) = st.org_membership(&org, &uid).await.unwrap_or_default();
-        // The directory never rewrites a suspended membership: a group change
-        // must not grant access an owner locked out.
+        // A locked membership is frozen: the mapping catches up on a later
+        // sign-in after unlock, and the writes repeat the exclusions so a lock
+        // landing mid-commit cannot create a locked owner.
         if member_locked { st.audited_batch(&[], &[], audit).await.map_err(|e| bad(&e))?; }
         else if let Some(role) = &mapped {
             // The directory's group mapping stays authoritative, except that it
@@ -3426,7 +3433,7 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
             if &current != role && current != "owner" {
                 user_guarded_commit(&st, &[&uid], &[
                     ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&uid)]),
-                    ("UPDATE org_members SET role=? WHERE org_id=? AND user_id=? AND role<>'owner'".into(), vec![json!(role), json!(&org), json!(&uid)]),
+                    ("UPDATE org_members SET role=? WHERE org_id=? AND user_id=? AND role<>'owner' AND locked=0".into(), vec![json!(role), json!(&org), json!(&uid)]),
                     ("UPDATE ldap_subjects SET role=? WHERE org_id=? AND dn=?".into(), vec![json!(role), json!(&org), json!(&user.dn)]),
                 ], &[0, 1], Some(audit)).await?;
             } else if current != "owner" {
@@ -3438,7 +3445,7 @@ async fn ldap_login(State(st): State<S>, PeerAddr(addr): PeerAddr, Json(r): Json
             let fallback = db::s(&row, "default_role");
             user_guarded_commit(&st, &[&uid], &[
                 ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&uid)]),
-                ("UPDATE org_members SET role=? WHERE org_id=? AND user_id=? AND role=? AND role<>'owner'".into(), vec![json!(&fallback), json!(&org), json!(&uid), json!(&stored_role)]),
+                ("UPDATE org_members SET role=? WHERE org_id=? AND user_id=? AND role=? AND role<>'owner' AND locked=0".into(), vec![json!(&fallback), json!(&org), json!(&uid), json!(&stored_role)]),
                 ("UPDATE ldap_subjects SET role='' WHERE org_id=? AND dn=?".into(), vec![json!(&org), json!(&user.dn)]),
             ], &[0, 1], Some(audit)).await?;
         } else { st.audited_batch(&[], &[], audit).await.map_err(|e| bad(&e))?; }
@@ -6539,11 +6546,12 @@ async fn list_tokens(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>)
     let rows = st.db.query("SELECT id,app_id,env_id,name,kind,expires_at,scopes,last_used_at,created_at,created_by FROM tokens WHERE app_id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn revoke_token(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT created_by,org_id FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"token not found"))?;
-    // Revoking your own token stays available. Managing another member's
-    // credential follows the membership gate, including a workspace lock.
+    // Admin revocation is a workspace action, so a locked membership is
+    // rejected here with the coded workspace_locked denial.
+    let org = db::s(&row,"org_id");
     if db::s(&row,"created_by") != uid {
-        let role = st.require_org(&db::s(&row,"org_id"), &uid).await?;
-        if role != "owner" && role != "admin" { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+        st.require_org(&org,&uid).await?;
+        if st.org_role(&org,&uid).await.as_deref() != Some("owner") && st.org_role(&org,&uid).await.as_deref() != Some("admin") { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
     }
     st.db.exec("DELETE FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": tid}))) }
 
