@@ -238,3 +238,207 @@ async fn a_runner_token_cannot_read_other_organisations_jobs() {
     let r = s.call(Method::GET, "/api/orgs", Some(bt.as_str()), None).await;
     assert_eq!(r.status, 200, "{}", r.text);
 }
+
+fn default_envs(runner_pub: &str, user_pub: &str, key: &[u8; 32]) -> Vec<Value> {
+    ["Development", "Staging", "Production"].iter().map(|name| json!({
+        "name": name,
+        "wrapped_key": oc::encrypt_to(user_pub, key).unwrap(),
+        "runner_wrapped_key": oc::encrypt_to(runner_pub, key).unwrap(),
+    })).collect()
+}
+
+#[tokio::test]
+async fn the_instance_policy_controls_new_app_environments() {
+    let s = Server::start().await;
+    let (token, org, user_pub) = register_verified(&s, "policy@test.invalid").await;
+    let info = s.call(Method::GET, "/api/instance", Some(&token), None).await;
+    assert_eq!(info.body["app_env_policy"], json!("managed"), "managed is the default: {}", info.text);
+    assert_eq!(info.body["app_env_policy_locked"], json!(false));
+
+    let r = s.call(Method::PUT, "/api/instance/app-env-policy", Some(&token), Some(json!({"policy": "delegated"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let info = s.call(Method::GET, "/api/instance", Some(&token), None).await;
+    assert_eq!(info.body["app_env_policy"], json!("delegated"));
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({"name": "no-runner"}))).await;
+    assert_eq!(r.status, 400, "a delegated app without a runner must fail: {} {}", r.status, r.text);
+
+    let runner = oc::Keypair::generate();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", org), Some(&token), Some(json!({"name": "corp", "public_key": runner.public}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let runner_id = r.body["id"].as_str().unwrap().to_string();
+
+    let env_key = oc::random_key();
+    let envs = default_envs(&runner.public, &user_pub, &env_key);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({
+        "name": "delegated-app", "readme": "zero knowledge", "mode": "delegated", "runner_id": runner_id, "envs": envs
+    }))).await;
+    assert_eq!(r.status, 200, "delegated app create failed: {} {}", r.status, r.text);
+    let app = r.body["id"].as_str().unwrap().to_string();
+    assert_eq!(r.body["mode"], json!("delegated"));
+
+    let r = s.call(Method::GET, &format!("/api/apps/{}/envs", app), Some(&token), None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let list = r.body.as_array().unwrap();
+    assert_eq!(list.len(), 3, "{}", r.text);
+    for env in list {
+        assert_eq!(env["mode"], json!("delegated"));
+        assert_eq!(env["runner_id"], json!(runner_id));
+        let eid = env["id"].as_str().unwrap();
+        let server = s.call(Method::GET, &format!("/api/envs/{}/secrets", eid), Some(&token), None).await;
+        assert_eq!(server.status, 409, "the server must not read a delegated default: {} {}", server.status, server.text);
+    }
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let wrapped: String = conn.query_row("SELECT wrapped_key FROM runner_env_keys WHERE runner_id=?", [&runner_id], |row| row.get(0)).unwrap();
+    assert_eq!(runner.decrypt(&wrapped).unwrap(), env_key.to_vec(), "the runner grant must unwrap to the client key");
+
+    // Switching the policy back creates managed apps again and rejects a client
+    // that still asks for delegated.
+    let r = s.call(Method::PUT, "/api/instance/app-env-policy", Some(&token), Some(json!({"policy": "managed"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let envs = default_envs(&runner.public, &user_pub, &oc::random_key());
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({"name": "mismatch", "mode": "delegated", "runner_id": runner_id, "envs": envs}))).await;
+    assert_eq!(r.status, 409, "the instance policy must win: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({"name": "managed-again"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let managed_app = r.body["id"].as_str().unwrap();
+    let r = s.call(Method::GET, &format!("/api/apps/{}/envs", managed_app), Some(&token), None).await;
+    assert_eq!(r.body.as_array().unwrap()[0]["mode"], json!("sse"));
+}
+
+#[tokio::test]
+async fn delegated_app_validation_leaves_no_partial_app() {
+    let s = Server::start().await;
+    let (token, org, user_pub) = register_verified(&s, "atomic@test.invalid").await;
+    let r = s.call(Method::PUT, "/api/instance/app-env-policy", Some(&token), Some(json!({"policy": "delegated"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let runner = oc::Keypair::generate();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", org), Some(&token), Some(json!({"name": "r", "public_key": runner.public}))).await;
+    let runner_id = r.body["id"].as_str().unwrap().to_string();
+    let key = oc::random_key();
+    let good = default_envs(&runner.public, &user_pub, &key);
+    let cases = vec![
+        json!({"name": "no-envs", "mode": "delegated", "runner_id": runner_id}),
+        json!({"name": "short", "mode": "delegated", "runner_id": runner_id, "envs": good[..2].to_vec()}),
+        json!({"name": "duplicate", "mode": "delegated", "runner_id": runner_id, "envs": [good[0], good[0], good[1]]}),
+        json!({"name": "bad-blob", "mode": "delegated", "runner_id": runner_id, "envs": [good[0], good[1], json!({"name": "Production", "wrapped_key": "nope", "runner_wrapped_key": "nope"})]}),
+        json!({"name": "", "mode": "delegated", "runner_id": runner_id, "envs": good}),
+    ];
+    for body in cases {
+        let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(body.clone())).await;
+        assert_eq!(r.status, 400, "invalid delegated app must fail: {} {}", r.text, body);
+    }
+    // A runner from another organisation is not usable either.
+    let (bt, bo, _) = register_verified(&s, "other-org@test.invalid").await;
+    let other = oc::Keypair::generate();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", bo), Some(&bt), Some(json!({"name": "other", "public_key": other.public}))).await;
+    let other_runner = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({"name": "foreign-runner", "mode": "delegated", "runner_id": other_runner, "envs": good}))).await;
+    assert_eq!(r.status, 400, "a foreign runner must be refused: {} {}", r.status, r.text);
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let apps: i64 = conn.query_row("SELECT COUNT(*) FROM apps WHERE org_id=?", [&org], |row| row.get(0)).unwrap();
+    assert_eq!(apps, 0, "a rejected app must leave no row behind");
+}
+
+#[tokio::test]
+async fn members_can_read_runner_keys_but_only_admins_create_runners() {
+    let s = Server::start().await;
+    let (token, org, _) = register_verified(&s, "admin@test.invalid").await;
+    let runner = oc::Keypair::generate();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", org), Some(&token), Some(json!({"name": "provisioned", "public_key": runner.public}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let runner_id = r.body["id"].as_str().unwrap().to_string();
+
+    let (mt, _, _) = register_verified(&s, "member@test.invalid").await;
+    // Invitations need the invitee's explicit consent; accept it before the
+    // member can read anything in the workspace.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&token), Some(json!({"email": "member@test.invalid", "role": "developer"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::POST, "/api/auth/accept-invite", Some(&mt), Some(json!({"token": r.body["invite_token"]}))).await;
+    assert_eq!(r.status, 200, "accept invitation: {}", r.text);
+
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/runners", org), Some(&mt), None).await;
+    assert_eq!(r.status, 200, "a member needs the public key to wrap env keys: {} {}", r.status, r.text);
+    assert_eq!(r.body.as_array().unwrap()[0]["pubkey"], json!(runner.public));
+    assert!(!r.text.contains("token"), "the runner list must never expose a token: {}", r.text);
+
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", org), Some(&mt), Some(json!({"name": "mine", "public_key": oc::Keypair::generate().public}))).await;
+    assert_eq!(r.status, 403, "members must not mint runner tokens: {} {}", r.status, r.text);
+
+    // A read-only custom role must not enumerate runner identities.
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/roles", org), Some(&token), Some(json!({"name": "viewer", "permissions": ["secrets:read"]}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let (vt, _, _) = register_verified(&s, "viewer@test.invalid").await;
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(&token), Some(json!({"email": "viewer@test.invalid", "role": "viewer"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = s.call(Method::GET, &format!("/api/orgs/{}/runners", org), Some(&vt), None).await;
+    assert_eq!(r.status, 403, "a read-only role must not list runner identities: {} {}", r.status, r.text);
+
+    // The member can still create a delegated app with the provisioned runner.
+    let r = s.call(Method::PUT, "/api/instance/app-env-policy", Some(&token), Some(json!({"policy": "delegated"}))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let me = s.call(Method::GET, "/api/me", Some(&mt), None).await;
+    let member_pub = me.body["pubkey"].as_str().unwrap();
+    let key = oc::random_key();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&mt), Some(json!({
+        "name": "member-app", "mode": "delegated", "runner_id": runner_id, "envs": default_envs(&runner.public, member_pub, &key)
+    }))).await;
+    assert_eq!(r.status, 200, "a member with secrets:write may use the runner: {} {}", r.status, r.text);
+}
+
+#[tokio::test]
+async fn a_delegated_rekey_replaces_the_runner_key_grant() {
+    let s = Server::start().await;
+    let (token, org, user_pub) = register_verified(&s, "rekey-runner@test.invalid").await;
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    let uid = me.body["id"].as_str().unwrap().to_string();
+    let runner_key = oc::Keypair::generate();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/runners", org), Some(&token), Some(json!({"name": "r", "public_key": runner_key.public}))).await;
+    let runner_id = r.body["id"].as_str().unwrap().to_string();
+    let r = s.call(Method::POST, &format!("/api/orgs/{}/apps", org), Some(&token), Some(json!({"name": "app"}))).await;
+    let app = r.body["id"].as_str().unwrap().to_string();
+
+    let old_key = oc::random_key();
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs", app), Some(&token), Some(json!({
+        "name": "garbage", "mode": "delegated", "runner_id": runner_id,
+        "wrapped_key": "a", "runner_wrapped_key": "b"
+    }))).await;
+    assert_eq!(r.status, 400, "a malformed wrapped key must not create an unreadable env: {} {}", r.status, r.text);
+    let r = s.call(Method::POST, &format!("/api/apps/{}/envs", app), Some(&token), Some(json!({
+        "name": "production", "mode": "delegated", "runner_id": runner_id,
+        "wrapped_key": oc::encrypt_to(&user_pub, &old_key).unwrap(),
+        "runner_wrapped_key": oc::encrypt_to(&runner_key.public, &old_key).unwrap()
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let env = r.body["id"].as_str().unwrap().to_string();
+    let key_hash = oc::hash_token("/:API_KEY");
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), Some(json!({
+        "secrets": [{"key_enc": oc::encrypt_symmetric(&old_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&old_key, b"one"), "key_hash": key_hash, "path_enc": oc::encrypt_symmetric(&old_key, b"/")}]
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+
+    let new_key = oc::random_key();
+    let secrets = json!([{
+        "key_hash": key_hash,
+        "key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"),
+        "value_enc": oc::encrypt_symmetric(&new_key, b"two"),
+        "path_enc": oc::encrypt_symmetric(&new_key, b"/")
+    }]);
+    let grants = json!([{"user_id": uid, "wrapped_key": oc::encrypt_to(&user_pub, &new_key).unwrap()}]);
+    // A delegated rotation without the runner grant would leave the runner
+    // unable to sync, so the server must refuse it.
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"secrets": secrets, "grants": grants}))).await;
+    assert_eq!(r.status, 400, "a delegated rekey needs runner_wrapped_key: {} {}", r.status, r.text);
+    let runner_wrapped = oc::encrypt_to(&runner_key.public, &new_key).unwrap();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"secrets": secrets, "grants": grants, "runner_wrapped_key": runner_wrapped}))).await;
+    assert_eq!(r.status, 200, "rekey failed: {} {}", r.status, r.text);
+
+    let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();
+    let stored: String = conn.query_row("SELECT wrapped_key FROM runner_env_keys WHERE runner_id=? AND env_id=?", [&runner_id, &env], |row| row.get(0)).unwrap();
+    assert_eq!(runner_key.decrypt(&stored).unwrap(), new_key.to_vec(), "the runner must receive the rotated key");
+    let e2e = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), None).await;
+    assert_eq!(e2e.status, 200, "{}", e2e.text);
+    let value_enc = e2e.body["secrets"][0]["value_enc"].as_str().unwrap();
+    let value = oc::decrypt_symmetric(&new_key, value_enc).unwrap();
+    assert_eq!(value, b"two");
+}

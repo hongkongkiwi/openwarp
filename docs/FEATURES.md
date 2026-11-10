@@ -796,3 +796,9 @@ replacement.
 - The outbound HTTP client resolves names through a public-address filter in
   production, so a hostname that later points at loopback or a private range is
   rejected at connection time, not only when the URL was saved.
+
+New apps get three default environments in the instance's chosen mode. Managed
+is the default; an instance owner can switch new apps to delegated under
+Settings, or an operator can set `OPENWARP_APP_ENV_POLICY=delegated` (which
+locks the setting). Existing apps keep their modes. Pure `e2e` environments
+remain an explicit per-environment choice.

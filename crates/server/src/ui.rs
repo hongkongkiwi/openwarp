@@ -1160,6 +1160,9 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
     <label class="row" style="gap:8px;margin-top:16px"><input type="checkbox" id="set-workspace-creation" ${inst.workspace_creation_open?'checked':''} ${inst.workspace_creation_env_locked?'disabled':''}> Allow workspace creation</label>
     <p class="small mut">Separate from account signup. When off, new accounts have no personal workspace; invitations still work. ${inst.workspace_creation_env_locked?'Locked by OPENWARP_WORKSPACE_CREATION.':''}</p>
     <button onclick="saveWorkspacePolicy()" ${inst.workspace_creation_env_locked?'disabled':''}>Save workspace policy</button>
+    <div class="field" style="margin-top:16px"><label for="set-app-policy" data-i18n="Mode for new apps">Mode for new apps</label><select id="set-app-policy" ${inst.app_env_policy_locked?'disabled':''}><option value="managed" ${inst.app_env_policy!=='delegated'?'selected':''}>Managed (server-side encryption)</option><option value="delegated" ${inst.app_env_policy==='delegated'?'selected':''}>Delegated (client encryption, runner sync)</option></select></div>
+    <button onclick="saveAppPolicy()" ${inst.app_env_policy_locked?'disabled':''}>Save environment policy</button>
+    <p class="small mut" style="margin-top:6px">${inst.app_env_policy_locked?'Locked by OPENWARP_APP_ENV_POLICY.':'Existing apps keep their current environments. Pure end-to-end environments stay an explicit per-environment choice.'}</p>
     <div class="row" style="margin-top:12px"><label for="set-instance-owner" data-i18n="New instance owner email">New instance owner email</label><input id="set-instance-owner" type="email" style="min-width:260px"><button onclick="transferInstance()" data-i18n="Transfer instance">Transfer instance</button></div>
     <p class="small mut" style="margin-top:6px" data-i18n="The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.">The new owner needs an active, verified account. A solo instance can delete its only account once its workspace is gone.</p></div>`:'';
   let tp=themePref();
@@ -1223,6 +1226,7 @@ async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_ch
     if($('set-oidc-sec').value)b.oidc_client_secret=$('set-oidc-sec').value;}
   await api('PUT',`/api/orgs/${ORG}/settings`,b);toastUI('Settings saved', false)}catch(e){toast(e.message,true)}}
 async function saveSignups(){try{let d=await api('PUT','/api/instance/signups',{open:$('set-signups').checked});toastUI('Signups '+(d.signups_open?'enabled':'disabled'), false);renderSettings()}catch(e){toast(e.message,true)}}
+async function saveAppPolicy(){try{let d=await api('PUT','/api/instance/app-env-policy',{policy:$('set-app-policy').value});toastUI('Environment policy: '+d.policy, false);renderSettings()}catch(e){toast(e.message,true)}}
 async function saveFeatureGrants(org){try{
   let names=[...document.querySelectorAll('input[data-feat-org]')].filter(i=>i.dataset.featOrg===org&&i.checked).map(i=>i.dataset.featName);
   await api('PUT','/api/instance/features',{org,features:names});toastUI('Features saved', false);renderSettings()

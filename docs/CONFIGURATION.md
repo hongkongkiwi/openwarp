@@ -52,6 +52,7 @@ The KMS bridge URL may be plain HTTP. In that case wrap requests and unwrap resp
 | --- | --- | --- |
 | `OPENWARP_SIGNUPS` | Stored instance policy; initially open | `open` or `closed` pins the policy and overrides the console toggle |
 | `OPENWARP_WORKSPACE_CREATION` | Stored instance policy; initially open | Pins workspace creation independently of signup. `closed`, `invite`, `invite_only`, `disabled`, `0` and `false` disable it (case-insensitive); other values enable it. Native environment and Worker bindings use the same setting. |
+| `OPENWARP_APP_ENV_POLICY` | Stored instance policy; `managed` default | `delegated` makes new apps create their three default environments client-encrypted and binds them to a runner; the value pins the policy and disables the console toggle |
 | `OPENWARP_EMAIL_WEBHOOK` | Unset | HTTP relay receiving `{to,subject,text}` for account mail |
 | `OPENWARP_EMAIL_TOKEN` | Unset | Optional bearer authentication for the mail relay |
 
