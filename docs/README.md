@@ -38,6 +38,7 @@ Run a local instance, choose an encryption boundary, then connect the workloads 
 | [HTTP API](API.md) | Bearer authentication, resource discovery, export, errors and contract boundaries, plus workload, path-policy, rotation and transit endpoints |
 | [Clients and automation](CLIENTS.md) | SDK directory inventory, Terraform, GitHub Actions and client differences |
 | [Integrations](INTEGRATIONS.md) | Provider configuration, sync options and destination-specific behavior |
+| [Agent credential broker](AGENT_BROKER.md) | Restricted HTTP and remote MCP operations without disclosing upstream credentials to agents |
 | [Webhooks](WEBHOOKS.md) | Signed outgoing subscriptions and incoming integration triggers |
 | [Webhook source review](WEBHOOK_REVIEW.md) | Inspected upstream webhook practices and limits |
 | [Kubernetes](KUBERNETES.md) | Workload consumption and the External Secrets Operator webhook bridge |

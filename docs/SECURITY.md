@@ -334,6 +334,27 @@ The CLI attempts to store access and refresh tokens in the operating system cred
 
 Lockbox shares are intended for one-time viewing. Anyone with the complete link can attempt to consume it. Treat the URL fragment containing the decryption key as secret material; do not send the link through a system that rewrites or previews sensitive links without testing that behavior.
 
+## Agent credential broker
+
+The [broker](AGENT_BROKER.md) separates credential use from credential retrieval.
+Its short-lived sessions authenticate only the broker endpoints, not the normal
+API or secret-management MCP. Current subject permissions, issuing administrator
+authority, service revision and session revocation are checked for invocations.
+Do not give the agent a human account session or another secret-reading token.
+
+Approved upstream services receive the credential. Output projections default to
+no data and permit selected scalar fields, but cannot prevent a malicious
+upstream from encoding credentials into an allowed field. Treat upstream
+services, the native broker and the instance operator as trusted. An agent can
+still misuse a permitted operation or receive sensitive business data.
+
+The initial broker supports native SSE environments only. Client-encrypted
+credentials do not gain a server-side decryption path. Private-egress overrides
+do not apply to broker destinations. Session-level human approval of privileged
+capabilities does not provide per-call confirmation, and revocation cannot undo
+an action already dispatched. Broker audit metadata excludes arguments, results
+and credential values.
+
 ## Before production use
 
 1. Obtain an independent review appropriate to the data you will store.

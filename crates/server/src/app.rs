@@ -24,6 +24,8 @@ include!("webhook_execution_tests.rs");
 #[cfg(all(test,not(target_arch="wasm32")))]
 include!("master_publication_tests.rs");
 #[path = "workspaces.rs"] mod workspaces;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[path = "broker.rs"] mod broker;
 use openwarp_crypto as oc;
 #[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
 use risaml::{
@@ -302,6 +304,7 @@ impl AppState {
         let bearer = headers.get("authorization").map(|v| v.to_str().ok().and_then(|s| s.strip_prefix("Bearer ")).filter(|s| !s.is_empty()).ok_or_else(|| err(StatusCode::UNAUTHORIZED,"invalid Authorization header"))).transpose()?;
         let cookie_only=bearer.is_none();
         let token=bearer.map(str::to_string).unwrap_or_else(|| cookie_val(headers,"ow_session"));
+        if token.starts_with("owb_") || cookie_val(headers,"ow_session").starts_with("owb_") { return Err(err(StatusCode::UNAUTHORIZED, "broker credentials are not account sessions")); }
         if token.is_empty() { return Err(err(StatusCode::UNAUTHORIZED, "missing Bearer token")); }
         let hash = oc::hash_token(&token);
         self.token_user_by_hash(&hash, cookie_only).await
@@ -6444,7 +6447,7 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
                 }
             };
             lists.is_empty() || lists.iter().all(|l| l.split(',').any(|c| ip_in_cidr(&client_ip, c))) } } };
-    if !allowed { return (StatusCode::FORBIDDEN, Json(json!({"error": format!("source IP {} not in organisation allowlist", client_ip)}))).into_response(); }
+    if !allowed { if path.starts_with("/api/broker/") || path.contains("/broker/") { return broker::failure(StatusCode::FORBIDDEN, &id()); } return (StatusCode::FORBIDDEN, Json(json!({"error": format!("source IP {} not in organisation allowlist", client_ip)}))).into_response(); }
     next.run(req).await }
 
 // API and MCP audiences are separate; administration needs org:admin, not
@@ -7954,7 +7957,7 @@ pub fn router(state: S) -> Router {
     api_router(state).merge(mcp)
 }
 fn api_router(state: S) -> Router {
-    let app = Router::new()
+    let app = Router::new().merge(broker::routes())
         .route("/api/capabilities", get(api_capabilities))
         .merge(webhooks::routes())
         .merge(worker_routes())
