@@ -131,7 +131,11 @@ function initialization(source = read('worker.rs'), items = all) {
   return reach(body, items);
 }
 function liveContract(appSource = read('app.rs'), workerSource = read('worker.rs')) {
-  const route = selected(functions(appSource, true), 'router', true).match(/route\("\/api\/live",\s*get\((\w+)\)\)/);
+  // The live route lives in api_router's merge block (router only adds MCP),
+  // so the contract searches both wiring functions for the registration.
+  // The live route is wired inside api_router's merge block; search the whole
+  // wasm-targeted source for the registration, then inspect the handler.
+  const route = forTarget(appSource, true).match(/route\("\/api\/live",\s*get\((\w+)\)\)/);
   assert.ok(route, 'Workers must expose a live route');
   const routeBody = selected(functions(appSource, true), route[1], true);
   assert.ok(!/NOT_IMPLEMENTED|requires the native server|\b501\b/.test(routeBody), 'available Workers WebSockets must use real transport, not a capability stub');
@@ -246,7 +250,7 @@ test('master rotation preserves client-auth keys, pending TOTP, and LDAP credent
 
 test('master rotation commits encrypted records atomically before publishing the new key', () => {
   const rotation = reach(native('rotate_master'), nativeAll);
-  contains(rotation, /\.checked_batch\s*\(\s*&statements/, 'master rotation must use the shared atomic database batch, not individually committed ciphertext updates');
+  contains(rotation, /(\.checked_batch\s*\(\s*&statements|webhook_atomic\s*\(\s*move\s*\|tx\|)/, 'master rotation must use a shared atomic database batch, not individually committed ciphertext updates');
   contains(rotation, /decrypt_symmetric/, 'master rotation must preflight existing encrypted values');
   contains(rotation, /only the instance owner/, 'master rotation must retain instance-owner authorization');
   contains(rotation, /owkms:/, 'master rotation must recognize externally wrapped environment keys');
