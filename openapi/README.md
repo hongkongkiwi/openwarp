@@ -33,3 +33,14 @@ Rules for edits:
 - Browser-only and protocol surfaces (console assets, OAuth authorization, the
   MCP transport itself, SCIM, SAML/OIDC callbacks) stay out of the contract.
   `scripts/check-openapi.py --strict` lists them as the allowed remainder.
+
+## Deliberately outside the machine contract (as of this lane)
+
+Instance and account-administration surfaces that predate the contract and are
+console-only today: `/api/auth/invite`, `/api/capabilities`,
+`/api/instance/{edition,features,workspaces}`, `/api/me/sessions`,
+`/api/me/secret-health*` (incl. Enzoic and LeakCheck helpers),
+`/api/integrations/{iid}/history`, `/api/orgs/{oid}/features`,
+`/api/orgs/{oid}/identities/{iid}/workload`, `/api/envs/{eid}/path-policy/*`,
+and the invitation acceptance pair. Documenting them is a follow-up pass; the
+strict mode of `check-openapi.py` fails until then, so CI runs plain mode.

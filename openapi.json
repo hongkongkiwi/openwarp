@@ -1166,6 +1166,54 @@
         },
         "type": "object"
       },
+      "IncomingWebhook": {
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "integration_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "url": {
+            "description": "Invocation URL; POST signed Standard Webhooks messages here.",
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "IncomingWebhookCreated": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "secret": {
+            "description": "whsec_-prefixed signing secret, shown exactly once.",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "Instance": {
         "allOf": [
           {
@@ -4107,6 +4155,272 @@
         },
         "type": "object"
       },
+      "WebhookAttempt": {
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "description": "processing, delivered, failed or lease_expired.",
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookDelivery": {
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "error_code": {
+            "description": "Safe failure code; never a provider response body.",
+            "type": "string"
+          },
+          "event_id": {
+            "description": "Stable event id; deduplicate on it.",
+            "type": "string"
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "next_attempt_at": {
+            "type": "integer"
+          },
+          "status": {
+            "description": "pending, processing, delivered, failed, dead_lettered or cancelled.",
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "webhook_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookReceipt": {
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "message_id": {
+            "description": "webhook-id header of the accepted message.",
+            "type": "string"
+          },
+          "next_attempt_at": {
+            "type": "integer"
+          },
+          "outcome": {
+            "description": "Truncated sync outcome message after processing.",
+            "type": "string"
+          },
+          "status": {
+            "description": "pending, processing, delivered, failed, dead_lettered or cancelled.",
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "webhook_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookReceiptDetail": {
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "body": {
+            "description": "Decrypted captured payload; null when not captured or erased by master-key rotation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_available": {
+            "type": "boolean"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "source_ip": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookReceiptQueued": {
+        "properties": {
+          "id": {
+            "description": "Receipt id; inspect it via the receipts endpoints.",
+            "type": "string"
+          },
+          "queued": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookRotation": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "public_key": {
+            "description": "New Ed25519 public key for asymmetric subscriptions.",
+            "type": "string"
+          },
+          "secret": {
+            "description": "New signing secret, shown exactly once.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookSubscription": {
+        "properties": {
+          "app_id": {
+            "description": "Application scope; empty means the entire workspace.",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "disabled_reason": {
+            "description": "Set when the subscription auto-paused after repeated dead-lettered deliveries.",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "events": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "public_key": {
+            "description": "whpk_-prefixed Ed25519 public key, present for asymmetric subscriptions.",
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookSubscriptionCreated": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "public_key": {
+            "description": "Present for asymmetric subscriptions.",
+            "type": "string"
+          },
+          "secret": {
+            "description": "whsec_-prefixed signing secret, shown exactly once.",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "WebhookTestQueued": {
+        "properties": {
+          "event_id": {
+            "description": "Stable event id the receiver can deduplicate on.",
+            "type": "string"
+          },
+          "queued": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "WorkloadTrust": {
         "properties": {
           "audience": {
@@ -4263,6 +4577,7 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "$comment": "Ported from the pre-split contract: device PKI lifecycle routes.",
     "/api/access-requests/{rid}/{action}": {
       "post": {
         "description": "Requires environment access and org:admin permission. approve adds an environment member; every other action string rejects. Already-decided requests return 400. Environment-scoped tokens cannot use this route.",
@@ -9675,6 +9990,401 @@
         ]
       }
     },
+    "/api/incoming-webhooks/{wid}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete an incoming trigger",
+        "tags": [
+          "webhooks"
+        ]
+      },
+      "patch": {
+        "description": "Renames the trigger or toggles enabled. Pausing cancels outstanding receipts.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncomingWebhook"
+                }
+              }
+            },
+            "description": "Updated trigger"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update an incoming trigger",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/incoming-webhooks/{wid}/reauthorize": {
+      "post": {
+        "description": "Binds the trigger to the caller's current credential and source IP without changing the URL or signing key. Cancels outstanding receipts and is audited.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncomingWebhook"
+                }
+              }
+            },
+            "description": "Reauthorized trigger"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Reauthorize an incoming trigger",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/incoming-webhooks/{wid}/receipts": {
+      "get": {
+        "description": "Receipt metadata only: status, attempts, outcome and safe error codes. Captured payloads are never included.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "default": 0,
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebhookReceipt"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Receipt rows"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List incoming receipts",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/incoming-webhooks/{wid}/receipts/{rid}": {
+      "get": {
+        "description": "One receipt's metadata plus its captured payload, decrypted on the fly. A payload erased by master-key rotation returns body_available=false with a null body.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookReceiptDetail"
+                }
+              }
+            },
+            "description": "Receipt with decrypted capture"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Receipt not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Inspect an incoming receipt",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/incoming-webhooks/{wid}/receipts/{rid}/replay": {
+      "post": {
+        "description": "Requeues a delivered, failed or dead-lettered receipt with the same stored bytes, resetting the attempt budget and outcome. The delivery-time authorization checks run again before any sync.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Receipt queued for replay"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Receipt not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Receipt is pending or in flight, or the queue is full"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replay an incoming receipt",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/incoming-webhooks/{wid}/rotate": {
+      "post": {
+        "description": "Generates a new signing secret. The invocation URL is unchanged.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRotation"
+                }
+              }
+            },
+            "description": "New signing secret"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rotate an incoming trigger signing key",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
     "/api/instance": {
       "get": {
         "parameters": [],
@@ -10620,6 +11330,126 @@
         "summary": "Test the integration credentials",
         "tags": [
           "integrations"
+        ]
+      }
+    },
+    "/api/integrations/{iid}/webhooks": {
+      "get": {
+        "description": "Lists the incoming triggers configured for one integration. Requires integrations:write plus environment access.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/IncomingWebhook"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Incoming triggers"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Integration not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List incoming integration triggers",
+        "tags": [
+          "webhooks"
+        ]
+      },
+      "post": {
+        "description": "Creates an incoming trigger and returns its invocation URL and one-time signing secret. Currently requires a server-encrypted environment.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncomingWebhookCreated"
+                }
+              }
+            },
+            "description": "Trigger with URL and one-time secret"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Integration not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Trigger limit reached or environment mode unsupported"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create an incoming webhook trigger",
+        "tags": [
+          "webhooks"
         ]
       }
     },
@@ -14439,6 +15269,71 @@
         ]
       }
     },
+    "/api/orgs/{oid}/pki/expiring": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List device certificates expiring within a window",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/pki/expiry-notify": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Send pending expiry email to verified active workspace owners and admins",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
     "/api/orgs/{oid}/roles": {
       "get": {
         "parameters": [
@@ -16443,6 +17338,249 @@
         ]
       }
     },
+    "/api/orgs/{oid}/webhooks": {
+      "get": {
+        "description": "Requires an organisation-admin credential (unscoped, or an OAuth/token principal carrying org:admin). Returns at most 100 subscriptions newest first.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebhookSubscription"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Subscriptions"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin or credential is environment-scoped"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List outgoing webhook subscriptions",
+        "tags": [
+          "webhooks"
+        ]
+      },
+      "post": {
+        "description": "Creates a subscription and returns its signing secret once as whsec_<base64>. The URL must be HTTPS outside private networks unless OPENWARP_ALLOW_PRIVATE_EGRESS=1. Optional app_id scopes deliveries to one application; events defaults to [\"*\"] and accepts audit action names or *. asymmetric=true adds an Ed25519 signature whose public key is returned as whpk_. A workspace holds at most 100 subscriptions.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "app_id": {
+                    "type": "string"
+                  },
+                  "asymmetric": {
+                    "type": "boolean"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "events": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookSubscriptionCreated"
+                }
+              }
+            },
+            "description": "Subscription with one-time signing secret"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid URL, name or event filters"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Subscription limit reached"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create an outgoing webhook subscription",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/attestation": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the attestation configuration",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Configure the attestation issuer and key",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
     "/api/pki/cas/{caid}/certs": {
       "get": {
         "description": "Requires workspace membership; rejects SSH CAs. Returns metadata, not certificate or private key PEM.",
@@ -16605,6 +17743,309 @@
         "summary": "Download an X.509 CRL",
         "tags": [
           "pki"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List devices under a CA",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a device record",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/codes": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint enrollment codes for existing devices",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/export": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "CSV inventory"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Export the device inventory as CSV",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/devices/import": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Bulk create devices and optionally mint enrollment codes",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/groups": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List device groups",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a device group",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/cas/{caid}/hook": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the enrollment policy hook configuration",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Configure the enrollment policy hook",
+        "tags": [
+          "PKI"
         ]
       }
     },
@@ -16788,6 +18229,34 @@
         ]
       }
     },
+    "/api/pki/cas/{caid}/revoke": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "caid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke a CA and every certificate it issued",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
     "/api/pki/certs/{cid}/revoke": {
       "post": {
         "description": "Requires org:admin when the certificate's CA exists. Marks the certificate revoked; does not read a JSON body.",
@@ -16861,6 +18330,483 @@
         "summary": "Revoke an X.509 certificate",
         "tags": [
           "pki"
+        ]
+      }
+    },
+    "/api/pki/devices/{did}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a device and revoke its certificates",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a device and its certificate history",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "patch": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update a device",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/enrollment": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint a single-use enrollment code",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/renew": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint a renewal code that revokes the previous certificate",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/revoke": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke a device's active certificate",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/devices/{did}/tpm": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the trusted TPM AK and PCR policy",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "ak_public": {
+                    "description": "Padded base64 exact TPM2B_PUBLIC, provisioned out of band",
+                    "type": "string"
+                  },
+                  "pcr_digest": {
+                    "description": "SHA256 of concatenated SHA256 PCR values 0 through 7",
+                    "pattern": "^[0-9A-Fa-f]{64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ak_public",
+                  "pcr_digest"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Provision a trusted TPM AK public area and PCR policy",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/enroll": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [],
+        "summary": "Enroll a device with a CSR and a one-time code (public)",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/groups/{gid}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a device group",
+        "tags": [
+          "PKI"
+        ]
+      },
+      "patch": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update a device group",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/groups/{gid}/revoke": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke every certificate in a group",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/renew": {
+      "post": {
+        "description": "Request challenge_id and padded base64 detached signature of the exact returned challenge text. P256 ECDSA SHA256 or P384 ECDSA SHA384 ASN.1 DER, Ed25519, or RSA PKCS1 SHA256. Optional attestation JWT or tpm_evidence follows the current CA policy, with nonce equal to challenge_id. Replacement issuance and previous-certificate revocation commit atomically.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "security": [],
+        "summary": "Renew with a detached proof signed by the active certificate key",
+        "tags": [
+          "PKI"
+        ]
+      }
+    },
+    "/api/pki/renew/challenge": {
+      "post": {
+        "description": "Request device_id and new PEM CSR. Returns challenge_id, exact challenge text and expires_at. A proof must use the existing active certificate key, not the CSR key.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Policy or authorization denied"
+          },
+          "409": {
+            "description": "State changed; retry"
+          }
+        },
+        "security": [],
+        "summary": "Create a five-minute renewal challenge for an active device certificate",
+        "tags": [
+          "PKI"
         ]
       }
     },
@@ -19310,6 +21256,463 @@
         ]
       }
     },
+    "/api/webhook-deliveries/{did}/attempts": {
+      "get": {
+        "description": "Per-attempt records with HTTP status, duration and safe failure codes, including expired claims. Response bodies are not captured.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebhookAttempt"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Attempt rows"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Delivery not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List delivery attempts",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhook-deliveries/{did}/retry": {
+      "post": {
+        "description": "Requeues a failed or dead-lettered delivery, preserving the event id and bytes and resetting the attempt budget.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "did",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Delivery queued for retry"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Delivery not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Only failed or dead-lettered deliveries can be retried"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Retry a failed delivery",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/{wid}": {
+      "delete": {
+        "description": "Cancels outstanding deliveries. Already transmitted requests cannot be recalled.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete an outgoing webhook",
+        "tags": [
+          "webhooks"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookSubscription"
+                }
+              }
+            },
+            "description": "Subscription without signing material"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read an outgoing webhook subscription",
+        "tags": [
+          "webhooks"
+        ]
+      },
+      "patch": {
+        "description": "Updates name, URL, event filters, application scope or enabled state. Any update increments the version and cancels outstanding deliveries.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "app_id": {
+                    "type": "string"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "events": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookSubscription"
+                }
+              }
+            },
+            "description": "Updated subscription"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update an outgoing webhook subscription",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/{wid}/deliveries": {
+      "get": {
+        "description": "Delivery metadata only: status, attempts, HTTP status, duration, safe error codes and next attempt time. Payloads and response bodies are never returned.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "default": 0,
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebhookDelivery"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Delivery rows"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List outgoing delivery history",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/{wid}/rotate": {
+      "post": {
+        "description": "Generates a new signing secret (and a new Ed25519 pair for asymmetric subscriptions). Returns the new secret and public key once.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRotation"
+                }
+              }
+            },
+            "description": "New signing material"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Webhook not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rotate an outgoing webhook signing key",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/{wid}/test": {
+      "post": {
+        "description": "Queues a metadata-only test event for an enabled subscription.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookTestQueued"
+                }
+              }
+            },
+            "description": "Test event queued"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Subscription paused or disabled"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Queue a signed test event",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
     "/health": {
       "get": {
         "description": "Unauthenticated. Returns 503 if the database probe fails.",
@@ -19340,6 +21743,84 @@
         "summary": "Probe database-backed service health",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/hooks/integrations/{wid}": {
+      "post": {
+        "description": "Signed ingestion endpoint authenticated by Standard Webhooks headers (webhook-id, webhook-timestamp, webhook-signature with v1 HMAC) rather than a bearer token. Bodies are capped at 64 KiB; a new accepted receipt returns 202, an identical replay returns 200 with duplicate=true, and changed bytes under a repeated id return 409. A queued receipt triggers a manual sync of the fixed integration.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Duplicate replay of an already accepted message"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookReceiptQueued"
+                }
+              }
+            },
+            "description": "Receipt accepted and queued"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid signature"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Message id reused with different bytes"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Source or hook rate budget exceeded"
+          }
+        },
+        "summary": "Ingest a signed webhook message",
+        "tags": [
+          "webhooks"
         ]
       }
     }

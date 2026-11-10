@@ -1,0 +1,316 @@
+{
+  "IncomingWebhook": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "enabled": {
+        "type": "boolean"
+      },
+      "id": {
+        "type": "string"
+      },
+      "integration_id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      },
+      "url": {
+        "description": "Invocation URL; POST signed Standard Webhooks messages here.",
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "IncomingWebhookCreated": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "secret": {
+        "description": "whsec_-prefixed signing secret, shown exactly once.",
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookAttempt": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "duration_ms": {
+        "type": "integer"
+      },
+      "error_code": {
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "status": {
+        "description": "processing, delivered, failed or lease_expired.",
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookDelivery": {
+    "properties": {
+      "attempts": {
+        "type": "integer"
+      },
+      "duration_ms": {
+        "type": "integer"
+      },
+      "error_code": {
+        "description": "Safe failure code; never a provider response body.",
+        "type": "string"
+      },
+      "event_id": {
+        "description": "Stable event id; deduplicate on it.",
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "next_attempt_at": {
+        "type": "integer"
+      },
+      "status": {
+        "description": "pending, processing, delivered, failed, dead_lettered or cancelled.",
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      },
+      "webhook_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookReceipt": {
+    "properties": {
+      "attempts": {
+        "type": "integer"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "duration_ms": {
+        "type": "integer"
+      },
+      "error_code": {
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "message_id": {
+        "description": "webhook-id header of the accepted message.",
+        "type": "string"
+      },
+      "next_attempt_at": {
+        "type": "integer"
+      },
+      "outcome": {
+        "description": "Truncated sync outcome message after processing.",
+        "type": "string"
+      },
+      "status": {
+        "description": "pending, processing, delivered, failed, dead_lettered or cancelled.",
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      },
+      "webhook_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookReceiptDetail": {
+    "properties": {
+      "attempts": {
+        "type": "integer"
+      },
+      "body": {
+        "description": "Decrypted captured payload; null when not captured or erased by master-key rotation.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body_available": {
+        "type": "boolean"
+      },
+      "content_type": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "error_code": {
+        "type": "string"
+      },
+      "http_status": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "message_id": {
+        "type": "string"
+      },
+      "outcome": {
+        "type": "string"
+      },
+      "source_ip": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookReceiptQueued": {
+    "properties": {
+      "id": {
+        "description": "Receipt id; inspect it via the receipts endpoints.",
+        "type": "string"
+      },
+      "queued": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookRotation": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "public_key": {
+        "description": "New Ed25519 public key for asymmetric subscriptions.",
+        "type": "string"
+      },
+      "secret": {
+        "description": "New signing secret, shown exactly once.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookSubscription": {
+    "properties": {
+      "app_id": {
+        "description": "Application scope; empty means the entire workspace.",
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "disabled_reason": {
+        "description": "Set when the subscription auto-paused after repeated dead-lettered deliveries.",
+        "type": "string"
+      },
+      "enabled": {
+        "type": "boolean"
+      },
+      "events": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "public_key": {
+        "description": "whpk_-prefixed Ed25519 public key, present for asymmetric subscriptions.",
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "integer"
+      },
+      "url": {
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookSubscriptionCreated": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "public_key": {
+        "description": "Present for asymmetric subscriptions.",
+        "type": "string"
+      },
+      "secret": {
+        "description": "whsec_-prefixed signing secret, shown exactly once.",
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WebhookTestQueued": {
+    "properties": {
+      "event_id": {
+        "description": "Stable event id the receiver can deduplicate on.",
+        "type": "string"
+      },
+      "queued": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  }
+}
