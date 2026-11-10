@@ -101,7 +101,7 @@ jobs:
         run: |
           cargo install worker-build --version 0.8.7
           cargo install wasm-bindgen-cli --version 0.2.130
-          cd crates/server && worker-build --release --no-default-features --features workload-identity,transit,change-requests
+          cd crates/server && worker-build --release --no-default-features --features workload-identity
       - name: Deployment configuration gate
         run: node --test scripts/tests/portable-runtime/worker-deployment.test.cjs
       - name: Workerd smoke test
