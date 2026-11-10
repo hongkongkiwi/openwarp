@@ -7062,7 +7062,7 @@
     },
     "/api/broker/mcp": {
       "post": {
-        "description": "Executes one tool call against a service-bound MCP endpoint with an owb_ session token, under the same revalidation, projection and audit rules as the HTTP executor.",
+        "description": "Executes one tool call against a service-bound MCP endpoint with an owb_ session token, under the same revalidation, projection and audit rules as the HTTP executor. The request advertises both required Accept media types, but responses are consumed as JSON only; a server that answers with an SSE stream fails with a bad gateway.",
         "responses": {
           "200": {
             "content": {
@@ -16491,7 +16491,7 @@
     },
     "/api/orgs/{oid}/broker/services": {
       "get": {
-        "description": "Lists the workspace's broker services. Requires broker:use; the caller also needs read authority on each service's environment history. Configs are returned without credential material.",
+        "description": "Lists the workspace's broker services. Requires an organisation admin; the caller also needs read authority on each service's environment history. Configs are returned without credential material.",
         "parameters": [
           {
             "in": "path",
@@ -16516,7 +16516,7 @@
         }
       },
       "post": {
-        "description": "Creates a broker service: one environment, one credential secret, kind http or mcp, and a policy of capabilities with optional path restrictions. The credential value is never accepted here; the service references a secret the environment already stores. Optimistic revisioning starts at 1; audited as broker.service.",
+        "description": "Creates a broker service: one environment, one credential secret, kind http or mcp, and a policy of capabilities with optional path restrictions. The credential value is never accepted here; the service references a secret the environment already stores. Optimistic revisioning starts at 1. Control-plane mutations carry no dedicated audit event; invocations are audited.",
         "parameters": [
           {
             "in": "path",
@@ -16716,14 +16716,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
+          "204": {
             "description": "Session revoked"
           }
         }

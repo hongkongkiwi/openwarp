@@ -236,7 +236,7 @@ async fn broker_issue_is_refused_while_a_lockdown_is_active() {
 }
 
 #[tokio::test]
-async fn broker_sessions_stop_when_the_issuer_becomes_path_restricted() {
+async fn broker_sessions_stop_when_the_credential_path_becomes_restricted() {
     let f = Fixture::new().await;
     let admin = f.s.register("broker-admin@test.invalid").await;
     let at = id(&admin,"token"); let auid = id(&admin,"user_id");
