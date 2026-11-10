@@ -175,6 +175,8 @@ fn builtin(kind: &str) -> (&'static str, &'static str) {
     match kind {
         "verify" => ("Verify your OpenWarp address",
             "Confirm your email address by opening this link:\n{{link}}\n\nIt expires in 24 hours. If you did not create an account, ignore this message."),
+        "link" => ("Confirm a sign-in link for OpenWarp",
+            "A sign-in attempt wants to link a provider identity to your OpenWarp account.\n\nConfirm it by opening this link:\n{{link}}\n\nIt expires in 10 minutes. If you did not start this, ignore this message."),
         "reset" => ("Reset your OpenWarp password",
             "Open this link to choose a new password:\n{{link}}\n\nIt expires in one hour. You will be asked for your recovery kit unless you choose to replace your key."),
         "invite" => ("You are invited to OpenWarp",

@@ -375,6 +375,23 @@ async function resetPassword(){try{
   toastUI(d.e2e_key_replaced?'Password set; your key was replaced':'Password set', false);await enterApp();
 }catch(e){toast(e.message,true)}}
 let MODE='login';
+function providerName(p){const m=(typeof PROVIDERS!=='undefined')&&PROVIDERS.find(x=>x[0]===p);if(p==='oidc'||p.startsWith('oidc:'))return 'SSO';return m?m[1]:p}
+function showLink(token,provider,org){
+  $('auth').style.display='grid';$('shell').style.display='none';owText($('authtitle'),'Link your sign-in');
+  $('authform').innerHTML=`<p class="mut">An account with this email already exists. Enter that account's password to link ${esc(providerName(provider||'this provider'))}.</p>
+    <div class="field"><label for="link-pw">Password</label><input id="link-pw" type="password" autocomplete="current-password" placeholder="account password"></div>
+    <div class="field"><label for="link-code">Authenticator or recovery code</label><input id="link-code" placeholder="if MFA is enabled"></div>
+    <button class="primary" style="width:100%;padding:11px" onclick="completeLink()">Link account</button>
+    <button class="ghost" style="width:100%;margin-top:6px" onclick="emailLink()">Email me a confirmation link</button>`;
+  $('authform').dataset.link=token;$('authform').dataset.linkorg=org||''}
+async function completeLink(){try{
+  let d=await api('POST','/api/auth/link/complete',{token:$('authform').dataset.link,password:$('link-pw').value,code:$('link-code').value});
+  T=d.token;history.replaceState(null,'',location.pathname);enterApp();
+}catch(e){toast(e.message,true)}}
+async function emailLink(){try{
+  await api('POST','/api/auth/link/email',{token:$('authform').dataset.link});
+  toast('Check your email for a confirmation link');
+}catch(e){toast(e.message,true)}}
 function authMode(m){MODE=m;$('seglogin').classList.toggle('on',m==='login');$('segreg').classList.toggle('on',m==='register');owText($('authtitle'),m==='login'?'Welcome back':'Create your account');owText($('authbtn'),m==='login'?'Sign in':'Create account')}
 async function doAuth(){try{
   if(MODE==='register'){let d=await api('POST','/api/auth/register',{email:$('email').value,password:$('pw').value});
@@ -1174,6 +1191,9 @@ async function renderSettings(){owText($('pagetitle'),'Settings');owDataText($('
   <div class="field"><label for="set-oidc-iss" data-i18n="OIDC issuer">OIDC issuer</label><input id="set-oidc-iss" value="${esc(s?.oidc_issuer||'')}" placeholder="https://accounts.google.com"${dis}></div>
   <div class="row"><input id="set-oidc-cid" value="${esc(s?.oidc_client_id||'')}" placeholder="OIDC client id" data-i18n-placeholder="OIDC client id"${dis}><input id="set-oidc-sec" type="password" placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}" data-i18n-placeholder="${s?.oidc_client_secret_set?'stored; leave blank to keep':'OIDC client secret'}"${dis}><input id="set-oidc-redir" value="${esc(s?.oidc_redirect_uri||'')}" placeholder="redirect URI" data-i18n-placeholder="redirect URI" style="min-width:260px"${dis}></div>
   <div class="field"><label for="set-oidc-domains" data-i18n="SSO email domains (comma separated; empty = any account at the issuer may join)">SSO email domains (comma separated; empty = any account at the issuer may join)</label><input id="set-oidc-domains" value="${esc(s?.oidc_allowed_domains||'')}" placeholder="example.com,subsidiary.example" style="width:100%"${dis}></div>
+  <div class="field"><label for="set-oidc-groups" data-i18n="SSO groups claim">SSO groups claim</label><input id="set-oidc-groups" value="${esc(s?.oidc_groups_claim||'')}" placeholder="groups"${dis}></div>
+  <div class="field"><label for="set-oidc-roles" data-i18n="Group to role map (Group=role;Group=role)">Group to role map</label><input id="set-oidc-roles" value="${esc(s?.oidc_group_roles||'')}" placeholder="{&quot;platform-admin&quot;:&quot;admin&quot;}"${dis}></div>
+  <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-group-join"${dis}> <span data-i18n="Allow a matching SSO group to join this workspace">Allow a matching SSO group to join this workspace</span></label>
   <label class="row" style="gap:8px;margin-bottom:8px"><input type="checkbox" id="set-oidc-auto" ${s?.oidc_auto_provision?'checked':''}${dis}> <span data-i18n="Allow first-time SSO users to join as developers">Allow first-time SSO users to join as developers</span></label>
   <div class="row" style="margin-top:10px"><button class="primary" onclick="saveSettings()" data-i18n="Save settings">Save settings</button></div></div>
   ${samlCard}
@@ -1194,6 +1214,9 @@ function oidcPreset(){let p=$('set-oidc-provider').value;let map={google:'https:
 async function saveSettings(){try{let b={ip_allowlist:$('set-ip').value,reuse_check:$('set-reuse').checked};
   if(isEnterprise()){b.oidc_auto_provision=$('set-oidc-auto').checked;b.oidc_allowed_domains=$('set-oidc-domains').value;
     b.oidc_provider=$('set-oidc-provider').value;
+    b.oidc_groups_claim=$('set-oidc-groups')?.value||'';
+    b.oidc_group_roles=$('set-oidc-roles')?.value||'';
+    b.oidc_group_membership=$('set-oidc-group-join')?.checked||false;
     if($('set-oidc-iss').value)b.oidc_issuer=$('set-oidc-iss').value;
     if($('set-oidc-cid').value)b.oidc_client_id=$('set-oidc-cid').value;
     if($('set-oidc-redir').value)b.oidc_redirect_uri=$('set-oidc-redir').value;
@@ -1513,6 +1536,19 @@ function boot(){
     owText($('authbtn'),'Verify code');$('authbtn').onclick=doMfa;}
   else if(h.startsWith('invite=')){showInvite(decodeURIComponent(h.slice(7).split('&')[0]));}
   else if(h.startsWith('reset=')){showReset(decodeURIComponent(h.slice(6).split('&')[0]));}
+  else if(h.startsWith('link=')){
+    // An SSO login matched an existing account: the server demands a password
+    // proof before binding the identity instead of linking by email alone.
+    let parts=h.slice(5).split('&');let provider='';let org='';
+    for(let p of parts.slice(1)){if(p.startsWith('provider='))provider=p.slice(9);if(p.startsWith('org='))org=p.slice(4);}
+    history.replaceState(null,'',location.pathname);
+    showLink(decodeURIComponent(parts[0]),decodeURIComponent(provider),decodeURIComponent(org));}
+  else if(h.startsWith('linked=')){
+    history.replaceState(null,'',location.pathname);
+    $('auth').style.display='grid';$('shell').style.display='none';
+    owText($('authtitle'),'Identity linked');
+    $('view').innerHTML='';
+    $('authform').innerHTML='<p class="mut" data-i18n="The sign-in identity is now linked to your account. Sign in again to continue.">The sign-in identity is now linked to your account. Sign in again to continue.</p><button class="primary" style="width:100%;padding:11px" onclick="authMode(\'login\');loadProviders()" data-i18n="Back to sign in">Back to sign in</button>';}
   else if(h.startsWith('error=')){
     // A sign-in method the binary has but the workspace has not enabled sends
     // the browser back here instead of a JSON body.

@@ -193,6 +193,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
   const media = { matches: !!opts.dark, listeners: [], addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); } };
   const responses = {
     '/api/auth/providers': { google: false, github: false, saml: true, signups: 'open' },
+    '/api/auth/providers': { google: false, github: false, signups: 'open' },
+    '/api/me/identities': { social: [], oidc: [] },
     '/api/instance': { instance_owner: false },
     '/api/instance/edition': { tier: 'self-hosted', enterprise: false, customer: null, expires_at: null, development: false, warning: null },
     '/api/me': { email: 'fixture@example.invalid' },

@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS link_challenges(token_hash TEXT PRIMARY KEY,provider TEXT NOT NULL,subject TEXT NOT NULL,issuer TEXT DEFAULT '',verified_issuer TEXT DEFAULT '',user_id TEXT NOT NULL,org_id TEXT DEFAULT '',email TEXT DEFAULT '',groups TEXT DEFAULT '[]',created_at BIGINT NOT NULL,expires_at BIGINT NOT NULL,used BIGINT DEFAULT 0);

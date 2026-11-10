@@ -119,15 +119,37 @@ impl Server {
     }
 
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let r = self.call_raw(method.clone(), path, token, body.clone()).await;
+        if r.status == 428 {
+            if let Some(t) = token {
+                if let Some(grant) = self.step_up(t, &r.body).await {
+                    return self.call_with_headers(method, path, token, body, &[("x-openwarp-step-up", &grant)]).await;
+                } } }
+        r }
+    async fn call_raw(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, self.url(path));
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = body { req = req.json(&b); }
         finish(req.send().await).await
     }
+    async fn call_with_headers(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>, headers: &[(&str, &str)]) -> Resp {
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = &body { req = req.json(b); }
+        for (k, v) in headers { req = req.header(*k, *v); }
+        finish(req.send().await).await
+    }
+    async fn step_up(&self, token: &str, info: &Value) -> Option<String> {
+        let risk = info["risk"].as_str().unwrap_or("very_risky");
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call_raw(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": risk}))).await;
+        if start.status != 200 { return None; }
+        let challenge = start.body["challenge"].as_str()?.to_string();
+        if !start.body["email_sent"].as_bool().unwrap_or(false) { return None; }
+        let text = wait_for_new_mail(&self.inbox, "sensitive action", before).await;
+        let code = six_digit_code_in(&text)?;
+        let verified = self.call_raw(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        verified.body["token"].as_str().map(str::to_string) }
 
     async fn form(&self, path: &str, form: &[(&str, String)], token: Option<&str>) -> Resp {
         let mut req = self.client.post(self.url(path)).form(form);
@@ -185,12 +207,26 @@ async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
     panic!("no email containing {:?} arrived", needle);
 }
 
+async fn wait_for_new_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str, before: usize) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if guard.len() > before {
+              if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+                  return m["text"].as_str().unwrap_or("").to_string(); } } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no new email containing {:?} arrived", needle);
+}
+
 fn extract_link(text: &str, needle: &str) -> String {
     for word in text.split_whitespace() {
         if let Some(i) = word.find(needle) { return word[i..].to_string(); }
     }
     panic!("no link containing {:?} in {:?}", needle, text);
 }
+
+fn six_digit_code_in(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).map(str::to_string) }
 
 async fn register(s: &Server, email: &str) -> Value {
     let r = s
@@ -868,7 +904,9 @@ zx/UpPmCIb8/3cJ8IR+QpA==
 -----END PRIVATE KEY-----"#;
 const OIDC_TEST_N: &str = "uTt-NHHm3ZFrMRYklTgNMQpbuY5FXX5P09Yen7BB6hyQ0S7cUYiXr2jAa-5ipW6eHej0FkOsnRc7IeoG-CKhO_1DjSjYavmSv0qSmmNA4qKxaV-1C36HPUb2W_9M8AbhYuI-JJtgQ2n9PVrxCHf0G4osxPaNBL9WEJMqnJO3c9bediZxOLSNGjs-owL8HHleUH5T7Bpimvj4iZ1xH2Yp-1UU4vyEEV757ULSA5OAjJdqk-Vf3BjSjbaR4vtfc2veqrdISKYbA_z8DGDfQM9QWfP5coE0542SH3KzJ2RG1TUn2U7QGtrc4LngJVMfgiZhBOidTH1VugBhxr-0kel1Yw";
 
-fn start_idp(email: &str) -> (String, Arc<Mutex<String>>) {
+struct MockIdp { issuer: String, nonce: Arc<Mutex<String>> }
+
+fn start_idp(email: &str) -> MockIdp {
     let listener = TcpListener::bind("127.0.0.1:0").expect("idp bind");
     let addr = listener.local_addr().expect("idp addr");
     let issuer = format!("http://{}", addr);
@@ -905,21 +943,19 @@ fn start_idp(email: &str) -> (String, Arc<Mutex<String>>) {
             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
         }
     });
-    (issuer, nonce_slot)
+    MockIdp { issuer, nonce: nonce_slot }
 }
 
-async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &str, nonce: &Arc<Mutex<String>>) -> String {
+async fn begin_oidc(s: &Server, session: &str, org: &str, idp: &MockIdp) -> String {
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(session), Some(json!({
-        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_issuer": idp.issuer, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
         "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
         "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid"}))).await;
     assert_eq!(r.status, 200, "oidc settings failed: {}", r.text);
     let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
     assert_eq!(r.status, 307, "oidc start failed: {}", r.text);
-    let location = r.header("location");
-    let params = parse_query(&location);
-    *nonce.lock().unwrap() = params.get("nonce").cloned().unwrap_or_default();
-    params.get("state").cloned().expect("state")
+    *idp.nonce.lock().unwrap() = parse_query(&r.header("location")).get("nonce").cloned().unwrap_or_default();
+    parse_query(&r.header("location")).get("state").cloned().expect("state")
 }
 
 #[tokio::test]
@@ -929,11 +965,17 @@ async fn oidc_does_not_link_an_existing_account_by_email() {
     let attacker = register(&s, "oidc-attacker@test.invalid").await;
     let at = attacker["token"].as_str().unwrap();
     let ao = attacker["org_id"].as_str().unwrap();
-    let (idp, nonce) = start_idp("oidc-victim@test.invalid");
-    let state = begin_oidc(&s, at, ao, &idp, &nonce).await;
+    let idp = start_idp("oidc-victim@test.invalid");
+    let state = begin_oidc(&s, at, ao, &idp).await;
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
-    assert_eq!(r.status, 409, "an existing email must be refused, got {} {}", r.status, r.header("location"));
-    assert!(!r.header("location").contains("token="), "no session may be issued for the victim: {}", r.header("location"));
+    assert_eq!(r.status, 307, "an existing email must be offered the proof flow, got {} {}", r.status, r.text);
+    let location = r.header("location");
+    assert!(location.contains("#link="), "the proof challenge must be returned: {}", location);
+    assert!(!location.contains("token="), "no session may be issued for the victim: {}", location);
+    let challenge = location.split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no link challenge in {}", location);
+    let bad = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "not-the-victims-password"}))).await;
+    assert_eq!(bad.status, 401, "a wrong password must not link the victim's identity, got {} {}", bad.status, bad.text);
     let _ = victim;
 }
 
@@ -943,8 +985,8 @@ async fn oidc_provisions_a_new_user() {
     let attacker = register(&s, "oidc-new@test.invalid").await;
     let at = attacker["token"].as_str().unwrap();
     let ao = attacker["org_id"].as_str().unwrap();
-    let (idp, nonce) = start_idp("oidc-newcomer@test.invalid");
-    let state = begin_oidc(&s, at, ao, &idp, &nonce).await;
+    let idp = start_idp("oidc-newcomer@test.invalid");
+    let state = begin_oidc(&s, at, ao, &idp).await;
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
     assert_eq!(r.status, 307, "new users should be provisioned, got {} {}", r.status, r.text);
     let location = r.header("location");
@@ -1068,17 +1110,15 @@ async fn oidc_new_users_need_org_auto_provisioning() {
     let owner = register(&s, "oidc-policy@test.invalid").await;
     let token = owner["token"].as_str().unwrap();
     let org = owner["org_id"].as_str().unwrap();
-    let (idp, nonce) = start_idp("oidc-nopolicy@test.invalid");
+    let idp = start_idp("oidc-nopolicy@test.invalid");
     let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
-        "oidc_issuer": idp, "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-client", "oidc_client_secret": "test-secret",
         "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base)}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/auth/oidc/{}/start", org), None, None).await;
     assert_eq!(r.status, 307, "{}", r.text);
-    let location = r.header("location");
-    let params = parse_query(&location);
-    *nonce.lock().unwrap() = params.get("nonce").cloned().unwrap_or_default();
-    let state = params.get("state").cloned().expect("state");
+    let state = parse_query(&r.header("location")).get("state").cloned().expect("state");
+    *idp.nonce.lock().unwrap() = parse_query(&r.header("location")).get("nonce").cloned().unwrap_or_default();
     let r = s.call(Method::GET, &format!("/api/auth/oidc/callback?code=abc&state={}", state), None, None).await;
     assert_eq!(r.status, 403, "an org without auto-provisioning must not admit a new SSO user, got {} {}", r.status, r.text);
 }

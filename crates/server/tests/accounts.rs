@@ -80,6 +80,9 @@ impl Server {
             .env_remove("OPENWARP_GOOGLE_CLIENT_ID")
             .env_remove("OPENWARP_GITHUB_CLIENT_ID")
             .env_remove("OPENWARP_APPLE_CLIENT_ID")
+            .env_remove("OPENWARP_APPLE_PRIVATE_KEY")
+            .env_remove("OPENWARP_APPLE_TEAM_ID")
+            .env_remove("OPENWARP_APPLE_KEY_ID")
             .env_remove("OPENWARP_OPENAI_CLIENT_ID")
             .env_remove("OPENWARP_MICROSOFT_CLIENT_ID")
             .env_remove("OPENWARP_OKTA_CLIENT_ID")
@@ -92,6 +95,9 @@ impl Server {
             .env_remove("OPENWARP_OIDC_ISSUER")
             .env_remove("OPENWARP_OIDC_CLIENT_ID")
             .env_remove("OPENWARP_OIDC_CLIENT_SECRET")
+            .env_remove("OPENWARP_OIDC_TOKEN_AUTH_METHOD")
+            .env_remove("OPENWARP_OIDC_PRIVATE_KEY")
+            .env_remove("OPENWARP_OIDC_KEY_ID")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (k, v) in extra {
@@ -113,13 +119,21 @@ impl Server {
     fn url(&self, path: &str) -> String { format!("{}{}", self.base, path) }
 
     async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let r = self.call_raw(method.clone(), path, token, body.clone()).await;
+        if r.status == 428 {
+            if let Some(t) = token {
+                if let Some(grant) = self.step_up(t, &r.body).await {
+                    return self.call_with_headers(method, path, token, body, &[("x-openwarp-step-up", &grant)]).await;
+                } } }
+        r }
+    async fn call_raw(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, self.url(path));
         if path.starts_with("/api/auth/social/") && path.contains("/callback") {
             req = req.header("cookie", self.social_cookies.lock().unwrap().join("; ")); }
         if let Some(t) = token { req = req.bearer_auth(t); }
         if let Some(b) = body { req = req.json(&b); }
         let response = req.send().await.expect("http request");
-        if path.starts_with("/api/auth/social/") && path.ends_with("/start") {
+        if path.starts_with("/api/auth/social/") && path.contains("/start") {
             for cookie in response.headers().get_all("set-cookie").iter().filter_map(|h| h.to_str().ok()).filter_map(|h| h.split(';').next()).filter(|c| c.starts_with("ow_social_")) {
                 self.social_cookies.lock().unwrap().push(cookie.to_string()); } }
         let status = response.status().as_u16();
@@ -128,6 +142,29 @@ impl Server {
         let body = serde_json::from_str(&text).unwrap_or(Value::Null);
         Resp { status, text, body, headers }
     }
+    async fn call_with_headers(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>, headers: &[(&str, &str)]) -> Resp {
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(t) = token { req = req.bearer_auth(t); }
+        if let Some(b) = &body { req = req.json(b); }
+        for (k, v) in headers { req = req.header(*k, *v); }
+        let response = req.send().await.expect("http request");
+        let status = response.status().as_u16();
+        let h = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Resp { status, text, body, headers: h }
+    }
+    async fn step_up(&self, token: &str, info: &Value) -> Option<String> {
+        let risk = info["risk"].as_str().unwrap_or("very_risky");
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call_raw(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": risk}))).await;
+        if start.status != 200 { return None; }
+        let challenge = start.body["challenge"].as_str()?.to_string();
+        if !start.body["email_sent"].as_bool().unwrap_or(false) { return None; }
+        let text = wait_for_new_mail(&self.inbox, "sensitive action", before).await;
+        let code = six_digit_code_in(&text)?;
+        let verified = self.call_raw(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        verified.body["token"].as_str().map(str::to_string) }
 
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
 
@@ -301,14 +338,16 @@ struct MockIdp { base: String, issuer: String, token_forms: Arc<Mutex<Vec<String
 
 /// Mock identity provider: discovery, JWKS, and a token endpoint that signs an
 /// id_token for the requested email. Also serves the GitHub endpoints.
-fn start_mock(email: &'static str, client_id: &'static str) -> MockIdp { start_mock_full(email, client_id, "", None, false) }
+fn start_mock(email: &'static str, client_id: &'static str) -> MockIdp { start_mock_full(email, client_id, "", None, false, &[]) }
 /// A non-empty suffix makes the issuer include a path that serves no discovery
 /// document, which exercises the explicit endpoint overrides.
-fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static str) -> MockIdp { start_mock_full(email, client_id, suffix, None, false) }
+fn start_mock_at(email: &'static str, client_id: &'static str, suffix: &'static str) -> MockIdp { start_mock_full(email, client_id, suffix, None, false, &[]) }
 /// Microsoft mode publishes a templated issuer and returns the UPN instead of email.
 fn start_mock_tenant(email: &'static str, client_id: &'static str, tenant: &'static str) -> MockIdp {
-    start_mock_full(email, client_id, "", Some(tenant), true) }
-fn start_mock_full(email: &'static str, client_id: &'static str, suffix: &'static str, tenant: Option<&'static str>, upn_only: bool) -> MockIdp {
+    start_mock_full(email, client_id, "", Some(tenant), true, &[]) }
+fn start_mock_groups(email: &'static str, client_id: &'static str, groups: &'static [&'static str]) -> MockIdp {
+    start_mock_full(email, client_id, "", None, false, groups) }
+fn start_mock_full(email: &'static str, client_id: &'static str, suffix: &'static str, tenant: Option<&'static str>, upn_only: bool, groups: &'static [&'static str]) -> MockIdp {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
     let addr = listener.local_addr().expect("mock addr");
     let base = format!("http://{}", addr);
@@ -355,6 +394,7 @@ fn start_mock_full(email: &'static str, client_id: &'static str, suffix: &'stati
                 let nonce = issued_nonce.lock().unwrap().clone();
                 if !nonce.is_empty() { claims["nonce"] = json!(nonce); }
                 if let Some(t) = tenant { claims["tid"] = json!(t); }
+                if !groups.is_empty() { claims["groups"] = json!(groups); }
                 if upn_only { claims["preferred_username"] = json!(email); }
                 else { claims["email"] = json!(email); claims["email_verified"] = json!(true); }
                 let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_PEM.as_bytes()).expect("rsa pem");
@@ -379,6 +419,28 @@ fn start_mock_full(email: &'static str, client_id: &'static str, suffix: &'stati
 fn set_expected_nonce(idp: &MockIdp, location: &str) {
     *idp.nonce.lock().unwrap() = query_param(location, "nonce");
 }
+
+fn jwt_claims(token: &str) -> Value {
+    let mut s = token.split('.').nth(1).expect("jwt payload").replace('-', "+").replace('_', "/");
+    while !s.len().is_multiple_of(4) { s.push('='); }
+    serde_json::from_slice(&openwarp_crypto::unb64(&s).expect("base64 payload")).expect("json payload") }
+
+fn form_value(form: &str, key: &str) -> String {
+    let raw = form.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v.to_string()).unwrap_or_default();
+    let bytes = raw.as_bytes(); let mut out = Vec::new(); let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&raw[i + 1..i + 3], 16) { out.push(v); i += 3; continue; } }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] }); i += 1; }
+    String::from_utf8_lossy(&out).into_owned() }
+
+fn signed_logout_token(issuer: &str, client_id: &str, subject: &str, jti: &str) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let claims = json!({"iss": issuer, "aud": client_id, "sub": subject, "iat": now, "exp": now + 120, "jti": jti,
+        "events": {"http://schemas.openid.net/event/backchannel-logout": {}}});
+    let header = jsonwebtoken::Header { alg: jsonwebtoken::Algorithm::RS256, kid: Some("t1".into()), ..Default::default() };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_PEM.as_bytes()).expect("rsa pem");
+    jsonwebtoken::encode(&header, &claims, &key).expect("sign logout token") }
 
 #[tokio::test]
 async fn signups_can_be_closed_and_invites_provision_accounts() {
@@ -772,6 +834,338 @@ async fn custom_oidc_rejects_an_id_token_without_the_flow_nonce() {
 }
 
 #[tokio::test]
+async fn custom_oidc_private_key_jwt_authenticates_the_client() {
+    let idp = start_mock("jwt-user@test.invalid", "test-oidc");
+    let s = Server::start_env(&[
+        ("OPENWARP_OIDC_ISSUER", idp.issuer.clone()),
+        ("OPENWARP_OIDC_CLIENT_ID", "test-oidc".to_string()),
+        ("OPENWARP_OIDC_TOKEN_AUTH_METHOD", "private_key_jwt".to_string()),
+        ("OPENWARP_OIDC_PRIVATE_KEY", TEST_PEM.to_string()),
+        ("OPENWARP_OIDC_KEY_ID", "client-key-1".to_string()),
+    ]).await;
+    let start = s.get("/api/auth/social/oidc/start").await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "{} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("jwt-user@test.invalid"), "{}", me.text);
+    let forms = idp.token_forms.lock().unwrap();
+    let form = forms.last().expect("token request");
+    assert!(form_value(form, "client_secret").is_empty(), "private_key_jwt must not send a secret: {}", form);
+    assert_eq!(form_value(form, "client_assertion_type"), "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", "form: {}", form);
+    let assertion = form_value(form, "client_assertion");
+    let header = jsonwebtoken::decode_header(&assertion).expect("assertion header");
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+    assert_eq!(header.kid.as_deref(), Some("client-key-1"));
+    let claims = jwt_claims(&assertion);
+    assert_eq!(claims["iss"], json!("test-oidc"));
+    assert_eq!(claims["sub"], json!("test-oidc"));
+    assert_eq!(claims["aud"], json!(format!("{}/token", idp.base)));
+}
+
+#[tokio::test]
+async fn custom_oidc_client_secret_jwt_authenticates_the_client() {
+    let idp = start_mock("secret-jwt-user@test.invalid", "test-oidc");
+    let s = Server::start_env(&[
+        ("OPENWARP_OIDC_ISSUER", idp.issuer.clone()),
+        ("OPENWARP_OIDC_CLIENT_ID", "test-oidc".to_string()),
+        ("OPENWARP_OIDC_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_OIDC_TOKEN_AUTH_METHOD", "client_secret_jwt".to_string()),
+    ]).await;
+    let start = s.get("/api/auth/social/oidc/start").await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "{} {}", r.status, r.text);
+    let forms = idp.token_forms.lock().unwrap();
+    let form = forms.last().expect("token request");
+    assert!(form_value(form, "client_secret").is_empty(), "client_secret_jwt must not send a secret: {}", form);
+    let assertion = form_value(form, "client_assertion");
+    let header = jsonwebtoken::decode_header(&assertion).expect("assertion header");
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::HS256);
+    let claims = jwt_claims(&assertion);
+    assert_eq!(claims["iss"], json!("test-oidc"));
+    assert_eq!(claims["aud"], json!(format!("{}/token", idp.base)));
+}
+
+#[tokio::test]
+async fn apple_p8_key_generates_the_client_secret() {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec key");
+    let pem = key.serialize_pem();
+    let idp = start_mock("apple-p8@test.invalid", "test-apple");
+    let s = Server::start_env(&[
+        ("OPENWARP_APPLE_CLIENT_ID", "test-apple".to_string()),
+        ("OPENWARP_APPLE_PRIVATE_KEY", pem),
+        ("OPENWARP_APPLE_TEAM_ID", "TEAM123456".to_string()),
+        ("OPENWARP_APPLE_KEY_ID", "KEY123456".to_string()),
+        ("OPENWARP_APPLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let r = s.get("/api/auth/providers").await;
+    assert_eq!(r.body["apple"], json!(true), "the .p8 key must configure Apple: {}", r.text);
+    let start = s.get("/api/auth/social/apple/start").await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let r = s.get(&format!("/api/auth/social/apple/callback?code=abc&state={}", state)).await;
+    assert_eq!(r.status, 307, "{} {}", r.status, r.text);
+    let token = r.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("apple-p8@test.invalid"), "{}", me.text);
+    let forms = idp.token_forms.lock().unwrap();
+    let secret = form_value(forms.last().expect("token request"), "client_secret");
+    assert!(!secret.is_empty(), "Apple must send a client secret: {:?}", *forms);
+    let header = jsonwebtoken::decode_header(&secret).expect("client secret header");
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::ES256);
+    assert_eq!(header.kid.as_deref(), Some("KEY123456"));
+    let claims = jwt_claims(&secret);
+    assert_eq!(claims["iss"], json!("TEAM123456"));
+    assert_eq!(claims["sub"], json!("test-apple"));
+    assert_eq!(claims["aud"], json!("https://appleid.apple.com"));
+}
+
+#[tokio::test]
+async fn oidc_group_claims_map_to_org_roles() {
+    let idp = start_mock_groups("group-admin@test.invalid", "test-oidc", &["openwarp-admins"]);
+    let s = Server::start().await;
+    let owner = register(&s, "group-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let settings = format!("/api/orgs/{}/settings", org);
+    let bad = s.call(Method::PUT, &settings, Some(ot), Some(json!({"oidc_group_roles": "{\"openwarp-admins\":\"root\"}"}))).await;
+    assert_eq!(bad.status, 400, "an unknown mapped role must be refused, got {} {}", bad.status, bad.text);
+    let r = s.call(Method::PUT, &settings, Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid",
+        "oidc_groups_claim": "groups", "oidc_group_roles": "{\"openwarp-admins\":\"admin\"}"
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    let token = cb.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
+    let row = orgs.body.as_array().and_then(|a| a.iter().find(|o| o["id"] == json!(org))).expect("the SSO user must join the org");
+    assert_eq!(row["role"], json!("admin"), "the matching group must set the org role: {}", orgs.text);
+}
+
+#[tokio::test]
+async fn oidc_group_membership_admits_a_matching_group() {
+    let idp = start_mock_groups("group-member@test.invalid", "test-oidc", &["openwarp-eng"]);
+    let s = Server::start().await;
+    let owner = register(&s, "group-join-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": false, "oidc_allowed_domains": "test.invalid",
+        "oidc_groups_claim": "groups", "oidc_group_roles": "{\"openwarp-eng\":\"developer\"}",
+        "oidc_group_membership": true
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "a matching group must admit the user: {} {}", cb.status, cb.text);
+    let token = cb.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(&token), None).await;
+    let row = orgs.body.as_array().and_then(|a| a.iter().find(|o| o["id"] == json!(org))).expect("the group member must join the org");
+    assert_eq!(row["role"], json!("developer"), "{}", orgs.text);
+}
+
+#[tokio::test]
+async fn provider_login_with_an_existing_email_offers_account_linking() {
+    let idp = start_mock("proof-owner@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let account = register(&s, "proof-owner@test.invalid").await;
+    let account_token = account.body["token"].as_str().unwrap().to_string();
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    let location = cb.header("location");
+    assert!(location.contains("#link="), "an existing email must offer the proof flow: {}", location);
+    assert!(!location.contains("token="), "no session may be issued before proof: {}", location);
+    let challenge = location.split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    let bad = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "wrong-password"}))).await;
+    assert_eq!(bad.status, 401, "a wrong password must not link the identity: {} {}", bad.status, bad.text);
+    let ok = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    let linked = ok.body["token"].as_str().unwrap();
+    let me = s.call(Method::GET, "/api/me", Some(linked), None).await;
+    assert_eq!(me.body["email"], json!("proof-owner@test.invalid"), "{}", me.text);
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&account_token), None).await;
+    assert!(ids.body["social"].as_array().map(|a| a.iter().any(|x| x["provider"] == json!("google"))).unwrap_or(false), "{}", ids.text);
+    let replay = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(replay.status, 400, "a link challenge must be single use: {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn provider_login_can_link_via_a_confirmation_email() {
+    let idp = start_mock("proof-email@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    register(&s, "proof-email@test.invalid").await;
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    let challenge = cb.header("location").split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no proof challenge in {}", cb.header("location"));
+    let sent = s.call(Method::POST, "/api/auth/link/email", None, Some(json!({"token": challenge}))).await;
+    assert_eq!(sent.status, 200, "{}", sent.text);
+    let text = wait_for_mail(&s.inbox, "/api/auth/link/verify?token=").await;
+    let link = extract_link(&text, "/api/auth/link/verify?token=");
+    let path = link.strip_prefix(&s.base).unwrap_or(&link).to_string();
+    let verified = s.get(&path).await;
+    assert_eq!(verified.status, 307, "{} {}", verified.status, verified.text);
+    let token = verified.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!(me.body["email"], json!("proof-email@test.invalid"), "{}", me.text);
+}
+
+#[tokio::test]
+async fn org_sso_can_link_an_existing_account_after_proof() {
+    let idp = start_mock("org-proof@test.invalid", "test-oidc");
+    let s = Server::start().await;
+    let owner = register(&s, "org-proof-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let existing = register(&s, "org-proof@test.invalid").await;
+    let existing_token = existing.body["token"].as_str().unwrap().to_string();
+    let added = s.call(Method::POST, &format!("/api/orgs/{}/members", org), Some(ot), Some(json!({"email": "org-proof@test.invalid", "role": "developer"}))).await;
+    assert_eq!(added.status, 200, "{}", added.text);
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": false, "oidc_allowed_domains": "test.invalid"
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    let challenge = cb.header("location").split("#link=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert!(!challenge.is_empty(), "no proof challenge in {}", cb.header("location"));
+    let ok = s.call(Method::POST, "/api/auth/link/complete", None, Some(json!({"token": challenge, "password": "correct-horse-battery"}))).await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    let session = ok.body["token"].as_str().unwrap();
+    let orgs = s.call(Method::GET, "/api/orgs", Some(session), None).await;
+    assert!(orgs.text.contains(org), "the linked account must keep its membership: {}", orgs.text);
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&existing_token), None).await;
+    assert!(ids.body["oidc"].as_array().map(|a| a.iter().any(|x| x["issuer"] == json!(idp.issuer))).unwrap_or(false), "{}", ids.text);
+}
+
+#[tokio::test]
+async fn account_linking_binds_a_provider_identity_to_an_existing_user() {
+    let idp = start_mock("linked-google@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let user = register(&s, "link-owner@test.invalid").await;
+    let token = user.body["token"].as_str().unwrap().to_string();
+    let start = s.call(Method::GET, "/api/auth/social/google/start?link=1", Some(&token), None).await;
+    assert_eq!(start.status, 307, "{}", start.text);
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 307, "{} {}", cb.status, cb.text);
+    assert!(cb.header("location").contains("#linked=google"), "{}", cb.header("location"));
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&token), None).await;
+    assert_eq!(ids.status, 200, "{}", ids.text);
+    assert!(ids.body["social"].as_array().map(|a| a.iter().any(|x| x["provider"] == json!("google") && x["subject"] == json!("mock-subject-1"))).unwrap_or(false), "{}", ids.text);
+
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert!(cb.header("set-cookie").contains("HttpOnly"), "a social login must set the session cookie: {}", cb.header("set-cookie"));
+    let linked_token = cb.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    let me = s.call(Method::GET, "/api/me", Some(&linked_token), None).await;
+    assert_eq!(me.body["email"], json!("link-owner@test.invalid"), "the linked identity must resolve to the existing account: {}", me.text);
+
+    let other = register(&s, "link-other@test.invalid").await;
+    let other_token = other.body["token"].as_str().unwrap();
+    let start = s.call(Method::GET, "/api/auth/social/google/start?link=1", Some(other_token), None).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    assert_eq!(cb.status, 409, "an identity cannot be linked twice, got {} {}", cb.status, cb.text);
+
+    let un = s.call(Method::POST, "/api/me/identities/unlink", Some(&token), Some(json!({"provider": "google", "subject": "mock-subject-1"}))).await;
+    assert_eq!(un.status, 200, "{}", un.text);
+    let ids = s.call(Method::GET, "/api/me/identities", Some(&token), None).await;
+    assert!(ids.body["social"].as_array().map(|a| a.is_empty()).unwrap_or(false), "the identity must be gone: {}", ids.text);
+}
+
+#[tokio::test]
+async fn backchannel_logout_revokes_sessions_and_rejects_replay() {
+    let idp = start_mock("logout-user@test.invalid", "test-google");
+    let s = Server::start_env(&[
+        ("OPENWARP_GOOGLE_CLIENT_ID", "test-google".to_string()),
+        ("OPENWARP_GOOGLE_CLIENT_SECRET", "test-secret".to_string()),
+        ("OPENWARP_GOOGLE_ISSUER", idp.issuer.clone()),
+    ]).await;
+    let start = s.get("/api/auth/social/google/start").await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/social/google/callback?code=abc&state={}", state)).await;
+    let token = cb.header("location").split("#token=").nth(1).unwrap_or("").to_string();
+    assert_eq!(s.call(Method::GET, "/api/me", Some(&token), None).await.status, 200, "the session must start valid");
+    let logout = signed_logout_token(&idp.issuer, "test-google", "mock-subject-1", "logout-1");
+    let r = s.post_form("/api/auth/social/google/backchannel-logout", &[("logout_token", &logout)]).await;
+    assert_eq!(r.status, 200, "{} {}", r.status, r.text);
+    assert_eq!(s.call(Method::GET, "/api/me", Some(&token), None).await.status, 401, "back-channel logout must revoke the session");
+    let replay = s.post_form("/api/auth/social/google/backchannel-logout", &[("logout_token", &logout)]).await;
+    assert_eq!(replay.status, 400, "a logout token must be single use: {} {}", replay.status, replay.text);
+}
+
+#[tokio::test]
+async fn org_backchannel_logout_revokes_the_sso_session() {
+    let idp = start_mock("org-logout@test.invalid", "test-oidc");
+    let s = Server::start().await;
+    let owner = register(&s, "org-logout-owner@test.invalid").await;
+    let ot = owner.body["token"].as_str().unwrap();
+    let org = owner.body["org_id"].as_str().unwrap();
+    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({
+        "oidc_issuer": idp.issuer.clone(), "oidc_client_id": "test-oidc", "oidc_client_secret": "secret",
+        "oidc_redirect_uri": format!("{}/api/auth/oidc/callback", s.base),
+        "oidc_auto_provision": true, "oidc_allowed_domains": "test.invalid"
+    }))).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let start = s.get(&format!("/api/auth/oidc/{}/start", org)).await;
+    set_expected_nonce(&idp, &start.header("location"));
+    let state = query_param(&start.header("location"), "state");
+    let cb = s.get(&format!("/api/auth/oidc/callback?code=abc&state={}", state)).await;
+    let token = cb.header("location").split("#token=").nth(1).unwrap_or("").split('&').next().unwrap_or("").to_string();
+    assert_eq!(s.call(Method::GET, "/api/me", Some(&token), None).await.status, 200);
+    let logout = signed_logout_token(&idp.issuer, "test-oidc", "mock-subject-1", "org-logout-1");
+    let r = s.post_form(&format!("/api/auth/oidc/{}/backchannel-logout", org), &[("logout_token", &logout)]).await;
+    assert_eq!(r.status, 200, "{} {}", r.status, r.text);
+    assert_eq!(s.call(Method::GET, "/api/me", Some(&token), None).await.status, 401, "the SSO session must be revoked");
+}
+
+#[tokio::test]
 async fn org_sso_requires_an_invite_when_signups_are_closed() {
     let idp = start_mock("sso-invite@test.invalid", "test-google");
     let s = Server::start().await;
@@ -894,12 +1288,44 @@ async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
     panic!("no email containing {:?} arrived", needle);
 }
 
+async fn wait_for_new_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str, before: usize) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if guard.len() > before {
+              if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+                  return m["text"].as_str().unwrap_or("").to_string(); } } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no new email containing {:?} arrived", needle);
+}
+
 fn extract_link(text: &str, needle: &str) -> String {
     for word in text.split_whitespace() {
         if let Some(i) = word.find(needle) { return word[i..].to_string(); }
     }
     panic!("no link containing {:?} in {:?}", needle, text);
 }
+
+fn six_digit_code_in(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).map(str::to_string) }
+
+fn b32decode(s: &str) -> Vec<u8> {
+    let mut bits = 0u32; let mut n = 0u32; let mut out = Vec::new();
+    for c in s.chars().filter(|c| *c != '=') {
+        let u = c.to_ascii_uppercase();
+        let v = match u { 'A'..='Z' => u as u32 - 'A' as u32, '2'..='7' => u as u32 - '2' as u32 + 26, _ => continue };
+        bits = (bits << 5) | v; n += 5;
+        if n >= 8 { n -= 8; out.push((bits >> n) as u8); } }
+    out }
+
+fn totp_now(secret_b32: &str) -> String {
+    use hmac::{Hmac, Mac}; use sha1::Sha1; type H = Hmac<Sha1>;
+    let counter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 30;
+    let mut m = H::new_from_slice(&b32decode(secret_b32)).expect("hmac key"); m.update(&counter.to_be_bytes());
+    let hash = m.finalize().into_bytes();
+    let off = (hash[19] & 0x0f) as usize;
+    let code = ((hash[off] as u32 & 0x7f) << 24) | ((hash[off + 1] as u32) << 16) | ((hash[off + 2] as u32) << 8) | hash[off + 3] as u32;
+    format!("{:06}", code % 1_000_000) }
 
 #[tokio::test]
 async fn email_verification_gates_login() {
