@@ -34,13 +34,16 @@ Rules for edits:
   MCP transport itself, SCIM, SAML/OIDC callbacks) stay out of the contract.
   `scripts/check-openapi.py --strict` lists them as the allowed remainder.
 
-## Deliberately outside the machine contract (as of this lane)
+## Coverage
 
-Instance and account-administration surfaces that predate the contract and are
-console-only today: `/api/auth/invite`, `/api/capabilities`,
-`/api/instance/{edition,features,workspaces}`, `/api/me/sessions`,
-`/api/me/secret-health*` (incl. Enzoic and LeakCheck helpers),
-`/api/integrations/{iid}/history`, `/api/orgs/{oid}/features`,
-`/api/orgs/{oid}/identities/{iid}/workload`, `/api/envs/{eid}/path-policy/*`,
-and the invitation acceptance pair. Documenting them is a follow-up pass; the
-strict mode of `check-openapi.py` fails until then, so CI runs plain mode.
+The contract covers every machine-relevant route the server registers, including
+webhooks (outgoing subscriptions, incoming triggers, receipts, replay and the
+signed ingestion endpoint), device PKI lifecycle routes, transit-compat keys,
+workspace feature grants, invites, sessions, path policies, workload identity
+bindings, the capabilities catalog, instance edition/workspaces settings,
+integration sync history, static rotation runs and the secret-health checks.
+`check-openapi.py --strict` enforces full coverage; CI runs it with `--strict`.
+
+Browser-only assets (`*.js` bundles), the OAuth authorization dance, MCP
+transport, SCIM and the browser OIDC/SAML/social callbacks remain excluded from
+the machine contract as before.

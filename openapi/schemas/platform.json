@@ -1,0 +1,278 @@
+{
+  "Capabilities": {
+    "properties": {
+      "routes": {
+        "items": {
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "webhooks": {
+        "properties": {
+          "dispatch": {
+            "description": "native or unsupported; Workers answers 501 for dispatch.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "object"
+  },
+  "EditionStatus": {
+    "properties": {
+      "customer": {
+        "description": "Instance owner only.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "development": {
+        "description": "Granted by the development licence.",
+        "type": "boolean"
+      },
+      "expires_at": {
+        "description": "Instance owner only.",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "tier": {
+        "description": "self-hosted or enterprise.",
+        "type": "string"
+      },
+      "warning": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "EnzoicSettings": {
+    "properties": {
+      "configured": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "FeatureGrant": {
+    "properties": {
+      "features": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "org_id": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "FeatureGrantList": {
+    "properties": {
+      "grants": {
+        "items": {
+          "$ref": "#/components/schemas/FeatureGrant"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "IntegrationHistoryEntry": {
+    "properties": {
+      "action": {
+        "description": "integration.sync or integration.sync_failed.",
+        "type": "string"
+      },
+      "actor": {
+        "type": "string"
+      },
+      "created_at": {
+        "type": "integer"
+      },
+      "detail": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "InviteMetadata": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "existing_account": {
+        "type": "boolean"
+      },
+      "expires_at": {
+        "type": "integer"
+      },
+      "org_id": {
+        "type": "string"
+      },
+      "org_name": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "InviteRow": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "email": {
+        "type": "string"
+      },
+      "expires_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "invited_by": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "InviteShare": {
+    "properties": {
+      "expires_at": {
+        "type": "integer"
+      },
+      "id": {
+        "type": "string"
+      },
+      "invite_token": {
+        "description": "Single-use redemption token for the share link.",
+        "type": "string"
+      },
+      "invite_url": {
+        "description": "Full redemption URL with the token fragment.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "OrgFeatures": {
+    "properties": {
+      "compiled": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "granted": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "PathPolicy": {
+    "properties": {
+      "rules": {
+        "description": "Ordered rules evaluated per secret path.",
+        "items": {
+          "type": "object"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "SecretHealthSettings": {
+    "properties": {
+      "api_key_set": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "SessionInfo": {
+    "properties": {
+      "created_at": {
+        "type": "integer"
+      },
+      "current": {
+        "description": "True when this session served the request.",
+        "type": "boolean"
+      },
+      "id": {
+        "description": "Stable id used to revoke the session.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SessionRevoked": {
+    "properties": {
+      "current": {
+        "description": "True when the deleted session served the request.",
+        "type": "boolean"
+      },
+      "revoked": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "SessionsRevoked": {
+    "properties": {
+      "revoked": {
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "WorkloadBinding": {
+    "properties": {
+      "audience": {
+        "type": "string"
+      },
+      "issuer": {
+        "type": "string"
+      },
+      "jwks_url": {
+        "description": "Optional; fetched instead of the inline JWKS.",
+        "type": "string"
+      },
+      "max_ttl_secs": {
+        "type": "integer"
+      },
+      "subject": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "WorkspaceCreationSetting": {
+    "properties": {
+      "workspace_creation_open": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  }
+}

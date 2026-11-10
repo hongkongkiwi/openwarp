@@ -192,6 +192,34 @@
         },
         "type": "object"
       },
+      "Capabilities": {
+        "properties": {
+          "routes": {
+            "items": {
+              "properties": {
+                "method": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "webhooks": {
+            "properties": {
+              "dispatch": {
+                "description": "native or unsupported; Workers answers 501 for dispatch.",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "ChainedAuditEntry": {
         "allOf": [
           {
@@ -813,6 +841,36 @@
         },
         "type": "object"
       },
+      "EditionStatus": {
+        "properties": {
+          "customer": {
+            "description": "Instance owner only.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "development": {
+            "description": "Granted by the development licence.",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "description": "Instance owner only.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tier": {
+            "description": "self-hosted or enterprise.",
+            "type": "string"
+          },
+          "warning": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "EmailRequest": {
         "properties": {
           "email": {
@@ -1033,6 +1091,14 @@
         ],
         "type": "object"
       },
+      "EnzoicSettings": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "Error": {
         "properties": {
           "error": {
@@ -1054,6 +1120,31 @@
           },
           "text": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "FeatureGrant": {
+        "properties": {
+          "features": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "org_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "FeatureGrantList": {
+        "properties": {
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/FeatureGrant"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -1452,6 +1543,24 @@
         ],
         "type": "object"
       },
+      "IntegrationHistoryEntry": {
+        "properties": {
+          "action": {
+            "description": "integration.sync or integration.sync_failed.",
+            "type": "string"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "IntegrationUpdate": {
         "properties": {
           "config": {
@@ -1462,6 +1571,29 @@
             "type": "string"
           },
           "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "InviteMetadata": {
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "existing_account": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "org_name": {
+            "type": "string"
+          },
+          "role": {
             "type": "string"
           }
         },
@@ -1499,6 +1631,48 @@
           },
           "ok": {
             "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "InviteRow": {
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "invited_by": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "InviteShare": {
+        "properties": {
+          "expires_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "invite_token": {
+            "description": "Single-use redemption token for the share link.",
+            "type": "string"
+          },
+          "invite_url": {
+            "description": "Full redemption URL with the token fragment.",
+            "type": "string"
           }
         },
         "type": "object"
@@ -2161,6 +2335,23 @@
         },
         "type": "object"
       },
+      "OrgFeatures": {
+        "properties": {
+          "compiled": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "granted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "OrgOwnership": {
         "properties": {
           "ok": {
@@ -2315,6 +2506,18 @@
           },
           "state_id": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "PathPolicy": {
+        "properties": {
+          "rules": {
+            "description": "Ordered rules evaluated per secret path.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -3030,6 +3233,14 @@
           }
         ]
       },
+      "SecretHealthSettings": {
+        "properties": {
+          "api_key_set": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "SecretInput": {
         "properties": {
           "comment": {
@@ -3467,6 +3678,42 @@
           },
           "user_id": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "SessionInfo": {
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "current": {
+            "description": "True when this session served the request.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Stable id used to revoke the session.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "SessionRevoked": {
+        "properties": {
+          "current": {
+            "description": "True when the deleted session served the request.",
+            "type": "boolean"
+          },
+          "revoked": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "SessionsRevoked": {
+        "properties": {
+          "revoked": {
+            "type": "integer"
           }
         },
         "type": "object"
@@ -4421,6 +4668,27 @@
         },
         "type": "object"
       },
+      "WorkloadBinding": {
+        "properties": {
+          "audience": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "jwks_url": {
+            "description": "Optional; fetched instead of the inline JWKS.",
+            "type": "string"
+          },
+          "max_ttl_secs": {
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "WorkloadTrust": {
         "properties": {
           "audience": {
@@ -4567,11 +4835,19 @@
           }
         },
         "type": "object"
+      },
+      "WorkspaceCreationSetting": {
+        "properties": {
+          "workspace_creation_open": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       }
     }
   },
   "info": {
-    "description": "Public REST surface used by the SDKs and the Terraform provider. Authentication is a bearer session token, service token, or OAuth access token. All paths are relative to the instance origin. Advanced browser and protocol surfaces (OAuth authorization, MCP, SCIM, PKI) are intentionally not part of this contract.",
+    "description": "Public REST surface used by the SDKs and the Terraform provider. Authentication is a bearer session token, service token, or OAuth access token. All paths are relative to the instance origin. Advanced browser and protocol surfaces (OAuth authorization, MCP transport, SCIM, PKI issuance, browser asset bundles) are intentionally not part of this contract; device PKI lifecycle routes are documented.",
     "title": "OpenWarp API",
     "version": "1.0.0"
   },
@@ -5635,6 +5911,47 @@
         ]
       }
     },
+    "/api/auth/invite": {
+      "get": {
+        "description": "Public metadata for an invitation token: workspace name and id, invited email, role, expiry and whether the address already has an account. Used by the redemption screen before sign-in.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteMetadata"
+                }
+              }
+            },
+            "description": "Invitation metadata"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Token required or invitation invalid"
+          }
+        },
+        "summary": "Read invitation metadata for redemption",
+        "tags": [
+          "invites"
+        ]
+      }
+    },
     "/api/auth/login": {
       "post": {
         "requestBody": {
@@ -6528,6 +6845,42 @@
         "summary": "Exchange verification codes for a single-use step-up grant",
         "tags": [
           "auth"
+        ]
+      }
+    },
+    "/api/capabilities": {
+      "get": {
+        "description": "Returns the route catalog for this build (method and path per registered machine route, including feature-gated surfaces present in the binary) plus the webhook dispatch capability. Requires any authenticated credential.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                }
+              }
+            },
+            "description": "Route catalog"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discover the API routes served by this build",
+        "tags": [
+          "capabilities"
         ]
       }
     },
@@ -8575,6 +8928,194 @@
         ]
       }
     },
+    "/api/envs/{eid}/path-policy/{role}": {
+      "delete": {
+        "description": "Deletes the role's path policy. Environment owner required.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a role path policy",
+        "tags": [
+          "path-policy"
+        ]
+      },
+      "get": {
+        "description": "Returns the stored path policy for the role, or null when none is set. Environment owner required.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathPolicy"
+                }
+              }
+            },
+            "description": "Policy or null"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a role path policy",
+        "tags": [
+          "path-policy"
+        ]
+      },
+      "put": {
+        "description": "Replaces the policy rules for the role. Requires an explicit SSE environment; role cannot be owner; at most 256 rules. Body is a rules array.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Rules array required, role invalid, or environment not SSE"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace a role path policy",
+        "tags": [
+          "path-policy"
+        ]
+      }
+    },
     "/api/envs/{eid}/policy": {
       "put": {
         "description": "Requires access to the environment; environment-scoped tokens may only target their own environment. Requires org:admin permission (owner/admin or a custom role granting it). Supply at least one supported policy field; max_versions=0 retains all versions.",
@@ -10560,6 +11101,42 @@
         ]
       }
     },
+    "/api/instance/edition": {
+      "get": {
+        "description": "Returns the active edition and licensing status. Commercial details (customer, expiry) are visible to the instance owner only.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditionStatus"
+                }
+              }
+            },
+            "description": "Edition status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the active edition and licensing status",
+        "tags": [
+          "instance"
+        ]
+      }
+    },
     "/api/instance/email-test": {
       "post": {
         "description": "Requires a nonempty recipient and configured email provider; returns its provider name after sending.",
@@ -10686,6 +11263,131 @@
         "summary": "Encrypt server-managed secret metadata (instance owner)",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/api/instance/features": {
+      "get": {
+        "description": "Instance-owner only: every workspace with its granted enterprise features.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureGrantList"
+                }
+              }
+            },
+            "description": "Feature grants per workspace"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Only the instance owner can inspect feature grants"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List workspace feature grants (instance owner)",
+        "tags": [
+          "instance"
+        ]
+      },
+      "put": {
+        "description": "Instance-owner only, replacement semantics: the request carries the full feature set for one workspace. Unknown names are rejected; names whose cargo features are not compiled into this build are rejected with 400.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "features": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "org": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "org",
+                  "features"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureGrant"
+                }
+              }
+            },
+            "description": "Saved grants"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown or uncompiled feature name"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Only the instance owner can change feature grants"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Workspace not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set workspace feature grants (instance owner)",
+        "tags": [
+          "instance"
         ]
       }
     },
@@ -11010,6 +11712,70 @@
         ]
       }
     },
+    "/api/instance/workspaces": {
+      "put": {
+        "description": "Instance-owner only. Opens or closes workspace creation. Conflicts when OPENWARP_WORKSPACE_CREATION pins the setting in the environment. Closing is refused while it would strand the only workspace.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "open": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "open"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceCreationSetting"
+                }
+              }
+            },
+            "description": "Saved setting"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Only the instance owner can change workspace creation"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "OPENWARP_WORKSPACE_CREATION controls this setting"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Open or close workspace creation (instance owner)",
+        "tags": [
+          "instance"
+        ]
+      }
+    },
     "/api/integrations/{iid}": {
       "delete": {
         "description": "Requires environment access and integrations:write. Removes local configuration, sync state and queued jobs; does not delete remote provider secrets.",
@@ -11165,6 +11931,55 @@
           }
         ],
         "summary": "Update an integration",
+        "tags": [
+          "integrations"
+        ]
+      }
+    },
+    "/api/integrations/{iid}/history": {
+      "get": {
+        "description": "Latest 50 sync and sync-failure audit rows for the integration, newest first. Requires secrets:read on the integration's environment.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/IntegrationHistoryEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Sync history rows"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Integration not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List integration sync history",
         "tags": [
           "integrations"
         ]
@@ -12631,6 +13446,711 @@
         ]
       }
     },
+    "/api/me/secret-health": {
+      "get": {
+        "description": "Reports whether a HaveIBeenPwned API key is configured. Revalidates queued checks first.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretHealthSettings"
+                }
+              }
+            },
+            "description": "Settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read secret-health settings",
+        "tags": [
+          "secret-health"
+        ]
+      },
+      "put": {
+        "description": "Stores or clears the HaveIBeenPwned API key (32 hexadecimal characters), encrypted with the instance master key.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "api_key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "api_key"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Saved or cleared"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "api_key must be 32 hexadecimal characters"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Store or clear the HaveIBeenPwned API key",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/email": {
+      "post": {
+        "description": "Requires explicit consent and a well-formed address; the check runs in the background with the configured provider.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "consent": {
+                    "type": "boolean"
+                  },
+                  "email": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "consent",
+                  "email"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Checks paused for this account or provider outage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Queue an email breach check",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/enzoic": {
+      "get": {
+        "description": "Reports whether Enzoic credentials are configured.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnzoicSettings"
+                }
+              }
+            },
+            "description": "Settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read Enzoic settings",
+        "tags": [
+          "secret-health"
+        ]
+      },
+      "put": {
+        "description": "Stores or clears the Enzoic API key and secret pair, encrypted with the instance master key.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "api_key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "api_secret": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "api_key",
+                  "api_secret"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Saved or cleared"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "api_key and api_secret required"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Store or clear Enzoic credentials",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/enzoic/accounts": {
+      "post": {
+        "description": "Relays an account-exposure check to Enzoic using the stored credentials.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "username"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Checks paused for this account or provider outage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Check an account against Enzoic",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/enzoic/credentials": {
+      "post": {
+        "description": "Relays a credential-exposure check to Enzoic using the stored credentials.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "password_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password_hash"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Checks paused for this account or provider outage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Check credentials against Enzoic",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/enzoic/password": {
+      "post": {
+        "description": "Requires explicit consent; accepts only a 10-character hex prefix and consent, nothing else. Relays a partial-hash password check so the full password never leaves the browser.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "consent": {
+                    "type": "boolean"
+                  },
+                  "prefix": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "prefix",
+                  "consent"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Checks paused for this account or provider outage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Check a password prefix against Enzoic",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/secret-health/leakcheck": {
+      "post": {
+        "description": "Requires explicit consent; accepts only a 24-character email hash prefix and consent.",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "consent": {
+                    "type": "boolean"
+                  },
+                  "email_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email_hash",
+                  "consent"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Checks paused for this account or provider outage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Check a LeakCheck email hash",
+        "tags": [
+          "secret-health"
+        ]
+      }
+    },
+    "/api/me/sessions": {
+      "delete": {
+        "description": "Ends every browser session for the account. API keys and OAuth tokens cannot do this; the caller must authenticate with the account session.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsRevoked"
+                }
+              }
+            },
+            "description": "Sessions revoked"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "API keys and OAuth tokens cannot revoke browser sessions"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke all browser sessions",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "get": {
+        "description": "Lists the account's browser sessions with a stable id each; `current` marks the session the request authenticated with.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SessionInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Session rows"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List browser sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/me/sessions/{sid}": {
+      "delete": {
+        "description": "Ends one browser session by id. `current` reports whether the deleted session was the one serving the request.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevoked"
+                }
+              }
+            },
+            "description": "Session revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Session not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke one browser session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/api/me/totp": {
       "delete": {
         "description": "Requires current password when known. Clears recovery codes if no factors remain.",
@@ -13733,6 +15253,52 @@
         ]
       }
     },
+    "/api/orgs/{oid}/features": {
+      "get": {
+        "description": "Returns the feature names compiled into this build and the ones granted to this workspace.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgFeatures"
+                }
+              }
+            },
+            "description": "Compiled and granted features"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing or invalid credential"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read workspace feature grants",
+        "tags": [
+          "features"
+        ]
+      }
+    },
     "/api/orgs/{oid}/identities": {
       "get": {
         "description": "Requires org:admin. Lists identity metadata and nullable client_id, never client secrets.",
@@ -14044,6 +15610,204 @@
         ]
       }
     },
+    "/api/orgs/{oid}/identities/{iid}/workload": {
+      "delete": {
+        "description": "Deletes the workload JWT binding; outstanding tokens stop working at their next exchange.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Identity not found"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Workspace owner required"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a workload JWT binding",
+        "tags": [
+          "workload"
+        ]
+      },
+      "get": {
+        "description": "Returns the workload JWT trust binding for the identity, or null when none is set. Workspace owner required.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadBinding"
+                }
+              }
+            },
+            "description": "Binding or null"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Identity not found"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Workspace owner required"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a workload JWT binding",
+        "tags": [
+          "workload"
+        ]
+      },
+      "put": {
+        "description": "Creates or replaces the workload JWT binding: issuer, audience, subject, optional JWKS URL or inline JWKS, max TTL. Workspace owner required.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkloadBinding"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Identity not found or invalid binding"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Workspace owner required"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create or replace a workload JWT binding",
+        "tags": [
+          "workload"
+        ]
+      }
+    },
     "/api/orgs/{oid}/identities/{iid}/workload-trust": {
       "get": {
         "description": "Requires org:admin in a running workspace. The identity must belong to this workspace; only an owner may configure privileged identities. Returns metadata including revoked trusts, without JWKS or bound claims.",
@@ -14302,6 +16066,183 @@
         "summary": "Revoke a workload trust and its tokens",
         "tags": [
           "identities"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/invites": {
+      "get": {
+        "description": "Lists outstanding (unaccepted, unexpired) invitations. Organisation admin required.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/InviteRow"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Outstanding invitations"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List outstanding invitations",
+        "tags": [
+          "invites"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/invites/{iid}": {
+      "delete": {
+        "description": "Revokes an outstanding invitation. Organisation admin required; audited.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Invitation revoked"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invitation not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke an invitation (org admin)",
+        "tags": [
+          "invites"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/invites/{iid}/resend": {
+      "post": {
+        "description": "Reissues the invitation with a fresh token and a 7-day expiry, keeping email and role. Organisation admin required; audited.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "iid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteShare"
+                }
+              }
+            },
+            "description": "New share token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an organisation admin"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invitation not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resend an invitation (org admin)",
+        "tags": [
+          "invites"
         ]
       }
     },
@@ -16957,6 +18898,423 @@
         ]
       }
     },
+    "/api/orgs/{oid}/transit-compat/keys": {
+      "get": {
+        "description": "Lists compatibility transit keys for the workspace. Requires transit:manage.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Keys"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List compatibility transit keys",
+        "tags": [
+          "transit-compat"
+        ]
+      },
+      "post": {
+        "description": "Creates a compatibility transit key. Requires transit:manage.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created key"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a compatibility transit key",
+        "tags": [
+          "transit-compat"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/transit-compat/keys/{kid}/decrypt": {
+      "post": {
+        "description": "Decrypts a ciphertext envelope, rejecting a wrong context. Requires the transit:decrypt scope on the same credential.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid ciphertext or request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Requires transit:decrypt"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Decrypt a compatibility transit payload",
+        "tags": [
+          "transit-compat"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/transit-compat/keys/{kid}/encrypt": {
+      "post": {
+        "description": "Encrypts a payload under the key's current version. Requires the transit:encrypt scope on the same credential.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid ciphertext or request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Requires transit:encrypt"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Encrypt a compatibility transit payload",
+        "tags": [
+          "transit-compat"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/transit-compat/keys/{kid}/rewrap": {
+      "post": {
+        "description": "Reencrypts the payload under the key's latest version. Requires the transit:decrypt scope on the same credential.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid ciphertext or request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Requires transit:decrypt"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rewrap a compatibility transit payload",
+        "tags": [
+          "transit-compat"
+        ]
+      }
+    },
+    "/api/orgs/{oid}/transit-compat/keys/{kid}/rotate": {
+      "post": {
+        "description": "Creates a new key version and rewraps existing ciphertext on request. Requires the transit:manage scope on the same credential.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid ciphertext or request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Requires transit:manage"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rotate a compatibility transit payload",
+        "tags": [
+          "transit-compat"
+        ]
+      }
+    },
     "/api/orgs/{oid}/transit/keys": {
       "get": {
         "description": "Requires org:admin and transit:manage. Environment credentials are forbidden. OAuth and service credentials require the explicit transit:manage scope, even when otherwise privileged.",
@@ -18978,6 +21336,62 @@
           }
         ],
         "summary": "Delete a rotation schedule",
+        "tags": [
+          "rotations"
+        ]
+      }
+    },
+    "/api/rotations/{rid}/run": {
+      "post": {
+        "description": "Runs a due rotation schedule immediately instead of waiting for its next_run time. Requires rotations:write on the schedule's environment and a non-expired schedule.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "rid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Rotation run result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Rotation schedule not found"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not permitted or credential scope mismatch"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Run a rotation schedule now",
         "tags": [
           "rotations"
         ]

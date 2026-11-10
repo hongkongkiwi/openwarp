@@ -1,6 +1,6 @@
 {
   "info": {
-    "description": "Public REST surface used by the SDKs and the Terraform provider. Authentication is a bearer session token, service token, or OAuth access token. All paths are relative to the instance origin. Advanced browser and protocol surfaces (OAuth authorization, MCP, SCIM, PKI) are intentionally not part of this contract.",
+    "description": "Public REST surface used by the SDKs and the Terraform provider. Authentication is a bearer session token, service token, or OAuth access token. All paths are relative to the instance origin. Advanced browser and protocol surfaces (OAuth authorization, MCP transport, SCIM, PKI issuance, browser asset bundles) are intentionally not part of this contract; device PKI lifecycle routes are documented.",
     "title": "OpenWarp API",
     "version": "1.0.0"
   },
