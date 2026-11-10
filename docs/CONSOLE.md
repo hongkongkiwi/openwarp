@@ -160,6 +160,8 @@ Compare and Clone sit in the environment toolbar. Compare lists keys only in thi
 
 Invite people by email and choose the narrowest suitable role. Managed developers have write and automation permissions; they are not read-only users. For a read-only role, use a custom permission list and verify the resulting access.
 
+Workspace owners can lock a member from the Members table. A locked member can still sign in and use other workspaces, but this workspace shows only the lock notice until an owner unlocks them. Owners cannot be locked.
+
 Teams organise members. Environment policy can restrict access or require approval for non-admin writes. Review proposals and access requests in context: the requester, target environment, permissions, and lifetime matter.
 
 Use app service tokens or machine identities for automation instead of a person's password. Record a newly issued credential securely, scope it, and revoke it when no longer needed. OAuth client scopes and workspace permissions both apply.
