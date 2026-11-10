@@ -109,11 +109,11 @@ def server_routes() -> dict[str, set[str]]:
     server = ROOT / "crates/server/src"
     src = "\n".join(
         strip_test_code((server / name).read_text())
-        for name in ("app.rs", "webhooks.rs", "ai.rs")
+        for name in ("app.rs", "webhooks.rs", "ai.rs", "broker.rs")
     )
     routes: dict[str, set[str]] = {}
     pattern = re.compile(
-        r'\.route\("([^"]+)"\s*,\s*(.+?)(?=\.route\(|\.layer\(|\.with_state\(|\Z)', re.S
+        r'\.route\("([^"]+)"\s*,\s*(.+?)(?=\)\s*(?:\}|;)|\.route\(|\.layer\(|\.with_state\(|\.merge\(|\Z)', re.S
     )
     for m in pattern.finditer(src):
         path, spec = m.group(1), m.group(2)
