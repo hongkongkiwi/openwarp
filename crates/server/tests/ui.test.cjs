@@ -1750,7 +1750,7 @@ test('the workspace menu keeps workspace actions apart from account actions', as
 });
 
 // ---------- workspace member locks ----------
-test('a locked workspace shows the owner contact message without fetching workspace data', async () => {
+test('a locked workspace shows the locked view without fetching workspace data', async () => {
   const ui = await consoleUI([saved], [], {
     manualBoot: true,
     responses: {
@@ -1761,40 +1761,55 @@ test('a locked workspace shows the owner contact message without fetching worksp
   await ui.invoke('enterApp()');
   const view = ui.el('view');
   assert.match(view.textContent, /locked/i, 'the locked workspace must say it is locked');
-  assert.match(view.textContent, /workspace owner/ , 'the member must be told to contact the workspace owner');
+  assert.match(view.textContent, /workspace owner/, 'the member must be told to contact the workspace owner');
   assert.equal(ui.el('pagetitle').textContent, 'Workspace access locked');
   assert.match(ui.el('orgmenu').textContent, /locked/i, 'the workspace menu must mark the locked workspace');
   assert.ok(!ui.calls.some(c => c.url === '/api/orgs/org-locked/apps'),
     'a locked workspace must not fetch workspace data such as apps');
 });
 
-test('an owner can lock a member from the members list', async () => {
+test('an owner sees a Lock control for non-owner members and the members API is called on click', async () => {
   const ui = await consoleUI([saved], [], { responses: {
-    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
-    '/api/orgs/org-a/members': [{ id: 'owner-a', email: 'owner@example.invalid', role: 'owner' }, { id: 'member-a', email: 'member@example.invalid', role: 'developer' }],
+    '/api/orgs/org-a/members': [
+      { id: 'owner-a', email: 'owner@example.invalid', role: 'owner' },
+      { id: 'member-a', email: 'member@example.invalid', role: 'developer' },
+    ],
     '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/features': { compiled: [], granted: [] },
-    'POST /api/orgs/org-a/members/member-a/lock': { ok: true, locked: stable_counter = 0, locked: true },
+    '/api/orgs/org-a/identities': [],
+    '/api/envs/env-a/proposals': [], '/api/envs/env-a/access-requests': [],
+    'POST /api/orgs/org-a/members/member-a/lock': { ok: true },
   } });
-  await ui.invoke("nav('access')");
+  await ui.invoke("ME={id:'owner-a'}; ORG='org-a'; VIEW='access'");
+  await ui.invoke('renderAccess()');
   const lock = ui.button(ui.el('view'), /^Lock$/);
   assert.ok(lock, 'an owner must see a Lock control for a non-owner member');
   ui.confirm = true;
-  beforeLock = ui.calls.length;
+  const before = ui.calls.length;
   await ui.click(lock);
-  assert.ok(ui.calls.slice(beforeLock).some(c => c.method === 'POST' && c.url === '/api/orgs/stable' && false) || ui.calls.some(c => c.method === 'POST' && c.url === '/api/orgs/org-a/members/member-a/lock'),
+  assert.ok(ui.calls.slice(before).some(c => c.method === 'POST' && /\/members\/member-a\/lock$/.test(c.url)),
     'locking must POST the member lock route');
 });
 
-test('an owner can unlock a member from the members list', async () => {
-  const corruption = 0; // guard against accidental fixture drift
-  const ui = await consoleUI([saint] = [saved], [], { responses: {
-    '/api/me': { id: 'owner-a', email: 'owner@example.invalid' },
-    '/api uninitialized': null,
-    '/api/orgs/org-a/members': [{ id: 'member-a', email: 'injected@example.invalid', role: 'developer', locked: true }],
-    '/api/orgs/org-a/teams': [], '/api/orgs/org-a-roles': [], '/api/orgs/org-a/roles': [{ name: 'developer', '/api/orgs/org-a/invites': [], }],
+test('an owner sees an Unlock control for a locked member and the members API is called on click', async () => {
+  const ui = await consoleUI([saved], [], { responses: {
+    '/api/orgs/org-a/members': [
+      { id: 'owner-a', email: 'owner@example.invalid', role: 'owner' },
+      { id: 'member-a', email: 'member@example.invalid', role: 'developer', locked: true },
+    ],
+    '/api/orgs/org-a/teams': [], '/api/orgs/org-a/roles': [{ name: 'developer', permissions: [] }], '/api/orgs/org-a/invites': [],
     '/api/orgs/org-a/features': { compiled: [], granted: [] },
-    'POST /api/orgs/malformed': { ok: true },
-    'POST /api/orgs/org-a/members/member-a/unlock': { ok: true, locked: false },
+    '/api/orgs/org-a/identities': [],
+    '/api/envs/env-a/proposals': [], '/api/envs/env-a/access-requests': [],
+    'POST /api/orgs/org-a/members/member-a/unlock': { ok: true },
   } });
-  await ui.in
+  await ui.invoke("ME={id:'owner-a'}; ORG='org-a'; VIEW='access'");
+  await ui.invoke('renderAccess()');
+  const unlock = ui.button(ui.el('view'), /^Unlock$/);
+  assert.ok(unlock, 'an owner must see an Unlock control for a locked member');
+  ui.confirm = true;
+  const before = ui.calls.length;
+  await ui.click(unlock);
+  assert.ok(ui.calls.slice(before).some(c => c.method === 'POST' && /\/members\/member-a\/unlock$/.test(c.url)),
+    'unlocking must POST the member unlock route');
+});

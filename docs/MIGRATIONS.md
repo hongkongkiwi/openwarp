@@ -341,7 +341,7 @@ WRANGLER=node_modules/.bin/wrangler scripts/d1-migrate-smoke.sh
 
 The script builds the Worker with the test-only `d1-smoke` feature, which adds
 an internal route that calls the same runner with the D1 binding. It applies the
-manifest, checks version 30 and the 16 squashed rows, and verifies that a second
+manifest, checks the manifest's tip version and the 16 squashed rows, and verifies that a second
 apply is a no-op. The production Worker build in `wrangler.toml` does not enable
 the feature, so that route is absent from deployed bundles. CI runs this after
 the Workerd smoke test.
