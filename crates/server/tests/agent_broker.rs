@@ -220,6 +220,22 @@ async fn broker_emergency_lockdown_revokes_live_agent_sessions() {
 }
 
 #[tokio::test]
+async fn broker_issue_is_refused_while_a_lockdown_is_active() {
+    let f = Fixture::new().await; let service = f.create(f.service()).await; let sid = id(&service,"id");
+    // Lockdown first: authority itself must refuse, and the write batch's
+    // lockdown guard must keep a racing issuance from committing a token that
+    // would survive the lockdown that deletes the sessions.
+    let lock = f.s.client.put(format!("{}/api/orgs/{}/emergency",f.s.base,f.org)).header("cookie",format!("ow_session={}",f.owner)).json(&json!({"locked":true})).send().await.unwrap();
+    assert_eq!(lock.status().as_u16(),200,"{}: {}",lock.status(),lock.text().await.unwrap_or_default());
+    let issued = f.issue(&sid,&f.uid,900).await;
+    assert_ne!(issued.status,201,"a locked workspace must not issue broker sessions: {} {}",issued.status,issued.text);
+    let restore = f.s.client.put(format!("{}/api/orgs/{}/emergency",f.s.base,f.org)).header("cookie",format!("ow_session={}",f.owner)).json(&json!({"locked":false})).send().await.unwrap();
+    assert_eq!(restore.status().as_u16(),200,"{}: {}",restore.status(),restore.text().await.unwrap_or_default());
+    let after = f.issue(&sid,&f.uid,900).await;
+    assert_eq!(after.status,201,"issuance must work again after restore: {} {}",after.status,after.text);
+}
+
+#[tokio::test]
 async fn broker_sessions_stop_when_the_issuer_becomes_path_restricted() {
     let f = Fixture::new().await;
     let admin = f.s.register("broker-admin@test.invalid").await;
@@ -240,4 +256,33 @@ async fn broker_sessions_stop_when_the_issuer_becomes_path_restricted() {
     denied(&pr,403); assert_eq!(pr.body["error"], json!("forbidden"), "{}", pr.text);
     let r = f.s.call(Method::POST,&f.path("sessions"),&at,Some(json!({"service_id":sid,"subject_user_id":auid,"capabilities":["lookup"],"approved_privileged_capabilities":[],"ttl_seconds":300}))).await;
     assert_eq!(r.status,403,"{}: {}",r.status,r.text);
+}
+
+#[tokio::test]
+async fn a_session_dies_when_its_issuer_becomes_restricted_even_if_the_path_stays_allowed() {
+    // Isolates the issuer guard from the credential-path check: the policy
+    // explicitly allows the credential's path with read, so a surviving
+    // session could only be explained by the missing issuer restriction.
+    let f = Fixture::new().await;
+    let admin = f.s.register("broker-restricted-issuer@test.invalid").await;
+    let at = id(&admin,"token"); let auid = id(&admin,"user_id");
+    let inv = f.s.call(Method::POST,&format!("/api/orgs/{}/members",f.org),&f.owner,Some(json!({"email":"broker-restricted-issuer@test.invalid","role":"admin"}))).await;
+    assert_eq!(inv.status,200,"{}: {}",inv.status,inv.text);
+    let acc = f.s.call(Method::POST,"/api/auth/accept-invite",&at,Some(json!({"token":inv.body["invite_token"]}))).await;
+    assert_eq!(acc.status,200,"{}: {}",acc.status,acc.text);
+    let mut v = f.service(); v["policy"]["allowed_member_ids"] = json!([auid]);
+    let service = f.create(v).await; let sid = id(&service,"id");
+    // The admin is the ISSUER here: Fixture::issue always authenticates as the
+    // owner, which would leave the issuer unrestricted no matter what the
+    // policy says.
+    let issued = f.s.call(Method::POST,&f.path("sessions"),&at,Some(json!({"service_id":sid,"subject_user_id":auid,"capabilities":["lookup"],"approved_privileged_capabilities":[],"ttl_seconds":900}))).await;
+    assert_eq!(issued.status,201,"{}: {}",issued.status,issued.text);
+    let token = id(&issued.body,"token");
+    assert_eq!(f.ping(&token).await.status,200,"a healthy admin delegation must execute");
+    // The catch-all rule allows every path with read, so the credential path
+    // stays reachable; the issuer (admin) is nonetheless now path-restricted.
+    let rules = json!({"rules":[{"prefix":"/","capabilities":["read"]}]});
+    let pol = f.s.call(Method::PUT,&format!("/api/envs/{}/path-policy/admin",f.env),&f.owner,Some(rules)).await;
+    assert_eq!(pol.status,200,"{}: {}",pol.status,pol.text);
+    denied(&f.ping(&token).await,403);
 }

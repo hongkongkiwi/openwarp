@@ -7033,6 +7033,60 @@
         ]
       }
     },
+    "/api/broker/http": {
+      "post": {
+        "description": "Executes one capability-scoped HTTP operation with an owb_ session token. Every dispatch revalidates the session, service revision, issuer authority and path policy, then proxies with the decrypted credential and projects the response to the capability's declared fields. Attempt and outcome are audited.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Projected operation result"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing, expired, revoked or stale session"
+          }
+        }
+      }
+    },
+    "/api/broker/mcp": {
+      "post": {
+        "description": "Executes one tool call against a service-bound MCP endpoint with an owb_ session token, under the same revalidation, projection and audit rules as the HTTP executor.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Projected tool result"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing, expired, revoked or stale session"
+          }
+        }
+      }
+    },
     "/api/capabilities": {
       "get": {
         "description": "Returns the route catalog for this build (method and path per registered machine route, including feature-gated surfaces present in the binary) plus the webhook dispatch capability. Requires any authenticated credential.",
@@ -16406,6 +16460,273 @@
         "tags": [
           "audit"
         ]
+      }
+    },
+    "/api/orgs/{oid}/broker/audit": {
+      "get": {
+        "description": "Reads the broker audit trail (invoke attempts, decisions, durations). Workspace audit authority applies.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Audit entries"
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/broker/services": {
+      "get": {
+        "description": "Lists the workspace's broker services. Requires broker:use; the caller also needs read authority on each service's environment history. Configs are returned without credential material.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Service list with revisions"
+          }
+        }
+      },
+      "post": {
+        "description": "Creates a broker service: one environment, one credential secret, kind http or mcp, and a policy of capabilities with optional path restrictions. The credential value is never accepted here; the service references a secret the environment already stores. Optimistic revisioning starts at 1; audited as broker.service.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Service created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid service config"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Caller lacks broker:use or environment authority"
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/broker/services/{sid}": {
+      "delete": {
+        "description": "Disables a broker service (config kept, enabled=false, revision bumped). Outstanding sessions for a disabled service stop passing session validation.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Service disabled"
+          }
+        }
+      },
+      "put": {
+        "description": "Updates a broker service with an expected revision; a mismatch returns 409. Changing the environment or credential re-checks authority and the credential binding.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Service updated"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Revision conflict or missing expected revision"
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/broker/sessions": {
+      "get": {
+        "description": "Lists live broker sessions for the workspace with subject, issuer, capabilities and expiry. Tokens are stored hashed and are never returned after issuance.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Session list"
+          }
+        }
+      },
+      "post": {
+        "description": "Issues a broker session (owb_ token shown once) bound to one service and one subject user, with an explicit capability list, TTL of 1-900 seconds, and optional approved privileged capabilities. The issuer needs broker:use and current authority over the service's environment and credential path; a restricted issuer cannot issue.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Session issued; token shown once"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Disabled service, missing authority, or unapproved privileged capability"
+          }
+        }
+      }
+    },
+    "/api/orgs/{oid}/broker/sessions/{sid}": {
+      "delete": {
+        "description": "Revokes a broker session immediately; the hashed token stops validating on the next dispatch.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "oid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Session revoked"
+          }
+        }
       }
     },
     "/api/orgs/{oid}/change-requests": {

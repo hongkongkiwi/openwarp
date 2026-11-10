@@ -6241,7 +6241,10 @@ async fn emergency_transition(st: &S, oid: &str, app: Option<&str>, locked: bool
         statements.push((format!("UPDATE sync_jobs SET status='pending',claim_id='',claimed_at=0 WHERE status='claimed' AND env_id IN (SELECT e.id FROM envs e JOIN apps a ON a.id=e.app_id WHERE {}=?)", if app.is_some() { "a.id" } else { "a.org_id" }), vec![json!(app.unwrap_or(oid))]));
         // Delegated agent credentials die with the lockdown: restoring the
         // workspace must not reactivate sessions issued before the incident.
-        if let Some(stmt) = broker::lockdown_statement(st, oid, app).await { statements.push(stmt); }
+        // A broker cleanup that cannot be computed must fail the lockdown:
+        // succeeding here would strand live agent sessions behind the halt.
+        let broker_stmt = broker::lockdown_statement(st, oid, app).await?;
+        if let Some(stmt) = broker_stmt { statements.push(stmt); }
     }
     st.audited_batch(&statements, &[], audit).await.map_err(|e| bad(&e))?;
     Ok(()) }

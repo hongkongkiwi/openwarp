@@ -111,17 +111,19 @@ async fn payload(req: Request, limit: usize) -> Result<Value> {
     let bytes=to_bytes(req.into_body(),limit).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?; serde_json::from_slice(&bytes).map_err(|_| invalid()) }
 // The service config JSON is not portable SQL, so the env-to-app mapping is
 // resolved here and the returned statement dies inside the emergency batch.
-pub(super) async fn lockdown_statement(st:&S,oid:&str,app:Option<&str>) -> Option<(String,Vec<Value>)> {
-    let rows=st.db.query("SELECT id,config FROM broker_services WHERE org_id=?",&[json!(&oid)]).await.ok()?;
+// Read failures propagate: a lockdown must not succeed while its broker
+// revocation silently went uncomputed.
+pub(super) async fn lockdown_statement(st:&S,oid:&str,app:Option<&str>) -> std::result::Result<Option<(String,Vec<Value>)>,(reqwest::StatusCode,axum::Json<Value>)> {
+    let rows=st.db.query("SELECT id,config FROM broker_services WHERE org_id=?",&[json!(&oid)])   .await.map_err(|e| (unavailable(e), axum::Json(Value::Null)))?;
     let mut sids=Vec::new();
     for r in &rows {
-        let env=serde_json::from_str::<Value>(&db::s(r,"config")).ok().and_then(|v| v["env_id"].as_str().map(|s| s.to_string())).unwrap_or_default();
+        let env=serde_json::from_str::<Value>(&db::s(r,"config")).map_err(|_| (reqwest::StatusCode::SERVICE_UNAVAILABLE, axum::Json(Value::Null)))?.get("env_id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
         if env.is_empty() { continue; }
-        let hit=st.db.one(&format!("SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=? AND {}=?",if app.is_some() { "a.id" } else { "a.org_id" }),&[json!(&env),json!(app.unwrap_or(oid))]).await.ok().flatten();
+        let hit=st.db.one(&format!("SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id WHERE e.id=? AND {}=?",if app.is_some() { "a.id" } else { "a.org_id" }),&[json!(&env),json!(app.unwrap_or(oid))]).await.map_err(|e| (unavailable(e), axum::Json(Value::Null)))?;
         if hit.is_some() { sids.push(db::s(r,"id")); } }
-    if sids.is_empty() { return None; }
+    if sids.is_empty() { return Ok(None); }
     let mut args:Vec<Value>=sids.iter().map(|s| json!(s)).collect(); args.insert(0,json!(&oid));
-    Some((format!("DELETE FROM broker_sessions WHERE org_id=? AND service_id IN ({})",vec!["?";sids.len()].join(",")),args)) }
+    Ok(Some((format!("DELETE FROM broker_sessions WHERE org_id=? AND service_id IN ({})",vec!["?";sids.len()].join(",")),args))) }
 pub(super) fn routes() -> Router<S> {    Router::new().route("/api/orgs/{oid}/broker/services",get(services).post(create_service))
         .route("/api/orgs/{oid}/broker/services/{sid}",put(update_service).delete(delete_service))
         .route("/api/orgs/{oid}/broker/sessions",get(sessions).post(issue))
@@ -162,7 +164,14 @@ async fn issue(State(st): State<S>,Path(oid): Path<String>,req: Request) -> Resp
         for c in &q.capabilities { let cap=s.caps().iter().find(|cap| &cap.id==c).ok_or(StatusCode::FORBIDDEN)?; if cap.privileged && !q.approved_privileged_capabilities.contains(c) { return Err(StatusCode::FORBIDDEN); } }
         if q.approved_privileged_capabilities.iter().any(|c| !q.capabilities.contains(c) || !s.caps().iter().any(|cap| &cap.id==c && cap.privileged)) { return Err(invalid()); }
         let token=oc::random_token("owb"); let sid=id(); let expires=now()+q.ttl_seconds;
-        st.db.exec("INSERT INTO broker_sessions(id,token_hash,org_id,service_id,revision,subject_user_id,issuer_user_id,capabilities,approvals,expires_at,revoked,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?)",&[json!(&sid),json!(oc::hash_token(&token)),json!(&oid),json!(&q.service_id),json!(db::n(&r,"revision")),json!(&q.subject_user_id),json!(&uid),json!(serde_json::to_string(&q.capabilities).map_err(unavailable)?),json!(serde_json::to_string(&q.approved_privileged_capabilities).map_err(unavailable)?),json!(expires),json!(now())]).await.map_err(unavailable)?;
+        // The guard repeats the lockdown check inside the write batch: an
+        // emergency lockdown landing between authority and commit must abort
+        // the insert, or a token could outlive the lockdown that deleted the
+        // sessions before it.
+        st.db.batch_checked(&[
+            ("UPDATE orgs SET emergency_locked=emergency_locked WHERE id=? AND emergency_locked=0".into(), vec![json!(&oid)]),
+            ("INSERT INTO broker_sessions(id,token_hash,org_id,service_id,revision,subject_user_id,issuer_user_id,capabilities,approvals,expires_at,revoked,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?)".into(), vec![json!(&sid),json!(oc::hash_token(&token)),json!(&oid),json!(&q.service_id),json!(db::n(&r,"revision")),json!(&q.subject_user_id),json!(&uid),json!(serde_json::to_string(&q.capabilities).map_err(unavailable)?),json!(serde_json::to_string(&q.approved_privileged_capabilities).map_err(unavailable)?),json!(expires),json!(now())]),
+        ], &[0]).await.map_err(|_| StatusCode::CONFLICT)?;
         Ok(json!({"id":sid,"token":token,"expires_at":expires,"service_id":q.service_id,"capabilities":q.capabilities})) }.await;
         match result { Ok(v)=>response(StatusCode::CREATED,v),Err(e)=>failure(e,&rid) } }
 }
@@ -204,7 +213,9 @@ mod native {
         reqwest::Client::builder().https_only(true).no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).no_gzip().no_brotli().no_deflate().no_zstd().timeout(Duration::from_secs(15)).resolve_to_addrs(host,&addresses).build().map_err(|_| StatusCode::BAD_GATEWAY)
     }
     async fn send(c:&reqwest::Client,url:&str,method:&str,args:&Value,key:&str,session:Option<&str>,notification:bool) -> Result<(Value,Option<String>)> {
-        let mut request=c.request(if method=="GET" { reqwest::Method::GET } else { reqwest::Method::POST },url).bearer_auth(key).header("accept","application/json").header("mcp-protocol-version","2025-06-18");
+        // The Streamable HTTP transport requires clients to advertise both
+        // media types; a conformant server may answer 406 to a JSON-only Accept.
+        let mut request=c.request(if method=="GET" { reqwest::Method::GET } else { reqwest::Method::POST },url).bearer_auth(key).header("accept","application/json, text/event-stream").header("mcp-protocol-version","2025-06-18");
         if method=="POST" { request=request.json(args); }
         if let Some(s)=session { request=request.header("mcp-session-id",s); }
         let mut r=request.send().await.map_err(|e| if e.is_timeout() { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY })?;
