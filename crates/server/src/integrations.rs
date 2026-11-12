@@ -3460,16 +3460,53 @@ fn probe_target(url: &str) -> String {
         _ => String::new(),
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_ip_allowed(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => probe_ip_allowed(v6.to_ipv4_mapped().unwrap().into()),
+        std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
+        std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ProbeResolver { restrict: bool, blocked: std::sync::Arc<std::sync::atomic::AtomicBool> }
+#[cfg(not(target_arch = "wasm32"))]
+impl reqwest::dns::Resolve for ProbeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let restrict = self.restrict; let blocked = self.blocked.clone();
+        Box::pin(async move {
+            let addrs: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if addrs.is_empty() { return Err(std::io::Error::other("empty DNS response").into()); }
+            if restrict && addrs.iter().any(|addr| !probe_ip_allowed(addr.ip())) {
+                blocked.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::other("blocked by egress policy").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
     let root = probe_base(kind, config)?;
     let target = probe_target(&root);
     if target.is_empty() { return Err("invalid integration endpoint URL".into()); }
-    if !crate::app::egress_allowed(&root) { return Err(format!("{} endpoint {target} is blocked: private and loopback targets are rejected in production", kind)); }
+    if !crate::app::egress_allowed(&root) { return Err("integration endpoint blocked by egress policy".into()); }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        match http_client().get(&root).send().await {
+        let restrict = crate::envcfg::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false)
+            && !crate::envcfg::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
+        let url = reqwest::Url::parse(&root).map_err(|_| "invalid integration endpoint URL")?;
+        let host = url.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+        if restrict && host.parse::<std::net::IpAddr>().is_ok_and(|ip| !probe_ip_allowed(ip)) { return Err("integration endpoint blocked by egress policy".into()); }
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30)).dns_resolver(std::sync::Arc::new(ProbeResolver { restrict, blocked: blocked.clone() }))
+            .build().map_err(|_| "integration probe client unavailable")?;
+        match client.get(url).send().await {
             Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {}; credentials are not verified by this probe", kind, r.status().as_u16())),
-            Err(_) => Err(format!("{} endpoint {target} unreachable", kind)),
+            Err(_) if blocked.load(std::sync::atomic::Ordering::Relaxed) => Err("integration endpoint blocked by egress policy".into()),
+            Err(_) => Err("integration endpoint unreachable".into()),
         }
     }
     #[cfg(target_arch = "wasm32")]

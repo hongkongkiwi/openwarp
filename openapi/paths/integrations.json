@@ -465,7 +465,7 @@
   },
   "/api/integrations/{iid}/test": {
     "post": {
-      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Providers with a bespoke test verify their API. For other known kinds the native server sends an unauthenticated GET without following redirects; any HTTP response, including 401 or 403, counts as reachable, not credential verification. URL userinfo is rejected. Workers return HTTP 400 without sending a generic probe.",
+      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Providers with a bespoke test verify their API. For other known kinds the native server sends an unauthenticated GET without following redirects; any HTTP response, including 401 or 403, counts as reachable, not credential verification. URL userinfo is rejected. In production, unless OPENWARP_ALLOW_PRIVATE_EGRESS=1, generic probes reject private or loopback IP literals and any hostname resolving to a private or loopback address; the connector uses the checked addresses without a proxy. Workers return HTTP 400 without sending a generic probe.",
       "parameters": [
         {
           "in": "path",
