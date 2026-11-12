@@ -29,7 +29,7 @@ Enterprise is the same installation plus a license. It unlocks:
 | SCIM 2.0 | User and group provisioning into members and teams |
 | Audit log streaming | Log streams with HMAC-signed retries, the workspace audit webhook and delivery attempts |
 
-Everything outside this table is core. The external KMS bridge stays in the self-hosted plan for now; HSM/KMIP enrollment, nested sub-organizations and private-network gateways are not gated because they are not implemented.
+Everything outside this table is core. The external KMS bridge stays in the self-hosted plan for now. HSM/KMIP enrollment, nested sub-organizations and inbound private-network gateways are not gated because they are not implemented; the outbound private-network worker, which polls for jobs from inside an isolated network, ships in core.
 
 ## Installing a license
 
