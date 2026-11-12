@@ -1,6 +1,6 @@
 // OpenWarp TypeScript SDK. No runtime dependencies; uses global fetch and runs
 // on Node 22+ (native type stripping) or any browser bundler. The contract is
-// ../../openapi.json; scripts/check-openapi.py keeps the spec and server aligned.
+// ../../../openapi.json; scripts/check-openapi.py keeps the spec and server aligned.
 
 export interface OpenWarpOptions {
   /** Instance origin, e.g. https://secrets.example.com */

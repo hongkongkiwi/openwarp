@@ -1,6 +1,6 @@
 """OpenWarp Python SDK. Standard library only.
 
-The contract is ../../openapi.json; ``scripts/check-openapi.py`` keeps the spec
+The contract is ../../../openapi.json; ``scripts/check-openapi.py`` keeps the spec
 and the server routes aligned. Advanced surfaces (OAuth authorization, MCP,
 SCIM, PKI) are intentionally not exposed here.
 """

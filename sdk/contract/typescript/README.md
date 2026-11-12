@@ -17,7 +17,7 @@ await ow.deploySecrets(envs[0].id, [{ key: "API_KEY", value: "v1" }]);
 console.log((await ow.exportEnv(envs[0].id)).text);
 ```
 
-The contract is [`../../openapi.json`](../../openapi.json). `OpenWarpError`
+The contract is [`../../../openapi.json`](../../../openapi.json). `OpenWarpError`
 carries `status` and the parsed body. Environment ids, tokens and org ids are
 all opaque strings; pass them through unchanged.
 
@@ -25,7 +25,7 @@ all opaque strings; pass them through unchanged.
 
 ```bash
 cargo build -p openwarp-server
-OPENWARP_BIN=target/debug/openwarp-server node --test sdks/typescript/sdk.test.ts
+OPENWARP_BIN=target/debug/openwarp-server node --test sdk/contract/typescript/sdk.test.ts
 ```
 
 The test starts a private server on a loopback port with a temporary SQLite
