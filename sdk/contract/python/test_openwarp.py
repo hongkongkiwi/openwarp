@@ -1,6 +1,6 @@
 """Integration test for the Python SDK against a real server binary.
 
-Run: OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest sdks/python/test_openwarp.py
+Run: OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest sdk/contract/python/test_openwarp.py
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from openwarp import Client, OpenWarpError  # noqa: E402
 
 BIN = os.environ.get(
     "OPENWARP_BIN",
-    str(Path(__file__).resolve().parents[2] / "target" / "debug" / "openwarp-server"),
+    str(Path(__file__).resolve().parents[3] / "target" / "debug" / "openwarp-server"),
 )
 
 

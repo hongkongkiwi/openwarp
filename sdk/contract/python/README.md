@@ -16,14 +16,14 @@ ow.deploy_secrets(env, [{"key": "API_KEY", "value": "v1"}])
 print(ow.export_env(env)["text"])
 ```
 
-The contract is [`../../openapi.json`](../../openapi.json). A non-2xx response
+The contract is [`../../../openapi.json`](../../../openapi.json). A non-2xx response
 raises `OpenWarpError` with `status` and the parsed `body`.
 
 ## Test
 
 ```bash
 cargo build -p openwarp-server
-OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest discover -s sdks/python -p 'test_*.py'
+OPENWARP_BIN=target/debug/openwarp-server python3 -m unittest discover -s sdk/contract/python -p 'test_*.py'
 ```
 
 The test starts a private server on a loopback port with a temporary SQLite

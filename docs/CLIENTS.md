@@ -19,7 +19,7 @@ Choose a client by the operation you need and its documented behavior. The repos
 
 ## Language clients
 
-There are two directory families in this checkout. Keep imports, constructor names and examples from the same family.
+Two client generations share the `sdk/` tree: convenience clients directly under `sdk/`, and OpenAPI-contract clients under `sdk/contract/`. Keep imports, constructor names and examples from the same generation.
 
 | Location | Interface and runtime | Reference |
 | --- | --- | --- |
@@ -27,10 +27,10 @@ There are two directory families in this checkout. Keep imports, constructor nam
 | `sdk/python` | `OpenWarp`; Python 3.8+, standard library | [Python README](../sdk/python/README.md) |
 | `sdk/go` | `Client`; Go 1.21+, standard library, context-aware methods | [Go README](../sdk/go/README.md) |
 | `sdk/rust` | Async `Client`; separate Cargo workspace with reqwest/rustls | [Rust README](../sdk/rust/README.md) |
-| `sdks/typescript` | `OpenWarp`; global Fetch and native TypeScript stripping or a bundler | [Contract client README](../sdks/typescript/README.md) |
-| `sdks/python` | `Client`; Python 3.10+, standard library | [Contract client README](../sdks/python/README.md) |
+| `sdk/contract/typescript` | `OpenWarp`; global Fetch and native TypeScript stripping or a bundler | [Contract client README](../sdk/contract/typescript/README.md) |
+| `sdk/contract/python` | `Client`; Python 3.10+, standard library | [Contract client README](../sdk/contract/python/README.md) |
 
-The `sdk/` clients document convenience methods for identity, resources, secrets, exports, leases and audit. The `sdks/` clients reference the OpenAPI contract and include server-backed tests. Neither directory's presence establishes release status or interoperability with an arbitrary server revision. Pin a reviewed source revision and run its documented checks against the server you intend to use.
+The direct `sdk/` clients document convenience methods for identity, resources, secrets, exports, leases and audit. The `sdk/contract/` clients reference the OpenAPI contract and include server-backed tests. Neither directory's presence establishes release status or interoperability with an arbitrary server revision. Pin a reviewed source revision and run its documented checks against the server you intend to use.
 
 ### Differences that affect correctness
 
@@ -50,7 +50,7 @@ Run client tests serially with builds and other suites. Never point a destructiv
 
 ## Terraform
 
-This checkout contains both [`terraform-provider/`](../terraform-provider/README.md) and [`terraform-provider-openwarp/`](../terraform-provider-openwarp/README.md). Both READMEs describe local development overrides, application/environment/secret/service-token resources and a secret data source. Use the build and configuration instructions from the directory you select; do not assume the two trees are interchangeable.
+The provider tree is [`terraform-provider-openwarp/`](../terraform-provider-openwarp/README.md). It describes local development overrides, application/environment/secret/service-token resources and a secret data source, and CI runs its unit, live client and acceptance tests.
 
 The provider READMEs state that the provider is not published to the Terraform Registry. A package name in an example is not evidence that a registry install is available.
 

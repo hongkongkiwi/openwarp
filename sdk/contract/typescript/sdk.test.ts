@@ -1,5 +1,5 @@
 // Integration test for the TypeScript SDK against a real server binary.
-// Run: node --test sdks/typescript/sdk.test.ts
+// Run: node --test sdk/contract/typescript/sdk.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { OpenWarp, OpenWarpError } from "./openwarp.ts";
 
 const BIN = process.env.OPENWARP_BIN
-  ?? fileURLToPath(new URL("../../target/debug/openwarp-server", import.meta.url));
+  ?? fileURLToPath(new URL("../../../target/debug/openwarp-server", import.meta.url));
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {

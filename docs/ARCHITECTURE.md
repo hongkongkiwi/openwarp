@@ -20,10 +20,9 @@ OpenWarp is a Rust workspace with a server, CLI, and cryptographic library. The 
 | [`crates/crypto/src/lib.rs`](../crates/crypto/src/lib.rs) | Encryption, key wrapping, and related primitives |
 | [`crates/server/tests`](../crates/server/tests) | HTTP, authorisation, account, integration, and UI tests |
 | [`crates/eso`](../crates/eso) | External Secrets Operator webhook bridge |
-| [`sdk`](../sdk) | TypeScript, Python, Go and Rust convenience clients |
-| [`sdks`](../sdks) | Additional TypeScript and Python contract clients |
+| [`sdk`](../sdk) | TypeScript, Python, Go and Rust clients; OpenAPI-contract clients under [`sdk/contract`](../sdk/contract) |
 | [`action`](../action) | GitHub Actions export client |
-| [`terraform-provider`](../terraform-provider) / [`terraform-provider-openwarp`](../terraform-provider-openwarp) | Separate Terraform provider trees; see the client inventory before choosing one |
+| [`terraform-provider-openwarp`](../terraform-provider-openwarp) | Terraform provider with unit, live client and acceptance tests |
 | [`deploy`](../deploy) | Deployment configuration, including the Caddy edge |
 | [`openapi.json`](../openapi.json) | Machine-readable API contract |
 | [`scripts`](../scripts) | Backup, contract checks, smoke tests and worktree helpers |
