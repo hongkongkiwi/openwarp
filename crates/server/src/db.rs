@@ -688,7 +688,7 @@ fn exec_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Resu
 fn query_sqlite(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
     let sql = sqlite_sql(sql);
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_param))).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
