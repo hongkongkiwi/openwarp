@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
@@ -30,8 +30,12 @@ impl Mock {
             while !done.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        // Accepted sockets can inherit O_NONBLOCK; wait for the declared body before answering.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                         let mut bytes = Vec::new();
+                        let mut complete = false;
                         let mut chunk = [0u8; 4096];
                         loop {
                             let n = stream.read(&mut chunk).unwrap_or(0);
@@ -43,9 +47,10 @@ impl Mock {
                                     let (key,value) = l.split_once(':')?;
                                     if key.eq_ignore_ascii_case("content-length") { value.trim().parse::<usize>().ok() } else { None }
                                 }).unwrap_or(0);
-                                if bytes.len() >= end + 4 + len { break; }
+                                if bytes.len() >= end + 4 + len { complete = true; break; }
                             }
                         }
+                        if !complete { continue; }
                         captured.lock().unwrap().push(String::from_utf8(bytes).unwrap());
                         let _ = stream.write_all(response.as_bytes());
                     }
@@ -81,6 +86,38 @@ fn success(output: &Output) {
     assert!(output.status.success(), "CLI failed: {}", String::from_utf8_lossy(&output.stderr));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private-test-token"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("private-test-token"));
+}
+
+#[test]
+fn management_mock_requires_complete_headers_and_declared_body() {
+    let mock = Mock::new(200, "{}", None);
+    let addr = mock.base.trim_start_matches("http://").to_string();
+    let body = "{\"name\":\"雪\"}";
+    let head = format!("POST /api/orgs HTTP/1.1\r\nAuthorization: Bearer private-test-token\r\nContent-Length: {}\r\n\r\n", body.len());
+    { let _ = TcpStream::connect(&addr).unwrap(); }
+    { let mut stream = TcpStream::connect(&addr).unwrap(); stream.write_all(b"POST /api/orgs HT").unwrap(); }
+    {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body.as_bytes()[..1]).unwrap();
+    }
+    let expected = format!("{head}{body}");
+    let sender = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body.as_bytes()[..1]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stream.write_all(&body.as_bytes()[1..]).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "mock did not answer the completed request");
+    });
+    sender.join().unwrap();
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "only the complete request and body may be recorded");
+    assert_eq!(calls[0], expected, "mock must preserve the complete head and declared body");
 }
 
 #[test]

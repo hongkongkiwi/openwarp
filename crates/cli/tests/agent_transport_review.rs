@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
@@ -27,11 +27,15 @@ impl Mock {
         let worker = thread::spawn(move || { while !s.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    // Accepted sockets can inherit O_NONBLOCK; wait for a complete head before answering.
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut request = Vec::new(); let mut buf = [0; 1024];
                     while !request.windows(4).any(|w| w==b"\r\n\r\n") {
                         match stream.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&buf[..n]) }
                     }
+                    if !request.windows(4).any(|w| w==b"\r\n\r\n") { continue; }
                     q.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
                     let body = r#"{"secrets":[{"key":"KEY","path":"/","value":"rendered-secret","type":"secret"}]}"#;
                     let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -63,6 +67,29 @@ fn positive_control(temp: &Temp, mock: &Mock) {
     fs::write(temp.path("template"), "{{secret /KEY}}").unwrap();
     success(&command(temp, &mock.host, &temp.path("template"), &temp.path("output")).output().unwrap());
     assert_eq!(fs::read_to_string(temp.path("output")).unwrap(), "rendered-secret");
+    mock.assert_bearer();
+}
+
+#[test]
+fn agent_transport_mock_serves_complete_requests_and_ignores_abandoned_connections() {
+    let mock = Mock::new();
+    let addr = mock.host.trim_start_matches("http://").to_string();
+    { let _ = TcpStream::connect(&addr).unwrap(); }
+    { let mut stream = TcpStream::connect(&addr).unwrap(); stream.write_all(b"GET /api/envs/env-test/export?base=1 HT").unwrap(); }
+    let sender = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        stream.write_all(b"GET /api/envs/env-test/export?base=1 HTTP/1.1\r\nAuthorization: Bearer review-dummy-token\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "mock did not answer the completed request");
+    });
+    sender.join().unwrap();
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "only the completed request may be recorded: {requests:?}");
+    assert!(requests[0].starts_with("GET /api/envs/env-test/export?base=1 HTTP/1.1\r\n"), "unexpected recorded request: {requests:?}");
+    drop(requests);
     mock.assert_bearer();
 }
 
