@@ -3473,7 +3473,7 @@ async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
         }
     }
     #[cfg(target_arch = "wasm32")]
-    Err("generic integration connection tests require the native server".into())
+    { Err("generic integration connection tests require the native server".into()) }
 }
 pub fn has_test(kind: &str) -> bool { KINDS.contains(&kind) }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
