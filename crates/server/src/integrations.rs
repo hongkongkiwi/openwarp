@@ -3427,12 +3427,7 @@ pub async fn sync_managed_with_tags(kind: &str, config: &Value, secrets: &[(Stri
     }))
 }
 
-// ---------- generic connection probe ----------
-// Every known kind must answer the test route. Kinds with a bespoke test
-// above verify a provider's actual API; the remaining kinds fall back to an
-// unauthenticated reachability probe against the same base URL their sync
-// implementation uses. Any HTTP response counts as reachable, because a 401
-// from a live provider is a credential problem, not a connection failure.
+// Generic probes check reachability, not credentials.
 fn probe_base(kind: &str, config: &Value) -> Result<String, String> {
     let required = |key: &str| -> Result<String, String> { let v = cfg(config, key);
         if v.is_empty() { Err(format!("{} connection test needs {} in the integration config", kind, key)) } else { Ok(v.trim_end_matches('/').to_string()) } };
@@ -3458,24 +3453,21 @@ fn probe_base(kind: &str, config: &Value) -> Result<String, String> {
         other => Err(format!("unknown integration kind: {other}")),
     }
 }
-// Errors and reports name the origin without its path or query, which may
-// embed a webhook token.
+// Report only the origin; paths and credentials can contain secrets.
 fn probe_target(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(u) => match (u.scheme(), u.host_str(), u.port()) { (s, Some(h), p) => format!("{s}://{h}{}", p.map(|p| format!(":{p}")).unwrap_or_default()), _ => url.to_string() },
-        Err(_) => url.to_string(),
+        Ok(u) if matches!(u.scheme(), "http" | "https") => match (u.host_str(), u.port()) { (Some(h), p) => format!("{}://{h}{}", u.scheme(), p.map(|p| format!(":{p}")).unwrap_or_default()), _ => String::new() },
+        _ => String::new(),
     }
 }
 async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
     let root = probe_base(kind, config)?;
     let target = probe_target(&root);
+    if target.is_empty() { return Err("invalid integration endpoint URL".into()); }
     if !crate::app::egress_allowed(&root) { return Err(format!("{} endpoint {target} is blocked: private and loopback targets are rejected in production", kind)); }
-    let started = std::time::Instant::now();
-    let response = http_client().get(&root).send().await;
-    let ms = started.elapsed().as_millis();
-    match response {
-        Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {} in {ms}ms; credentials are not verified by this probe", kind, r.status().as_u16())),
-        Err(e) => Err(format!("{} endpoint {target} unreachable after {ms}ms: {e}", kind)),
+    match http_client().get(&root).send().await {
+        Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {}; credentials are not verified by this probe", kind, r.status().as_u16())),
+        Err(_) => Err(format!("{} endpoint {target} unreachable", kind)),
     }
 }
 pub fn has_test(kind: &str) -> bool { KINDS.contains(&kind) }

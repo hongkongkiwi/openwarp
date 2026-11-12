@@ -108,6 +108,73 @@ async fn probe_reports_an_unreachable_endpoint() {
 }
 
 #[tokio::test]
+async fn probe_unreachable_error_redacts_url_secrets_from_the_entire_body() {
+    let (s, token, env) = suite().await;
+    // A bound socket without a listener reserves a local port that refuses connections.
+    let target = tokio::net::TcpSocket::new_v4().unwrap(); target.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let sentinels = ["probe-user-sentinel", "probe-password-sentinel", "probe-path-sentinel", "probe-query-sentinel"];
+    let url = format!("http://{}:{}@{}/{}?token={}", sentinels[0], sentinels[1], target.local_addr().unwrap(), sentinels[2], sentinels[3]);
+    let iid = make_integration(&s, &token, &env, "webhook", json!({"url": url})).await;
+    let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert!(r.body["error"].as_str().unwrap_or_default().contains("unreachable"), "{}", r.text);
+    let leaked: Vec<_> = sentinels.iter().filter(|secret| r.text.contains(**secret)).collect();
+    assert!(leaked.is_empty(), "URL secrets {leaked:?} leaked in response: {}", r.text);
+}
+
+#[tokio::test]
+async fn probe_malformed_url_error_redacts_secrets_from_the_entire_body() {
+    let (s, token, env) = suite().await;
+    let sentinels = ["invalid-user-sentinel", "invalid-password-sentinel", "invalid-path-sentinel", "invalid-query-sentinel"];
+    let url = format!("http://{}:{}@127.0.0.1:invalid-port/{}?token={}", sentinels[0], sentinels[1], sentinels[2], sentinels[3]);
+    let iid = make_integration(&s, &token, &env, "webhook", json!({"url": url})).await;
+    let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    let error = r.body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("invalid") || error.contains("unreachable"), "{}", r.text);
+    let leaked: Vec<_> = sentinels.iter().filter(|secret| r.text.contains(**secret)).collect();
+    assert!(leaked.is_empty(), "URL secrets {leaked:?} leaked in response: {}", r.text);
+}
+
+#[tokio::test]
+async fn probe_treats_401_and_403_as_reachable_without_sending_credentials() {
+    let (s, token, env) = suite().await;
+    for status in [401, 403] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/probe", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let tx = tx.clone(); async move {
+                let (parts, body) = request.into_parts();
+                let body = axum::body::to_bytes(body, 8192).await.unwrap();
+                tx.send((parts, body)).unwrap();
+                axum::http::StatusCode::from_u16(status).unwrap()
+            }
+        });
+        let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let iid = make_integration(&s, &token, &env, "webhook", json!({"url": url, "token": "probe-bearer-sentinel", "signing_secret": "probe-signing-sentinel"})).await;
+        let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
+        fixture.abort();
+        assert_eq!(r.status, 200, "HTTP {status}: {}", r.text);
+        assert_eq!(r.body["ok"], json!(true), "{}", r.text);
+        let detail = r.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(&format!("HTTP {status}")), "detail: {detail}");
+        assert!(detail.contains("credentials are not verified"), "detail: {detail}");
+        let (parts, body) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().expect("probe request missing");
+        assert_eq!(parts.method, Method::GET);
+        assert_eq!(parts.uri, "/probe");
+        for name in ["authorization", "cookie", "x-openwarp-timestamp", "x-openwarp-signature"] {
+            assert!(!parts.headers.contains_key(name), "probe sent {name}");
+        }
+        assert!(body.is_empty(), "probe sent a request body");
+        let request = format!("{:?}{:?}{:?}", parts.uri, parts.headers, body);
+        for secret in ["probe-bearer-sentinel", "probe-signing-sentinel", token.as_str()] {
+            assert!(!request.contains(secret), "probe sent a credential");
+        }
+    }
+}
+
+#[tokio::test]
 async fn probe_requires_config_keys_and_never_501s() {
     let (s, token, env) = suite().await;
     for (kind, config, fragment) in [
