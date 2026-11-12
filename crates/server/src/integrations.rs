@@ -3427,9 +3427,58 @@ pub async fn sync_managed_with_tags(kind: &str, config: &Value, secrets: &[(Stri
     }))
 }
 
-pub fn has_test(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "linode" | "digitalocean_ssh" | "ssh" | "keeper" | "oci_vault" | "huggingface")
+// ---------- generic connection probe ----------
+// Every known kind must answer the test route. Kinds with a bespoke test
+// above verify a provider's actual API; the remaining kinds fall back to an
+// unauthenticated reachability probe against the same base URL their sync
+// implementation uses. Any HTTP response counts as reachable, because a 401
+// from a live provider is a credential problem, not a connection failure.
+fn probe_base(kind: &str, config: &Value) -> Result<String, String> {
+    let required = |key: &str| -> Result<String, String> { let v = cfg(config, key);
+        if v.is_empty() { Err(format!("{} connection test needs {} in the integration config", kind, key)) } else { Ok(v.trim_end_matches('/').to_string()) } };
+    match kind {
+        "github" => Ok(base(config, "https://api.github.com")),
+        "gitlab" => Ok(base(config, "https://gitlab.com/api/v4")),
+        "vercel" => Ok(base(config, "https://api.vercel.com")),
+        "netlify" => Ok(base(config, "https://api.netlify.com")),
+        "cloudflare" | "cloudflare_pages" => Ok(base(config, "https://api.cloudflare.com")),
+        "supabase" => Ok(base(config, "https://api.supabase.com")),
+        "nomad" => Ok(base(config, "http://127.0.0.1:4646")),
+        "coolify" => Ok(base(config, "https://app.coolify.io")),
+        "gcp_secret_manager" => Ok(base(config, "https://secretmanager.googleapis.com")),
+        "digitalocean" => Ok(base(config, "https://api.digitalocean.com")),
+        "railway" => Ok(base(config, "https://backboard.railway.app")),
+        "render" => Ok(base(config, "https://api.render.com")),
+        "flyio" => Ok(base(config, "https://api.machines.dev")),
+        "heroku" => Ok(base(config, "https://api.heroku.com")),
+        "azure_key_vault" => { if !cfg(config, "base_url").is_empty() { Ok(base(config, "")) } else { required("vault").map(|v| format!("https://{v}.vault.azure.net")) } }
+        "kubernetes" => required("api_server"),
+        "hashicorp_vault" => required("addr"),
+        "webhook" => required("url"),
+        other => Err(format!("unknown integration kind: {other}")),
+    }
 }
+// Errors and reports name the origin without its path or query, which may
+// embed a webhook token.
+fn probe_target(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match (u.scheme(), u.host_str(), u.port()) { (s, Some(h), p) => format!("{s}://{h}{}", p.map(|p| format!(":{p}")).unwrap_or_default()), _ => url.to_string() },
+        Err(_) => url.to_string(),
+    }
+}
+async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
+    let root = probe_base(kind, config)?;
+    let target = probe_target(&root);
+    if !crate::app::egress_allowed(&root) { return Err(format!("{} endpoint {target} is blocked: private and loopback targets are rejected in production", kind)); }
+    let started = std::time::Instant::now();
+    let response = http_client().get(&root).send().await;
+    let ms = started.elapsed().as_millis();
+    match response {
+        Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {} in {ms}ms; credentials are not verified by this probe", kind, r.status().as_u16())),
+        Err(e) => Err(format!("{} endpoint {target} unreachable after {ms}ms: {e}", kind)),
+    }
+}
+pub fn has_test(kind: &str) -> bool { KINDS.contains(&kind) }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
     match kind {
         "trigger" => trigger_test(config).await,
@@ -3475,7 +3524,43 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "keeper" => keeper_test(config).await,
         "oci_vault" => oci_vault_test(config).await,
         "huggingface" => huggingface_test(config).await,
-        _ => Err(format!("connection test is not implemented for kind {}", kind)),
+        _ => generic_test(kind, config).await,
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[test]
+    fn probe_bases_mirror_sync_defaults() {
+        let empty = json!({});
+        for (kind, want) in [
+            ("github", "https://api.github.com"), ("gitlab", "https://gitlab.com/api/v4"), ("vercel", "https://api.vercel.com"),
+            ("netlify", "https://api.netlify.com"), ("cloudflare", "https://api.cloudflare.com"), ("cloudflare_pages", "https://api.cloudflare.com"),
+            ("supabase", "https://api.supabase.com"), ("coolify", "https://app.coolify.io"), ("gcp_secret_manager", "https://secretmanager.googleapis.com"),
+            ("digitalocean", "https://api.digitalocean.com"), ("railway", "https://backboard.railway.app"), ("render", "https://api.render.com"),
+            ("flyio", "https://api.machines.dev"), ("heroku", "https://api.heroku.com"), ("nomad", "http://127.0.0.1:4646"),
+        ] { assert_eq!(probe_base(kind, &empty).unwrap(), want, "default base for {kind}"); }
+    }
+    #[test]
+    fn probe_base_overrides_and_required_keys() {
+        assert_eq!(probe_base("gitlab", &json!({"base_url": "https://git.example/api/v4/"})).unwrap(), "https://git.example/api/v4");
+        assert_eq!(probe_base("azure_key_vault", &json!({"vault": "mine"})).unwrap(), "https://mine.vault.azure.net");
+        assert_eq!(probe_base("azure_key_vault", &json!({"base_url": "https://vault.internal"})).unwrap(), "https://vault.internal");
+        for (kind, key) in [("azure_key_vault", "vault"), ("kubernetes", "api_server"), ("hashicorp_vault", "addr"), ("webhook", "url")] {
+            let e = probe_base(kind, &json!({})).unwrap_err();
+            assert!(e.contains(key) && e.contains(kind), "{kind}: {e}");
+        }
+        assert!(probe_base("nonsense", &json!({})).unwrap_err().contains("unknown integration kind"));
+    }
+    #[test]
+    fn probe_target_hides_paths_and_query() {
+        assert_eq!(probe_target("https://hooks.example/x/secret?token=abc"), "https://hooks.example");
+        assert_eq!(probe_target("http://127.0.0.1:4646"), "http://127.0.0.1:4646");
+    }
+    #[test]
+    fn every_kind_answers_the_test_route() {
+        for kind in KINDS { assert!(has_test(kind), "{kind} must be testable"); }
     }
 }
 fn form_encode(s: &str) -> String {

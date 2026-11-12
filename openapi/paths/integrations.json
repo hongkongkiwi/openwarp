@@ -465,7 +465,7 @@
   },
   "/api/integrations/{iid}/test": {
     "post": {
-      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Native provider tests run only for supported kinds; other kinds return 501.",
+      "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Providers with a bespoke test verify their API; every other known kind answers with an unauthenticated reachability probe against its configured endpoint, where any HTTP response, including 401 or 403, counts as reachable.",
       "parameters": [
         {
           "in": "path",
@@ -526,16 +526,6 @@
             }
           },
           "description": "Environment or application not found"
-        },
-        "501": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Error"
-              }
-            }
-          },
-          "description": "Connection test not implemented for this provider kind"
         }
       },
       "security": [

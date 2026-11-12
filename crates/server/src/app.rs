@@ -1928,10 +1928,10 @@ async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<Str
     let key = st.env_key(&eid).await?;
     let config: Value = serde_json::from_slice(&oc::decrypt_symmetric_compat(&key, &integration_aad(&eid, &iid, "config"), &db::s(&row, "config_enc")).map_err(|e| bad(&e))?).unwrap_or(json!({}));
     let kind = db::s(&row, "kind");
-    if integrations::has_test(&kind) { let result = integrations::test(&kind, &config).await;
-        crate::ai::activity(&st,(&org,"",&eid),&uid,&h,if result.is_ok() { "integration.test" } else { "integration.test_failed" },&iid,1).await;
-        let msg = result.map_err(|e| bad(&e))?; return Ok(j(json!({"ok": true, "detail": msg}))); }
-    Err(err(StatusCode::NOT_IMPLEMENTED, &format!("connection test is not implemented for kind {}; use Sync to verify it against the live service", kind))) }
+    let result = integrations::test(&kind, &config).await;
+    crate::ai::activity(&st,(&org,"",&eid),&uid,&h,if result.is_ok() { "integration.test" } else { "integration.test_failed" },&iid,1).await;
+    let msg = result.map_err(|e| bad(&e))?;
+    Ok(j(json!({"ok": true, "detail": msg}))) }
 async fn integration_history(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "integration not found"))?;
     let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
