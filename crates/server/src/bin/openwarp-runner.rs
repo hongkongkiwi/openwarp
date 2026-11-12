@@ -70,7 +70,7 @@ async fn run_test(kind: &str, config: &Value) -> Result<(String, Vec<(String, St
         "instabox" => integrations::instabox_test(config).await?,
         "boat" => integrations::boat_test(config).await?,
         "daytona" => integrations::daytona_test(config).await?,
-        _ => return Err(format!("connection test is not implemented for kind {}", kind)),
+        _ => integrations::test(kind, config).await?,
     };
     Ok((msg, Vec::new()))
 }

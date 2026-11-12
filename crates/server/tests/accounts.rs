@@ -45,14 +45,6 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    // True ephemeral: the OS never hands out a port that is still bound, so
-    // parallel test binaries cannot converge the way a PID-derived scan
-    // does. The only residual hazard is the gap between dropping this
-    // listener and the child binding it, which the startup retry covers.
-    TcpListener::bind("127.0.0.1:0").expect("ephemeral port").local_addr().expect("local addr").port()
-}
-
 impl Server {
     async fn start() -> Server {
         Server::start_env(&[]).await
@@ -63,7 +55,8 @@ impl Server {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("openwarp-accounts-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let port = free_port();
+        let api_listener = TcpListener::bind("127.0.0.1:0").expect("reserve API port");
+        let port = api_listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{}", port);
         let (inbox_url, inbox) = start_inbox();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
@@ -103,13 +96,15 @@ impl Server {
         for (k, v) in extra {
             cmd.env(k, v);
         }
+        drop(api_listener);
         let child = cmd.spawn().expect("spawn openwarp-server");
         let client = Client::builder().no_proxy().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().expect("http client");
-        let server = Server { child, base, dir, client, inbox, social_cookies: Mutex::new(Vec::new()) };
+        let mut server = Server { child, base, dir, client, inbox, social_cookies: Mutex::new(Vec::new()) };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
+            assert!(server.child.try_wait().unwrap().is_none(), "account fixture server exited before readiness");
             if let Ok(r) = server.client.get(server.url("/health")).send().await {
-                if r.status().is_success() { return server; }
+                if r.status().is_success() && r.json::<Value>().await.is_ok_and(|v| v["ok"] == true && v["service"] == "openwarp") { return server; }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

@@ -3427,9 +3427,92 @@ pub async fn sync_managed_with_tags(kind: &str, config: &Value, secrets: &[(Stri
     }))
 }
 
-pub fn has_test(kind: &str) -> bool {
-    matches!(kind, "trigger" | "instabox" | "boat" | "daytona" | "aws_secrets_manager" | "aws_parameter_store" | "1password" | "onepassword" | "dokploy" | "caprover" | "portainer" | "docker_swarm" | "bitbucket" | "circleci" | "teamcity" | "travisci" | "terraform_cloud" | "qovery" | "laravel_forge" | "openwarp" | "devin" | "cloudflare_secrets_store" | "octopus_deploy" | "azure_devops" | "cursor" | "northflank" | "spacelift" | "rundeck" | "cloud66" | "humanitec" | "ovh_kms" | "scaleway_secret_manager" | "azure_app_configuration" | "vultr" | "hetzner" | "linode" | "digitalocean_ssh" | "ssh" | "keeper" | "oci_vault" | "huggingface")
+// Generic probes check reachability, not credentials.
+fn probe_base(kind: &str, config: &Value) -> Result<String, String> {
+    let required = |key: &str| -> Result<String, String> { let v = cfg(config, key);
+        if v.is_empty() { Err(format!("{} connection test needs {} in the integration config", kind, key)) } else { Ok(v.trim_end_matches('/').to_string()) } };
+    match kind {
+        "github" => Ok(base(config, "https://api.github.com")),
+        "gitlab" => Ok(base(config, "https://gitlab.com/api/v4")),
+        "vercel" => Ok(base(config, "https://api.vercel.com")),
+        "netlify" => Ok(base(config, "https://api.netlify.com")),
+        "cloudflare" | "cloudflare_pages" => Ok(base(config, "https://api.cloudflare.com")),
+        "supabase" => Ok(base(config, "https://api.supabase.com")),
+        "nomad" => Ok(base(config, "http://127.0.0.1:4646")),
+        "coolify" => Ok(base(config, "https://app.coolify.io")),
+        "gcp_secret_manager" => Ok(base(config, "https://secretmanager.googleapis.com")),
+        "digitalocean" => Ok(base(config, "https://api.digitalocean.com")),
+        "railway" => Ok(base(config, "https://backboard.railway.app")),
+        "render" => Ok(base(config, "https://api.render.com")),
+        "flyio" => Ok(base(config, "https://api.machines.dev")),
+        "heroku" => Ok(base(config, "https://api.heroku.com")),
+        "azure_key_vault" => { if !cfg(config, "base_url").is_empty() { Ok(base(config, "")) } else { required("vault").map(|v| format!("https://{v}.vault.azure.net")) } }
+        "kubernetes" => required("api_server"),
+        "hashicorp_vault" => required("addr"),
+        "webhook" => required("url"),
+        other => Err(format!("unknown integration kind: {other}")),
+    }
 }
+// Report only the origin; paths and credentials can contain secrets.
+fn probe_target(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") && u.username().is_empty() && u.password().is_none() => match (u.host_str(), u.port()) { (Some(h), p) => format!("{}://{h}{}", u.scheme(), p.map(|p| format!(":{p}")).unwrap_or_default()), _ => String::new() },
+        _ => String::new(),
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_ip_allowed(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => probe_ip_allowed(v6.to_ipv4_mapped().unwrap().into()),
+        std::net::IpAddr::V4(v4) => { let [a,b,_,_]=v4.octets(); !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || a==0 || a>=240 || (a==100 && (64..=127).contains(&b)) || (a==192 && (b==0 || b==2 || b==168)) || (a==198 && (b==18 || b==19 || b==51)) || (a==203 && b==0)) },
+        std::net::IpAddr::V6(v6) => { let n=v6.segments(); (n[0]&0xe000)==0x2000 && n[0]!=0x2002 && !(n[0]==0x2001 && (n[1]<0x0200 || n[1]==0x0db8)) && !(n[0]==0x3fff && (n[1]&0xf000)==0) },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ProbeResolver { restrict: bool, blocked: std::sync::Arc<std::sync::atomic::AtomicBool> }
+#[cfg(not(target_arch = "wasm32"))]
+impl reqwest::dns::Resolve for ProbeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let restrict = self.restrict; let blocked = self.blocked.clone();
+        Box::pin(async move {
+            let addrs: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if addrs.is_empty() { return Err(std::io::Error::other("empty DNS response").into()); }
+            if restrict && addrs.iter().any(|addr| !probe_ip_allowed(addr.ip())) {
+                blocked.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::other("blocked by egress policy").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
+    let root = probe_base(kind, config)?;
+    let target = probe_target(&root);
+    if target.is_empty() { return Err("invalid integration endpoint URL".into()); }
+    if !crate::app::egress_allowed(&root) { return Err("integration endpoint blocked by egress policy".into()); }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let restrict = crate::envcfg::var("OPENWARP_ENV").map(|v| v.eq_ignore_ascii_case("production")).unwrap_or(false)
+            && !crate::envcfg::var("OPENWARP_ALLOW_PRIVATE_EGRESS").map(|v| v == "1").unwrap_or(false);
+        let url = reqwest::Url::parse(&root).map_err(|_| "invalid integration endpoint URL")?;
+        let host = url.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+        if restrict && host.parse::<std::net::IpAddr>().is_ok_and(|ip| !probe_ip_allowed(ip)) { return Err("integration endpoint blocked by egress policy".into()); }
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30)).dns_resolver(std::sync::Arc::new(ProbeResolver { restrict, blocked: blocked.clone() }))
+            .build().map_err(|_| "integration probe client unavailable")?;
+        match client.get(url).send().await {
+            Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {}; credentials are not verified by this probe", kind, r.status().as_u16())),
+            Err(_) if blocked.load(std::sync::atomic::Ordering::Relaxed) => Err("integration endpoint blocked by egress policy".into()),
+            Err(_) => Err("integration endpoint unreachable".into()),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    { Err("generic integration connection tests require the native server".into()) }
+}
+pub fn has_test(kind: &str) -> bool { KINDS.contains(&kind) }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
     match kind {
         "trigger" => trigger_test(config).await,
@@ -3475,7 +3558,67 @@ pub async fn test(kind: &str, config: &Value) -> Result<String, String> {
         "keeper" => keeper_test(config).await,
         "oci_vault" => oci_vault_test(config).await,
         "huggingface" => huggingface_test(config).await,
-        _ => Err(format!("connection test is not implemented for kind {}", kind)),
+        _ => generic_test(kind, config).await,
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[test]
+    fn probe_bases_mirror_sync_defaults() {
+        let empty = json!({});
+        for (kind, want) in [
+            ("github", "https://api.github.com"), ("gitlab", "https://gitlab.com/api/v4"), ("vercel", "https://api.vercel.com"),
+            ("netlify", "https://api.netlify.com"), ("cloudflare", "https://api.cloudflare.com"), ("cloudflare_pages", "https://api.cloudflare.com"),
+            ("supabase", "https://api.supabase.com"), ("coolify", "https://app.coolify.io"), ("gcp_secret_manager", "https://secretmanager.googleapis.com"),
+            ("digitalocean", "https://api.digitalocean.com"), ("railway", "https://backboard.railway.app"), ("render", "https://api.render.com"),
+            ("flyio", "https://api.machines.dev"), ("heroku", "https://api.heroku.com"), ("nomad", "http://127.0.0.1:4646"),
+        ] { assert_eq!(probe_base(kind, &empty).unwrap(), want, "default base for {kind}"); }
+    }
+    #[test]
+    fn probe_base_overrides_and_required_keys() {
+        assert_eq!(probe_base("gitlab", &json!({"base_url": "https://git.example/api/v4/"})).unwrap(), "https://git.example/api/v4");
+        assert_eq!(probe_base("azure_key_vault", &json!({"vault": "mine"})).unwrap(), "https://mine.vault.azure.net");
+        assert_eq!(probe_base("azure_key_vault", &json!({"base_url": "https://vault.internal"})).unwrap(), "https://vault.internal");
+        for (kind, key) in [("azure_key_vault", "vault"), ("kubernetes", "api_server"), ("hashicorp_vault", "addr"), ("webhook", "url")] {
+            let e = probe_base(kind, &json!({})).unwrap_err();
+            assert!(e.contains(key) && e.contains(kind), "{kind}: {e}");
+        }
+        assert!(probe_base("nonsense", &json!({})).unwrap_err().contains("unknown integration kind"));
+    }
+    #[test]
+    fn probe_target_hides_paths_and_query() {
+        assert_eq!(probe_target("https://hooks.example/x/secret?token=abc"), "https://hooks.example");
+        assert_eq!(probe_target("http://127.0.0.1:4646"), "http://127.0.0.1:4646");
+    }
+    #[test]
+    fn every_kind_answers_the_test_route() {
+        for kind in KINDS { assert!(has_test(kind), "{kind} must be testable"); }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_ip_denies_non_public_destinations() {
+        let denied = [
+            "0.0.0.0", "0.1.2.3", "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254",
+            "100.64.0.0", "100.100.100.200", "100.127.255.255", "192.0.0.1", "192.0.2.1", "192.2.0.1",
+            "198.18.0.1", "198.19.255.255", "198.51.100.1", "203.0.113.1", "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255",
+            "::", "::1", "fc00::1", "fe80::1", "ff02::1", "64:ff9b::808:808", "64:ff9b:1::1", "2002:0808:0808::1",
+            "2001::1", "2001:100::1", "2001:db8::1", "3fff::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:100.100.100.200", "::ffff:198.51.100.1",
+        ];
+        let unexpected: Vec<_> = denied.iter().copied().filter(|raw| probe_ip_allowed(raw.parse().unwrap())).collect();
+        assert!(unexpected.is_empty(), "{} of {} non-public destinations were allowed: {}", unexpected.len(), denied.len(), unexpected.join(", "));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_ip_allows_public_destinations() {
+        let allowed = [
+            "1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.0", "198.17.255.255", "198.20.0.1",
+            "2001:4860:4860::8888", "2606:4700:4700::1111", "2001:200::1", "3fff:1000::1", "::ffff:8.8.8.8",
+        ];
+        let unexpected: Vec<_> = allowed.iter().copied().filter(|raw| !probe_ip_allowed(raw.parse().unwrap())).collect();
+        assert!(unexpected.is_empty(), "{} of {} public destinations were denied: {}", unexpected.len(), allowed.len(), unexpected.join(", "));
     }
 }
 fn form_encode(s: &str) -> String {
