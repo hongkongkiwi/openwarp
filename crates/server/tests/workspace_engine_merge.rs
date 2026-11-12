@@ -507,7 +507,24 @@ async fn independent_admission(kind: Kind) {
     let s=Server::start().await; let (owner,org)=s.owner().await;
     let password=s.register(EMAIL).await; s.invite(&owner,&org).await;
     let provider=Provider::configure(kind,&s,&owner,&org,true,"test.invalid").await;
-    provider.login(&s,&org).await.expect(409,"pending invite cannot silently crosslink a password account by email");
+    let r=provider.login(&s,&org).await;
+    if let Kind::Oidc = kind {
+        r.expect(307,"existing OIDC email requires account proof");
+        let location=r.headers["location"].to_str().unwrap();
+        assert!(location.starts_with("/#link="),"OIDC must return an account-proof challenge: {}",location);
+        assert!(!location.contains("token="),"OIDC must not issue a session before account proof");
+        assert!(!r.headers.get_all("set-cookie").iter().any(|h|h.to_str().unwrap().starts_with("ow_session=")),"OIDC must not issue a session cookie before account proof");
+        let challenge=location.strip_prefix("/#link=").unwrap().split('&').next().unwrap();
+        assert!(!challenge.is_empty(),"OIDC account-proof challenge must not be empty");
+        let sessions_before:i64=s.db().query_row("SELECT COUNT(*) FROM sessions",[],|r|r.get(0)).unwrap();
+        let denied=s.call(Method::POST,"/api/auth/link/complete",None,Some(json!({"token":challenge,"password":"wrong-password"}))).await;
+        denied.expect(401,"wrong account proof cannot link an invited identity");
+        assert!(!denied.headers.get_all("set-cookie").iter().any(|h|h.to_str().unwrap().starts_with("ow_session=")),"wrong account proof must not issue a session cookie");
+        let sessions_after:i64=s.db().query_row("SELECT COUNT(*) FROM sessions",[],|r|r.get(0)).unwrap();
+        assert_eq!(sessions_after,sessions_before,"wrong account proof must not create a server session");
+        let bindings:i64=s.db().query_row("SELECT COUNT(*) FROM oidc_subjects WHERE issuer=? AND subject=?",rusqlite::params![s.idp.base,EMAIL],|r|r.get(0)).unwrap();
+        assert_eq!(bindings,0,"failed account proof must not bind the OIDC identity");
+    } else { r.expect(409,"pending invite cannot silently crosslink a password account by email"); }
     assert_eq!(s.invitation_state(&org),(0,0)); s.check_session(&password).await;
 }
 macro_rules! provider_tests {

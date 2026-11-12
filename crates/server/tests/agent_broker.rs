@@ -18,33 +18,46 @@ impl Server {
     async fn start() -> Self {
         let dir = std::env::temp_dir().join(format!("openwarp-broker-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).unwrap();
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = api_listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
         let inbox = Arc::new(Mutex::new(Vec::new())); let sink = inbox.clone();
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
-                let Ok(mut stream) = incoming else { break }; let mut buf = Vec::new(); let mut chunk = [0; 8192];
+                let Ok(mut stream) = incoming else { break }; let mut buf = Vec::new(); let mut chunk = [0; 8192]; let mut accepted = false;
                 while let Ok(n) = stream.read(&mut chunk) {
                     if n == 0 { break; } buf.extend_from_slice(&chunk[..n]);
                     if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..end]);
+                        if head.lines().next() != Some("POST /mail HTTP/1.1") { break; }
                         let len = head.lines().find_map(|l| { let (k,v) = l.split_once(':')?; if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None } }).unwrap_or(0);
-                        if buf.len() >= end + 4 + len { if let Ok(v) = serde_json::from_slice(&buf[end+4..end+4+len]) { sink.lock().unwrap().push(v); } break; }
+                        if buf.len() >= end + 4 + len { if let Ok(v) = serde_json::from_slice(&buf[end+4..end+4+len]) { sink.lock().unwrap().push(v); accepted = true; } break; }
                     }
                 }
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                let status = if accepted { "200 OK" } else { "400 Bad Request" };
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
             }
         });
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
         for (key, _) in std::env::vars().filter(|(k,_)| k.starts_with("OPENWARP_") || k.ends_with("_PROXY") || k == "REDIS_URL") { cmd.env_remove(key); }
-        let child = cmd.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display())).env("ADDR", format!("127.0.0.1:{port}"))
+        cmd.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display())).env("ADDR", format!("127.0.0.1:{port}"))
             .env("OPENWARP_PUBLIC_URL", &base).env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            .stdout(Stdio::null()).stderr(Stdio::null());
+        // Reserve the API port until the mail listener and child configuration are ready.
+        drop(api_listener);
+        let child = cmd.spawn().unwrap();
         let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build().unwrap();
-        let s = Self { child, dir, base, client, inbox }; let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline { if s.client.get(format!("{}/health", s.base)).send().await.is_ok_and(|r| r.status().is_success()) { return s; } tokio::time::sleep(Duration::from_millis(100)).await; }
+        let mut s = Self { child, dir, base, client, inbox }; let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            assert!(s.child.try_wait().unwrap().is_none(), "private broker test server exited before readiness");
+            if server_is_healthy(s.client.get(format!("{}/health", s.base)).send().await).await {
+                assert!(s.child.try_wait().unwrap().is_none(), "private broker test server exited during readiness");
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         panic!("private broker test server did not start");
     }
     async fn call(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> Resp {
@@ -66,6 +79,39 @@ impl Server {
         assert_eq!(login.status, 200); user["token"] = login.body["token"].clone(); user["user_id"] = login.body["user_id"].clone(); user
     }
 }
+async fn server_is_healthy(response: Result<reqwest::Response, reqwest::Error>) -> bool {
+    let Ok(response) = response else { return false };
+    response.status().is_success() && response.json::<Value>().await.is_ok_and(|body| body["ok"] == true && body["service"] == "openwarp")
+}
+
+#[tokio::test]
+async fn broker_fixture_health_requires_server_identity() {
+    async fn probe(status: u16, body: &str) -> bool {
+        let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/health", listener.local_addr().unwrap());
+        let sink = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new(); let mut chunk = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap(); assert!(n > 0, "health request ended before headers");
+                request.extend_from_slice(&chunk[..n]); assert!(request.len() <= 4096, "health request headers too large");
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let client = Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+        let healthy = server_is_healthy(client.get(url).send().await).await;
+        sink.join().unwrap(); healthy
+    }
+    assert!(!probe(200, "{}").await, "mail sink HTTP 200 must not satisfy server readiness");
+    assert!(probe(200, r#"{"ok":true,"service":"openwarp"}"#).await);
+    assert!(!probe(503, r#"{"ok":true,"service":"openwarp"}"#).await);
+    assert!(!probe(200, r#"{"ok":false,"service":"openwarp"}"#).await);
+    assert!(!probe(200, r#"{"ok":true,"service":"other"}"#).await);
+    assert!(!probe(200, "not-json").await);
+}
+
 async fn finish(r: reqwest::Response) -> Resp { let status = r.status().as_u16(); let text = r.text().await.unwrap(); let body = serde_json::from_str(&text).unwrap_or(Value::Null); Resp { status, body, text } }
 fn id(v: &Value, key: &str) -> String { v[key].as_str().unwrap_or_else(|| panic!("missing {key}")).to_string() }
 struct Fixture { s: Server, owner: String, uid: String, org: String, app: String, env: String, other_env: String, secret: String }
