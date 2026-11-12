@@ -59,22 +59,8 @@ jobs:
       - run: node --test --test-concurrency=1 crates/server/tests/ui.test.cjs crates/server/tests/ui-contrast.test.cjs crates/server/tests/ui-accessibility.test.cjs crates/server/tests/auth-v2.test.cjs crates/server/tests/e2e-libsodium.test.cjs crates/server/tests/vendor-integrity.test.cjs crates/server/tests/secret-health.test.cjs crates/server/tests/secret-health-ui.test.cjs crates/server/tests/secret-health-rotation.test.cjs crates/server/tests/secret-health-lockdown-ui.test.cjs tests/secret-health-enzoic.test.cjs tests/secret-health-providers.test.cjs tests/secret-health-enzoic-pairs.test.cjs tests/secret-health-enzoic-vectors.test.cjs crates/server/tests/workers-mfa.test.cjs crates/server/tests/workers-runtime.test.cjs crates/server/tests/workers-atomic.test.cjs crates/server/tests/workers-parity.test.cjs crates/server/tests/workers-protocol.test.cjs crates/server/tests/workers-live.test.cjs
       - run: python3 scripts/check-openapi.py --strict
       # The SDK tests spawn the binary cargo test just built.
-      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
-      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdks/python -p 'test_*.py'
-
-  terraform:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: terraform-provider/go.mod
-          cache-dependency-path: terraform-provider/go.sum
-      - run: cargo build -p openwarp-server
-      - run: cd terraform-provider && go build ./... && go vet ./...
-      - run: cd terraform-provider && OPENWARP_BIN="$GITHUB_WORKSPACE/target/debug/openwarp-server" go test ./...
+      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdk/contract/typescript/sdk.test.ts
+      - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdk/contract/python -p 'test_*.py'
 
   worker:
     runs-on: ubuntu-latest

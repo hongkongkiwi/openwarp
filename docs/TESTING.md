@@ -41,8 +41,8 @@ SDK, Terraform, Workers and container commands are defined in [.github/workflows
 
 ```bash
 cargo build --bin openwarp-server
-OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdks/typescript/sdk.test.ts
-OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdks/python -p 'test_*.py'
+OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdk/contract/typescript/sdk.test.ts
+OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdk/contract/python -p 'test_*.py'
 OPENWARP_BIN="$PWD/target/debug/openwarp-server" cargo test --manifest-path sdk/rust/Cargo.toml
 ```
 
@@ -96,7 +96,7 @@ Not yet implemented; sequenced in the rollout plan.
 
 ## CI lanes
 
-Current jobs in [ci.yml](../.github/workflows/ci.yml): `rust` (Clippy, workspace tests with PostgreSQL 17 and MariaDB 11.4 services, four Node suites, OpenAPI check, TypeScript and Python SDKs), `terraform` (legacy provider against a built server), `worker` (wasm check, bundle, deployment gate, workerd smoke), `docker` (build plus startup smoke), `sdks-and-provider` (Rust SDK, Terraform provider, acceptance tests).
+Current jobs in [ci.yml](../.github/workflows/ci.yml): `rust` (Clippy, workspace tests with PostgreSQL 17 and MariaDB 11.4 services, four Node suites, OpenAPI check, TypeScript and Python SDKs), `worker` (wasm check, bundle, deployment gate, workerd smoke), `docker` (build plus startup smoke), `sdks-and-provider` (Rust SDK, TypeScript SDK, Terraform provider unit, live client and acceptance tests).
 
 Planned additions, sequenced in the rollout plan: a browser lane, a hard-failing backend gate when required fixtures are absent, a scheduled full matrix (all browsers, clients, adapters, historical migrations, restart and replica cases), and release acceptance including ephemeral Kubernetes for ESO. Backend, security and Workers-sensitive changes should run their applicable gates before merge, not only nightly.
 
