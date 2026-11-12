@@ -12489,7 +12489,7 @@
     },
     "/api/integrations/{iid}/test": {
       "post": {
-        "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Providers with a bespoke test verify their API; every other known kind answers with an unauthenticated reachability probe against its configured endpoint, where any HTTP response, including 401 or 403, counts as reachable.",
+        "description": "Requires environment access and integrations:write. Delegated mode queues a connection test. Providers with a bespoke test verify their API. For other known kinds the native server sends an unauthenticated GET without following redirects; any HTTP response, including 401 or 403, counts as reachable, not credential verification. URL userinfo is rejected. Workers return HTTP 400 without sending a generic probe.",
         "parameters": [
           {
             "in": "path",
@@ -12519,7 +12519,7 @@
                 }
               }
             },
-            "description": "Invalid request"
+            "description": "Invalid request or endpoint, egress rejection, unreachable endpoint, or generic probe unsupported on Workers"
           },
           "401": {
             "content": {

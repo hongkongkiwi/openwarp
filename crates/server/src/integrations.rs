@@ -3456,7 +3456,7 @@ fn probe_base(kind: &str, config: &Value) -> Result<String, String> {
 // Report only the origin; paths and credentials can contain secrets.
 fn probe_target(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") => match (u.host_str(), u.port()) { (Some(h), p) => format!("{}://{h}{}", u.scheme(), p.map(|p| format!(":{p}")).unwrap_or_default()), _ => String::new() },
+        Ok(u) if matches!(u.scheme(), "http" | "https") && u.username().is_empty() && u.password().is_none() => match (u.host_str(), u.port()) { (Some(h), p) => format!("{}://{h}{}", u.scheme(), p.map(|p| format!(":{p}")).unwrap_or_default()), _ => String::new() },
         _ => String::new(),
     }
 }
@@ -3465,10 +3465,15 @@ async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
     let target = probe_target(&root);
     if target.is_empty() { return Err("invalid integration endpoint URL".into()); }
     if !crate::app::egress_allowed(&root) { return Err(format!("{} endpoint {target} is blocked: private and loopback targets are rejected in production", kind)); }
-    match http_client().get(&root).send().await {
-        Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {}; credentials are not verified by this probe", kind, r.status().as_u16())),
-        Err(_) => Err(format!("{} endpoint {target} unreachable", kind)),
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match http_client().get(&root).send().await {
+            Ok(r) => Ok(format!("{} endpoint {target} answered HTTP {}; credentials are not verified by this probe", kind, r.status().as_u16())),
+            Err(_) => Err(format!("{} endpoint {target} unreachable", kind)),
+        }
     }
+    #[cfg(target_arch = "wasm32")]
+    Err("generic integration connection tests require the native server".into())
 }
 pub fn has_test(kind: &str) -> bool { KINDS.contains(&kind) }
 pub async fn test(kind: &str, config: &Value) -> Result<String, String> {

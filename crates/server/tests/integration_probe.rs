@@ -113,7 +113,7 @@ async fn probe_unreachable_error_redacts_url_secrets_from_the_entire_body() {
     // A bound socket without a listener reserves a local port that refuses connections.
     let target = tokio::net::TcpSocket::new_v4().unwrap(); target.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let sentinels = ["probe-user-sentinel", "probe-password-sentinel", "probe-path-sentinel", "probe-query-sentinel"];
-    let url = format!("http://{}:{}@{}/{}?token={}", sentinels[0], sentinels[1], target.local_addr().unwrap(), sentinels[2], sentinels[3]);
+    let url = format!("http://{}/{}/{}?token={}&password={}", target.local_addr().unwrap(), sentinels[0], sentinels[2], sentinels[3], sentinels[1]);
     let iid = make_integration(&s, &token, &env, "webhook", json!({"url": url})).await;
     let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
     assert_eq!(r.status, 400, "{}", r.text);
@@ -130,8 +130,7 @@ async fn probe_malformed_url_error_redacts_secrets_from_the_entire_body() {
     let iid = make_integration(&s, &token, &env, "webhook", json!({"url": url})).await;
     let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
     assert_eq!(r.status, 400, "{}", r.text);
-    let error = r.body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("invalid") || error.contains("unreachable"), "{}", r.text);
+    assert_eq!(r.body["error"], json!("invalid integration endpoint URL"), "{}", r.text);
     let leaked: Vec<_> = sentinels.iter().filter(|secret| r.text.contains(**secret)).collect();
     assert!(leaked.is_empty(), "URL secrets {leaked:?} leaked in response: {}", r.text);
 }
@@ -172,6 +171,55 @@ async fn probe_treats_401_and_403_as_reachable_without_sending_credentials() {
             assert!(!request.contains(secret), "probe sent a credential");
         }
     }
+}
+
+#[tokio::test]
+async fn probe_rejects_url_userinfo_before_sending_any_request() {
+    let (s, token, env) = suite().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let tx = tx.clone(); async move {
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, 8192).await;
+            tx.send((parts, body)).unwrap();
+            axum::http::StatusCode::OK
+        }
+    });
+    let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let config = |url: String| json!({"url": url, "token": "probe-bearer-sentinel", "signing_secret": "probe-signing-sentinel"});
+    let iid = make_integration(&s, &token, &env, "webhook", config(format!("http://{address}/probe"))).await;
+    let control = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
+    assert_eq!(control.status, 200, "benign probe: {}", control.text);
+    assert_eq!(control.body["ok"], json!(true), "{}", control.text);
+    let (parts, body) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("benign probe must reach the listener").expect("fixture must remain alive");
+    let body = body.expect("benign probe body must be readable");
+    assert_eq!(parts.method, Method::GET);
+    assert_eq!(parts.uri, "/probe");
+    for name in ["authorization", "cookie", "x-openwarp-timestamp", "x-openwarp-signature"] {
+        assert!(!parts.headers.contains_key(name), "benign probe sent {name}");
+    }
+    assert!(body.is_empty(), "benign probe sent a request body");
+    let request = format!("{:?}{:?}{:?}", parts.uri, parts.headers, body);
+    for secret in ["probe-bearer-sentinel", "probe-signing-sentinel", token.as_str()] {
+        assert!(!request.contains(secret), "benign probe sent a credential");
+    }
+    assert!(rx.try_recv().is_err(), "benign probe sent more than one request");
+
+    let url = format!("http://probe-user-sentinel:probe-password-sentinel@{address}/probe");
+    let iid = make_integration(&s, &token, &env, "webhook", config(url)).await;
+    let r = s.call(Method::POST, &format!("/api/integrations/{iid}/test"), &token, None).await;
+    let mut recorded = Vec::new();
+    if let Ok(request) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+        recorded.push(request.expect("fixture must remain alive"));
+    }
+    while let Ok(request) = rx.try_recv() { recorded.push(request); }
+    fixture.abort();
+    let sent_authorization = recorded.iter().any(|(parts, _)| parts.headers.contains_key("authorization"));
+    assert_eq!(recorded.len(), 0, "userinfo probe sent requests (authorization header present: {sent_authorization}); API HTTP {}: {}", r.status, r.text);
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(r.body["error"], json!("invalid integration endpoint URL"), "{}", r.text);
 }
 
 #[tokio::test]
