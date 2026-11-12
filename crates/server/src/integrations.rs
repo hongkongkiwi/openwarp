@@ -3464,8 +3464,8 @@ fn probe_target(url: &str) -> String {
 fn probe_ip_allowed(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => probe_ip_allowed(v6.to_ipv4_mapped().unwrap().into()),
-        std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
-        std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local()),
+        std::net::IpAddr::V4(v4) => { let [a,b,_,_]=v4.octets(); !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || a==0 || a>=240 || (a==100 && (64..=127).contains(&b)) || (a==192 && (b==0 || b==2 || b==168)) || (a==198 && (b==18 || b==19 || b==51)) || (a==203 && b==0)) },
+        std::net::IpAddr::V6(v6) => { let n=v6.segments(); (n[0]&0xe000)==0x2000 && n[0]!=0x2002 && !(n[0]==0x2001 && (n[1]<0x0200 || n[1]==0x0db8)) && !(n[0]==0x3fff && (n[1]&0xf000)==0) },
     }
 }
 
@@ -3595,6 +3595,30 @@ mod probe_tests {
     #[test]
     fn every_kind_answers_the_test_route() {
         for kind in KINDS { assert!(has_test(kind), "{kind} must be testable"); }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_ip_denies_non_public_destinations() {
+        let denied = [
+            "0.0.0.0", "0.1.2.3", "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254",
+            "100.64.0.0", "100.100.100.200", "100.127.255.255", "192.0.0.1", "192.0.2.1", "192.2.0.1",
+            "198.18.0.1", "198.19.255.255", "198.51.100.1", "203.0.113.1", "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255",
+            "::", "::1", "fc00::1", "fe80::1", "ff02::1", "64:ff9b::808:808", "64:ff9b:1::1", "2002:0808:0808::1",
+            "2001::1", "2001:100::1", "2001:db8::1", "3fff::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:100.100.100.200", "::ffff:198.51.100.1",
+        ];
+        let unexpected: Vec<_> = denied.iter().copied().filter(|raw| probe_ip_allowed(raw.parse().unwrap())).collect();
+        assert!(unexpected.is_empty(), "{} of {} non-public destinations were allowed: {}", unexpected.len(), denied.len(), unexpected.join(", "));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_ip_allows_public_destinations() {
+        let allowed = [
+            "1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.0", "198.17.255.255", "198.20.0.1",
+            "2001:4860:4860::8888", "2606:4700:4700::1111", "2001:200::1", "3fff:1000::1", "::ffff:8.8.8.8",
+        ];
+        let unexpected: Vec<_> = allowed.iter().copied().filter(|raw| !probe_ip_allowed(raw.parse().unwrap())).collect();
+        assert!(unexpected.is_empty(), "{} of {} public destinations were denied: {}", unexpected.len(), allowed.len(), unexpected.join(", "));
     }
 }
 fn form_encode(s: &str) -> String {

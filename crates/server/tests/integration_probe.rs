@@ -38,7 +38,7 @@ impl Server {
             }
         });
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
-        for (key, _) in std::env::vars().filter(|(k,_)| k.starts_with("OPENWARP_") || k.ends_with("_PROXY") || k == "REDIS_URL") { cmd.env_remove(key); }
+        for (key, _) in std::env::vars().filter(|(k,_)| k.starts_with("OPENWARP_") || k.to_ascii_uppercase().ends_with("_PROXY") || k == "REDIS_URL") { cmd.env_remove(key); }
         cmd.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display())).env("ADDR", format!("127.0.0.1:{port}"))
             .env("OPENWARP_PUBLIC_URL", &base).env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
             .stdout(Stdio::null()).stderr(Stdio::null());
