@@ -4,11 +4,8 @@
 use serde_json::{json, Value};
 
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
-#[cfg(not(target_arch = "wasm32"))]
-fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::builder().build().expect("http client")) }
-#[cfg(target_arch = "wasm32")]
-fn http_client() -> crate::http::Client { crate::http::Client::new() }
-async fn req(r: crate::http::RequestBuilder) -> Result<String, String> {
+fn http_client() -> crate::integration_http::Client { crate::integration_http::Client::new() }
+async fn req(r: crate::integration_http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }

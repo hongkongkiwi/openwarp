@@ -7,7 +7,7 @@ export default class SafeReporter {
     for (const annotation of test.annotations.filter(value => ['safe-browser-counts', 'safe-phase', 'safe-focus'].includes(value.type))) console.log(annotation.description);
     for (const error of result.errors) {
       console.log('Failure details withheld to avoid secret-bearing diagnostics. Assertion locations:');
-      console.log((error.stack || '').split('\n').filter(line => /^\s+at .*\/(specs\/|fixture\.mjs)/.test(line)).join('\n'));
+      console.log((error.stack || '').split('\n').filter(line => /^\s+at .*[/\\](specs[/\\]|fixture\.mjs)/.test(line)).join('\n'));
     }
   }
   onError() { console.error('HARNESS ERROR (details withheld to avoid secret-bearing diagnostics)'); }

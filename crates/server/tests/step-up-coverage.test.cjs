@@ -44,7 +44,9 @@ for (const [file, risks] of Object.entries(catalog)) {
 }
 test('standard and autonomous entry points do not acquire interactive proof', () => {
   for (const name of ['create_app', 'create_env', 'create_e2e_env', 'create_proposal', 'request_access', 'put_emergency', 'put_app_emergency', 'enroll_device', 'self_renew_device', 'trigger_sync', 'process_rotations_inner']) {
-    for (const body of functions(app, name)) assert.ok(!body.includes('require_step_up('), name);
+    const bodies = functions(app, name);
+    assert.ok(bodies.length, 'app.rs:' + name + ' exists');
+    for (const body of bodies) assert.ok(!body.includes('require_step_up('), name);
   }
 });
 test('path-restricted sessions can obtain proof without opening other auth operations', () => {

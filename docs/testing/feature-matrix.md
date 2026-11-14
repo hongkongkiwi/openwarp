@@ -2,7 +2,9 @@
 
 The inventory below was re-baselined 2026-11-10 against 9baf897; it was first bound to 8425e29 on 2026-11-09. The dated update below supersedes stale inventory claims for the named areas, not the remaining historical case proposals. How to run things: [../TESTING.md](../TESTING.md). Journeys: [scenarios.md](scenarios.md). Rollout: [../plans/2026-11-09-comprehensive-testing.md](../plans/2026-11-09-comprehensive-testing.md).
 
-## Current bounded update, 2026-11-14
+## Local acceptance snapshot, 2026-11-14
+
+This snapshot predates PR #32 and its CI repairs. The results below describe the pre-publication worktree, not the current PR head or its checks.
 
 A1 through A3 were accepted locally. The historical pre-wallet A4 full core run passed 961 tests with 2 ignored across 133 suites; full all-features collected 1,139, with 1,135 passed, 0 failed and 4 ignored. The current post-wallet full core run collected 969: 967 passed, 0 failed and 2 ignored. Full all-features collected 1,148: 1,144 passed, 0 failed and 4 ignored. Both commands exited 0 and supersede the A4 full runs. The current runs used distinct owned PostgreSQL fixtures for leases (trust, port 54289) and static rotation (SCRAM, port 64529), plus owned Redis; all were stopped and the before and after inventories matched. The four all-features ignored cases cover receipt Redis, ESO, PostgreSQL replica and Worker SAML. Separately focused prior runs do not change the ignored count. Remote CI has not run. The current worktree is based on `f1c63c4` plus uncommitted changes. The following are local results, not a full feature audit:
 

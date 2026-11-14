@@ -183,7 +183,7 @@ impl Fixture {
         }
         for (name, hash) in previous { db.execute("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES('parity-integration',?,?)", params![name, hash]).unwrap(); }
         db.execute("INSERT INTO sync_jobs(id,env_id,integration_id,runner_id,kind,created_at) VALUES('parity-job','parity-env','parity-integration','parity-runner',?,1)", [job_kind]).unwrap();
-        fixture.sensitive.extend([PROVIDER_TOKEN.into(), AWS_SECRET.into(), fixture.keypair.secret_b64(), oc::b64(&fixture.environment_key)]);
+        fixture.sensitive.extend([PROVIDER_TOKEN.into(), AWS_SECRET.into(), OLD_VALUE.into(), UNRELATED_VALUE.into(), fixture.keypair.secret_b64(), oc::b64(&fixture.environment_key)]);
         fixture
     }
     fn db(&self) -> Connection {

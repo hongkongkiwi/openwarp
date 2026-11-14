@@ -5437,6 +5437,7 @@ async fn revoke_lease_remote_locked(st: &S, lid: &str, audit: Option<[&str;6]>, 
                     *remote_started = true;
                     if let Err(e) = crate::pglease::drop_role_with_outcome(&conn, &username).await {
                         if matches!(e, crate::pglease::RenewError::NotSent) { *remote_started = false; return Err(bad("Postgres lease revocation failed before sending DROP ROLE")); }
+                        if matches!(e, crate::pglease::RenewError::Rejected) { *remote_started = false; return Err(bad("Postgres rejected lease revocation")); }
                         return Err(bad("Postgres lease revocation failed"));
                     } } }
             Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
@@ -7177,6 +7178,7 @@ async fn renew_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>,
             remote_started = true;
             if let Err(e) = crate::pglease::renew_role(&conn, &db::s(&row,"username"), expires_at).await {
                 if matches!(e, crate::pglease::RenewError::NotSent) { remote_started = false; return Err(bad("PostgreSQL renewal failed before sending ALTER ROLE")); }
+                if matches!(e, crate::pglease::RenewError::Rejected) { remote_started = false; return Err(bad("PostgreSQL rejected lease renewal")); }
                 return Err(err(StatusCode::CONFLICT,"PostgreSQL renewal outcome unresolved; operation claim retained, operator reconciliation required"));
             }
         }
@@ -7279,6 +7281,7 @@ async fn process_rotations_inner(st: &S) {
     let _ = st.db.exec("DELETE FROM rate_limits WHERE window_start<?", &[json!(now() - 86400)]).await;
     let _ = st.db.exec("DELETE FROM live_events WHERE created_at<?", &[json!(now() - 3600)]).await;
     let _ = st.db.exec("DELETE FROM wrap_tokens WHERE expires_at<?", &[json!(now() - 3600)]).await;
+    let _ = st.db.exec("DELETE FROM deleted_env_receipts WHERE expires_at<=?", &[json!(now())]).await;
     let due = st.db.query("SELECT * FROM rotation_schedules WHERE enabled=1 AND next_run<=?", &[json!(now())]).await.unwrap_or_default();
     for r in &due {
         let id = db::s(r,"id"); let eid = db::s(r,"env_id"); let key_name = db::s(r,"key_name");
@@ -8285,7 +8288,7 @@ async fn api_request(st: &S, h: &HeaderMap, peer: PeerAddr, args: &Value) -> Res
     *req.headers_mut()=h.clone(); req.headers_mut().remove("content-length"); req.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/json"));
     if let Some(grant)=args.get("step_up") { let grant=grant.as_str().ok_or("step_up must be a string")?; if grant.len()>1024 {return Err("step_up too long".into());} req.headers_mut().insert("x-openwarp-step-up",grant.parse().map_err(|_|"invalid step_up")?); }
     req.extensions_mut().insert(peer); req.extensions_mut().insert(McpDispatch);
-    let response = api_router(st.clone()).oneshot(req).await.map_err(|e|e.to_string())?;
+    let response = api_router(st.clone()).oneshot(req).await.map_err(|e| -> String { match e {} })?;
     let status=response.status(); let bytes=axum::body::to_bytes(response.into_body(),8*1024*1024).await.map_err(|e|e.to_string())?;
     let body=serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_|json!(String::from_utf8_lossy(&bytes)));
     Ok(management_result(json!({"status":status.as_u16(),"body":body}), !status.is_success()))

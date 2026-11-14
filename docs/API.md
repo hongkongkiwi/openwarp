@@ -139,8 +139,8 @@ minutes and allow five failed code attempts; grants last five minutes and are
 consumed once. A very risky grant can satisfy a major action, not the reverse.
 
 Both cookie and Bearer account sessions use this contract. Service, OAuth and
-machine credentials cannot complete it and retain their existing scopes and
-policy restrictions. A grant does not replace authorization or revive a revoked
+machine credentials are exempt from step-up and cannot complete its interactive
+challenge. Their existing scopes and policy restrictions still apply. A grant does not replace authorization or revive a revoked
 session. Handler authorization and local input validation precede consumption;
 an operation can still fail afterwards on a concurrent conflict or external
 provider failure, so do not retry effects blindly. A very risky action returns

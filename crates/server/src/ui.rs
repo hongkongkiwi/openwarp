@@ -201,18 +201,19 @@ function confirmEmergency(locked,project=false){let org=ORG,app=APP?.id,scope=pr
 async function apiRaw(m,u,b){return apiRequest(m,u,b)}
 let STEP_UP=null;
 function settleStepUp(error,grant){let pending=STEP_UP;if(!pending)return;STEP_UP=null;
-  for(let id of ['su-totp','su-email'])if($(id))$(id).value='';
-  closeModal();$('modal').innerHTML='';
-  if(pending.saved&&stepCurrent(pending.context)){let m=$('modal');for(let node of pending.saved.nodes)m.appendChild(node);PRODUCT_DIALOG=pending.saved.product;PRODUCT_SERIAL=pending.saved.serial;LASTFOCUS=pending.saved.last;
-    for(let name of ['role','aria-modal','aria-label','aria-labelledby']){let value=pending.saved.attrs[name];if(value===null)m.removeAttribute(name);else m.setAttribute(name,value)}$('modalwrap').classList.add('show');if(pending.saved.focus?.focus)pending.saved.focus.focus()}
+  if(pending.shown||!stepCurrent(pending.context)){for(let id of ['su-totp','su-email'])if($(id))$(id).value='';
+    closeModal();$('modal').innerHTML='';
+    if(pending.saved&&stepCurrent(pending.context)){let m=$('modal');for(let node of pending.saved.nodes)m.appendChild(node);PRODUCT_DIALOG=pending.saved.product;PRODUCT_SERIAL=pending.saved.serial;LASTFOCUS=pending.saved.last;
+      for(let name of ['role','aria-modal','aria-label','aria-labelledby']){let value=pending.saved.attrs[name];if(value===null)m.removeAttribute(name);else m.setAttribute(name,value)}$('modalwrap').classList.add('show');if(pending.saved.focus?.focus)pending.saved.focus.focus()}}
   if(error)pending.reject(error);else pending.resolve(grant)}
 async function stepUp(info,context){
   if(STEP_UP)throw new Error('Another action is awaiting verification');
-  return new Promise((resolve,reject)=>{let pending={context,resolve,reject,saved:null};STEP_UP=pending;
+  return new Promise((resolve,reject)=>{let pending={context,resolve,reject,saved:null,shown:false};STEP_UP=pending;
     (async()=>{try{
       let r=await fetch('/api/auth/step-up/start',{method:'POST',headers:H(),body:JSON.stringify({risk:info.risk})}),start=JSON.parse(await r.text());
       if(STEP_UP!==pending)return;if(!stepCurrent(context))throw new Error('Session or workspace changed');if(!r.ok)throw new Error(start.error||'Could not start verification');
       if(start.not_required){settleStepUp(null,'');return}
+      pending.shown=true;
       if(modalOpen()){let m=$('modal');pending.saved={nodes:Array.from(m.childNodes||m.children).filter(n=>typeof n!=='string'),product:PRODUCT_DIALOG,serial:PRODUCT_SERIAL,last:LASTFOCUS,focus:document.activeElement,attrs:Object.fromEntries(['role','aria-modal','aria-label','aria-labelledby'].map(n=>[n,m.getAttribute(n)]))};m.innerHTML=''}
       const methods=start.methods||[];
       modal(`<h3>Confirm this action</h3><p class="mut">${start.email_sent?'Enter the code sent to your account email.':'Enter your authenticator or recovery code.'}</p>${methods.includes('totp')?'<div class="field"><label for="su-totp">Authenticator or recovery code</label><input id="su-totp" autocomplete="one-time-code"></div>':''}${methods.includes('email')?'<div class="field"><label for="su-email">Emailed code</label><input id="su-email" inputmode="numeric" autocomplete="one-time-code"></div>':''}<p id="su-error" role="alert"></p><div class="row"><button class="primary" id="su-verify">Verify</button><button class="ghost" onclick="settleStepUp(new Error('Verification cancelled'))">Cancel</button></div>`,'Confirm action',true);
@@ -532,7 +533,7 @@ function orgMenuKey(e){if(!orgMenuOpen())return;let items=orgMenuItems();if(!ite
   else if(e.key==='Home'){e.preventDefault();items[0].focus()}
   else if(e.key==='End'){e.preventDefault();items[items.length-1].focus()}
   else if(e.key==='Escape'){e.preventDefault();closeOrgMenu();$('orgbtn').focus()}}
-async function switchOrg(id){aiReset();if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRET_EPOCH++;SECRETS=[];ORG=id||ORG;clearPkiState();APP=null;ENV=null;EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';PROJECT_DIRECT=false;rememberOrg(ORG);renderOrgMenu();applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
+async function switchOrg(id){aiReset();SECRET_EPOCH++;if(PRODUCT_DIALOG)closeModal();PRODUCT_SERIAL++;SECRETS=[];ORG=id||ORG;clearPkiState();APP=null;ENV=null;EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner';PROJECT_DIRECT=false;rememberOrg(ORG);renderOrgMenu();applyEmergency(false,false);await refreshEmergency();await nav(EMERGENCY?'settings':'apps')}
 async function refreshOrgs(){ORGS=await api('GET','/api/orgs');renderOrgMenu();EMERGENCY_OWNER=ORGS.find(o=>o.id===ORG)?.role==='owner'}
 
 // ---------- navigation ----------

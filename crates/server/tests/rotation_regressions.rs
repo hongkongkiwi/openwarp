@@ -34,7 +34,12 @@ async fn isolated_case(name: &'static str, target: &str) {
     command.args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env("OPENWARP_ROTATION_REGRESSION_CHILD", name).env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", url);
     let output = tokio::task::spawn_blocking(move || command.output().expect("run isolated rotation fixture")).await.unwrap();
-    assert!(output.status.success(), "isolated rotation fixture failed ({:?})\n{}\n{}", output.status.code(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "isolated rotation fixture failed ({:?})", output.status.code());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "running 1 test")
+        && stdout.lines().any(|line| line == format!("test {name} ... ok"))
+        && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; ")),
+        "isolated rotation fixture must execute exactly its selected test with one pass and no ignored tests");
 }
 struct Allow(Option<String>);
 impl Drop for Allow {

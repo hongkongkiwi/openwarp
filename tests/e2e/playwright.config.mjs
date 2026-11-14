@@ -6,6 +6,7 @@ process.env.PLAYWRIGHT_NO_COPY_PROMPT = '1';
 export default defineConfig({
   testDir: './specs',
   fullyParallel: false,
+  forbidOnly: !!process.env.CI,
   workers: 1,
   retries: 0,
   timeout: 120000,
