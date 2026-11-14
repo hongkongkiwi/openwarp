@@ -10,6 +10,7 @@ pub mod envcfg;
 pub mod features;
 pub mod http;
 pub mod inference_leases;
+mod integration_http;
 pub mod integrations;
 pub mod log;
 pub mod mailer;

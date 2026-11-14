@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
 
 jobs:
   rust:
@@ -22,6 +25,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      lease-postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openwarp
+          POSTGRES_PASSWORD: openwarp
+          POSTGRES_DB: postgres
+        ports:
+          - 54289:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
       mariadb:
         image: mariadb:11.4
         env:
@@ -34,13 +50,33 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      receipt-redis:
+        image: redis:7.4
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
+      REDIS_URL: redis://127.0.0.1:6379
       OPENWARP_TEST_POSTGRES_URL: postgres://openwarp:openwarp@127.0.0.1:5432/postgres
       OPENWARP_TEST_MYSQL_URL: mysql://root:openwarp@127.0.0.1:3306/mysql
       # The static-rotation regressions drive a real PostgreSQL role lifecycle.
       # sslmode=disable: the fixture connects with NoTls and the static-rotation
       # validator only accepts explicit disable on a literal loopback address.
       OPENWARP_TEST_STATIC_PG: postgres://openwarp:openwarp@127.0.0.1:5432/postgres?sslmode=disable
+      OPENWARP_TEST_LEASE_PG: postgres://openwarp:openwarp@127.0.0.1:54289/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,6 +88,32 @@ jobs:
           node-version: "24"
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=2
+      - name: ESO consumer test
+        run: |
+          cargo build -p openwarp-eso
+          output=$(OPENWARP_ESO_BIN="$PWD/target/debug/openwarp-eso" cargo test -p openwarp-server --test eso_consumer -- --ignored --exact scoped_service_token_exports_shared_values_and_preserves_deleted_environment_404 --test-threads=1)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Fx 'running 1 test'
+          printf '%s\n' "$output" | grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+      - name: Redis receipt regression
+        env:
+          OPENWARP_TEST_RECEIPT_REDIS_URL: redis://127.0.0.1:6380
+          OPENWARP_TEST_RECEIPT_REDIS_OWNED: "1"
+        run: |
+          output=$(cargo test -p openwarp-server --features redis-cache --test deleted_env_receipt_regressions -- --ignored --exact redis_logged_out_static_token_cannot_regain_access_as_a_deletion_receipt --test-threads=1)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Fx 'running 1 test'
+          printf '%s\n' "$output" | grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+      - name: PostgreSQL replica process test
+        run: |
+          output=$(cargo test -p openwarp-server --test restart_replica -- --ignored --exact postgres_two_processes_share_reads_revocation_and_replica_restart --test-threads=1)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Fx 'running 1 test'
+          printf '%s\n' "$output" | grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+      - run: node --test scripts/tests/required-backends.test.cjs
+      - run: node scripts/required-backends.mjs
+      - run: npm run check --prefix action
+      - run: node --test action/action.test.cjs
       # The default build is core only, so the enterprise surfaces and their
       # tests need their own pass or they stop being compiled at all.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -61,6 +123,24 @@ jobs:
       # The SDK tests spawn the binary cargo test just built.
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" node --test sdk/contract/typescript/sdk.test.ts
       - run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" python3 -m unittest discover -s sdk/contract/python -p 'test_*.py'
+
+  browser-authored-increment:
+    name: Browser authored acceptance increment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tests/e2e/package-lock.json
+      - run: npm --prefix tests/e2e ci --ignore-scripts
+      - run: node tests/e2e/node_modules/playwright/cli.js install --with-deps chromium firefox webkit
+      - run: cargo build -p openwarp-server
+      - run: npm --prefix tests/e2e run test:chromium -- --workers=1 --retries=0
+      - run: npm --prefix tests/e2e run test:critical -- --workers=1 --retries=0
 
   worker:
     runs-on: ubuntu-latest
@@ -103,7 +183,15 @@ jobs:
           node scripts/worker-protocol-smoke.mjs
           node scripts/worker-live-smoke.mjs
           node scripts/worker-key-smoke.mjs
+          node scripts/worker-deleted-env-receipts-smoke.mjs
+          node scripts/worker-wallet-storage-smoke.mjs
+      - name: Build the Worker bundle with SAML
+        run: cd crates/server && worker-build --release --no-default-features --features workload-identity,change-requests,saml
+      - name: SAML smoke tests
+        run: |
+          export WRANGLER="$PWD/node_modules/.bin/wrangler"
           sh scripts/worker-saml-smoke.sh
+          node scripts/worker-saml-metadata-smoke.mjs
       - name: D1 migration driver
         run: WRANGLER="$PWD/node_modules/.bin/wrangler" scripts/d1-migrate-smoke.sh
 
@@ -123,7 +211,7 @@ jobs:
         run: |
           docker run -d --name openwarp-ci -p 8080:8080 \
             -e OPENWARP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)" openwarp:ci
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/health; then break; fi
             sleep 1
           done
@@ -147,6 +235,9 @@ jobs:
         with:
           go-version: "1.27.3"
           cache-dependency-path: terraform-provider-openwarp/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: hashicorp/setup-terraform@v3
       # The live SDK and provider tests start the real binary, so build it once
       # and point every suite at the absolute path.
@@ -155,6 +246,13 @@ jobs:
         run: |
           npm ci --prefix sdk/typescript
           OPENWARP_BIN="$PWD/target/debug/openwarp-server" npm test --prefix sdk/typescript
+      - name: Python SDK
+        run: PYTHONPATH=sdk/python python -m unittest discover -s sdk/python/tests -p 'test_*.py'
+      - name: Go SDK
+        working-directory: sdk/go
+        run: |
+          go vet ./...
+          go test ./...
       - name: Rust SDK
         run: OPENWARP_BIN="$PWD/target/debug/openwarp-server" cargo test --manifest-path sdk/rust/Cargo.toml
       - name: Terraform provider unit and live client tests

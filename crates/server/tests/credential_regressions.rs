@@ -124,9 +124,9 @@ async fn transit_rewrap_requires_encrypt_and_decrypt_scopes_for_service_and_oaut
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
-struct Native { child: Option<Child>, dir: PathBuf, base: String, client: reqwest::Client }
+struct Native { child: Option<Child>, dir: PathBuf, base: String, client: reqwest::Client, inbox: std::sync::Arc<std::sync::Mutex<Vec<Value>>>, relay: tokio::task::JoinHandle<()> }
 impl Drop for Native {
-    fn drop(&mut self) { if let Some(mut child) = self.child.take() { let _ = child.kill(); let _ = child.wait(); } let _ = std::fs::remove_dir_all(&self.dir); }
+    fn drop(&mut self) { if let Some(mut child) = self.child.take() { let _ = child.kill(); let _ = child.wait(); } self.relay.abort(); let _ = std::fs::remove_dir_all(&self.dir); }
 }
 impl Native {
     async fn new(f: &Fixture) -> Self {
@@ -146,14 +146,23 @@ impl Native {
         let addr = listener.local_addr().unwrap(); drop(listener);
         let base = format!("http://{}", addr);
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
+        let inbox = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = inbox.clone();
+        let mail_app = Router::new().route("/mail", axum::routing::post(move |axum::Json(mail): axum::Json<Value>| {
+            let sink = sink.clone(); async move { sink.lock().unwrap().push(mail); axum::Json(json!({})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
+        let relay = tokio::spawn(async move { axum::serve(listener, mail_app).await.unwrap(); });
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}", dir.join("test.db").display())).env("ADDR", addr.to_string())
             .env("OPENWARP_ENV", "test").env("OPENWARP_PUBLIC_URL", &base).env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1")
             .env("OPENWARP_AUTH_PROVIDERS", "password").env("TOKIO_WORKER_THREADS", "2")
+            .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url)
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_KMS_URL").env_remove("OPENWARP_KMS_TOKEN").env_remove("REDIS_URL")
             .stdout(Stdio::null()).stderr(Stdio::from(log)).spawn().unwrap();
         let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap();
-        let mut server = Self { child: Some(child), dir, base, client };
+        let mut server = Self { child: Some(child), dir, base, client, inbox, relay };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(status) = server.child.as_mut().unwrap().try_wait().unwrap() { panic!("server exited {}: {}", status, std::fs::read_to_string(server.dir.join("server.log")).unwrap()); }
@@ -169,6 +178,24 @@ impl Native {
         let response = request.send().await.unwrap();
         let status = response.status().as_u16();
         let text = response.text().await.unwrap();
+        Reply { status, body: serde_json::from_str(&text).unwrap_or(json!(text)) }
+    }
+    async fn verified_rotation(&self, session: &str, body: Value) -> Reply {
+        let before = self.inbox.lock().unwrap().len();
+        let started = self.call("POST", "/api/auth/step-up/start", session, json!({"risk":"very_risky"})).await.ok();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "rotation verification email did not arrive");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call("POST", "/api/auth/step-up/verify", session, json!({"challenge":started["challenge"],"email_code":code})).await.ok();
+        let response = self.client.post(format!("{}/api/instance/rotate-master", self.base)).bearer_auth(session)
+            .header("x-openwarp-step-up", verified["token"].as_str().expect("rotation grant")).json(&body).send().await.unwrap();
+        let status = response.status().as_u16(); let text = response.text().await.unwrap();
         Reply { status, body: serde_json::from_str(&text).unwrap_or(json!(text)) }
     }
     fn token_count(&self) -> i64 {
@@ -253,7 +280,7 @@ async fn native_master_rotation_preserves_v2_login_or_refuses_without_mutation()
         (root, auth, envs)
     };
     let before = snapshot();
-    let rotated = server.call("POST", "/api/instance/rotate-master", token, json!({"new_key":oc::b64(&[6;32])})).await;
+    let rotated = server.verified_rotation(token, json!({"new_key":oc::b64(&[6;32])})).await;
     assert!(matches!(rotated.status, 200 | 409), "rotation must succeed safely or explicitly refuse: {} {}", rotated.status, rotated.body);
     if rotated.status == 409 { assert_eq!(snapshot(), before, "refused rotation changed existing encrypted records"); }
     let login = v2_login(&server).await;

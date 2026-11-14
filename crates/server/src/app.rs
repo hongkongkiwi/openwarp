@@ -27,7 +27,7 @@ include!("master_publication_tests.rs");
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[path = "broker.rs"] mod broker;
 use openwarp_crypto as oc;
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 use risaml::{
     AcsEndpoint, AuthnRequest, BrowserInput, CertificatePem, Credentials, EntityId, FormField,
     IdpDescriptor, MetadataTrustPolicy, Pending, PendingSnapshot, PrivateKeyPem, RelayStateParam,
@@ -37,7 +37,7 @@ use risaml::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, sync::atomic::{AtomicUsize, Ordering as AtomicOrdering}};
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
@@ -490,21 +490,21 @@ impl AppState {
     }
     async fn decrypt_secret(&self, key: &[u8;32], row: &Row, user: Option<&str>) -> Value {
         let sid = db::s(row, "id"); let env = db::s(row, "env_id"); let version = db::n(row, "version");
-        let (mut value, mut decrypt_error) = match decrypt_secret_value(key, &env, &sid, "value", version, &db::s(row, "value_enc")) {
+        let stype = db::s(row, "secret_type");
+        let (mut value, mut decrypt_error) = if wallet_type(&stype) { (String::new(), false) } else { match decrypt_secret_value(key, &env, &sid, "value", version, &db::s(row, "value_enc")) {
             Ok(b) => (String::from_utf8_lossy(&b).into_owned(), false),
-            Err(_) => (String::new(), true) };
-        if let Some(user) = user {
+            Err(_) => (String::new(), true) } };
+        if let Some(user) = user.filter(|_| !wallet_type(&stype)) {
             if let Ok(Some(ov)) = self.db.one("SELECT value_enc FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(user)]).await {
                 if let Ok(b) = decrypt_secret_value(key, &env, &sid, &format!("override:{}", user), version, &db::s(&ov, "value_enc")) { value = String::from_utf8_lossy(&b).into_owned(); decrypt_error = false; }
             }
         }
-        let stype = db::s(row, "secret_type");
         let path = if db::s(row, "path_enc").is_empty() { db::s(row, "path") } else {
             decrypt_secret_value(key, &env, &sid, "path", version, &db::s(row, "path_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "path")) };
         let tags = if db::s(row, "tags_enc").is_empty() { db::s(row, "tags") } else {
             decrypt_secret_value(key, &env, &sid, "tags", version, &db::s(row, "tags_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|_| db::s(row, "tags")) };
         json!({"id": sid, "key": oc::decrypt_symmetric_compat(key, &secret_aad(&env, &sid, "key"), &db::s(row, "key_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            "value": if stype == "sealed" { Value::Null } else { json!(value) }, "decrypt_error": decrypt_error,
+            "value": if stype == "sealed" || wallet_type(&stype) { Value::Null } else { json!(value) }, "decrypt_error": decrypt_error,
             "path": path, "comment": decrypt_secret_value(key, &env, &sid, "comment", version, &db::s(row,"comment_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
             "tags": tags, "type": stype, "version": version, "updated_at": db::n(row,"updated_at")})
     }
@@ -515,9 +515,9 @@ impl AppState {
         let mut out = Vec::new();
         for r in &rows { if let Some(uid) = subject { if self.restricted_env(env_id, uid).await? { let Ok(path) = self.stored_path(&key, r) else { continue }; if !self.path_allowed(env_id, uid, &path, "read").await? { continue; } } } let v = self.decrypt_secret(&key, r, user).await; out.push((v["key"].as_str().unwrap_or("").to_string(), v["value"].as_str().unwrap_or("").to_string(), v)); }
         // resolve ${KEY} and ${/path/KEY} references
-        let map: HashMap<String, String> = out.iter().map(|(k, v, raw)| (format!("{}{}", raw["path"].as_str().unwrap_or("/"), k), v.clone())).collect();
-        let by_key: HashMap<String, String> = out.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
-        for item in out.iter_mut() { if item.2["type"].as_str() == Some("sealed") { continue; } for _ in 0..5 { let before = item.1.clone(); item.1 = resolve_refs(&item.1, &map, &by_key); if item.1 == before { break; } } item.2["value"] = json!(item.1); }
+        let map: HashMap<String, String> = out.iter().filter(|(_, _, raw)| !wallet_type(raw["type"].as_str().unwrap_or(""))).map(|(k, v, raw)| (format!("{}{}", raw["path"].as_str().unwrap_or("/"), k), v.clone())).collect();
+        let by_key: HashMap<String, String> = out.iter().filter(|(_, _, raw)| !wallet_type(raw["type"].as_str().unwrap_or(""))).map(|(k, v, _)| (k.clone(), v.clone())).collect();
+        for item in out.iter_mut() { if item.2["type"].as_str() == Some("sealed") || wallet_type(item.2["type"].as_str().unwrap_or("")) { continue; } for _ in 0..5 { let before = item.1.clone(); item.1 = resolve_refs(&item.1, &map, &by_key); if item.1 == before { break; } } item.2["value"] = json!(item.1); }
         Ok(out)
     }
     #[allow(clippy::type_complexity)]
@@ -886,7 +886,7 @@ async fn delete_me(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<St
         "DELETE FROM step_up_challenges WHERE user_id=?", "DELETE FROM step_up_grants WHERE user_id=?",
         "DELETE FROM passkeys WHERE user_id=?", "DELETE FROM passkey_registrations WHERE user_id=?",
         "DELETE FROM mfa_passkey_states WHERE user_id=?", "DELETE FROM email_codes WHERE user_id=?",
-        "DELETE FROM tokens WHERE created_by=?", "DELETE FROM wrap_tokens WHERE created_by=?", "UPDATE ssh_certs SET revoked=1 WHERE actor=?",
+        "DELETE FROM tokens WHERE created_by=?", "DELETE FROM deleted_env_receipts WHERE created_by=?", "DELETE FROM wrap_tokens WHERE created_by=?", "UPDATE ssh_certs SET revoked=1 WHERE actor=?",
         "DELETE FROM env_keys WHERE user_id=?",
         "DELETE FROM overrides WHERE user_id=?", "DELETE FROM org_members WHERE user_id=?",
         "DELETE FROM team_members WHERE user_id=?", "DELETE FROM app_members WHERE user_id=?",
@@ -933,6 +933,7 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
     let integrations = "SELECT i.id FROM integrations i JOIN envs e ON e.id=i.env_id JOIN apps a ON a.id=e.app_id WHERE a.org_id=?";
     let statements = vec![
         "DELETE FROM tokens WHERE org_id=?".to_string(),
+        "DELETE FROM deleted_env_receipts WHERE org_id=?".to_string(),
         "DELETE FROM tokens WHERE created_by IN (SELECT id FROM identities WHERE org_id=?)".to_string(),
         "DELETE FROM identity_credentials WHERE identity_id IN (SELECT id FROM identities WHERE org_id=?)".to_string(),
         format!("DELETE FROM tokens WHERE app_id IN ({})", apps),
@@ -1020,7 +1021,7 @@ async fn delete_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, 
         if workspaces::creation_open(&st).await? { "UPDATE meta SET v=v WHERE k='workspace_policy_lock'" } else { "UPDATE meta SET v=v WHERE k='workspace_policy_lock' AND (SELECT COUNT(*) FROM orgs)>1" }
     } else { "UPDATE meta SET v=v WHERE k='workspace_creation_open' AND (v<>'0' OR (SELECT COUNT(*) FROM orgs)>1)" };
     guarded.push((guard.into(),vec![])); guarded.extend(stmts);
-    user_guarded_commit(&st, &[&uid], &guarded, &[0, 1, 2, 3, 4, 5], Some(["","","",&uid,"org.delete",&format!("{} ({})",name,oid)])).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed, has unresolved leases or rotations, or is the last workspace while creation is disabled; refresh, reconcile, or enable creation first") } else { e })?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; user_guarded_commit(&st, &[&uid], &guarded, &[0, 1, 2, 3, 4, 5], Some(["","","",&uid,"org.delete",&format!("{} ({})",name,oid)])).await.map_err(|e| if e.0 == StatusCode::CONFLICT { err(StatusCode::CONFLICT, "workspace ownership changed, has unresolved leases or rotations, or is the last workspace while creation is disabled; refresh, reconcile, or enable creation first") } else { e })?;
     Ok(j(json!({"deleted":true, "workspace":name}))) }
 async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     // A locked member must be able to leave rather than stay trapped in a
@@ -1033,7 +1034,7 @@ async fn leave_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -
         let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
         if owners.len() <= 1 { return Err(err(StatusCode::CONFLICT, "transfer ownership before leaving; an organisation needs an owner")); }
     }
-    st.audited_batch(&[
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[
         ("DELETE FROM org_members WHERE org_id=? AND user_id=?".into(),vec![json!(&oid),json!(&uid)]),
         ("DELETE FROM team_members WHERE user_id=? AND team_id IN (SELECT id FROM teams WHERE org_id=?)".into(),vec![json!(&uid),json!(&oid)]),
     ], &[], [&oid,"","",&uid,"org.leave",""]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
@@ -1044,7 +1045,7 @@ async fn transfer_org(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     let member = st.db.one("SELECT u.active AS active,u.email_verified AS email_verified,m.locked AS locked FROM org_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=? AND m.user_id=?", &[json!(&oid), json!(target)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
     if db::n(&member,"active") == 0 || db::n(&member,"email_verified") == 0 { return Err(err(StatusCode::CONFLICT, "the new owner needs an active, verified account")); }
     if db::n(&member,"locked") != 0 { return Err(err(StatusCode::CONFLICT, "unlock the member before transferring ownership")); }
-    user_guarded_commit(&st, &[&uid, target], &[
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; user_guarded_commit(&st, &[&uid, target], &[
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(target)]),
         ("UPDATE org_members SET role=role WHERE org_id=? AND user_id=? AND role='owner'".into(), vec![json!(&oid), json!(&uid)]),
         ("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=? AND locked=0".into(), vec![json!(&oid), json!(target)]),
@@ -1064,7 +1065,7 @@ async fn update_member_role(State(st): State<S>, h: HeaderMap, Path((oid, target
         let owners = st.db.query("SELECT user_id FROM org_members WHERE org_id=? AND role='owner'", &[json!(&oid)]).await.map_err(|e| bad(&e))?;
         if owners.len() <= 1 { return Err(err(StatusCode::CONFLICT, "an organisation needs at least one owner")); }
     }
-    let audit: [&str;6] = [&oid, "", "", &uid, "member.role", &format!("{}={}", target, new_role)];
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let audit: [&str;6] = [&oid, "", "", &uid, "member.role", &format!("{}={}", target, new_role)];
     if new_role == "owner" {
         user_guarded_commit(&st, &[&uid, &target], &[
             ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&target)]),
@@ -1085,6 +1086,7 @@ async fn set_member_lock(st: &S, h: &HeaderMap, oid: &str, target: &str, locked:
     if target_role == "owner" && locked { return Err(err(StatusCode::CONFLICT, "workspace owners cannot be locked; change the member's role first")); }
     // The write repeats the owner exclusion so a lock that races an ownership
     // change commits zero rows instead of stranding a locked owner.
+    require_step_up(st, h, &uid, StepUpRisk::TwoFactor).await?;
     if locked {
         st.audited_batch(&[("UPDATE org_members SET locked=1 WHERE org_id=? AND user_id=? AND role<>'owner'".into(), vec![json!(oid), json!(target)])], &[0], [oid, "", "", &uid, "member.lock", target]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "workspace owners cannot be locked; change the member's role first") } else { bad(&e) })?;
     } else {
@@ -1109,7 +1111,7 @@ async fn invite_member(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     if !valid_email(&email) { return Err(bad("email required")); }
     // The invitee redeems a single-use link with a password, a v2 key, or a
     // configured provider; issuing it never adds membership by itself.
-    let token = oc::random_token("inv"); let expires = now()+7*86400; let iid = id();
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let token = oc::random_token("inv"); let expires = now()+7*86400; let iid = id();
     st.db.batch(&[
         ("DELETE FROM invites WHERE email=? AND org_id=? AND accepted=0".into(),vec![json!(&email),json!(&oid)]),
         ("INSERT INTO invites(id,token_hash,email,org_id,role,invited_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)".into(),vec![json!(&iid),json!(oc::hash_token(&token)),json!(&email),json!(&oid),json!(&new_role),json!(&uid),json!(now()),json!(expires)]),
@@ -1263,9 +1265,26 @@ async fn list_envs(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -
     Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, app) = st.require_env(&eid, &uid).await?;
     st.check_admin(&org, &uid).await?;
+    let roles = st.db.query("SELECT id,name,permissions FROM roles WHERE org_id=?", &[json!(&org)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"receipt role policy unavailable"))?;
+    let mut role_matches = Vec::new(); let mut receipt_params = Vec::new();
+    let deleted_at = now(); let receipt_cap = deleted_at + 30*86400;
+    receipt_params.extend([json!(deleted_at),json!(receipt_cap),json!(receipt_cap),json!(&eid)]);
+    // Changed role snapshots are omitted, not trusted after their parsed grant changes.
+    for role in roles {
+        let raw = db::s(&role,"permissions");
+        let perms = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+        if perms.iter().any(|p| p == "*" || p == "secrets:read") {
+            role_matches.push("(r.id=? AND r.name=? AND r.permissions=?)");
+            receipt_params.extend([json!(db::s(&role,"id")),json!(db::s(&role,"name")),json!(raw)]);
+        }
+    }
+    let custom_read = if role_matches.is_empty() { "0=1".to_string() } else { role_matches.join(" OR ") };
     let mut stmts = vec![
         ("UPDATE orgs SET name=name WHERE id=?".into(), vec![json!(&org)]),
+        ("UPDATE apps SET name=name WHERE id=? AND org_id=?".into(), vec![json!(&app), json!(&org)]),
         ("UPDATE envs SET name=name WHERE id=? AND app_id=? AND NOT EXISTS (SELECT 1 FROM leases WHERE env_id=? AND revoked<>1)".into(), vec![json!(&eid), json!(&app), json!(&eid)]),
+        // Select still-live credentials under the deletion locks, never from a preflight snapshot.
+        (format!(r#"INSERT INTO deleted_env_receipts(token_id,token_hash,created_by,org_id,app_id,env_id,env_name,app_name,workspace_name,scopes,original_expires_at,deleted_at,expires_at,kind,trust_id,workload_revision,restricted) SELECT t.id,t.token_hash,t.created_by,o.id,a.id,e.id,e.name,a.name,o.name,t.scopes,t.expires_at,?,CASE WHEN t.expires_at>0 AND t.expires_at<? THEN t.expires_at ELSE ? END,t.kind,t.trust_id,t.workload_revision,e.restricted FROM tokens t JOIN envs e ON e.id=t.env_id JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id JOIN users u ON u.id=t.created_by JOIN org_members m ON m.org_id=o.id AND m.user_id=u.id WHERE e.id=? AND t.app_id=a.id AND t.org_id=o.id AND t.kind='human' AND t.trust_id='' AND t.workload_revision='' AND (t.expires_at=0 OR t.expires_at>OW_NOW()) AND u.active=1 AND u.email_verified=1 AND m.locked=0 AND (t.scopes='' OR t.scopes='*' OR t.scopes='secrets:read' OR t.scopes LIKE 'secrets:read %' OR t.scopes LIKE '% secrets:read' OR t.scopes LIKE '% secrets:read %' OR t.scopes LIKE '* %' OR t.scopes LIKE '% *' OR t.scopes LIKE '% * %') AND (m.role IN ('owner','admin','developer') OR EXISTS (SELECT 1 FROM roles r WHERE r.org_id=o.id AND r.name=m.role AND ({custom_read}))) AND (e.restricted=0 OR m.role IN ('owner','admin') OR EXISTS (SELECT 1 FROM env_members em WHERE em.env_id=e.id AND em.user_id=u.id) OR EXISTS (SELECT 1 FROM app_members am WHERE am.app_id=a.id AND am.user_id=u.id) OR EXISTS (SELECT 1 FROM team_env_grants g JOIN team_members tm ON tm.team_id=g.team_id WHERE g.env_id=e.id AND tm.user_id=u.id))"#), receipt_params),
     ];
     for sql in [
         "DELETE FROM wrap_tokens WHERE env_id=?",
@@ -1289,7 +1308,7 @@ async fn delete_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) 
         "DELETE FROM envs WHERE id=?",
     ] { stmts.push((sql.into(), vec![json!(&eid)])); }
     stmts.push(("DELETE FROM meta WHERE k=?".into(), vec![json!(format!("rekey_required:{}", eid))]));
-    st.audited_rotation_batch(&stmts, &[0,1], [&org,&app,&eid,&uid,"env.delete",""],None,"SELECT id FROM rotation_schedules WHERE env_id=? AND (pending_enc<>'' OR execution_token<>'')",&[json!(&eid)]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "environment changed or has unresolved leases; revoke every lease before deleting it") } else { bad(&e) })?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_rotation_batch(&stmts, &[0,1,2], [&org,&app,&eid,&uid,"env.delete",""],None,"SELECT id FROM rotation_schedules WHERE env_id=? AND (pending_enc<>'' OR execution_token<>'')",&[json!(&eid)]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "environment changed or has unresolved leases; revoke every lease before deleting it") } else { bad(&e) })?; Ok(j(json!({"ok": true}))) }
 async fn set_env_policy(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_admin(&org, &uid).await?;
     let mut changed = Vec::new();
@@ -1302,7 +1321,7 @@ async fn set_env_policy(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
         statements.push((("UPDATE envs SET max_versions=? WHERE id=?").to_string(), ([json!(v), json!(&eid)]).to_vec()));
         changed.push(format!("max_versions={}", v)); }
     if changed.is_empty() { return Err(bad("restricted, require_approval or max_versions required")); }
-    st.audited_batch(&statements, &[], [&org, &app, &eid, &uid, "env.policy", &changed.join(",")]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org, &app, &eid, &uid, "env.policy", &changed.join(",")]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"ok": true, "policy": changed}))) }
 async fn list_members(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid, &uid).await?;
     let rows = st.db.query("SELECT u.id AS id, u.email AS email, u.created_at AS created_at, m.role AS role, m.locked AS locked FROM users u JOIN org_members m ON m.user_id=u.id WHERE m.org_id=? ORDER BY m.role, u.email", &[json!(oid)]).await.map_err(|e| bad(&e))?;
@@ -1312,7 +1331,7 @@ async fn remove_member(State(st): State<S>, h: HeaderMap, Path((oid, target)): P
     if target == uid { return Err(bad("use another admin to remove yourself; leaving your own organisation is not supported")); }
     let target_role = st.org_role(&oid, &target).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "member not found"))?;
     if target_role == "owner" && role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can remove an owner")); }
-    st.audited_batch(&[("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)".into(), vec![json!(oid), json!(target), json!(oid)])], &[0], [&oid, "", "", &uid, "member.remove", &target]).await.map_err(|e| if e.contains("version conflict") {bad("cannot remove the last owner")} else {bad(&e)})?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[("DELETE FROM org_members WHERE org_id=? AND user_id=? AND (role<>'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id=? AND role='owner')>1)".into(), vec![json!(oid), json!(target), json!(oid)])], &[0], [&oid, "", "", &uid, "member.remove", &target]).await.map_err(|e| if e.contains("version conflict") {bad("cannot remove the last owner")} else {bad(&e)})?;
     Ok(j(json!({"ok": true}))) }
 async fn update_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?;
@@ -1365,9 +1384,10 @@ async fn delete_app(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) 
         "DELETE FROM envs WHERE app_id=?",
         "DELETE FROM app_members WHERE app_id=?",
         "DELETE FROM tokens WHERE app_id=?",
+        "DELETE FROM deleted_env_receipts WHERE app_id=?",
         "DELETE FROM apps WHERE id=?",
     ] { stmts.push((sql.into(), vec![json!(&aid)])); }
-    st.audited_rotation_batch(&stmts, &[0,1], [&org,&aid,"",&uid,"app.delete",""],None,"SELECT id FROM rotation_schedules WHERE env_id IN (SELECT id FROM envs WHERE app_id=?) AND (pending_enc<>'' OR execution_token<>'')",&[json!(&aid)]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "application changed or has unresolved leases; revoke every lease before deleting it") } else { bad(&e) })?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_rotation_batch(&stmts, &[0,1], [&org,&aid,"",&uid,"app.delete",""],None,"SELECT id FROM rotation_schedules WHERE env_id IN (SELECT id FROM envs WHERE app_id=?) AND (pending_enc<>'' OR execution_token<>'')",&[json!(&aid)]).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "application changed or has unresolved leases; revoke every lease before deleting it") } else { bad(&e) })?; Ok(j(json!({"ok": true}))) }
 async fn update_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     if r.name.is_empty() || r.name.len() > 32 || !r.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { return Err(bad("env name must match ^[a-zA-Z0-9-_]{1,32}$")); }
@@ -1387,7 +1407,7 @@ async fn clone_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     let mut cloned = 0; let mut skipped = 0; let mut statements: Vec<(String,Vec<Value>)> = Vec::new(); let mut require_one: Vec<usize> = Vec::new();
     for (_, _, raw) in items {
         let stype = raw["type"].as_str().unwrap_or("secret");
-        if stype == "sealed" { skipped += 1; continue; }
+        if stype == "sealed" || wallet_type(stype) { skipped += 1; continue; }
         let s = SecretIn{ key: raw["key"].as_str().unwrap_or("").into(), value: raw["value"].as_str().unwrap_or("").into(), path: raw["path"].as_str().unwrap_or("/").into(), comment: raw["comment"].as_str().unwrap_or("").into(), tags: raw["tags"].as_str().unwrap_or("").into(), secret_type: stype.into(), expected_version: None };
         let kname = s.key.to_uppercase();
         let khash = key_index(&key, &s.path, &kname);
@@ -1396,7 +1416,7 @@ async fn clone_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
         require_one.push(statements.len()); statements.push(("UPDATE envs SET id=id WHERE id=?".into(), vec![json!(target)]));
         require_one.push(statements.len()); statements.extend(secret_statements(&st, target, &org, &key, &uid, &s, &master).await?); cloned += 1;
     }
-    st.audited_batch_master(&statements, &require_one, [&org, &app, &eid, &uid, "env.clone", &format!("{}->{} cloned={} skipped={}", eid, target, cloned, skipped)], master).await.map_err(secret_batch_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch_master(&statements, &require_one, [&org, &app, &eid, &uid, "env.clone", &format!("{}->{} cloned={} skipped={}", eid, target, cloned, skipped)], master).await.map_err(secret_batch_error)?;
     let sync_errors = trigger_sync(&st, target, &uid).await;
     Ok(j(json!({"cloned": cloned, "skipped": skipped, "sync_errors": sync_errors}))) }
 async fn compare_envs(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?;
@@ -1415,6 +1435,22 @@ async fn compare_envs(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>
     only_source.sort(); only_target.sort(); changed.sort();
     Ok(j(json!({"only_in_source": only_source, "only_in_target": only_target, "changed": changed, "same": same}))) }
 
+pub(crate) fn wallet_type(stype: &str) -> bool { matches!(stype, "wallet_private_key" | "wallet_recovery_phrase") }
+async fn reveal_wallet(State(st): State<S>, h: HeaderMap, Path((eid, sid)): Path<(String, String)>) -> Res {
+    let uid = st.token_user(&h).await?;
+    if step_up_user(&st, &h).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "wallet reveal requires an account session")); }
+    st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let env = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "env not found"))?;
+    if db::s(&env, "mode") != "sse" { return Err(bad("wallet reveal requires a server-encrypted environment")); }
+    let row = st.db.one("SELECT * FROM secrets WHERE id=? AND env_id=? AND deleted=0 AND e2e=0", &[json!(&sid), json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "wallet not found"))?;
+    if !wallet_type(&db::s(&row, "secret_type")) { return Err(bad("secret is not a wallet")); }
+    st.check_secret_path(&sid, &uid, "read").await?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?;
+    let key = st.env_key(&eid).await?;
+    let value = decrypt_secret_value(&key, &eid, &sid, "value", db::n(&row, "version"), &db::s(&row, "value_enc")).map_err(|_| bad("cannot decrypt wallet"))?;
+    st.audited_batch(&[], &[], [&org, &app, &eid, &uid, "wallet.reveal", &sid]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "cannot audit wallet reveal"))?;
+    Ok(j(json!({"value": String::from_utf8(value).map_err(|_| bad("invalid wallet encoding"))?})))
+}
 async fn list_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let items = st.list_secrets_decrypted(&eid, &uid).await?; st.audit(&org, &app, &eid, &uid, "secret.list", &format!("{}", items.len())).await;
     let tag = q.get("tag").cloned().unwrap_or_default();
@@ -1454,7 +1490,7 @@ async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     }
     let inputs = deduped;
     for s in &inputs { st.check_path(&eid, &uid, &s.path, "write").await?; }
-    let scan_findings: Vec<Value> = inputs.iter().filter(|s| s.secret_type != "sealed").filter_map(|s| {
+    let scan_findings: Vec<Value> = inputs.iter().filter(|s| s.secret_type != "sealed" && !wallet_type(&s.secret_type)).filter_map(|s| {
         let rules = scan_rules(&s.value);
         if rules.is_empty() { None } else { Some(json!({"key": s.key, "path": s.path, "rules": rules})) }
     }).collect();
@@ -1464,7 +1500,7 @@ async fn deploy_secrets(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
         let prepared = secret_statements(&st, &eid, &org, &key, &uid, s, &master).await?;
         require_one.push(statements.len()); statements.extend(prepared);
     }
-    st.audited_batch_master(&statements, &require_one, [&org,&app,&eid,&uid,"secret.deploy",&format!("{} secrets",count)], master).await.map_err(secret_batch_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch_master(&statements, &require_one, [&org,&app,&eid,&uid,"secret.deploy",&format!("{} secrets",count)], master).await.map_err(secret_batch_error)?;
     let sync_errors = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"deployed": count, "sync_errors": sync_errors, "scan_findings": scan_findings}))) }
 fn secret_batch_error(e: String) -> (StatusCode, Json<Value>) {
     if e == webhooks::EPOCH_STALE { webhooks::epoch_stale() } else if e.starts_with("version conflict:") { err(StatusCode::CONFLICT, &e) } else { bad(&e) }
@@ -1496,7 +1532,9 @@ async fn secret_statements(st: &S, eid: &str, org: &str, key: &[u8;32], uid: &st
         }
     }
     let mut stype = if s.secret_type.is_empty() { "secret".to_string() } else { s.secret_type.clone() };
-    if !matches!(stype.as_str(), "secret" | "sealed" | "ssh_key" | "config") { return Err(bad("secret type must be secret, sealed, ssh_key or config")); }
+    if !matches!(stype.as_str(), "secret" | "sealed" | "ssh_key" | "config" | "wallet_private_key" | "wallet_recovery_phrase") { return Err(bad("invalid secret type")); }
+    if let Some(row) = &existing { let current = db::s(row, "secret_type"); if wallet_type(&current) && current != stype { return Err(bad("wallet secrets cannot change type; delete and recreate")); } }
+    if wallet_type(&stype) && st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"mode")) != Some("sse".into()) { return Err(bad("wallet storage requires a server-encrypted environment")); }
     if stype == "ssh_key" && ssh_keys::public_key_error(&kname, &s.value).is_some() { return Err(bad("an ssh_key value must be a single-line OpenSSH public key")); }
     if let Some(row) = &existing { if db::s(row, "secret_type") == "sealed" { if stype != "sealed" { return Err(bad("sealed secrets cannot change type; delete and recreate")); } stype = "sealed".to_string(); } }
     // Only real secret values are indexed. Sealed values are excluded so a
@@ -1552,19 +1590,19 @@ async fn rotation_secret_batch(st: &S, eid: &str, sid: &str, statements: &[(Stri
             params.extend([json!(String::from_utf8(name).map_err(|_| bad("invalid secret name"))?),json!(st.stored_path(&key,&row)?)]);
         }
     }
-    let checked=if fields[4]=="secret.delete" { vec![0] } else { Vec::new() };
+    let checked=if matches!(fields[4], "secret.delete" | "secret.restore") { vec![0] } else { Vec::new() };
     st.audited_rotation_batch(statements,&checked,fields,master,&blocked,&params).await.map_err(secret_batch_error)?;
     Ok(())
 }
 async fn delete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
     let eid = db::s(&row, "env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:delete").await?; st.check_secret_path(&sid, &uid, "delete").await?;
-    rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?".into(), vec![json!(now()),json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.delete",&sid], None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?".into(), vec![json!(now()),json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.delete",&sid], None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
 async fn undelete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
     let eid = db::s(&row, "env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     require_approval_for_write(&st, &eid, &org, &uid).await?;
-    st.audited_batch(&[("UPDATE secrets SET deleted=0,deleted_at=0,updated_at=? WHERE id=? AND deleted=1".into(),vec![json!(now()),json!(sid)])], &[0], [&org,&app,&eid,&uid,"secret.undelete",&sid]).await.map_err(|e| if e.contains("version conflict") {bad("secret is not deleted")} else {bad(&e)})?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[("UPDATE secrets SET deleted=0,deleted_at=0,updated_at=? WHERE id=? AND deleted=1".into(),vec![json!(now()),json!(sid)])], &[0], [&org,&app,&eid,&uid,"secret.undelete",&sid]).await.map_err(|e| if e.contains("version conflict") {bad("secret is not deleted")} else {bad(&e)})?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
 // Unlike delete (a recoverable tombstone), destroy removes the value and its
 // history permanently. Point-in-time recovery cannot bring it back.
 async fn destroy_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
@@ -1574,23 +1612,25 @@ async fn destroy_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<Strin
     statements.push((("DELETE FROM secret_versions WHERE secret_id=?").to_string(), ([json!(sid)]).to_vec()));
     statements.push((("DELETE FROM overrides WHERE secret_id=?").to_string(), ([json!(sid)]).to_vec()));
     statements.push((("DELETE FROM secrets WHERE id=?").to_string(), ([json!(sid)]).to_vec()));
-    rotation_secret_batch(&st,&eid,&sid,&statements,[&org, &app, &eid, &uid, "secret.destroy", &sid],None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"destroyed": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&statements,[&org, &app, &eid, &uid, "secret.destroy", &sid],None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"destroyed": true}))) }
 async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
+    let row = st.db.one("SELECT env_id,secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     st.check_scope(&h, &eid).await?; st.check_secret_path(&sid, &uid, "read").await?;
-    let key = st.env_key(&eid).await?; let sealed = st.db.one("SELECT secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map(|r| r.map(|x| db::s(&x,"secret_type") == "sealed").unwrap_or(false)).unwrap_or(false);
+    let key = st.env_key(&eid).await?; let current_type = db::s(&row, "secret_type"); let sealed = current_type == "sealed"; let wallet = wallet_type(&current_type);
     let rows = st.db.query("SELECT * FROM secret_versions WHERE secret_id=? ORDER BY version DESC", &[json!(sid)]).await.map_err(|e| bad(&e))?;
     let mut visible_rows = Vec::new(); for r in rows { if st.path_allowed(&eid, &uid, &db::s(&r,"path"), "read").await? { visible_rows.push(r); } }
-    let items: Vec<Value> = visible_rows.iter().map(|r| json!({"version": db::n(r,"version"), "path": db::s(r,"path"), "tags": db::s(r,"tags"), "value": if sealed { "[SEALED]".to_string() } else { decrypt_secret_value(&key, &eid, &sid, "value", db::n(r,"version"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
+    let items: Vec<Value> = visible_rows.iter().map(|r| json!({"version": db::n(r,"version"), "path": db::s(r,"path"), "tags": db::s(r,"tags"), "value": if wallet || wallet_type(&db::s(r,"secret_type")) { "[WALLET]".to_string() } else if sealed { "[SEALED]".to_string() } else { decrypt_secret_value(&key, &eid, &sid, "value", db::n(r,"version"), &db::s(r,"value_enc")).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }, "created_at": db::n(r,"created_at"), "created_by": db::s(r,"created_by")})).collect();
     Ok(j(json!(items))) }
 async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(String, i64)>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
+    let row = st.db.one("SELECT env_id,secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     st.check_scope(&h, &eid).await?; st.check_secret_path(&sid, &uid, "write").await?;
     require_approval_for_write(&st, &eid, &org, &uid).await?;
     // An E2E environment has no server-side key; restoring its ciphertext
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
     let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
+    let current_type = db::s(&row,"secret_type"); let version_type = db::s(&v,"secret_type");
+    if (wallet_type(&current_type) || wallet_type(&version_type)) && current_type != version_type { return Err(bad("wallet restore cannot change type")); }
     st.check_path(&eid, &uid, &db::s(&v,"path"), "read").await?;
     let cur = st.db.one("SELECT version FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?;
     let new_ver = cur.as_ref().map(|r| db::n(r,"version")).unwrap_or(0) + 1;
@@ -1611,25 +1651,27 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
         }
         None => (db::s(&v,"value_enc"), db::s(&v,"comment_enc"), String::new(), db::s(&v,"tags"), String::new()),
     };
-    rotation_secret_batch(&st,&eid,&sid,&[
-        ("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,tags_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=?".into(), vec![json!(value_enc), json!(&restored_fp), json!(comment_enc), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(now()), json!(uid), json!(sid)]),
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[
+        ("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,tags_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=? AND secret_type=?".into(), vec![json!(value_enc), json!(&restored_fp), json!(comment_enc), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(now()), json!(uid), json!(sid), json!(current_type)]),
         ("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)".into(), vec![json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(uid)]),
     ], [&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)], Some(master)).await?;
     prune_versions(&st, &eid, &sid, new_ver).await?;
     let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?;
+    let row = st.db.one("SELECT env_id,secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?;
     if st.restricted_env(&eid,&uid).await? { st.check_perm(&org,&uid,"secrets:write").await?; st.check_secret_path(&sid,&uid,"write").await?; }
+    if wallet_type(&db::s(&row,"secret_type")) { return Err(bad("wallet secrets do not support personal overrides")); }
     let key = st.env_key(&eid).await?; let val = r.secrets.first().map(|s| s.value.clone()).unwrap_or_default();
     let enc = oc::encrypt_symmetric_aad(&key, &secret_aad(&eid, &sid, &format!("override:{}", uid)), val.as_bytes());
-    if st.db.exec("INSERT INTO overrides(secret_id,user_id,value_enc) VALUES(?,?,?)", &[json!(sid), json!(uid), json!(&enc)]).await.is_err() {
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; if st.db.exec("INSERT INTO overrides(secret_id,user_id,value_enc) VALUES(?,?,?)", &[json!(sid), json!(uid), json!(&enc)]).await.is_err() {
         st.db.exec("UPDATE overrides SET value_enc=? WHERE secret_id=? AND user_id=?", &[json!(&enc), json!(sid), json!(uid)]).await.map_err(|e| bad(&e))?;
     }
     Ok(j(json!({"ok":true}))) }
 
 async fn get_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id,key_enc,version FROM secrets WHERE id=? AND deleted=0", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
+    let row = st.db.one("SELECT env_id,key_enc,version,secret_type FROM secrets WHERE id=? AND deleted=0", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
     let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?; st.check_secret_path(&sid,&uid,"read").await?;
+    if wallet_type(&db::s(&row,"secret_type")) { return Err(bad("wallet secrets do not support personal overrides")); }
     let ov = st.db.one("SELECT value_enc FROM overrides WHERE secret_id=? AND user_id=?", &[json!(sid), json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no personal override"))?;
     let key = st.env_key(&eid).await?;
     let value = decrypt_secret_value(&key, &eid, &sid, &format!("override:{}", uid), db::n(&row,"version"), &db::s(&ov,"value_enc")).map_err(|e| bad(&e))?;
@@ -1638,7 +1680,7 @@ async fn get_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>
 async fn delete_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=? AND deleted=0", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
     let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?; st.check_secret_path(&sid,&uid,"read").await?;
-    st.audited_batch(&[("DELETE FROM overrides WHERE secret_id=? AND user_id=?".into(),vec![json!(sid),json!(uid)])], &[0], [&org,&app,&eid,&uid,"secret.override_delete",&sid]).await.map_err(|e|if e.contains("version conflict") {err(StatusCode::NOT_FOUND,"no personal override")} else {bad(&e)})?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[("DELETE FROM overrides WHERE secret_id=? AND user_id=?".into(),vec![json!(sid),json!(uid)])], &[0], [&org,&app,&eid,&uid,"secret.override_delete",&sid]).await.map_err(|e|if e.contains("version conflict") {err(StatusCode::NOT_FOUND,"no personal override")} else {bad(&e)})?;
     Ok(j(json!({"deleted": true}))) }
 
 async fn scan_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
@@ -1646,7 +1688,7 @@ async fn scan_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) ->
     let items = st.list_secrets_decrypted(&eid, &uid).await?;
     let mut findings = Vec::new();
     for (_, _, raw) in items {
-        if raw["type"].as_str() == Some("sealed") { continue; }
+        if raw["type"].as_str() == Some("sealed") || wallet_type(raw["type"].as_str().unwrap_or("")) { continue; }
         let rules = scan_rules(raw["value"].as_str().unwrap_or(""));
         if !rules.is_empty() { findings.push(json!({"key": raw["key"], "path": raw["path"], "rules": rules})); }
     }
@@ -1712,12 +1754,12 @@ async fn reuse_check(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
     if !matches.is_empty() { st.audit(&org, &app, &eid, &uid, "secret.reuse_warned", &format!("{} values", matches.len())).await; }
     Ok(j(json!({"enabled": true, "matches": matches}))) }
 async fn export_env(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org,&uid,"secrets:read").await?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?;
     // base=1 skips the caller's personal overrides. Deployments must not pick up
     // whichever stand-in values the token owner happens to keep locally.
     let items = if q.get("base").map(|v| v == "1" || v == "true").unwrap_or(false) { st.list_secrets_with(&eid, None, Some(&uid)).await? } else { st.list_secrets_decrypted(&eid,&uid).await? };
-    let total = items.len();
-    let visible: Vec<(String,String,Value)> = items.into_iter().filter(|(_,_,raw)| raw["type"].as_str() != Some("sealed")).collect();
-    let omitted = total - visible.len();
+    let omitted = items.iter().filter(|(_,_,raw)| raw["type"].as_str() == Some("sealed")).count();
+    let visible: Vec<(String,String,Value)> = items.into_iter().filter(|(_,_,raw)| raw["type"].as_str() != Some("sealed") && !wallet_type(raw["type"].as_str().unwrap_or(""))).collect();
     let text = visible.iter().map(|(k,v,_)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n");
     st.audit(&org,&app,&eid,&uid,"secret.export",&format!("{} secrets, {} sealed omitted", visible.len(), omitted)).await;
     crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"secret.export","",visible.len()).await;
@@ -1764,7 +1806,7 @@ async fn create_token(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>
     for s in &scopes { if !matches!(*s, "secrets:read" | "secrets:write" | "org:admin" | "pki:read" | "pki:write" | "transit:manage" | "transit:encrypt" | "transit:decrypt" | "transit:rewrap" | "*") { return Err(bad("scopes may contain secrets:read, secrets:write, org:admin, pki:read, pki:write, transit:manage, transit:encrypt, transit:decrypt, transit:rewrap or *")); } }
     let scopes = scopes.join(" ");
     let expires_at = if r.expires_in > 0 { now() + r.expires_in.clamp(60, 365 * 86400) } else { 0 };
-    st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(org), json!(aid), json!(r.env_id), json!(if r.name.is_empty(){"token".into()}else{r.name.clone()}), json!(oc::hash_token(&token)), json!(expires_at), json!(scopes), json!(now()), json!(uid)]).await.map_err(|e| bad(&e))?;
     crate::ai::activity(&st,(&org,&aid,&r.env_id),&uid,&h,"token.create",&tid,1).await;
     Ok(j(json!({"id": tid, "token": token, "expires_at": expires_at, "scopes": scopes}))) }
 async fn audit_list(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
@@ -1787,7 +1829,7 @@ async fn audit_verify(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
     let head_ok = head_seq == expect - 1 && (head_seq == 0 || head_hash == prev);
     Ok(j(json!({"ok": first_bad.is_none() && head_ok, "checked": checked, "first_bad": first_bad, "unchained": unchained, "head_seq": head_seq, "head_matches": head_ok}))) }
 async fn create_team(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(r): Json<NameReq>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
-    let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(oid), json!(r.name)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": tid}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(oid), json!(r.name)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": tid}))) }
 async fn list_teams(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
     let rows = st.db.query("SELECT * FROM teams WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn list_team_grants(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
@@ -1799,11 +1841,11 @@ async fn add_team_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<Strin
     let tid = body.get("team_id").and_then(|v| v.as_str()).unwrap_or("");
     if st.db.one("SELECT id FROM teams WHERE id=? AND org_id=?", &[json!(tid), json!(&org)]).await.map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::NOT_FOUND, "team not found in this organisation")); }
     statements.push((("INSERT INTO team_env_grants(team_id,env_id) VALUES(?,?)").to_string(), ([json!(tid), json!(&eid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"team.grant",tid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"team.grant",tid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
 async fn remove_team_grant(State(st): State<S>, h: HeaderMap, Path((eid, tid)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_admin(&org, &uid).await?;
     statements.push((("DELETE FROM team_env_grants WHERE team_id=? AND env_id=?").to_string(), ([json!(&tid), json!(&eid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"team.revoke",&tid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"team.revoke",&tid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
 async fn list_team_members(State(st): State<S>, h: HeaderMap, Path((oid, tid)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     st.require_org(&oid, &uid).await?;
     if st.db.one("SELECT id FROM teams WHERE id=? AND org_id=?", &[json!(&tid), json!(&oid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::NOT_FOUND, "team not found")); }
@@ -1815,11 +1857,11 @@ async fn add_team_member(State(st): State<S>, h: HeaderMap, Path((oid, tid)): Pa
     let target = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     if st.org_role(&oid, target).await.is_none() { return Err(err(StatusCode::NOT_FOUND, "user is not a member of this organisation")); }
     statements.push((("INSERT INTO team_members(team_id,user_id) VALUES(?,?)").to_string(), ([json!(&tid), json!(target)]).to_vec()));
-    st.audited_batch(&statements, &[], [&oid,"","",&uid,"team.member.add",target]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&oid,"","",&uid,"team.member.add",target]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
 async fn remove_team_member(State(st): State<S>, h: HeaderMap, Path((oid, tid, target)): Path<(String, String, String)>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     st.check_admin(&oid, &uid).await?;
     statements.push((("DELETE FROM team_members WHERE team_id=? AND user_id=? AND team_id IN (SELECT id FROM teams WHERE org_id=?)").to_string(), ([json!(&tid), json!(&target), json!(&oid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&oid,"","",&uid,"team.member.remove",&target]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&oid,"","",&uid,"team.member.remove",&target]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
 
 async fn create_lockbox(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let _ = uid;
     let val = body.get("secrets").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|s| s.get("value")).and_then(|v| v.as_str())
@@ -1827,7 +1869,7 @@ async fn create_lockbox(State(st): State<S>, h: HeaderMap, Json(body): Json<Valu
     if val.is_empty() { return Err(bad("value required")); }
     let expires_in = body.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(86400).clamp(60, 7 * 86400);
     let max_views = body.get("max_views").and_then(|v| v.as_i64()).unwrap_or(1).clamp(1, 10);
-    let key = oc::random_key(); let lid = id(); let created_at = now(); let expires_at = created_at + expires_in;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let key = oc::random_key(); let lid = id(); let created_at = now(); let expires_at = created_at + expires_in;
     st.db.exec("INSERT INTO lockbox(id,value_enc,expires_at,max_views,created_at) VALUES(?,?,?,?,?)", &[json!(lid), json!(oc::encrypt_symmetric(&key, val.as_bytes())), json!(expires_at), json!(max_views), json!(created_at)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": lid, "key": oc::b64(&key), "url": format!("/lockbox/{}#{}", lid, oc::b64(&key)), "expires_at": expires_at, "max_views": max_views}))) }
 async fn open_lockbox(State(st): State<S>, Path(lid): Path<String>, h: HeaderMap) -> Res {
@@ -1860,7 +1902,7 @@ async fn create_wrap(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>,
     let items = st.list_secrets_base(&eid).await?;
     let mut secrets = serde_json::Map::new();
     for (k, value, raw) in &items {
-        if raw["type"].as_str() == Some("sealed") { continue; }
+        if raw["type"].as_str() == Some("sealed") || wallet_type(raw["type"].as_str().unwrap_or("")) { continue; }
         // Two secrets can share a key name in different paths, so non-root
         // entries carry their path instead of overwriting one another.
         let path = raw["path"].as_str().unwrap_or("/");
@@ -1908,7 +1950,7 @@ async fn create_integration(State(st): State<S>, h: HeaderMap, Path(eid): Path<S
     let mode = st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")).unwrap_or_default();
     let config_enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, &config).await? }
         else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
-    st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.db.exec("INSERT INTO integrations(id,env_id,kind,name,config_enc,created_at) VALUES(?,?,?,?,?,?)", &[json!(iid), json!(eid), json!(kind), json!(body.get("name").and_then(|v| v.as_str()).unwrap_or(kind)), json!(config_enc), json!(now())]).await.map_err(|e| bad(&e))?;
     crate::ai::activity(&st,(&org,"",&eid),&uid,&h,"integration.create",&iid,1).await;
     Ok(j(json!({"id": iid}))) }
 async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
@@ -1916,13 +1958,13 @@ async fn list_integrations(State(st): State<S>, h: HeaderMap, Path(eid): Path<St
 async fn sync_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let (org, _) = st.require_env(&db::s(&row, "env_id"), &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
-    let result = sync_one(&st, &iid, &uid).await;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let result = sync_one(&st, &iid, &uid).await;
     crate::ai::activity(&st,(&org,"",&db::s(&row,"env_id")),&uid,&h,if result.is_ok() { "integration.sync" } else { "integration.sync_failed" },&iid,1).await;
     let msg = result?; Ok(j(json!({"ok": true, "detail": msg}))) }
 async fn test_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM integrations WHERE id=?", &[json!(iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
     let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "integrations:write").await?;
-    if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; if st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(&eid)]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "mode")) == Some("delegated".into()) {
         enqueue_sync(&st, &eid, &iid, "test").await?;
         return Ok(j(json!({"ok": true, "detail": "connection test queued for the customer runner"}))); }
     let key = st.env_key(&eid).await?;
@@ -1950,7 +1992,7 @@ async fn update_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
         let enc = if mode == "delegated" { seal_to_runner(&st, &eid, &iid, config).await? }
             else { oc::encrypt_symmetric_aad(&st.env_key(&eid).await?, &integration_aad(&eid, &iid, "config"), config.to_string().as_bytes()) };
         statements.push((("UPDATE integrations SET config_enc=? WHERE id=?").to_string(), ([json!(enc), json!(&iid)]).to_vec())); }
-    st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"integration.update",&iid]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"integration.update",&iid]).await.map_err(|e|bad(&e))?;
     crate::ai::activity(&st,(&org,&app,&eid),&uid,&h,"integration.update",&iid,1).await; Ok(j(json!({"ok": true}))) }
 async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     let row = st.db.one("SELECT env_id FROM integrations WHERE id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration not found"))?;
@@ -1958,7 +2000,7 @@ async fn delete_integration(State(st): State<S>, h: HeaderMap, Path(iid): Path<S
     statements.push((("DELETE FROM integration_sync_state WHERE integration_id=?").to_string(), ([json!(&iid)]).to_vec()));
     statements.push(("DELETE FROM sync_jobs WHERE integration_id=?".into(), vec![json!(&iid)]));
     statements.push(("DELETE FROM integrations WHERE id=?".into(), vec![json!(&iid)]));
-    st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"integration.delete",&iid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deleted": iid}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"integration.delete",&iid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deleted": iid}))) }
 async fn trigger_sync(st: &S, eid: &str, uid: &str) -> Vec<String> { if st.restricted_principal(uid).await.unwrap_or(true) { return Vec::new(); } trigger_sync_with(st, eid, uid, true).await }
 async fn trigger_sync_internal(st: &S, eid: &str) -> Vec<String> { trigger_sync_with(st, eid, "rotation-scheduler", false).await }
 async fn trigger_sync_with(st: &S, eid: &str, uid: &str, enforce: bool) -> Vec<String> {
@@ -2015,6 +2057,7 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
             if !valid_secret_key(&kname) { skipped.push(name); continue; }
             if initial == "import_local" && existing.contains_key(&kname) { continue; }
             if initial == "import_remote" && existing.get(&kname).map(String::as_str) == Some("sealed") { skipped.push(format!("{} (sealed)", kname)); continue; }
+            if existing.get(&kname).is_some_and(|t| wallet_type(t)) { skipped.push(format!("{} (wallet)", kname)); continue; }
             let s = SecretIn { key: kname, value, path: "/".into(), comment: "imported by integration sync".into(), tags: "import".into(), secret_type: "secret".into(), expected_version: None };
             require_one.push(statements.len()); statements.push(("UPDATE envs SET id=id WHERE id=?".into(), vec![json!(&eid)]));
             require_one.push(statements.len()); statements.extend(secret_statements(st, &eid, &org, &env_key, uid, &s, &master).await?);
@@ -2027,10 +2070,10 @@ async fn sync_one_inner(st: &S, iid: &str, uid: &str, enforce: bool, manual: boo
     // string would overwrite the value on the remote side. Personal overrides are
     // a per-user view and must not become the shared deployed value either.
     let items = st.list_secrets_base(&eid).await?;
-    let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
+    let located: Vec<(String, String, String, String)> = items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && !wallet_type(raw["type"].as_str().unwrap_or("")) && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))).map(|(k, v, raw)| (raw["path"].as_str().unwrap_or("/").to_string(), k.clone(), v.clone(), raw["type"].as_str().unwrap_or("secret").to_string())).collect();
     let pairs = integrations::secret_keys(&located);
     let mut tags_by_name: HashMap<String, String> = HashMap::new();
-    for (k, _, raw) in items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))) {
+    for (k, _, raw) in items.iter().filter(|(_, _, raw)| raw["type"].as_str() != Some("sealed") && !wallet_type(raw["type"].as_str().unwrap_or("")) && integrations::path_selected(&config, raw["path"].as_str().unwrap_or("/"))) {
         tags_by_name.entry(integrations::desired_name(&config, k)).or_insert_with(|| raw["tags"].as_str().unwrap_or("").to_string());
     }
     st.require_app_running(&app).await?;
@@ -2070,7 +2113,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
     let ts = body.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(now);
     // Restore the whole environment as it stood at ts: a secret created later
     // must disappear, and a secret deleted before ts must stay deleted.
-    let rows = st.db.query("SELECT id,version,deleted_at,path FROM secrets WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
+    let rows = st.db.query("SELECT id,version,deleted_at,path,secret_type FROM secrets WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?;
     let mut restored = 0; let mut removed = 0; let mut statements: Vec<(String,Vec<Value>)> = Vec::new(); let master = st.master();
     let mut checked=Vec::new();
     for r in &rows {
@@ -2078,6 +2121,8 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
         let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND created_at<=? ORDER BY created_at DESC, version DESC LIMIT 1", &[json!(&sid), json!(ts)]).await.map_err(|e| bad(&e))?;
         match v {
             Some(v) => {
+                let current_type = db::s(r,"secret_type"); let version_type = db::s(&v,"secret_type");
+                if (wallet_type(&current_type) || wallet_type(&version_type)) && current_type != version_type { return Err(bad("wallet point-in-time restore cannot change type")); }
                 let was_deleted = del_at > 0 && del_at <= ts;
                 let new_ver = cur + 1;
                 let tomb = if was_deleted { 1 } else { 0 };
@@ -2110,7 +2155,7 @@ async fn pitr(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(b
             }
         }
     }
-    st.audited_rotation_batch(&statements, &checked, [&org,&app,&eid,&uid,"env.pitr",&format!("ts={} restored={} removed={}",ts,restored,removed)], Some(master),"SELECT id FROM rotation_schedules WHERE env_id=? AND (pending_enc<>'' OR execution_token<>'')",&[json!(&eid)]).await.map_err(secret_batch_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_rotation_batch(&statements, &checked, [&org,&app,&eid,&uid,"env.pitr",&format!("ts={} restored={} removed={}",ts,restored,removed)], Some(master),"SELECT id FROM rotation_schedules WHERE env_id=? AND (pending_enc<>'' OR execution_token<>'')",&[json!(&eid)]).await.map_err(secret_batch_error)?;
     let _ = trigger_sync(&st, &eid, &uid).await;
     Ok(j(json!({"restored": restored, "removed": removed}))) }
 
@@ -2183,7 +2228,7 @@ async fn org_settings(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>
             if field == "oidc_client_secret" && v.is_empty() && !body.get("clear_oidc_client_secret").and_then(|x|x.as_bool()).unwrap_or(false) { continue; }
             let stored = if enc { oc::encrypt_symmetric(&master, v.as_bytes()) } else { v.to_string() };
             statements.extend(meta_statements(&format!("{}:{}", field, oid), &stored)); } }
-    st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "org.settings", ""], master).await.map_err(master_write_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "org.settings", ""], master).await.map_err(master_write_error)?;
     Ok(j(json!({"ok":true}))) }
 async fn get_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
@@ -2201,11 +2246,11 @@ async fn put_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<St
     } else {
         statements.push((("INSERT INTO rotation_hooks(org_id,url,secret_enc,created_at) VALUES(?,?,?,?)").to_string(), ([json!(&oid), json!(&url), json!(&secret_enc), json!(now())]).to_vec()));
     }
-    st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "rotation_hook.set", &url], master).await.map_err(master_write_error)?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "rotation_hook.set", &url], master).await.map_err(master_write_error)?; Ok(j(json!({"ok": true}))) }
 async fn delete_rotation_hook(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
     st.check_admin(&oid, &uid).await?;
     statements.push((("DELETE FROM rotation_hooks WHERE org_id=?").to_string(), ([json!(&oid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&oid, "", "", &uid, "rotation_hook.delete", ""]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&oid, "", "", &uid, "rotation_hook.delete", ""]).await.map_err(|e|bad(&e))?; Ok(j(json!({"ok": true}))) }
 async fn fire_rotation_hook(st: &S, org: &str, env: &str, key: &str, value: &str) -> Option<String> {
     if let Err(e)=st.epoch_ok().await { return Some(if e.1.0.get("code").and_then(|v|v.as_str())==Some(webhooks::EPOCH_STALE) {"instance key epoch changed".into()} else {"instance key check unavailable".into()}); }
     if st.require_running(org).await.is_err() { return Some("workspace emergency lockdown or unavailable status".into()); }
@@ -2227,7 +2272,7 @@ async fn rotate_secret(State(st): State<S>, h: HeaderMap, Path(eid): Path<String
     let row = st.db.one("SELECT id FROM secrets WHERE env_id=? AND (key_index=? OR key_hash=?) AND deleted=0", &[json!(eid), json!(&khash), json!(&legacy)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found; create it first"))?;
     let mut statements = vec![("UPDATE envs SET id=id WHERE id=?".to_string(), vec![json!(&eid)])];
     statements.extend(secret_statements(&st,&eid,&org,&key,&uid,&SecretIn{key:key_name.into(),value:new_val.clone(),path:path.into(),comment:"auto-rotation".into(),tags:"".into(),secret_type:"secret".into(),expected_version:None},&master).await?);
-    st.audited_batch_master(&statements,&[0,1],[&org,&app,&eid,&uid,"secret.rotate",key_name],master).await.map_err(secret_batch_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch_master(&statements,&[0,1],[&org,&app,&eid,&uid,"secret.rotate",key_name],master).await.map_err(secret_batch_error)?;
     let sync_errors = trigger_sync(&st, &eid, &uid).await;
     let rotation_hook_error = fire_rotation_hook(&st, &org, &eid, key_name, &new_val).await;
     Ok(j(json!({"key":key_name,"value":new_val,"secret_id":db::s(&row,"id"),"sync_errors":sync_errors,"rotation_hook_error":rotation_hook_error}))) }
@@ -2336,7 +2381,7 @@ async fn e2e_put(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Jso
             statements.push(("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,path,tags,created_at,created_by) VALUES(?,?,1,?,?,?,?,?,?)".into(), vec![json!(id()), json!(sid), json!(key_enc), json!(value_enc), json!(&path), json!(""), json!(now()), json!(uid)]));
         } count += 1;
     }
-    st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deployed": count}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org,&app,&eid,&uid,"secret.e2e_deploy",&format!("{} secrets",count)]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deployed": count}))) }
 async fn e2e_get(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let wrapped = st.db.one("SELECT wrapped_key FROM env_keys WHERE env_id=? AND user_id=?", &[json!(eid), json!(uid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::FORBIDDEN, "no wrapped env key for caller; ask a member to grant access"))?;
     let rows = st.db.query("SELECT id,path,path_enc,key_hash,key_enc,value_enc,version,updated_at FROM secrets WHERE env_id=? AND deleted=0 AND e2e=1", &[json!(eid)]).await.map_err(|e| bad(&e))?;
@@ -2346,7 +2391,7 @@ async fn e2e_grant(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     let email = body.get("email").and_then(|v| v.as_str()).unwrap_or(""); let wrapped = body.get("wrapped_key").and_then(|v| v.as_str()).unwrap_or("");
     if email.is_empty() || wrapped.is_empty() { return Err(bad("email and wrapped_key (wrapped client-side for grantee) required")); }
     let target = st.db.one("SELECT id FROM users WHERE email=?", &[json!(email.to_lowercase())]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("user not found"))?;
-    if st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(eid), json!(db::s(&target,"id")), json!(wrapped)]).await.is_err() {
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; if st.db.exec("INSERT INTO env_keys(env_id,user_id,wrapped_key) VALUES(?,?,?)", &[json!(eid), json!(db::s(&target,"id")), json!(wrapped)]).await.is_err() {
         st.db.exec("UPDATE env_keys SET wrapped_key=? WHERE env_id=? AND user_id=?", &[json!(wrapped), json!(eid), json!(db::s(&target,"id"))]).await.map_err(|e| bad(&e))?;
     }
     Ok(j(json!({"ok": true}))) }
@@ -2446,13 +2491,13 @@ async fn e2e_rekey(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, J
     // re-encrypted under a key nobody can unwrap.
     stmts.extend(meta_statements(&format!("rekey_required:{}", eid), "0"));
     let detail = if remove_user.is_empty() { format!("{} secrets, {} grants", rekeyed, grants.len()) } else { format!("{} secrets, {} grants, removed {}", rekeyed, grants.len(), remove_user) };
-    st.audited_batch(&stmts, &[], [&org, &app, &eid, &uid, "e2e.rekey", &detail]).await.map_err(|e| bad(&format!("rekey did not complete: {}", e)))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&stmts, &[], [&org, &app, &eid, &uid, "e2e.rekey", &detail]).await.map_err(|e| bad(&format!("rekey did not complete: {}", e)))?;
     Ok(j(json!({"rekeyed": rekeyed, "grants": grants.len()}))) }
 async fn e2e_revoke(State(st): State<S>, h: HeaderMap, Path((eid, target)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     let mut statements=vec![("DELETE FROM env_keys WHERE env_id=? AND user_id=?".into(), vec![json!(&eid), json!(&target)])];
     statements.extend(meta_statements(&format!("rekey_required:{}", eid), "1"));
-    st.audited_batch(&statements, &[0], [&org,&app,&eid,&uid,"e2e.revoke",&target]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::NOT_FOUND,"no key grant for that user")} else {bad(&e)})?; Ok(j(json!({"revoked": target, "rekey_required": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[0], [&org,&app,&eid,&uid,"e2e.revoke",&target]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::NOT_FOUND,"no key grant for that user")} else {bad(&e)})?; Ok(j(json!({"revoked": target, "rekey_required": true}))) }
 async fn user_lookup(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let uid = st.token_user(&h).await?;
     let email = q.get("email").cloned().unwrap_or_default();
     // One response for "no such account" and "exists but shares no organisation"
@@ -2715,6 +2760,11 @@ async fn unlink_identity(State(st): State<S>, h: HeaderMap, Json(body): Json<Val
     let provider = body.get("provider").and_then(|v| v.as_str()).unwrap_or("");
     let subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     if subject.is_empty() { return Err(bad("subject is required")); }
+    if issuer.is_empty() && provider.is_empty() { return Err(bad("provider or issuer is required")); }
+    let linked = if !issuer.is_empty() { st.db.one("SELECT user_id FROM oidc_subjects WHERE issuer=? AND subject=? AND user_id=?", &[json!(issuer),json!(subject),json!(&uid)]).await }
+        else { st.db.one("SELECT user_id FROM social_subjects WHERE provider=? AND subject=? AND user_id=?", &[json!(provider),json!(subject),json!(&uid)]).await }.map_err(|e| bad(&e))?;
+    if linked.is_none() { return Err(err(StatusCode::NOT_FOUND,"identity is not linked to this account")); }
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let removed = if !issuer.is_empty() {
         let n = st.db.exec("DELETE FROM oidc_subjects WHERE issuer=? AND subject=? AND user_id=?", &[json!(issuer), json!(subject), json!(&uid)]).await.map_err(|e| bad(&e))?;
         if n > 0 { let _ = st.db.exec("DELETE FROM identity_bindings WHERE issuer=? AND subject=? AND user_id=?", &[json!(issuer), json!(subject), json!(&uid)]).await; }
@@ -2968,49 +3018,46 @@ async fn oidc_callback(State(st): State<S>, Query(q): Query<HashMap<String,Strin
     Ok((hdr, axum::response::Redirect::temporary(&format!("/#token={}&org={}", token, oid))).into_response()) }
 
 // ---------- SAML 2.0 service provider ----------
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 struct SamlReplayCache { st: S }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 impl ReplayCache for SamlReplayCache {
     fn check_and_store(&mut self, key: ReplayKey, expires_at: SystemTime) -> Result<(), SamlError> {
         let cache_key = key.cache_key();
         let expires = expires_at.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_else(|_| now() + 600);
-        // The risaml trait is synchronous but this runs inside the async ACS
-        // handler. Move the DB write onto the runtime without nesting runtimes
-        // in the normal multi-thread server; unit callers use a fresh runtime.
-        let st = self.st.clone();
-        let stored = cache_key.clone();
-        let write = async move {
-            st.db.exec("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(stored), json!(expires)]).await
-        };
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(write)),
-            Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime.block_on(write),
-                Err(e) => Err(e.to_string()),
-            },
+        #[cfg(target_arch = "wasm32")]
+        let result = self.st.db.exec_sync("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(&cache_key), json!(expires)]);
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = {
+            // risaml requires synchronous replay storage; native DB drivers are async.
+            let st = self.st.clone();
+            let stored = cache_key.clone();
+            let write = async move {
+                st.db.exec("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)", &[json!(stored), json!(expires)]).await
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(write)),
+                Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime.block_on(write),
+                    Err(e) => Err(e.to_string()),
+                },
+            }
         };
         match result {
             Ok(_) => Ok(()),
             Err(_) => Err(SamlError::ReplayDetected { key: cache_key }),
         } } }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn saml_config_row(st: &S, org: &str) -> Result<Row, (StatusCode, Json<Value>)> {
     st.db.one("SELECT * FROM saml_configs WHERE org_id=?", &[json!(org)]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "SAML is not configured for this organisation")) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 fn saml_sp_entity(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/metadata", base.trim_end_matches('/'), org) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 fn saml_acs_url(base: &str, org: &str) -> String { format!("{}/api/auth/saml/{}/acs", base.trim_end_matches('/'), org) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
-fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> {
-    use rsa::pkcs8::EncodePrivateKey;
-    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
-    let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| e.to_string())?.to_string();
-    let kp = rcgen::KeyPair::from_pem(&pem).map_err(|e| e.to_string())?;
-    let cert = ca_params(cn, false).self_signed(&kp).map_err(|e| e.to_string())?;
-    Ok((pem, cert.pem())) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
+fn saml_signing_keypair(cn: &str) -> Result<(String, String), String> { crate::pki::saml_signing_keypair(cn) }
+#[cfg(feature = "saml")]
 fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsigned: bool) -> Result<IdpDescriptor, String> {
     let entity = EntityId::try_new(idp_entity).map_err(|e| e.to_string())?;
     if !trusted_cert.trim().is_empty() {
@@ -3019,7 +3066,7 @@ fn saml_descriptor(idp_entity: &str, xml: &str, trusted_cert: &str, allow_unsign
     } else if allow_unsigned {
         IdpDescriptor::from_metadata_xml_for(entity, xml, MetadataTrustPolicy::UnsignedForCompatibility).map_err(|e| e.to_string())
     } else { Err("SAML metadata must be signed by metadata_trusted_cert, or set allow_unsigned_metadata".into()) } }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, String> {
     let key_pem = oc::decrypt_symmetric(&st.master(), &db::s(cfg,"sp_key_enc")).map_err(|e| e.to_string())?;
     let creds = Credentials {
@@ -3031,7 +3078,7 @@ fn saml_sp_config(st: &S, base: &str, org: &str, cfg: &Row) -> Result<SpConfig, 
         .credentials(creds)
         .validation(SpValidationPolicy::strict())
         .build().map_err(|e| e.to_string()) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?; st.require_enterprise(edition::Feature::OrgSso)?; st.require_feature(&oid, "saml").await?;
     let base = issuer(&st, &h);
@@ -3058,7 +3105,7 @@ async fn get_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         "auto_provision": db::n(&cfg,"auto_provision") == 1,
         "allowed_domains": db::s(&cfg,"allowed_domains"),
     }))) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     st.require_feature(&oid, "saml").await?;
@@ -3068,10 +3115,7 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     let mut xml = body.get("metadata_xml").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let metadata_url = body.get("metadata_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if xml.is_empty() && !metadata_url.is_empty() {
-        if !url_ok(&metadata_url) || !egress_allowed(&metadata_url) { return Err(bad("metadata_url must be an http(s) URL outside private networks")); }
-        let text = http_client().get(&metadata_url).send().await.map_err(|e| bad(&e.to_string()))?.text().await.map_err(|e| bad(&e.to_string()))?;
-        if text.len() > 2_000_000 { return Err(bad("SAML metadata is too large")); }
-        xml = text;
+        xml = crate::http::saml_metadata_get(&metadata_url).await.map_err(|e| bad(&e))?;
     }
     if xml.is_empty() { return Err(bad("metadata_xml or metadata_url is required")); }
     let trusted_cert = body.get("metadata_trusted_cert").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -3096,9 +3140,10 @@ async fn put_saml_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
         vec![("INSERT INTO saml_configs(org_id,idp_entity_id,idp_metadata_xml,sp_key_enc,sp_cert_pem,allow_unsigned_metadata,metadata_trusted_cert,auto_provision,allowed_domains,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)".into(),
             vec![json!(&oid), json!(&idp_entity_id), json!(&xml), json!(&key_enc), json!(&cert_pem), json!(if allow_unsigned {1} else {0}), json!(&trusted_cert), json!(if auto {1} else {0}), json!(&domains), json!(now())])]
     };
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?;
     st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "saml.configure", &idp_entity_id], master).await.map_err(master_write_error)?;
     Ok(j(json!({"ok": true, "sp_metadata_url": saml_sp_entity(&issuer(&st,&h), &oid)}))) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
     if let Err(e)=st.epoch_ok().await { return e.into_response(); }
     if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
@@ -3107,7 +3152,7 @@ async fn saml_metadata(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     let mut resp = sp.metadata_xml().to_string().into_response();
     resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/samlmetadata+xml"));
     resp }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Response {
     if let Err(e)=st.epoch_ok().await { return e.into_response(); }
     if let Err(e) = st.require_enterprise(edition::Feature::OrgSso) { return e.into_response(); }
@@ -3132,7 +3177,7 @@ async fn saml_start(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) 
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]).await;
     if let Err(e) = st.db.exec("INSERT INTO saml_pending(state,org_id,snapshot,created_at) VALUES(?,?,?,?)", &[json!(&state), json!(&oid), json!(&snapshot), json!(now())]).await { return bad(&e).into_response(); }
     axum::response::Redirect::temporary(&url).into_response() }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str, email: &str) -> Result<String, (StatusCode, Json<Value>)> {
     if let Some(bound) = st.db.one("SELECT user_id FROM saml_subjects WHERE org_id=? AND idp_entity_id=? AND name_id=?", &[json!(org), json!(idp_entity), json!(name_id)]).await.map_err(|e| bad(&e))? {
         let uid = db::s(&bound, "user_id");
@@ -3172,7 +3217,7 @@ async fn provision_saml_user(st: &S, org: &str, idp_entity: &str, name_id: &str,
     st.audited_batch(&statements, &[], [org, "", "", &uid, "auth.saml_provision", &format!("{} {}", email, name_id)]).await.map_err(|e| bad(&e))?;
     claim_instance_owner(st, &uid).await;
     Ok(uid) }
-#[cfg(all(feature = "saml", not(target_arch = "wasm32")))]
+#[cfg(feature = "saml")]
 async fn saml_acs(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, axum::extract::Form(form): axum::extract::Form<HashMap<String,String>>) -> Response {
     if let Err(e)=st.epoch_ok().await { return e.into_response(); }
     if !st.feature_granted(&oid, "saml").await { return err(StatusCode::FORBIDDEN, "SAML sign-in is not enabled for this workspace").into_response(); }
@@ -3335,13 +3380,13 @@ async fn put_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     // created. A new endpoint must not inherit them, or an admin could point
     // the URL at a directory that asserts an existing member's DN.
     if url_changed { statements.push(("DELETE FROM ldap_subjects WHERE org_id=?".into(), vec![json!(&oid)])); }
-    st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "ldap.configure", &format!("{} url_changed={}", url, url_changed)], master).await.map_err(master_write_error)?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "ldap.configure", &format!("{} url_changed={}", url, url_changed)], master).await.map_err(master_write_error)?;
     Ok(j(json!({"ok": true}))) }
 #[cfg(feature = "ldap")]
 async fn delete_ldap_config(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res {
     let uid = st.token_user(&h).await?; st.check_admin(&oid, &uid).await?;
     st.require_feature(&oid, "ldap").await?;
-    st.audited_batch(&[
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; st.audited_batch(&[
         ("DELETE FROM ldap_configs WHERE org_id=?".into(), vec![json!(&oid)]),
         ("DELETE FROM ldap_subjects WHERE org_id=?".into(), vec![json!(&oid)]),
     ], &[], [&oid, "", "", &uid, "ldap.delete", ""]).await.map_err(|e| bad(&e))?;
@@ -4229,6 +4274,9 @@ async fn put_feature_grants(State(st): State<S>, h: HeaderMap, Json(body): Json<
     let list = body.get("features").and_then(|v| v.as_array()).ok_or_else(|| bad("features must be an array"))?;
     let mut names = Vec::new();
     for v in list { names.push(v.as_str().ok_or_else(|| bad("features must contain strings"))?.to_string()); }
+    if names.iter().any(|n| !crate::features::known(n)) { return Err(bad("unknown feature name")); }
+    if names.iter().any(|n| !crate::features::compiled(n)) { return Err(bad("this build does not include one of the requested features")); }
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     st.set_feature_grants(&org, &names, &uid).await?;
     let saved = st.feature_grants(&org).await;
     st.audit(&org, "", "", &uid, "instance.features", &saved.join(" ")).await;
@@ -4244,7 +4292,7 @@ async fn set_signups(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>)
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can change signup policy")); }
     if crate::envcfg::var("OPENWARP_SIGNUPS").is_ok() { return Err(err(StatusCode::CONFLICT, "OPENWARP_SIGNUPS controls signups on this instance")); }
     let open = body.get("open").and_then(|v| v.as_bool()).ok_or_else(|| bad("open must be a boolean"))?;
-    st.audited_batch(&meta_statements("signups_open",if open {"1"} else {"0"}), &[], ["","","",&uid,"instance.signups",if open {"open"} else {"invite"}]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&meta_statements("signups_open",if open {"1"} else {"0"}), &[], ["","","",&uid,"instance.signups",if open {"open"} else {"invite"}]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"signups_open": open}))) }
 async fn set_instance_owner(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
@@ -4257,7 +4305,7 @@ async fn set_instance_owner(State(st): State<S>, h: HeaderMap, Json(body): Json<
     if target == uid { return Err(bad("choose another account")); }
     let row = st.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(&target)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "account not found"))?;
     if db::n(&row,"active") == 0 || db::n(&row,"email_verified") == 0 { return Err(err(StatusCode::CONFLICT, "the new instance owner needs an active, verified account")); }
-    user_guarded_commit(&st, &[&uid, &target], &[
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; user_guarded_commit(&st, &[&uid, &target], &[
         ("UPDATE users SET active=active WHERE id=? AND active=1 AND email_verified=1".into(), vec![json!(&target)]),
         ("UPDATE meta SET v=? WHERE k='instance_owner' AND v=?".into(), vec![json!(&target), json!(&uid)]),
     ], &[0, 1], Some(["","","",&uid,"instance.owner",&target])).await?;
@@ -4325,37 +4373,68 @@ async fn encrypt_metadata(State(st): State<S>, h: HeaderMap) -> Res {
     }
     st.audited_batch(&statements, &[], ["", "", "", &uid, "instance.encrypt_metadata", &format!("{} secrets", updated)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"updated": updated}))) }
-// Complete inventory shared by rotation and first-boot master identity validation.
-async fn master_updates(db: &Db, old: &[u8; 32], new: &[u8; 32]) -> Result<Vec<(String, Vec<Value>)>, String> {
-    let mut updates = Vec::new();
-    for (table, id_col, col, predicate) in [
-        ("envs", "id", "env_key_wrapped", "env_key_wrapped<>''"),
-        ("meta", "k", "v", "k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%'"),
-        ("pki_cas", "id", "key_enc", "key_enc<>''"),
-        ("log_streams", "id", "secret", "secret<>''"),
-        ("saml_configs", "org_id", "sp_key_enc", "sp_key_enc<>''"),
-        ("rotation_hooks", "org_id", "secret_enc", "secret_enc<>''"),
-        ("ldap_configs", "org_id", "bind_password_enc", "bind_password_enc<>''"),
-        ("ai_settings", "org_id", "key_enc", "key_enc<>''"),
-        ("users", "id", "auth_key_enc", "auth_key_enc<>''"),
-    ] {
-        let rows = db.query(&format!("SELECT {},{} FROM {} WHERE {}", id_col, col, table, predicate), &[]).await?;
+// Feature-disabled stores still belong to the root inventory of this database.
+struct MasterStore { table: &'static str, ids: &'static [&'static str], col: &'static str, predicate: &'static str }
+const MASTER_STORES: &[MasterStore] = &[
+    MasterStore { table: "envs", ids: &["id"], col: "env_key_wrapped", predicate: "env_key_wrapped<>'' AND env_key_wrapped NOT LIKE 'owkms:%'" },
+    MasterStore { table: "meta", ids: &["k"], col: "v", predicate: "v<>'' AND (k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%' OR k LIKE 'hibp_api_key:%' OR k LIKE 'enzoic_credentials:%')" },
+    MasterStore { table: "pki_cas", ids: &["id"], col: "key_enc", predicate: "key_enc<>''" },
+    MasterStore { table: "log_streams", ids: &["id"], col: "secret", predicate: "secret<>''" },
+    MasterStore { table: "saml_configs", ids: &["org_id"], col: "sp_key_enc", predicate: "sp_key_enc<>''" },
+    MasterStore { table: "rotation_hooks", ids: &["org_id"], col: "secret_enc", predicate: "secret_enc<>''" },
+    MasterStore { table: "ldap_configs", ids: &["org_id"], col: "bind_password_enc", predicate: "bind_password_enc<>''" },
+    MasterStore { table: "ai_settings", ids: &["org_id"], col: "key_enc", predicate: "key_enc<>''" },
+    MasterStore { table: "users", ids: &["id"], col: "auth_key_enc", predicate: "auth_key_enc<>''" },
+    MasterStore { table: "pki_cas", ids: &["id"], col: "hook_secret_enc", predicate: "hook_secret_enc<>''" },
+    MasterStore { table: "webhook_subscriptions", ids: &["id"], col: "secret_enc", predicate: "secret_enc<>''" },
+    MasterStore { table: "incoming_webhooks", ids: &["id"], col: "secret_enc", predicate: "secret_enc<>''" },
+    MasterStore { table: "webhook_subscriptions", ids: &["id"], col: "sign_key_enc", predicate: "sign_key_enc<>''" },
+    MasterStore { table: "compat_transit_keys", ids: &["id", "org_id"], col: "wrapping_key", predicate: "1=1" },
+    MasterStore { table: "transit_versions", ids: &["key_id", "org_id", "version"], col: "key_enc", predicate: "1=1" },
+];
+impl MasterStore {
+    fn select(&self) -> String { format!("SELECT * FROM {} WHERE {}",self.table,self.predicate) }
+    fn updates(&self, rows: &[Row], old: &[u8;32], new: &[u8;32]) -> Result<Vec<(String,Vec<Value>)>,String> {
+        let mut updates=Vec::new();
+        // Count plus exact identity/ciphertext CAS rejects insertions as well as stale rows.
+        updates.push((format!("UPDATE webhook_serialization SET epoch=epoch WHERE id=1 AND (SELECT COUNT(*) FROM {} WHERE {})=?",self.table,self.predicate),vec![json!(rows.len())]));
         for row in rows {
-            let id = db::s(&row, id_col); let value = db::s(&row, col);
-            if value.is_empty() || (table == "envs" && value.starts_with("owkms:")) { continue; }
-            let plain = match table {
-                "users" => oc::decrypt_symmetric_aad(old, &auth_key_aad(&id), &value),
-                "ai_settings" => oc::decrypt_symmetric_aad(old, &crate::ai::key_aad(&id), &value),
-                _ => oc::decrypt_symmetric(old, &value),
-            }.map_err(|_| format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition", table, col, id))?;
-            let encrypted = match table {
-                "users" => oc::encrypt_symmetric_aad(new, &auth_key_aad(&id), &plain),
-                "ai_settings" => oc::encrypt_symmetric_aad(new, &crate::ai::key_aad(&id), &plain),
-                _ => oc::encrypt_symmetric(new, &plain),
+            let value=db::s(row,self.col); let id=db::s(row,self.ids[0]);
+            let aad=match (self.table,self.col) {
+                ("users",_) => Some(auth_key_aad(&id)),
+                ("ai_settings",_) => Some(crate::ai::key_aad(&id)),
+                ("webhook_subscriptions","sign_key_enc") => Some(format!("webhook-sign:{}",id).into_bytes()),
+                ("webhook_subscriptions"|"incoming_webhooks",_) => Some(format!("webhook:{}",id).into_bytes()),
+                ("compat_transit_keys",_) => Some(transit_compat::wrapping_aad(&db::s(row,"org_id"),&id)),
+                ("transit_versions",_) => Some(json!(["openwarp:transit:wrap:v1",db::s(row,"org_id"),id,db::n(row,"version")]).to_string().into_bytes()),
+                _ => None,
             };
-            updates.push((format!("UPDATE {} SET {}=? WHERE {}=?", table, col, id_col), vec![json!(encrypted), json!(id)]));
+            let plain=match &aad { Some(aad)=>oc::decrypt_symmetric_aad(old,aad,&value),None=>oc::decrypt_symmetric(old,&value) }
+                .map_err(|_|format!("{}.{} for {} cannot be decrypted with the current master key; refusing transition",self.table,self.col,id))?;
+            if matches!(self.table,"compat_transit_keys"|"transit_versions") && plain.len()!=32 { return Err(format!("invalid {} key; refusing transition",self.table)); }
+            let encrypted=match &aad { Some(aad)=>oc::encrypt_symmetric_aad(new,aad,&plain),None=>oc::encrypt_symmetric(new,&plain) };
+            let mut sql=format!("UPDATE {} SET {}=? WHERE {}",self.table,self.col,self.ids.iter().map(|id|format!("{}=?",id)).collect::<Vec<_>>().join(" AND "));
+            let mut params=vec![json!(encrypted)];
+            params.extend(self.ids.iter().map(|id|row[*id].clone()));
+            sql.push_str(&format!(" AND {}=?",self.col)); params.push(json!(value));
+            if self.table=="ai_settings" { sql.push_str(" AND settings=?"); params.push(json!(db::s(row,"settings"))); }
+            updates.push((sql,params));
         }
+        Ok(updates)
     }
+}
+fn master_generation_update(row: Option<&Row>, old: &[u8;32], new: &[u8;32]) -> Result<Option<(String,Vec<Value>)>,String> {
+    let Some(row)=row else { return Ok(None); };
+    let previous=db::s(row,"v"); let fingerprint=hmac_hex(old,b"openwarp:transit:root:v1");
+    if previous.split(':').next()!=Some(fingerprint.as_str()) { return Err("transit root generation does not match the current master key".into()); }
+    Ok(Some(("UPDATE meta SET v=? WHERE k='transit:root-generation' AND v=?".into(),vec![json!(format!("{}:{}",hmac_hex(new,b"openwarp:transit:root:v1"),id())),json!(previous)])))
+}
+async fn master_updates(db: &Db, old: &[u8; 32], new: &[u8; 32]) -> Result<Vec<(String, Vec<Value>)>, String> {
+    let mut updates=Vec::new();
+    for store in MASTER_STORES { updates.extend(store.updates(&db.query(&store.select(),&[]).await?,old,new)?); }
+    let generation=db.one("SELECT v FROM meta WHERE k='transit:root-generation'",&[]).await?;
+    if let Some(update)=master_generation_update(generation.as_ref(),old,new)? { updates.push(update); }
+    else { updates.push(("UPDATE webhook_serialization SET epoch=epoch WHERE id=1 AND NOT EXISTS(SELECT 1 FROM meta WHERE k='transit:root-generation')".into(),vec![])); }
     Ok(updates)
 }
 
@@ -4363,18 +4442,15 @@ pub async fn verify_master(db: &Db, key: &[u8; 32]) -> Result<(), String> {
     if let Some(row) = db.one("SELECT v FROM meta WHERE k='master_key_check'", &[]).await? {
         let plain = oc::decrypt_symmetric(key, &db::s(&row, "v")).map_err(|_| "configured master key does not match the database; restore the current key".to_string())?;
         if plain != b"openwarp-master-key-v1" { return Err("invalid persisted master key verifier".into()); }
-    } else {
-        master_updates(db, key, key).await?;
     }
+    master_updates(db, key, key).await?;
     Ok(())
 }
 // Custody transitions delete or mint root material, and a persisted verifier
 // only proves agreement with whoever wrote it: the full inventory must also
 // decrypt under the root before custody moves.
 async fn verify_master_full(db: &Db, key: &[u8; 32]) -> Result<(), String> {
-    verify_master(db, key).await?;
-    master_updates(db, key, key).await?;
-    Ok(())
+    verify_master(db, key).await
 }
 /// Adopt the root another boot persisted first. The candidate this boot minted
 /// is discarded only after the winner proves itself against the inventory.
@@ -4521,10 +4597,9 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let _ai_guard = st.ai_credentials.lock().await;
     let old = st.master();
     let ai_updates = crate::ai::rewrap(&st, &old, &new).await?;
-    #[cfg(feature = "transit")]
-    let transit_root = transit::root(&st, &old).await?;
     if old == new { return Err(bad("new_key is the current key")); }
     verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?;
     // The fence advances first in the same transaction, then every encrypted
     // row is snapshotted, rewrapped and audited. Any decrypt or write failure
     // rolls back the whole rotation, including the epoch advance.
@@ -4541,66 +4616,29 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
         if st2.master() != old {return Err(err(StatusCode::CONFLICT,"master key changed during preflight; retry"));}
         let result = handle.block_on(st2.db.webhook_atomic(move |tx| {
             let epoch=webhooks::epoch_advance(tx,&old,&new)?;
-            #[cfg(feature = "transit")]
-            transit::rotation_tx(tx,&old,&new,&transit_root)?;
-            transit_compat::rewrap_master_tx(tx,&old,&new)?;
+            let generation=tx.one("SELECT v FROM meta WHERE k='transit:root-generation'",&[])?;
+            if let Some((sql,params))=master_generation_update(generation.as_ref(),&old,&new)? {
+                if tx.exec(&sql,&params)?!=1 { return Err("transit root changed during rotation".into()); }
+            }
             tx.exec("DELETE FROM email_codes",&[])?;
             // Captured incoming payloads are transient debug data sealed with
             // the old master; rotation erases them rather than rewrapping.
             tx.exec("UPDATE webhook_receipts SET body_enc=''",&[])?;
             for (sql,params) in &ai_updates { if tx.exec(sql,params)? != 1 { return Err("AI credential changed during rotation".into()); } }
-            for table in ["webhook_subscriptions","incoming_webhooks"] {
-                for row in tx.query(&format!("SELECT id,secret_enc FROM {}",table),&[])? {
-                    let wid=db::s(&row,"id"); let aad=format!("webhook:{}",wid);
-                    let plain=oc::decrypt_symmetric_aad(&old,aad.as_bytes(),&db::s(&row,"secret_enc")).map_err(|_|"webhook key cannot be decrypted; refusing master rotation")?;
-                    tx.exec(&format!("UPDATE {} SET secret_enc=? WHERE id=?",table),&[json!(oc::encrypt_symmetric_aad(&new,aad.as_bytes(),&plain)),json!(wid)])?;
-                }
-            }
-            for row in tx.query("SELECT id,sign_key_enc FROM webhook_subscriptions WHERE sign_key_enc<>''",&[])? {
-                let wid=db::s(&row,"id"); let aad=format!("webhook-sign:{}",wid);
-                let plain=oc::decrypt_symmetric_aad(&old,aad.as_bytes(),&db::s(&row,"sign_key_enc")).map_err(|_|"a webhook signing key cannot be decrypted; refusing master rotation")?;
-                tx.exec("UPDATE webhook_subscriptions SET sign_key_enc=? WHERE id=?",&[json!(oc::encrypt_symmetric_aad(&new,aad.as_bytes(),&plain)),json!(wid)])?;
-            }
             let mut counts=(0usize,0usize,0usize,0usize,0usize,0usize); let mut auth_count=0usize; let mut ldap_count=0usize;
-            for row in tx.query("SELECT id,env_key_wrapped FROM envs",&[])? {
-                let id=db::s(&row,"id"); let wrapped=db::s(&row,"env_key_wrapped");
-                if wrapped.starts_with("owkms:") || wrapped.is_empty() { continue; }
-                let plain=oc::decrypt_symmetric(&old,&wrapped).map_err(|_|"existing environment keys cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE envs SET env_key_wrapped=? WHERE id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(id)])?; counts.0+=1;
-            }
-            for row in tx.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%' OR k LIKE 'hibp_api_key:%' OR k LIKE 'enzoic_credentials:%'",&[])? {
-                let k=db::s(&row,"k"); let value=db::s(&row,"v"); if value.is_empty() {continue;}
-                let plain=oc::decrypt_symmetric(&old,&value).map_err(|_|format!("stored secret {} cannot be decrypted with the current master key; refusing rotation",k))?;
-                tx.exec("UPDATE meta SET v=? WHERE k=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(k)])?; counts.1+=1;
-            }
-            for row in tx.query("SELECT id,auth_key_enc FROM users WHERE auth_key_enc<>''",&[])? {
-                let id=db::s(&row,"id"); let plain=oc::decrypt_symmetric_aad(&old,&auth_key_aad(&id),&db::s(&row,"auth_key_enc")).map_err(|_|"an account auth key cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE users SET auth_key_enc=? WHERE id=?",&[json!(oc::encrypt_symmetric_aad(&new,&auth_key_aad(&id),&plain)),json!(id)])?; auth_count+=1;
-            }
-            for row in tx.query("SELECT org_id,bind_password_enc FROM ldap_configs WHERE bind_password_enc<>''",&[])? {
-                let org=db::s(&row,"org_id"); let plain=oc::decrypt_symmetric(&old,&db::s(&row,"bind_password_enc")).map_err(|_|"an LDAP bind password cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE ldap_configs SET bind_password_enc=? WHERE org_id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(org)])?; ldap_count+=1;
-            }
-            for row in tx.query("SELECT id,hook_secret_enc FROM pki_cas WHERE hook_secret_enc<>''",&[])? {
-                let cid=db::s(&row,"id"); let plain=oc::decrypt_symmetric(&old,&db::s(&row,"hook_secret_enc")).map_err(|_|"a CA hook secret cannot be decrypted; refusing master rotation")?;
-                if tx.exec("UPDATE pki_cas SET hook_secret_enc=? WHERE id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(cid)])? != 1 { return Err("CA hook changed during rotation".into()); }
-            }
-            for row in tx.query("SELECT id,key_enc FROM pki_cas",&[])? {
-                let id=db::s(&row,"id"); let plain=oc::decrypt_symmetric(&old,&db::s(&row,"key_enc")).map_err(|_|"a CA private key cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE pki_cas SET key_enc=? WHERE id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(id)])?; counts.2+=1;
-            }
-            for row in tx.query("SELECT id,secret FROM log_streams",&[])? {
-                let id=db::s(&row,"id"); let value=db::s(&row,"secret"); if value.is_empty() {continue;}
-                let plain=oc::decrypt_symmetric(&old,&value).map_err(|_|"a log stream secret cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE log_streams SET secret=? WHERE id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(id)])?; counts.3+=1;
-            }
-            for row in tx.query("SELECT org_id,sp_key_enc FROM saml_configs",&[])? {
-                let org=db::s(&row,"org_id"); let plain=oc::decrypt_symmetric(&old,&db::s(&row,"sp_key_enc")).map_err(|_|"a SAML signing key cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE saml_configs SET sp_key_enc=? WHERE org_id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(org)])?; counts.4+=1;
-            }
-            for row in tx.query("SELECT org_id,secret_enc FROM rotation_hooks WHERE secret_enc<>''",&[])? {
-                let org=db::s(&row,"org_id"); let plain=oc::decrypt_symmetric(&old,&db::s(&row,"secret_enc")).map_err(|_|"a rotation hook secret cannot be decrypted with the current master key; refusing rotation")?;
-                tx.exec("UPDATE rotation_hooks SET secret_enc=? WHERE org_id=?",&[json!(oc::encrypt_symmetric(&new,&plain)),json!(org)])?; counts.5+=1;
+            for store in MASTER_STORES {
+                let rows=tx.query(&store.select(),&[])?;
+                match (store.table,store.col) {
+                    ("envs",_)=>counts.0=rows.len(), ("meta",_)=>counts.1=rows.len(),
+                    ("pki_cas","key_enc")=>counts.2=rows.len(), ("log_streams",_)=>counts.3=rows.len(),
+                    ("saml_configs",_)=>counts.4=rows.len(), ("rotation_hooks",_)=>counts.5=rows.len(),
+                    ("users",_)=>auth_count=rows.len(), ("ldap_configs",_)=>ldap_count=rows.len(), _=>(),
+                }
+                // AI's native helper already applied its settings-and-key snapshot above.
+                if store.table=="ai_settings" { continue; }
+                for (sql,params) in store.updates(&rows,&old,&new)? {
+                    if tx.exec(&sql,&params)?!=1 { return Err("root-encrypted record changed during rotation".into()); }
+                }
             }
             if tx.one("SELECT v FROM meta WHERE k='master'",&[])?.is_some() {tx.exec("UPDATE meta SET v=? WHERE k='master'",&[json!(oc::b64(&new))])?;}
             // The boot verifier proves the configured key on the next start, so
@@ -4622,88 +4660,64 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     { let st2 = st.clone(); tokio::spawn(async move { backfill_value_fingerprints(&st2).await; }); }
     Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "cas": counts.2, "streams": counts.3, "saml": counts.4, "hooks": counts.5}, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 
-// The Workers build has no blocking runtime, rusqlite, or OCSP/CRL signing;
-// these instance and PKI routes answer 501 there.
-// The Workers deployment rotates online through the configured KMS bridge:
-// the batch runs inline on the single-threaded runtime (the DO storage driver
-// is synchronous under the hood), so there is no blocking wrapper here.
+// KMS preparation may yield to other DO events; the final inventory and checked
+// transaction use synchronous DO SQL and publish the root before another yield.
 #[cfg(target_arch = "wasm32")]
 async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value>) -> Res {
     let uid = st.token_user(&h).await?;
     if instance_owner(&st).await.as_deref() != Some(uid.as_str()) { return Err(err(StatusCode::FORBIDDEN, "only the instance owner can rotate the master key")); }
     let new: [u8; 32] = oc::unb64(body.get("new_key").and_then(|v| v.as_str()).unwrap_or("")).map_err(|_| bad("new_key must be base64"))?.try_into().map_err(|_| bad("new_key must decode to exactly 32 bytes"))?;
+    // Ordinary HTTP handlers hold the read side across awaited saves. Rotation
+    // bypasses that middleware and drains those handlers before taking a root.
+    let _key_guard=st.key_gate.write().await;
     let old = st.master();
     if old == new { return Err(bad("new_key is the current key")); }
-    verify_master(&st.db, &old).await.map_err(|e| bad(&e))?;
-    // Preflight every encrypted value before touching the database. The same
-    // record sets rotate here as on the native server; feature-specific
-    // stores (pki, saml, ldap, hooks) exist in the canonical schema even when
-    // their routes are compiled out, so an empty sweep stays correct.
-    let envs = st.db.query("SELECT id,env_key_wrapped FROM envs", &[]).await.map_err(|e| bad(&e))?;
-    let mut env_updates = Vec::new();
-    for r in &envs {
-        let wrapped = db::s(r, "env_key_wrapped");
-        if wrapped.starts_with("owkms:") || wrapped.is_empty() { env_updates.push((db::s(r, "id"), wrapped)); continue; }
-        let plain = oc::decrypt_symmetric(&old, &wrapped)
-            .map_err(|_| bad("existing environment keys cannot be decrypted with the current master key; refusing rotation"))?;
-        env_updates.push((db::s(r, "id"), oc::encrypt_symmetric(&new, &plain)));
+    verify_master_full(&st.db, &old).await.map_err(|e| bad(&e))?;
+    let mut custody=Vec::new();
+    for name in ["master","master_key_check","kms_root"] {
+        let row=st.db.one("SELECT v FROM meta WHERE k=?",&[json!(name)]).await.map_err(|e|bad(&e))?;
+        custody.push((name,row.map(|r|db::s(&r,"v"))));
     }
-    let metas = st.db.query("SELECT k,v FROM meta WHERE k LIKE 'oidc_client_secret:%' OR k LIKE 'totp_secret:%' OR k LIKE 'totp_pending:%' OR k LIKE 'hibp_api_key:%' OR k LIKE 'enzoic_credentials:%'", &[]).await.map_err(|e| bad(&e))?;
-    let mut meta_updates = Vec::new();
-    for r in &metas {
-        let value = db::s(r, "v"); if value.is_empty() { continue; }
-        let plain = oc::decrypt_symmetric(&old, &value)
-            .map_err(|_| bad(&format!("stored secret {} cannot be decrypted with the current master key; refusing rotation", db::s(r, "k"))))?;
-        meta_updates.push((db::s(r, "k"), oc::encrypt_symmetric(&new, &plain)));
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?;
+    // Do external work before the final snapshot. A failed wrap makes one
+    // attempt, returns 400 and leaves all local records untouched.
+    let kms_root=if let Some(kms)=st.kms() {
+        let wrapped=kms.wrap(&new,"master").await.map_err(|e|bad(&e))?;
+        if kms.unwrap(&wrapped,"master").await.map_err(|e|bad(&e))?.as_slice()!=new { return Err(bad("KMS root roundtrip returned a different key")); }
+        Some(wrapped)
+    } else {
+        if custody.iter().any(|(name,value)|*name=="kms_root" && value.is_some()) { return Err(err(StatusCode::CONFLICT,"restore the KMS bridge before rotating its root")); }
+        None
+    };
+    if st.master()!=old { return Err(err(StatusCode::CONFLICT,"master key changed during preflight; retry")); }
+    verify_master(&st.db,&old).await.map_err(|e|bad(&e))?;
+    let epoch=st.db.one("SELECT epoch,master_hash FROM webhook_serialization WHERE id=1",&[]).await.map_err(|e|bad(&e))?.ok_or_else(||bad("missing webhook serialization row"))?;
+    let old_hash=db::s(&epoch,"master_hash");
+    if !old_hash.is_empty() && old_hash!=oc::hash_token(&oc::b64(&old)) { return Err(webhooks::epoch_stale()); }
+    let next_epoch=db::n(&epoch,"epoch").checked_add(1).ok_or_else(||bad("webhook epoch exhausted"))?;
+    let mut statements=vec![("UPDATE webhook_serialization SET epoch=?,master_hash=? WHERE id=1 AND epoch=? AND master_hash=?".into(),vec![json!(next_epoch),json!(oc::hash_token(&oc::b64(&new))),json!(db::n(&epoch,"epoch")),json!(old_hash)],Some(1))];
+    let mut counts=(0usize,0usize,0usize); let mut rotated_records=0usize;
+    // All awaits from this snapshot through publication are synchronous DO SQL.
+    for store in MASTER_STORES {
+        let rows=st.db.query(&store.select(),&[]).await.map_err(|e|bad(&e))?;
+        match store.table { "envs"=>counts.0=rows.len(),"meta"=>counts.1=rows.len(),"users"=>counts.2=rows.len(),_=>() }
+        rotated_records+=rows.len();
+        for (sql,params) in store.updates(&rows,&old,&new).map_err(|e|bad(&e))? { statements.push((sql,params,Some(1))); }
     }
-    let users = st.db.query("SELECT id,auth_key_enc FROM users WHERE auth_key_enc<>''", &[]).await.map_err(|e| bad(&e))?;
-    let mut auth_updates = Vec::new();
-    for r in users { let uid = db::s(&r, "id"); let aad = auth_key_aad(&uid); let plain = oc::decrypt_symmetric_aad(&old, &aad, &db::s(&r, "auth_key_enc")).map_err(|_| bad("authentication key unavailable; refusing root rotation"))?; auth_updates.push((uid, oc::encrypt_symmetric_aad(&new, &aad, &plain))); }
-    // Webhook signing keys and the serialization epoch live outside the
-    // generic sweeps: rewrap them and advance the fence so post-rotation
-    // reads pass the epoch check instead of answering 503 epoch_stale.
-    let mut webhook_key_updates = Vec::new();
-    for table in ["webhook_subscriptions", "incoming_webhooks"] {
-        for r in st.db.query(&format!("SELECT id,secret_enc FROM {} WHERE secret_enc<>''", table), &[]).await.map_err(|e| bad(&e))? {
-            let wid = db::s(&r, "id"); let aad = format!("webhook:{}", wid);
-            let plain = oc::decrypt_symmetric_aad(&old, aad.as_bytes(), &db::s(&r, "secret_enc")).map_err(|_| bad("a webhook signing key cannot be decrypted with the current master key; refusing rotation"))?;
-            webhook_key_updates.push((table.to_string(), wid, oc::encrypt_symmetric_aad(&new, aad.as_bytes(), &plain)));
+    let generation=st.db.one("SELECT v FROM meta WHERE k='transit:root-generation'",&[]).await.map_err(|e|bad(&e))?;
+    if let Some((sql,params))=master_generation_update(generation.as_ref(),&old,&new).map_err(|e|bad(&e))? { statements.push((sql,params,Some(1))); }
+    else { statements.push(("UPDATE webhook_serialization SET epoch=epoch WHERE id=1 AND NOT EXISTS(SELECT 1 FROM meta WHERE k='transit:root-generation')".into(),vec![],Some(1))); }
+    for (name,previous) in custody {
+        let replacement=match name { "master"=>oc::b64(&new),"master_key_check"=>oc::encrypt_symmetric(&new,b"openwarp-master-key-v1"),"kms_root"=>kms_root.clone().unwrap_or_default(),_=>unreachable!() };
+        if let Some(previous)=previous {
+            statements.push(("UPDATE meta SET v=? WHERE k=? AND v=?".into(),vec![json!(replacement),json!(name),json!(previous)],Some(1)));
+        } else {
+            if name=="master_key_check" || (name=="kms_root" && kms_root.is_some()) { return Err(err(StatusCode::CONFLICT,"missing persisted root custody record; restart before rotating")); }
+            statements.push(("UPDATE webhook_serialization SET epoch=epoch WHERE id=1 AND NOT EXISTS(SELECT 1 FROM meta WHERE k=?)".into(),vec![json!(name)],Some(1)));
         }
     }
-    let mut sign_updates = Vec::new();
-    for r in st.db.query("SELECT id,sign_key_enc FROM webhook_subscriptions WHERE sign_key_enc<>''", &[]).await.map_err(|e| bad(&e))? {
-        let wid = db::s(&r, "id"); let aad = format!("webhook-sign:{}", wid);
-        let plain = oc::decrypt_symmetric_aad(&old, aad.as_bytes(), &db::s(&r, "sign_key_enc")).map_err(|_| bad("a webhook signing seed cannot be decrypted with the current master key; refusing rotation"))?;
-        sign_updates.push((wid, oc::encrypt_symmetric_aad(&new, aad.as_bytes(), &plain)));
-    }
-    let generated_master = st.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.map_err(|e| bad(&e))?.is_some();
-    let old_master_hash = oc::hash_token(&oc::b64(&old));
-    let new_master_hash = oc::hash_token(&oc::b64(&new));
-    let mut statements: Vec<(String, Vec<Value>, Option<u64>)> = Vec::new();
-    // The epoch fence advances first: a stale replica's concurrent rotation
-    // leaves the CAS at zero rows and aborts this batch.
-    statements.push(("UPDATE webhook_serialization SET epoch=epoch+1,master_hash=? WHERE id=1 AND (master_hash='' OR master_hash=?)".into(), vec![json!(new_master_hash), json!(old_master_hash)], Some(1)));
-    for (id, wrapped) in &env_updates { statements.push(("UPDATE envs SET env_key_wrapped=? WHERE id=?".into(), vec![json!(wrapped), json!(id)], Some(1))); }
-    for (k, value) in &meta_updates { statements.push(("UPDATE meta SET v=? WHERE k=?".into(), vec![json!(value), json!(k)], Some(1))); }
-    for (uid, value) in &auth_updates { statements.push(("UPDATE users SET auth_key_enc=? WHERE id=?".into(), vec![json!(value), json!(uid)], Some(1))); }
-    for (table, wid, wrapped) in &webhook_key_updates { statements.push((format!("UPDATE {} SET secret_enc=? WHERE id=?", table), vec![json!(wrapped), json!(wid)], Some(1))); }
-    for (wid, wrapped) in &sign_updates { statements.push(("UPDATE webhook_subscriptions SET sign_key_enc=? WHERE id=?".into(), vec![json!(wrapped), json!(wid)], Some(1))); }
-    // Captured incoming payloads are transient debug data sealed with the old
-    // master; rotation erases them rather than rewrapping.
-    statements.push(("UPDATE webhook_receipts SET body_enc=''".into(), vec![], None));
-    statements.push(("DELETE FROM email_codes".into(), vec![], None));
-    if generated_master { statements.push(("UPDATE meta SET v=? WHERE k='master'".into(), vec![json!(oc::b64(&new))], Some(1))); }
-    statements.push(("UPDATE meta SET v=? WHERE k='master_key_check'".into(), vec![json!(oc::encrypt_symmetric(&new, b"openwarp-master-key-v1"))], Some(1)));
-    // A configured KMS bridge wraps the replacement root; a failed wrap
-    // surfaces as HTTP 400 after exactly one attempt, leaving the batch
-    // unexecuted and the old root authoritative.
-    if let Some(kms) = st.kms() {
-        let wrapped = kms.wrap(&new, "master").await.map_err(|e| bad(&e))?;
-        statements.push(("UPDATE meta SET v=? WHERE k='kms_root'".into(), vec![json!(wrapped)], Some(1)));
-    } else if st.db.one("SELECT v FROM meta WHERE k='kms_root'", &[]).await.map_err(|e| bad(&e))?.is_some() {
-        return Err(err(StatusCode::CONFLICT, "restore the KMS bridge before rotating its root"));
-    }
-    let counts = (env_updates.len(), meta_updates.len(), auth_updates.len());
+    statements.push(("UPDATE webhook_receipts SET body_enc=''".into(),vec![],None));
+    statements.push(("DELETE FROM email_codes".into(),vec![],None));
     st.db.checked_batch(&statements, false).await
         .map_err(|_| err(StatusCode::CONFLICT, "master rotation conflicted with a key mutation; no changes applied"))?;
     *st.master.write().unwrap_or_else(|e| e.into_inner()) = new;
@@ -4713,7 +4727,7 @@ async fn rotate_master(State(st): State<S>, h: HeaderMap, Json(body): Json<Value
     let _ = st.db.exec("DELETE FROM meta WHERE k='migration:value_fp'", &[]).await;
     backfill_value_fingerprints(&st).await;
     st.audit("", "", "", &uid, "instance.master_rotate", &format!("envs={} meta={} auth={}", counts.0, counts.1, counts.2)).await;
-    Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "auth": counts.2}, "rotated_records": counts.0 + counts.1 + counts.2, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
+    Ok(j(json!({"ok": true, "rotated": {"envs": counts.0, "meta": counts.1, "auth": counts.2}, "rotated_records": rotated_records, "note": "If OPENWARP_MASTER_KEY is set in the environment, update it and restart with the new value."}))) }
 #[cfg(target_arch = "wasm32")]
 async fn ocsp_respond() -> Response { err(StatusCode::NOT_IMPLEMENTED, "OCSP requires the native server").into_response() }
 #[cfg(target_arch = "wasm32")]
@@ -4721,25 +4735,147 @@ async fn ca_crl() -> Response { err(StatusCode::NOT_IMPLEMENTED, "CRL generation
 
 // ---------- SCIM groups + user lifecycle ----------
 #[cfg(feature = "scim")]
-async fn scim_group_json(st: &S, row: &Row) -> Value { let tid = db::s(row,"id");
-    let members = st.db.query("SELECT user_id FROM team_members WHERE team_id=?", &[json!(tid)]).await.unwrap_or_default();
-    json!({"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"], "id": tid, "displayName": db::s(row,"name"), "members": members.iter().map(|m| json!({"value": db::s(m,"user_id"), "$ref": format!("/scim/v2/Users/{}", db::s(m,"user_id"))})).collect::<Vec<_>>()}) }
+async fn scim_group_json(st: &S, row: &Row) -> Result<Value, (StatusCode, Json<Value>)> { let tid = db::s(row,"id");
+    let members = st.db.query("SELECT user_id FROM team_members WHERE team_id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?;
+    Ok(json!({"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"], "id": tid, "displayName": db::s(row,"name"), "members": members.iter().map(|m| json!({"value": db::s(m,"user_id"), "$ref": format!("/scim/v2/Users/{}", db::s(m,"user_id"))})).collect::<Vec<_>>()})) }
 #[cfg(feature = "scim")]
-async fn scim_replace_members(st: &S, org: &str, tid: &str, body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
-    st.db.exec("DELETE FROM team_members WHERE team_id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?;
-    for m in body.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default() { if let Some(uid) = m.get("value").and_then(|v| v.as_str()) { if scim_member(st, org, uid).await { let _ = st.db.exec("INSERT INTO team_members(team_id,user_id) VALUES(?,?)", &[json!(tid), json!(uid)]).await; } } } Ok(()) }
+fn scim_field<'a>(object: &'a serde_json::Map<String, Value>, name: &str) -> Result<Option<&'a Value>, (StatusCode, Json<Value>)> {
+    let mut fields = object.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name));
+    let value = fields.next().map(|(_, value)| value);
+    if fields.next().is_some() { return Err(bad("duplicate SCIM attribute")); }
+    Ok(value)
+}
+#[cfg(feature = "scim")]
+fn scim_parse_members(value: &Value) -> Result<Vec<String>, (StatusCode, Json<Value>)> {
+    let mut members = Vec::new();
+    for member in value.as_array().ok_or_else(|| bad("members must be an array"))? {
+        let object = member.as_object().ok_or_else(|| bad("member must be an object"))?;
+        let uid = scim_field(object, "value")?.and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| bad("member value required"))?;
+        if !members.iter().any(|v| v == uid) { members.push(uid.to_string()); }
+    }
+    Ok(members)
+}
+#[cfg(feature = "scim")]
+#[derive(Clone, Copy)]
+enum ScimGroupAction { Add, Replace, Remove }
+#[cfg(feature = "scim")]
+enum ScimGroupChange { Name(String), Members(ScimGroupAction, Vec<String>), ClearMembers }
+#[cfg(feature = "scim")]
+fn scim_parse_group_patch(body: &Value) -> Result<Vec<ScimGroupChange>, (StatusCode, Json<Value>)> {
+    let operations = body.get("Operations").and_then(Value::as_array).filter(|v| !v.is_empty()).ok_or_else(|| bad("Operations must be a non-empty array"))?;
+    let mut changes = Vec::new();
+    for operation in operations {
+        let object = operation.as_object().ok_or_else(|| bad("operation must be an object"))?;
+        let action = match scim_field(object, "op")?.and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
+            Some("add") => ScimGroupAction::Add, Some("replace") => ScimGroupAction::Replace, Some("remove") => ScimGroupAction::Remove,
+            _ => return Err(bad("unsupported SCIM operation")),
+        };
+        let path = scim_field(object, "path")?;
+        let value = scim_field(object, "value")?;
+        match path {
+            None => {
+                if matches!(action, ScimGroupAction::Remove) { return Err(bad("remove requires a path")); }
+                let fields = value.and_then(Value::as_object).ok_or_else(|| bad("pathless operation requires an object"))?;
+                if fields.is_empty() || fields.keys().any(|k| !k.eq_ignore_ascii_case("displayName") && !k.eq_ignore_ascii_case("members")) { return Err(bad("unsupported SCIM attribute")); }
+                if let Some(name) = scim_field(fields, "displayName")? { changes.push(ScimGroupChange::Name(name.as_str().ok_or_else(|| bad("displayName must be a string"))?.to_string())); }
+                if let Some(members) = scim_field(fields, "members")? { changes.push(ScimGroupChange::Members(action, scim_parse_members(members)?)); }
+            }
+            Some(path) => {
+                let path = path.as_str().ok_or_else(|| bad("path must be a string"))?;
+                if path.eq_ignore_ascii_case("displayName") {
+                    if matches!(action, ScimGroupAction::Remove) { return Err(bad("cannot remove displayName")); }
+                    changes.push(ScimGroupChange::Name(value.and_then(Value::as_str).ok_or_else(|| bad("displayName must be a string"))?.to_string()));
+                } else if path.eq_ignore_ascii_case("members") {
+                    if matches!(action, ScimGroupAction::Remove) && value.is_none() { changes.push(ScimGroupChange::ClearMembers); }
+                    else { changes.push(ScimGroupChange::Members(action, scim_parse_members(value.ok_or_else(|| bad("members value required"))?)?)); }
+                } else {
+                    let filter = path.get(..8).filter(|p| p.eq_ignore_ascii_case("members["))
+                        .and_then(|_| path.get(8..)).and_then(|p| p.strip_suffix(']')).ok_or_else(|| bad("unsupported SCIM path"))?;
+                    let (attribute, rest) = filter.split_once(' ').ok_or_else(|| bad("invalid member filter"))?;
+                    let (operator, quoted) = rest.split_once(' ').ok_or_else(|| bad("invalid member filter"))?;
+                    let uid = quoted.strip_prefix('"').and_then(|v| v.strip_suffix('"')).filter(|v| !v.is_empty() && !v.contains(['"', '\\'])).ok_or_else(|| bad("invalid member filter"))?;
+                    if !attribute.eq_ignore_ascii_case("value") || !operator.eq_ignore_ascii_case("eq") || !matches!(action, ScimGroupAction::Remove) || value.is_some() { return Err(bad("unsupported member filter")); }
+                    changes.push(ScimGroupChange::Members(action, vec![uid.to_string()]));
+                }
+            }
+        }
+    }
+    Ok(changes)
+}
+#[cfg(feature = "scim")]
+async fn scim_group_plan(st: &S, org: &str, tid: &str, name: &str, original: Vec<String>, changes: Vec<ScimGroupChange>, create: bool) -> Result<Vec<(String, Vec<Value>)>, (StatusCode, Json<Value>)> {
+    let mut members = original.clone(); let mut desired_name = name.to_string(); let mut targets = Vec::new();
+    for change in changes {
+        match change {
+            ScimGroupChange::Name(value) => desired_name = value,
+            ScimGroupChange::ClearMembers => members.clear(),
+            ScimGroupChange::Members(action, values) => {
+                for uid in &values {
+                    let grant = !matches!(action, ScimGroupAction::Remove);
+                    let sql = if grant { "SELECT user_id FROM org_members WHERE org_id=? AND user_id=? AND locked=0" } else { "SELECT user_id FROM org_members WHERE org_id=? AND user_id=?" };
+                    if st.db.one(sql, &[json!(org), json!(uid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(bad(if grant { "member is not an unlocked workspace member" } else { "member is not a workspace member" })); }
+                    let target = (uid.clone(), grant); if !targets.contains(&target) { targets.push(target); }
+                }
+                match action {
+                    ScimGroupAction::Add => for uid in values { if !members.contains(&uid) { members.push(uid); } },
+                    ScimGroupAction::Replace => members = values,
+                    ScimGroupAction::Remove => for uid in values { let index = members.iter().position(|m| m == &uid).ok_or_else(|| bad("member is not in group"))?; members.remove(index); },
+                }
+            }
+        }
+    }
+    let (mut sql, mut params) = if create {
+        ("INSERT INTO teams(id,org_id,name) SELECT ?,?,? WHERE 1=1".to_string(), vec![json!(tid), json!(org), json!(desired_name)])
+    } else {
+        ("UPDATE teams SET name=? WHERE id=? AND org_id=? AND name=? AND (SELECT COUNT(*) FROM team_members WHERE team_id=?)=?".to_string(), vec![json!(desired_name), json!(tid), json!(org), json!(name), json!(tid), json!(original.len())])
+    };
+    for uid in &original { sql.push_str(" AND EXISTS(SELECT 1 FROM team_members WHERE team_id=? AND user_id=?)"); params.extend([json!(tid), json!(uid)]); }
+    for (uid, grant) in &targets {
+        sql.push_str(if *grant { " AND EXISTS(SELECT 1 FROM org_members WHERE org_id=? AND user_id=? AND locked=0)" } else { " AND EXISTS(SELECT 1 FROM org_members WHERE org_id=? AND user_id=?)" }); params.extend([json!(org), json!(uid)]);
+    }
+    let mut batch = vec![(sql, params)];
+    for uid in &original { if !members.contains(uid) { batch.push(("DELETE FROM team_members WHERE team_id=? AND user_id=?".into(), vec![json!(tid), json!(uid)])); } }
+    for uid in &members { if !original.contains(uid) { batch.push(("INSERT INTO team_members(team_id,user_id) VALUES(?,?)".into(), vec![json!(tid), json!(uid)])); } }
+    Ok(batch)
+}
+#[cfg(feature = "scim")]
+async fn scim_apply_group(st: &S, org: &str, tid: &str, changes: Vec<ScimGroupChange>) -> Result<(), (StatusCode, Json<Value>)> {
+    let lease = format!("scim-group:{}", tid); let owner = id();
+    let acquired = st.db.exec("UPDATE instance_leases SET owner=?,expires_at=OW_NOW()+30 WHERE name=? AND expires_at<OW_NOW()", &[json!(owner), json!(lease)]).await.map_err(|e| bad(&e))?;
+    if acquired == 0 {
+        if let Err(e) = st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,OW_NOW()+30)", &[json!(lease), json!(owner)]).await {
+            if st.db.one("SELECT name FROM instance_leases WHERE name=?", &[json!(lease)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "group update in progress")); }
+            return Err(bad(&e));
+        }
+    }
+    // Read only after acquiring the lease; fence its owner inside the write transaction.
+    // The fence row stays locked through commit, so expiry cannot admit a stale replacement.
+    let result = async {
+        let row = st.db.one("SELECT name FROM teams WHERE id=? AND org_id=?", &[json!(tid), json!(org)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "group not found"))?;
+        let rows = st.db.query("SELECT user_id FROM team_members WHERE team_id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?;
+        let original = rows.iter().map(|row| db::s(row, "user_id")).collect();
+        let mut batch = vec![("UPDATE instance_leases SET expires_at=OW_NOW()+30 WHERE name=? AND owner=? AND expires_at>=OW_NOW()".to_string(), vec![json!(lease), json!(owner)])];
+        batch.extend(scim_group_plan(st, org, tid, &db::s(&row, "name"), original, changes, false).await?);
+        let checked: Vec<usize> = (0..batch.len()).collect();
+        st.db.batch_checked(&batch, &checked).await.map_err(|e| if e.contains("version conflict") { err(StatusCode::CONFLICT, "group changed during update") } else { bad(&e) })
+    }.await;
+    let released = st.db.exec("DELETE FROM instance_leases WHERE name=? AND owner=?", &[json!(lease), json!(owner)]).await.map_err(|e| bad(&e));
+    result?; released?; Ok(())
+}
 #[cfg(feature = "scim")]
 async fn scim_create_group(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res {
     let org = scim_org(&st, &h, &q).await?;
     let name = body.get("displayName").and_then(|v| v.as_str()).unwrap_or(""); if name.is_empty() { return Err(bad("displayName required")); }
-    let tid = id(); st.db.exec("INSERT INTO teams(id,org_id,name) VALUES(?,?,?)", &[json!(tid), json!(org), json!(name)]).await.map_err(|e| bad(&e))?;
-    scim_replace_members(&st, &org, &tid, &body).await?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.unwrap(); Ok(j(scim_group_json(&st,&row).await)) }
+    let members = match body.get("members") { Some(value) => scim_parse_members(value)?, None => Vec::new() }; let tid = id();
+    let batch = scim_group_plan(&st, &org, &tid, name, Vec::new(), vec![ScimGroupChange::Members(ScimGroupAction::Replace, members)], true).await?;
+    let checked: Vec<usize> = (0..batch.len()).collect(); st.db.batch_checked(&batch, &checked).await.map_err(|e| bad(&e))?;
+    let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await?)) }
 #[cfg(feature = "scim")]
 async fn scim_list_groups(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let rows = st.db.query("SELECT * FROM teams WHERE org_id=? ORDER BY name", &[json!(org)]).await.map_err(|e| bad(&e))?;
     let (start, count) = scim_page(&q); let filter = scim_eq_filter(&q);
     let mut all: Vec<Value> = Vec::with_capacity(rows.len());
-    for r in &rows { all.push(scim_group_json(&st, r).await); }
+    for r in &rows { all.push(scim_group_json(&st, r).await?); }
     if let Some(name) = filter { all.retain(|g| g["displayName"].as_str().map(|d| d.eq_ignore_ascii_case(&name)).unwrap_or(false)); }
     let total = all.len(); let page: Vec<Value> = all.into_iter().skip(start - 1).take(count).collect();
     let page_len = page.len();
@@ -4748,22 +4884,22 @@ async fn scim_list_groups(State(st): State<S>, h: HeaderMap, Query(q): Query<Has
 async fn scim_get_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&row,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
-    Ok(j(scim_group_json(&st,&row).await)) }
+    Ok(j(scim_group_json(&st,&row).await?)) }
 #[cfg(feature = "scim")]
 async fn scim_put_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
-    if let Some(name) = body.get("displayName").and_then(|v| v.as_str()) { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(name), json!(tid)]).await.map_err(|e| bad(&e))?; }
-    scim_replace_members(&st, &org, &tid, &body).await?; let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await)) }
+    let members = match body.get("members") { Some(value) => scim_parse_members(value)?, None => Vec::new() }; let mut changes = Vec::new();
+    if let Some(name) = body.get("displayName").and_then(|v| v.as_str()) { changes.push(ScimGroupChange::Name(name.to_string())); }
+    changes.push(ScimGroupChange::Members(ScimGroupAction::Replace, members)); scim_apply_group(&st, &org, &tid, changes).await?;
+    let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await?)) }
 #[cfg(feature = "scim")]
 async fn scim_patch_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>, Json(body): Json<Value>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
     if db::s(&existing,"org_id") != org { return Err(err(StatusCode::NOT_FOUND,"group not found")); }
-    for op in body.get("Operations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let path = op.get("path").and_then(|v| v.as_str()).unwrap_or(""); let val = op.get("value").cloned().unwrap_or(json!({}));
-        if path == "displayName" { if let Some(n) = val.as_str() { st.db.exec("UPDATE teams SET name=? WHERE id=?", &[json!(n), json!(tid)]).await.map_err(|e| bad(&e))?; } }
-        else if path.starts_with("members") { scim_replace_members(&st, &org, &tid, &json!({"members": val})).await?; } }
-    let row = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await)) }
+    let changes = scim_parse_group_patch(&body)?;
+    scim_apply_group(&st, &org, &tid, changes).await?;
+    let row = st.db.one("SELECT * FROM teams WHERE id=? AND org_id=?", &[json!(tid), json!(org)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?; Ok(j(scim_group_json(&st,&row).await?)) }
 #[cfg(feature = "scim")]
 async fn scim_delete_group(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>, Query(q): Query<HashMap<String,String>>) -> Res { let org = scim_org(&st, &h, &q).await?;
     let existing = st.db.one("SELECT * FROM teams WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"group not found"))?;
@@ -4820,6 +4956,9 @@ async fn runner_for_env(st: &S, eid: &str) -> Result<(String, String), (StatusCo
     let runner = st.db.one("SELECT pubkey FROM runners WHERE id=?", &[json!(&rid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("runner not found"))?;
     Ok((rid, db::s(&runner, "pubkey"))) }
 async fn seal_to_runner(st: &S, eid: &str, iid: &str, config: &Value) -> Result<String, (StatusCode, Json<Value>)> {
+    if !config.is_object() { return Err(bad("delegated integration config must be an object")); }
+    if config.get("initial_sync").is_some_and(|v| v.as_str() != Some("overwrite")) { return Err(bad("delegated sync supports initial_sync overwrite only; initial import requires client-side deployment")); }
+    for flag in ["dry_run", "auto_sync"] { if config.get(flag).is_some_and(|v| !v.is_boolean()) { return Err(bad(&format!("{} must be a boolean", flag))); } }
     let (rid, pubkey) = runner_for_env(st, eid).await?;
     // The sealed box has no AAD, so bind the payload to its integration inside
     // the plaintext and make the runner verify it before using the config.
@@ -4871,26 +5010,37 @@ async fn runner_jobs(State(st): State<S>, h: HeaderMap) -> Res {
         if st.db.exec("UPDATE sync_jobs SET status='claimed',claimed_at=?,claim_id=? WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) AND EXISTS (SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE e.id=sync_jobs.env_id AND o.emergency_locked=0 AND a.emergency_locked=0)", &[json!(claimed_at), json!(&claim), json!(&jid), json!(stale)]).await.unwrap_or(0) == 0 { continue; }
         let eid = db::s(job, "env_id"); let iid = db::s(job, "integration_id");
         let fail = async |msg: &str| { let _ = st.db.exec("UPDATE sync_jobs SET status='failed',detail=? WHERE id=? AND claim_id=?", &[json!(msg), json!(&jid), json!(&claim)]).await; };
-        let env = match st.db.one("SELECT runner_id FROM envs WHERE id=?", &[json!(&eid)]).await { Ok(Some(e)) => e, _ => { fail("environment no longer exists").await; continue; } };
+        let env = match st.db.one("SELECT runner_id,name FROM envs WHERE id=?", &[json!(&eid)]).await { Ok(Some(e)) => e, _ => { fail("environment no longer exists").await; continue; } };
         if db::s(&env, "runner_id") != rid { fail("runner does not own this environment").await; continue; }
         let wrapped = match st.db.one("SELECT wrapped_key FROM runner_env_keys WHERE runner_id=? AND env_id=?", &[json!(&rid), json!(&eid)]).await { Ok(Some(w)) => db::s(&w, "wrapped_key"), _ => { fail("no wrapped environment key for this runner").await; continue; } };
-        let integ = match st.db.one("SELECT kind,config_enc FROM integrations WHERE id=?", &[json!(&iid)]).await { Ok(Some(i)) => i, _ => { fail("integration no longer exists").await; continue; } };
+        let integ = match st.db.one("SELECT kind,config_enc FROM integrations WHERE id=? AND env_id=?", &[json!(&iid), json!(&eid)]).await { Ok(Some(i)) => i, _ => { fail("integration no longer exists").await; continue; } };
         // Sealed values are never readable, so a runner job must never carry them.
-        let secrets = st.db.query("SELECT key_enc,value_enc,key_hash,path FROM secrets WHERE env_id=? AND deleted=0 AND secret_type<>'sealed'", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
-        let prev = st.db.query("SELECT remote_name FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await.unwrap_or_default();
+        let secrets = st.db.query("SELECT id,key_enc,value_enc,key_hash,path,path_enc,tags,tags_enc,secret_type,version FROM secrets WHERE env_id=? AND deleted=0 AND secret_type NOT IN ('sealed','wallet_private_key','wallet_recovery_phrase')", &[json!(&eid)]).await.map_err(|e| bad(&e))?;
+        let prev = st.db.query("SELECT remote_name,value_hash FROM integration_sync_state WHERE integration_id=?", &[json!(&iid)]).await.map_err(|e| bad(&e))?;
         if st.require_env_running(&eid).await.is_err() { continue; }
         if st.db.one("SELECT id FROM sync_jobs WHERE id=? AND status='claimed' AND claim_id=?", &[json!(&jid), json!(&claim)]).await.map_err(|e| bad(&e))?.is_none() { continue; }
         jobs.push(json!({
-            "id": jid, "claim": claim, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"),
+            "id": jid, "claim": claim, "env_id": eid, "integration_id": iid, "job_kind": db::s(job, "kind"), "environment": db::s(&env, "name"),
             "kind": db::s(&integ, "kind"), "config_enc": db::s(&integ, "config_enc"), "wrapped_key": wrapped,
             "secrets": secrets.iter().map(db::obj).collect::<Vec<_>>(),
             "previous": prev.iter().map(|r| db::s(r, "remote_name")).collect::<Vec<_>>(),
+            "previous_hashes": prev.iter().map(|r| (db::s(r, "remote_name"), json!(db::s(r, "value_hash")))).collect::<serde_json::Map<String, Value>>(),
         }));
     }
     runner_auth(&st, &h).await?;
     Ok(j(json!({"jobs": jobs}))) }
 #[derive(Deserialize)] struct ManagedSecret { name: String, #[serde(default)] value_hash: String }
-#[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] detail: String, #[serde(default)] managed: Vec<ManagedSecret>, #[serde(default)] claim: String }
+#[derive(Deserialize)] struct JobResultReq { ok: bool, #[serde(default)] code: String, #[serde(default)] managed: Vec<ManagedSecret>, #[serde(default)] claim: String, #[serde(default)] job_id: String, #[serde(default)] persist_managed: Option<bool>, #[serde(default)] managed_mode: String }
+fn runner_result_detail(ok: bool, kind: &str, code: &str) -> &'static str {
+    match (ok, kind, code) {
+        (false, _, "config_invalid") => "Runner configuration or job preparation failed",
+        (false, "test", _) => "Provider connection test failed",
+        (false, _, _) => "Provider sync failed",
+        (true, "test", _) => "Provider connection test completed",
+        (true, "sync", "dry_run_completed") => "Sync dry-run completed",
+        (true, _, _) => "Provider sync completed",
+    }
+}
 async fn runner_job_result(State(st): State<S>, h: HeaderMap, Path(jid): Path<String>, Json(r): Json<JobResultReq>) -> Res {
     let (rid, _) = runner_auth(&st, &h).await?;
     let job = st.db.one("SELECT * FROM sync_jobs WHERE id=? AND runner_id=?", &[json!(&jid), json!(&rid)]).await.map_err(|e| bad(&e))?
@@ -4901,14 +5051,32 @@ async fn runner_job_result(State(st): State<S>, h: HeaderMap, Path(jid): Path<St
     // rejects the old runner's late result.
     let eid = db::s(&job, "env_id"); let iid = db::s(&job, "integration_id");
     let (org, app) = st.env_org_app(&eid).await?;
+    if !matches!(r.managed_mode.as_str(), "" | "merge_only") { return Err(bad("unsupported managed ownership mode")); }
+    let merge = r.managed_mode == "merge_only";
+    if (r.persist_managed.is_some() || merge) && r.job_id != jid { return Err(bad("ownership result must name this job_id")); }
+    if r.persist_managed.is_none() && !r.managed.is_empty() { return Err(bad("managed results require an explicit persist_managed policy; upgrade the runner")); }
+    let persist = r.persist_managed == Some(true);
+    if persist && (!r.ok || db::s(&job, "kind") != "sync") { return Err(bad("only a successful sync may replace ownership")); }
+    if merge && (r.ok || db::s(&job, "kind") != "sync" || r.persist_managed != Some(false)) { return Err(bad("merge_only requires a failed sync with persist_managed false")); }
+    if persist || merge {
+        let integration = st.db.one("SELECT kind FROM integrations WHERE id=? AND env_id=?", &[json!(&iid), json!(&eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("integration no longer exists"))?;
+        if !integrations::is_stateful(&db::s(&integration, "kind")) { return Err(bad("nonmanaged sync must not persist ownership")); }
+        let mut names = std::collections::HashSet::new();
+        if r.managed.iter().any(|m| m.name.is_empty() || m.value_hash.is_empty() || !names.insert(&m.name)) { return Err(bad("managed names and value hashes must be nonempty and names unique")); }
+    }
+    // Legacy detail and adapter output can contain provider-echoed plaintext; never persist them.
+    let detail = runner_result_detail(r.ok, &db::s(&job, "kind"), &r.code);
     let mut statements = vec![("UPDATE sync_jobs SET status=?,detail=? WHERE id=? AND runner_id=? AND status='claimed' AND claim_id=? AND EXISTS (SELECT 1 FROM envs e JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE e.id=sync_jobs.env_id AND o.emergency_locked=0 AND a.emergency_locked=0)".into(),
-        vec![json!(if r.ok { "done" } else { "failed" }), json!(&r.detail), json!(&jid), json!(&rid), json!(&r.claim)])];
+        vec![json!(if r.ok { "done" } else { "failed" }), json!(detail), json!(&jid), json!(&rid), json!(&r.claim)])];
     let require_one = vec![0];
-    if r.ok && db::s(&job, "kind") == "sync" && !r.managed.is_empty() {
+    if persist {
         statements.push(("DELETE FROM integration_sync_state WHERE integration_id=?".into(), vec![json!(&iid)]));
         for m in &r.managed { statements.push(("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) VALUES(?,?,?)".into(), vec![json!(&iid), json!(&m.name), json!(&m.value_hash)])); }
+    } else if merge {
+        // A failed write cannot confirm a new value for an existing name; keep its acknowledged hash.
+        for m in &r.managed { statements.push(("INSERT INTO integration_sync_state(integration_id,remote_name,value_hash) SELECT ?,?,? WHERE NOT EXISTS (SELECT 1 FROM integration_sync_state WHERE integration_id=? AND remote_name=?)".into(), vec![json!(&iid), json!(&m.name), json!(&m.value_hash), json!(&iid), json!(&m.name)])); }
     }
-    st.audited_batch(&statements, &require_one, [&org, &app, &eid, "runner", if r.ok { "integration.sync" } else { "integration.sync_failed" }, &format!("{} {}", iid, r.detail)]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::CONFLICT, "this claim was superseded; refresh the job queue")} else {bad(&e)})?;
+    st.audited_batch(&statements, &require_one, [&org, &app, &eid, "runner", if r.ok { "integration.sync" } else { "integration.sync_failed" }, &format!("{} {}", iid, detail)]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::CONFLICT, "this claim was superseded; refresh the job queue")} else {bad(&e)})?;
     Ok(j(json!({"status": if r.ok { "done" } else { "failed" }}))) }
 
 // ---------- machine identities + Universal Auth (Infisical-inspired) ----------
@@ -4921,7 +5089,7 @@ async fn create_identity(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
     // with a role that is admin-equivalent under another name. The role must
     // exist first: permissions are immutable, so this read cannot go stale.
     if st.role_privileged(&oid, &want).await && caller_role != "owner" { return Err(err(StatusCode::FORBIDDEN, "only an owner can create an identity with admin rights")); }
-    let iid = id(); let client_id = oc::random_token("cid"); let client_secret = oc::random_token("csec");
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let iid = id(); let client_id = oc::random_token("cid"); let client_secret = oc::random_token("csec");
     statements.push((("INSERT INTO identities(id,org_id,name,role,created_at) VALUES(?,?,?,?,?)").to_string(), ([json!(iid), json!(oid), json!(r.name), json!(want), json!(now())]).to_vec()));
     statements.push((("INSERT INTO identity_credentials(id,identity_id,client_id,secret_hash,created_at) VALUES(?,?,?,?,?)").to_string(), ([json!(id()), json!(iid), json!(client_id), json!(oc::hash_token(&client_secret)), json!(now())]).to_vec()));
     st.audited_batch(&statements, &[], [&oid,"","",&uid,"identity.create",&r.name]).await.map_err(|e|bad(&e))?;
@@ -4935,7 +5103,7 @@ async fn delete_identity(State(st): State<S>, h: HeaderMap, Path((oid, iid)): Pa
     statements.push((("DELETE FROM identity_credentials WHERE identity_id=?").to_string(), ([json!(&iid)]).to_vec()));
     statements.push((("DELETE FROM tokens WHERE created_by=?").to_string(), ([json!(&iid)]).to_vec()));
     statements.push((("DELETE FROM identities WHERE id=?").to_string(), ([json!(&iid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&oid,"","",&uid,"identity.delete",&iid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deleted": iid}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&oid,"","",&uid,"identity.delete",&iid]).await.map_err(|e|bad(&e))?; Ok(j(json!({"deleted": iid}))) }
 async fn rotate_identity(State(st): State<S>, h: HeaderMap, Path((oid, iid)): Path<(String, String)>) -> Res { let uid = st.token_user(&h).await?;
     st.check_admin(&oid, &uid).await?;
     let row = st.db.one("SELECT role FROM identities WHERE id=? AND org_id=?", &[json!(&iid), json!(&oid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "identity not found"))?;
@@ -4951,7 +5119,7 @@ async fn rotate_identity(State(st): State<S>, h: HeaderMap, Path((oid, iid)): Pa
         vec![("INSERT INTO identity_credentials(id,identity_id,client_id,secret_hash,created_at) VALUES(?,?,?,?,?)".into(), vec![json!(id()), json!(&iid), json!(&client_id), json!(oc::hash_token(&secret)), json!(now())])]
     };
     let require_one: Vec<usize> = if existing.is_some() { vec![0] } else { Vec::new() };
-    st.audited_batch(&statements, &require_one, [&oid,"","",&uid,"identity.rotate",&iid]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &require_one, [&oid,"","",&uid,"identity.rotate",&iid]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"id": iid, "client_id": client_id, "client_secret": secret, "note": "client_secret shown once"}))) }
 async fn universal_login(State(st): State<S>, Json(body): Json<Value>) -> Res {
     let cid = body.get("client_id").and_then(|v| v.as_str()).unwrap_or(""); let secret = body.get("client_secret").and_then(|v| v.as_str()).unwrap_or("");
@@ -4984,10 +5152,10 @@ async fn decide_proposal(State(st): State<S>, h: HeaderMap, Path((pid, action)):
             if !s.key.is_empty() { require_one.push(statements.len()); statements.push(("UPDATE envs SET id=id WHERE id=?".into(), vec![json!(&eid)]));
                 require_one.push(statements.len()); statements.extend(secret_statements(&st, &eid, &org, &key, &uid, &s, &master).await?); count += 1; } }
         statements.push(("UPDATE proposals SET status='approved',decided_by=? WHERE id=?".into(), vec![json!(uid), json!(pid)]));
-        st.audited_batch_master(&statements, &require_one, [&org,&app,&eid,&uid,"proposal.approve",&format!("{} applied {} secrets",pid,count)], master).await.map_err(secret_batch_error)?; let sync_errors = trigger_sync(&st,&eid,&uid).await;
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch_master(&statements, &require_one, [&org,&app,&eid,&uid,"proposal.approve",&format!("{} applied {} secrets",pid,count)], master).await.map_err(secret_batch_error)?; let sync_errors = trigger_sync(&st,&eid,&uid).await;
         Ok(j(json!({"status":"approved","applied":count,"sync_errors":sync_errors})))
     } else if action == "reject" {
-        st.audited_batch(&[("UPDATE proposals SET status='rejected',decided_by=? WHERE id=?".into(), vec![json!(uid), json!(pid)])], &[], [&org,&app,&eid,&uid,"proposal.reject",&pid]).await.map_err(|e| bad(&e))?; Ok(j(json!({"status":"rejected"})))
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[("UPDATE proposals SET status='rejected',decided_by=? WHERE id=?".into(), vec![json!(uid), json!(pid)])], &[], [&org,&app,&eid,&uid,"proposal.reject",&pid]).await.map_err(|e| bad(&e))?; Ok(j(json!({"status":"rejected"})))
     } else { Err(bad("action must be approve or reject")) } }
 
 // ---------- access requests ----------
@@ -5002,6 +5170,7 @@ async fn decide_access(State(st): State<S>, h: HeaderMap, Path((rid, action)): P
     if db::s(&row,"status") != "pending" { return Err(bad("already decided")); }
     let eid = db::s(&row,"env_id"); let (org, app) = st.require_env(&eid, &uid).await?;
     st.check_admin(&org, &uid).await?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
     if action == "approve" { let target = db::s(&row,"user_id"); st.audited_batch(&[("DELETE FROM env_members WHERE env_id=? AND user_id=?".into(), vec![json!(&eid),json!(&target)]),("INSERT INTO env_members(env_id,user_id) VALUES(?,?)".into(), vec![json!(&eid),json!(&target)]),("UPDATE access_requests SET status='approved',decided_by=? WHERE id=?".into(), vec![json!(uid),json!(rid)])], &[2], [&org,&app,&eid,&uid,"access.approve",&target]).await.map_err(|e| bad(&e))?;
         Ok(j(json!({"status":"approved"})))
     } else { st.db.exec("UPDATE access_requests SET status='rejected',decided_by=? WHERE id=?", &[json!(uid), json!(rid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"status":"rejected"}))) } }
@@ -5017,15 +5186,30 @@ async fn complete_lease(st: &S, lid: &str, value: &str, username: &str, config: 
     st.db.batch_checked(&[("UPDATE leases SET value_enc=?,username=?,config_enc=? WHERE id=? AND value_enc='' AND revoked=0".into(), vec![json!(value), json!(username), json!(config), json!(lid)])], &[0]).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("lease {} issued but persistence failed; pending reservation retained, operator reconciliation required", lid)))
 }
+fn validate_provider_lease(typ: &str, config: &Value, name: &str) -> Result<(), String> {
+    match typ {
+        "aws_iam" => integrations::validate_aws_lease_config(config),
+        "planetscale" => integrations::validate_planetscale_lease(config, name),
+        "instabox" => integrations::validate_instabox_lease(config, name),
+        "openrouter" => integrations::validate_openrouter_lease(config, name),
+        "resend" => integrations::validate_resend_lease(config, name),
+        "openai" => integrations::validate_openai_lease(config),
+        "huggingface" => integrations::validate_huggingface_lease(config, name),
+        _ => inference_leases::validate_lease(typ, config, name),
+    }
+}
 async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "leases:write").await?;
     let key = st.env_key(&eid).await?; let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("lease").to_string();
     let ttl = body.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(60, 30 * 86400); let lid = id();
     let typ = body.get("type").and_then(|v| v.as_str()).unwrap_or("generic");
+    validate_provider_lease(typ, body.get("config").unwrap_or(&Value::Null), &name).map_err(|e| bad(&e))?;
     let pending = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"type":"pending", "request":body}).to_string().as_bytes());
     if typ == "postgres" {
         let conn = body.get("config").and_then(|c| c.get("connection")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if conn.is_empty() { return Err(bad("postgres dynamic secret requires config.connection")); }
         if db_target_allowed(&conn).map_err(|e| bad(&e))? != "postgres" { return Err(bad("postgres dynamic secret requires a postgres:// connection")); }
+        #[cfg(target_arch = "wasm32")]
+        conn.parse::<tokio_postgres::Config>().map_err(|e| bad(&e.to_string()))?;
         // A worker-delivered lease is created by the worker inside the private
         // network; the server only queues the job and records the credential.
         #[cfg(not(target_arch = "wasm32"))]
@@ -5036,7 +5220,8 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
                 if db::n(&bound, "last_seen") + 90 < now() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "worker has not dialled in; the server will not connect to the database itself")); }
                 let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
                 let password = oc::random_token("dyn");
-                reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+                require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
                 let payload = json!({"connection": conn, "username": username, "password": password, "statement": "create"});
                 let jid = match queue_worker_job(&st, &worker_id, &eid, "postgres.create", &key, &payload, &lid).await {
                     Ok(jid) => jid,
@@ -5048,6 +5233,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         }
         let username = format!("dyn_{}", oc::random_token("").chars().take(12).collect::<String>().to_lowercase());
         let password = oc::random_token("dyn");
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
         if let Err(e) = crate::pglease::create_role(&conn, &username, &password, now() + ttl).await {
             if crate::pglease::drop_role(&conn, &username).await.is_err() { return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("lease {} issuance and Postgres cleanup failed; pending reservation retained, operator reconciliation required", lid))); }
@@ -5067,6 +5253,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         let username = format!("dyn_{}", oc::random_token("").chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect::<String>().to_lowercase());
         let password = oc::random_token("dyn");
         for grant in &grants { crate::mysqllease::grant_sql(grant, &username).map_err(|e| bad(&e))?; }
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
         if let Err(e) = crate::mysqllease::create_account(&conn, &username, &password, &grants).await {
             // A half-granted account must not outlive the failed request.
@@ -5079,6 +5266,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         return Ok(j(json!({"id": lid, "username": username, "password": password, "expires_at": now()+ttl, "type":"mysql"}))); }
     if typ == "aws_iam" {
         let config = body.get("config").cloned().unwrap_or(json!({}));
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
         let creds = integrations::sts_assume_role(&config).await.map_err(|e| bad(&e))?;
         let config_enc = oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "config"), json!({"type":"aws_iam"}).to_string().as_bytes());
@@ -5087,6 +5275,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
     }
     if typ == "planetscale" {
         let config = body.get("config").cloned().unwrap_or(json!({}));
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
         let issued = integrations::planetscale_create_password(&config, &name, ttl).await.map_err(|e| bad(&e))?;
         let password = issued["password"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
@@ -5102,6 +5291,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
     }
     if typ == "instabox" {
         let config = body.get("config").cloned().unwrap_or(json!({}));
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
         let issued = integrations::instabox_create_ssh_token(&config, &name, ttl).await.map_err(|e| bad(&e))?;
         let token = issued["token"].as_str().unwrap_or(""); let remote_id = issued["id"].as_str().unwrap_or("");
@@ -5114,6 +5304,7 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
     }
 	    if matches!(typ, "openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") {
         let config = body.get("config").cloned().unwrap_or(json!({}));
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
         reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
 		        let issued = match typ {
 	            "openrouter" => integrations::openrouter_create_key(&config, &name, ttl).await,
@@ -5166,14 +5357,67 @@ async fn create_lease_v2(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         return Ok(j(json!({"id": lid, "value": secret, "remote_id": remote_id, "expires_at": now()+ttl, "type": typ})));
     }
     let value = oc::random_token("dyn");
-    reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
+        reserve_lease(&st, &org, &eid, &lid, &name, &pending, now()+ttl).await?;
     complete_lease(&st, &lid, &oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), value.as_bytes()), "", "").await?;
     Ok(j(json!({"id": lid, "value": value, "expires_at": now()+ttl}))) }
-async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>) -> Result<(), (StatusCode, Json<Value>)> {
+// Expired operation claims are not stolen: an interrupted remote SQL statement may still finish.
+async fn lease_operation_lock(st: &S, lid: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let name = format!("lease-op:{}", lid); let owner = id();
+    if let Err(e) = st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,OW_NOW()+60)", &[json!(&name), json!(&owner)]).await {
+        if st.db.one("SELECT name FROM instance_leases WHERE name=?", &[json!(&name)]).await.map_err(|e| bad(&e))?.is_some() { return Err(err(StatusCode::CONFLICT, "lease operation in progress or unresolved; operator reconciliation required for an interrupted operation")); }
+        return Err(bad(&e));
+    }
+    Ok((name, owner))
+}
+fn lease_operation_guard(lock: &(String, String)) -> (String, Vec<Value>) {
+    ("UPDATE instance_leases SET expires_at=OW_NOW()+60 WHERE name=? AND owner=? AND expires_at>OW_NOW()".into(), vec![json!(&lock.0), json!(&lock.1)])
+}
+async fn lease_operation_release(st: &S, lock: &(String, String)) -> Result<(), (StatusCode, Json<Value>)> {
+    st.db.batch_checked(&[("DELETE FROM instance_leases WHERE name=? AND owner=?".into(), vec![json!(&lock.0), json!(&lock.1)])], &[0]).await.map_err(|_| err(StatusCode::CONFLICT, "lease operation claim could not be released; reconcile before retrying"))
+}
+async fn lease_renewal_target(st: &S, row: &db::Row) -> (String, Result<Option<String>, String>) {
+    if db::s(row,"value_enc").is_empty() { return ("pending".into(), Err("lease issuance is unresolved".into())); }
+    let enc = db::s(row,"config_enc");
+    if enc.is_empty() {
+        return if db::s(row,"username").is_empty() { ("generic".into(), Ok(None)) } else { ("unknown".into(), Err("lease configuration is unresolved".into())) };
+    }
+    let eid = db::s(row,"env_id"); let lid = db::s(row,"id");
+    let cfg = match async {
+        let key = st.env_key(&eid).await.map_err(|_| "lease environment key unavailable")?;
+        let plain = oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &lid, "config"), &enc).map_err(|_| "lease config could not be decrypted")?;
+        serde_json::from_slice::<Value>(&plain).map_err(|_| "invalid lease config")
+    }.await { Ok(cfg) => cfg, Err(e) => return ("unknown".into(), Err(e.into())) };
+    let kind = cfg.get("type").and_then(Value::as_str).unwrap_or("unknown").to_string();
+    let target = match kind.as_str() {
+        "postgres" => {
+            let conn = cfg.get("connection").and_then(Value::as_str).unwrap_or("");
+            if cfg.get("delivery").is_some() || cfg.get("worker_id").is_some() { Err("worker-delivered or unresolved PostgreSQL leases cannot be renewed".into()) }
+            else if conn.is_empty() || db::s(row,"username").is_empty() { Err("PostgreSQL lease configuration is unresolved".into()) }
+            else { match db_target_allowed(conn) { Ok("postgres") => Ok(Some(conn.to_string())), _ => Err("PostgreSQL lease target is not permitted or invalid".into()) } }
+        }
+        "pending" => Err("lease issuance is unresolved".into()),
+        _ => Err("lease provider does not support in-place renewal".into()),
+    };
+    (kind, target)
+}
+async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>, expired: Option<i64>) -> Result<(), (StatusCode, Json<Value>)> {
+    let lock = lease_operation_lock(st, lid).await?; let mut remote_started = false;
+    let result = revoke_lease_remote_locked(st, lid, audit, expired, &lock, &mut remote_started).await;
+    if result.is_ok() || !remote_started { lease_operation_release(st, &lock).await?; }
+    if result.is_err() && remote_started { return Err(err(StatusCode::CONFLICT, "lease revocation outcome unresolved; operation claim retained, operator reconciliation required")); }
+    result
+}
+async fn revoke_lease_remote_locked(st: &S, lid: &str, audit: Option<[&str;6]>, expired: Option<i64>, lock: &(String, String), remote_started: &mut bool) -> Result<(), (StatusCode, Json<Value>)> {
     let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
+    if db::n(&row,"revoked") != 0 { return Ok(()); }
+    if let Some(expiry) = expired {
+        st.db.batch_checked(&[lease_operation_guard(lock), ("UPDATE leases SET attempted_at=OW_NOW() WHERE id=? AND revoked=0 AND expires_at=? AND expires_at<=OW_NOW() AND attempted_at<=OW_NOW()-60".into(), vec![json!(lid), json!(expiry)])], &[0,1]).await.map_err(|_| err(StatusCode::CONFLICT, "lease no longer due for expiry"))?;
+    }
     let eid = db::s(&row,"env_id"); let key = st.env_key(&eid).await?;
     if db::s(&row,"value_enc").is_empty() { return Err(err(StatusCode::CONFLICT, "lease issuance is unresolved; operator reconciliation required before revocation")); }
     if !db::s(&row,"config_enc").is_empty() { let plain = oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, lid, "config"), &db::s(&row,"config_enc")).map_err(|_| bad("lease config could not be decrypted"))?; let cfg: Value = serde_json::from_slice(&plain).map_err(|_| bad("invalid lease config"))?;
+        st.db.batch_checked(&[lease_operation_guard(lock)], &[0]).await.map_err(|_| err(StatusCode::CONFLICT, "lease operation claim expired before revocation"))?;
         match cfg.get("type").and_then(|v| v.as_str()) {
             Some("postgres") => {
                 // A worker-delivered role is dropped by the worker that created it,
@@ -5183,20 +5427,25 @@ async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>) -
                     let wid = cfg.get("worker_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let bound = worker_for_target(st, &eid, &wid, "postgres").await?;
                     if db::n(&bound, "last_seen") + 90 < now() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "worker has not dialled in; the role was not dropped")); }
+                    *remote_started = true;
                     queue_worker_job(st, &wid, &eid, "postgres.drop", &key, &json!({"connection": cfg.get("connection").and_then(|v| v.as_str()).unwrap_or(""), "username": db::s(&row,"username"), "statement": "drop"}), lid).await?;
                     true
                 } else { false };
                 #[cfg(target_arch = "wasm32")]
                 let queued = false;
                 if !queued { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
-                    crate::pglease::drop_role(&conn, &username).await.map_err(|_| bad("Postgres lease revocation failed"))?; } }
+                    *remote_started = true;
+                    if let Err(e) = crate::pglease::drop_role_with_outcome(&conn, &username).await {
+                        if matches!(e, crate::pglease::RenewError::NotSent) { *remote_started = false; return Err(bad("Postgres lease revocation failed before sending DROP ROLE")); }
+                        return Err(bad("Postgres lease revocation failed"));
+                    } } }
             Some("mysql") => { let conn = cfg.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_string(); let username = db::s(&row,"username");
-                crate::mysqllease::drop_account(&conn, &username).await.map_err(|_| bad("MySQL lease revocation failed"))?; }
+                *remote_started = true; crate::mysqllease::drop_account(&conn, &username).await.map_err(|_| bad("MySQL lease revocation failed"))?; }
             Some("planetscale") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
-                integrations::planetscale_revoke_password(&cfg, remote).await.map_err(|e| bad(&e))?; }
+                *remote_started = true; integrations::planetscale_revoke_password(&cfg, remote).await.map_err(|e| bad(&e))?; }
             Some("instabox") => { let remote = cfg.get("remote_id").and_then(|v| v.as_str()).unwrap_or("");
                 let machine = cfg.get("machine_id").and_then(|v| v.as_str()).unwrap_or("");
-                integrations::instabox_revoke_ssh_token(&cfg, machine, remote).await.map_err(|e| bad(&e))?; }
+                *remote_started = true; integrations::instabox_revoke_ssh_token(&cfg, machine, remote).await.map_err(|e| bad(&e))?; }
             Some(kind @ ("openrouter" | "resend" | "openai" | "huggingface" | "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes")) => {
                 let base = cfg.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let parent = cfg.get("parent").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -5208,7 +5457,8 @@ async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>) -
 	                let user_id = cfg.get("user_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let kind = kind.to_string();
                 // A failed remote delete must not mark the local lease revoked.
-	                let remote_result = match kind.as_str() {
+                        *remote_started = true;
+		                let remote_result = match kind.as_str() {
 	                    "openrouter" => integrations::openrouter_revoke_key(&base, &parent, &remote).await,
 	                    "resend" => integrations::resend_revoke_key(&base, &parent, &remote).await,
 	                    "huggingface" => integrations::huggingface_revoke_token(&base, &parent, &hf_org, &service_account, &remote).await,
@@ -5231,28 +5481,28 @@ async fn revoke_lease_remote_inner(st: &S, lid: &str, audit: Option<[&str;6]>) -
             }
             _ => {}
         } }
-    if let Some(fields)=audit { st.audited_batch(&[("UPDATE leases SET revoked=1 WHERE id=?".into(), vec![json!(lid)])], &[], fields).await.map_err(|e| bad(&e))?; }
-    else { st.db.exec("UPDATE leases SET revoked=1 WHERE id=?", &[json!(lid)]).await.map_err(|e| bad(&e))?; }
+    let statements = [lease_operation_guard(lock), ("UPDATE leases SET revoked=1 WHERE id=? AND revoked=0 AND expires_at=?".into(), vec![json!(lid), json!(db::n(&row,"expires_at"))])];
+    if let Some(fields)=audit { st.audited_batch(&statements, &[0,1], fields).await.map_err(|e| bad(&e))?; }
+    else { st.db.batch_checked(&statements, &[0,1]).await.map_err(|e| bad(&e))?; }
     Ok(()) }
-async fn revoke_lease_remote(st: &S, lid: &str) -> Result<(), (StatusCode, Json<Value>)> { revoke_lease_remote_inner(st, lid, None).await }
-async fn revoke_lease_remote_audited(st: &S, lid: &str, audit: [&str;6]) -> Result<(), (StatusCode, Json<Value>)> { revoke_lease_remote_inner(st, lid, Some(audit)).await }
+#[cfg(test)]
+async fn revoke_lease_remote(st: &S, lid: &str) -> Result<(), (StatusCode, Json<Value>)> { revoke_lease_remote_inner(st, lid, None, None).await }
+async fn revoke_lease_remote_audited(st: &S, lid: &str, audit: [&str;6]) -> Result<(), (StatusCode, Json<Value>)> { revoke_lease_remote_inner(st, lid, Some(audit), None).await }
 async fn revoke_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM leases WHERE id=?", &[json!(&lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
     let eid = db::s(&row,"env_id"); let (org, app) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "leases:write").await?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
     revoke_lease_remote_audited(&st, &lid, [&org, &app, &eid, &uid, "lease.revoke", &lid]).await?;
     Ok(j(json!({"revoked": lid}))) }
 async fn lookup_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(&lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
     let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
-    let kind = st.env_key(&eid).await.ok()
-        .and_then(|key| oc::decrypt_symmetric_compat(&key, &lease_aad(&eid, &lid, "config"), &db::s(&row,"config_enc")).ok())
-        .and_then(|plain| serde_json::from_slice::<Value>(&plain).ok())
-        .and_then(|cfg| cfg.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| "generic".to_string());
+    let (kind, target) = lease_renewal_target(&st, &row).await;
     let expires_at = db::n(&row,"expires_at"); let revoked = db::n(&row,"revoked") != 0;
+    let unresolved = st.db.one("SELECT name FROM instance_leases WHERE name=?", &[json!(format!("lease-op:{}",lid))]).await.map_err(|e| bad(&e))?.is_some();
     Ok(j(json!({"id": db::s(&row,"id"), "name": db::s(&row,"name"), "env_id": eid, "type": kind,
         "username": db::s(&row,"username"), "created_at": db::n(&row,"created_at"), "expires_at": expires_at,
-        "revoked": revoked, "renewable": !revoked && expires_at > now()}))) }
+        "revoked": revoked, "renewable": !revoked && expires_at > now() && target.is_ok() && !unresolved}))) }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(feature = "pki")]
@@ -5386,6 +5636,7 @@ async fn create_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>, J
     let kind = if parent.is_some() { "intermediate" } else { "root" };
     let master=st.master(); let cid = id(); let insert_sql = "INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,serial,created_at,parent_id,ca_kind,kind) VALUES(?,?,?,?,?,?,?,?,?,'x509')";
     let params = vec![json!(&cid), json!(&oid), json!(&name), json!(&issued.certificate_pem), json!(oc::encrypt_symmetric(&master, issued.private_key_pem.as_bytes())), json!(&issued.serial_hex), json!(now()), json!(&parent_id), json!(kind)];
+    require_step_up(&st, &h, &uid, if parent_id.is_empty() { StepUpRisk::VeryRisky } else { StepUpRisk::TwoFactor }).await?;
     if parent_id.is_empty() {
         st.epoch_write(&[(insert_sql.into(), params)], &[0], master).await.map_err(master_write_error)?;
     } else {
@@ -5463,7 +5714,7 @@ async fn issue_cert(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>,
     // lockdown either commits first (the lock check fails) or waits and sweeps
     // this certificate afterwards.
     let lock = pki_issuer_lock(&issue_app); let lock_params = pki_issuer_params(&issue_app, &caid);
-    match st.db.tx_locked(&lock, &lock_params, |r| issuer_unchanged(r,&ca), &stmts, &expect).await {
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; match st.db.tx_locked(&lock, &lock_params, |r| issuer_unchanged(r,&ca), &stmts, &expect).await {
         Ok(_) => {}
         Err(e) if e == "lock condition failed" => return Err(err(StatusCode::CONFLICT, "CA was revoked; retry")),
         Err(e) if e.contains("affected 0 rows") => return Err(err(StatusCode::CONFLICT, "device changed while issuing; retry")),
@@ -5530,7 +5781,7 @@ async fn revoke_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<String>)
     let row = st.db.one("SELECT ca_id,device_id FROM pki_certs WHERE id=?", &[json!(cid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"cert not found"))?;
     let ca = st.db.one("SELECT org_id FROM pki_cas WHERE id=? AND kind='x509'", &[json!(db::s(&row,"ca_id"))]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?; st.check_perm(&db::s(&ca,"org_id"),&uid,"pki:write").await?;
     let device = db::s(&row,"device_id"); if device.is_empty() { st.check_admin(&db::s(&ca,"org_id"),&uid).await?; } else { pki_env_access(&st,&load_device(&st,&device).await?,&uid).await?; }
-    let t = now(); st.db.exec("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE id=? AND revoked=0", &[json!(t), json!(cid)]).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let t = now(); st.db.exec("UPDATE pki_certs SET revoked=1,revoked_at=? WHERE id=? AND revoked=0", &[json!(t), json!(cid)]).await.map_err(|e| bad(&e))?;
     let did = db::s(&row,"device_id");
     if !did.is_empty() { let _ = st.db.exec("UPDATE pki_devices SET active_cert_id='',updated_at=? WHERE id=? AND active_cert_id=?", &[json!(t), json!(&did), json!(cid)]).await; }
     Ok(j(json!({"revoked": cid}))) }
@@ -5630,6 +5881,7 @@ async fn update_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
 #[cfg(feature = "pki")]
 async fn revoke_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let t = now();
     // Invalidate codes and the epoch, then sweep the certificates, atomically.
     let counts = st.db.tx(&[
@@ -5643,6 +5895,7 @@ async fn revoke_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String
 #[cfg(feature = "pki")]
 async fn delete_device(State(st): State<S>, h: HeaderMap, Path(did): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = load_device(&st,&did).await?; pki_env_access(&st,&row,&uid).await?; let org = db::s(&row,"org_id"); st.check_perm(&org,&uid,"pki:write").await?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let t = now();
     // Tombstone, sweep and removal in one transaction: no interleaving can
     // attach a certificate, and a failure leaves the device intact.
@@ -6007,6 +6260,7 @@ async fn revoke_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>
     if !scoped.is_empty() && db::s(&row,"env_id") != scoped { return Err(err(StatusCode::FORBIDDEN, "this token is scoped to a different environment")); }
     let members=st.db.query("SELECT id,env_id FROM pki_devices WHERE group_id=?",&[json!(&gid)]).await.map_err(|e| bad(&e))?;
     for member in &members { pki_env_access(&st,member,&uid).await?; }
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let t = now();
     // No group-wide sweep: a concurrently added or moved device was not part
     // of the authorised snapshot, so only mutate exact checked id/env pairs.
@@ -6030,6 +6284,7 @@ async fn revoke_group(State(st): State<S>, h: HeaderMap, Path(gid): Path<String>
 async fn revoke_ca(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let ca = st.db.one("SELECT * FROM pki_cas WHERE kind='x509' AND id=?", &[json!(&caid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"CA not found"))?;
     let org = db::s(&ca,"org_id"); st.check_admin(&org,&uid).await?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let t = now();
     // Lock the CA row first, then take the fresh statement snapshot that sees
     // any intermediate created between the caller's read and this transaction.
@@ -6204,6 +6459,54 @@ pub async fn pki_expiry_alerts(st: &S) {
         meta_set(st, &key, &day.to_string()).await; } }
 
 
+// Receipts terminate here and never become principals for any downstream handler.
+async fn deleted_env_receipt_middleware(State(st): State<S>, req: axum::extract::Request, next: Next) -> Response {
+    let mut auth = req.headers().get_all(axum::http::header::AUTHORIZATION).iter();
+    let bearer = auth.next().and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).filter(|v| !v.is_empty());
+    if auth.next().is_some() { return err(StatusCode::UNAUTHORIZED, "invalid Authorization header").into_response(); }
+    let Some(bearer) = bearer else { return next.run(req).await; };
+    let hash = oc::hash_token(bearer);
+    #[cfg(all(feature = "redis-cache", not(target_arch = "wasm32")))]
+    if st.cache_revoked(&hash) { return err(StatusCode::UNAUTHORIZED,"credential revoked").into_response(); }
+    let receipt = match st.db.one("SELECT * FROM deleted_env_receipts WHERE token_hash=?", &[json!(&hash)]).await {
+        Ok(Some(row)) => row, Ok(None) => return next.run(req).await,
+        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "deletion receipt unavailable").into_response(),
+    };
+    match deleted_env_receipt_response(&st, req, &receipt).await { Ok(value) => value.into_response(), Err(e) => e.into_response() }
+}
+async fn deleted_env_receipt_response(st: &S, req: axum::extract::Request, receipt: &Row) -> Res {
+    let unavailable = || err(StatusCode::SERVICE_UNAVAILABLE, "deletion receipt policy unavailable");
+    let invalid = || err(StatusCode::UNAUTHORIZED, "invalid deletion receipt");
+    let org = db::s(receipt, "org_id"); let app = db::s(receipt, "app_id"); let env = db::s(receipt, "env_id"); let creator = db::s(receipt, "created_by");
+    let scopes = db::s(receipt, "scopes"); let original_expiry = db::n(receipt, "original_expires_at"); let expiry = db::n(receipt, "expires_at"); let deleted = db::n(receipt, "deleted_at");
+    if expiry <= now() || deleted <= 0 || expiry > deleted.saturating_add(30*86400) || (original_expiry != 0 && expiry > original_expiry) || db::s(receipt, "kind") != "human" || !db::s(receipt, "trust_id").is_empty() || !db::s(receipt, "workload_revision").is_empty() { return Err(invalid()); }
+    if !scopes.is_empty() && !scope_has(&scopes, "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "receipt lacks read scope")); }
+    if st.db.one("SELECT id FROM tokens WHERE id=? OR token_hash=? UNION ALL SELECT id FROM envs WHERE id=?", &[json!(db::s(receipt,"token_id")), json!(db::s(receipt,"token_hash")), json!(&env)]).await.map_err(|_| unavailable())?.is_some() { return Err(invalid()); }
+    let user = st.db.one("SELECT active,email_verified FROM users WHERE id=?", &[json!(&creator)]).await.map_err(|_| unavailable())?.ok_or_else(invalid)?;
+    if db::n(&user,"active") != 1 || db::n(&user,"email_verified") != 1 { return Err(invalid()); }
+    let policy = st.db.one("SELECT o.ip_allowlist,o.emergency_locked AS workspace_locked,a.emergency_locked AS app_locked,m.role,m.locked FROM apps a JOIN orgs o ON o.id=a.org_id JOIN org_members m ON m.org_id=o.id AND m.user_id=? WHERE a.id=? AND o.id=?", &[json!(&creator), json!(&app), json!(&org)]).await.map_err(|_| unavailable())?.ok_or_else(|| err(StatusCode::FORBIDDEN, "receipt membership or application no longer exists"))?;
+    if db::n(&policy,"locked") != 0 { return Err(err_code(StatusCode::FORBIDDEN, "workspace_locked", "receipt creator is locked in this workspace")); }
+    if db::n(&policy,"workspace_locked") != 0 || db::n(&policy,"app_locked") != 0 { return Err(err(StatusCode::FORBIDDEN, "emergency lockdown blocks deletion receipts")); }
+    let role = db::s(&policy,"role");
+    if !matches!(role.as_str(), "owner" | "admin" | "developer") {
+        let permissions = st.db.one("SELECT permissions FROM roles WHERE org_id=? AND name=?", &[json!(&org), json!(&role)]).await.map_err(|_| unavailable())?;
+        let permissions = permissions.and_then(|r| serde_json::from_str::<Vec<String>>(&db::s(&r,"permissions")).ok()).unwrap_or_default();
+        if !permissions.iter().any(|p| p == "*" || p == "secrets:read") { return Err(err(StatusCode::FORBIDDEN, "receipt creator lacks read permission")); }
+    }
+    let peer = req.extensions().get::<PeerAddr>().map(|p| p.0.to_string());
+    let proxy_ok = peer.as_deref().is_some_and(|ip| crate::envcfg::var("OPENWARP_TRUSTED_PROXIES").unwrap_or_else(|_| "127.0.0.1/32,::1".into()).split(',').any(|c| ip_in_cidr(ip,c)));
+    let forwarded = if proxy_ok && crate::envcfg::var("OPENWARP_TRUST_PROXY").is_ok_and(|v| v == "1") { req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()) } else { None };
+    let ip = forwarded.or(peer).unwrap_or_default(); let list = db::s(&policy,"ip_allowlist");
+    if ip.parse::<std::net::IpAddr>().is_err() || (!list.trim().is_empty() && !list.split(',').any(|c| ip_in_cidr(&ip,c))) { return Err(err(StatusCode::FORBIDDEN, "source IP not in organisation allowlist")); }
+    if st.db.one("SELECT token_id FROM deleted_env_receipts WHERE token_id=? AND token_hash=? AND expires_at>OW_NOW()", &[json!(db::s(receipt,"token_id")),json!(db::s(receipt,"token_hash"))]).await.map_err(|_| unavailable())?.is_none() { return Err(invalid()); }
+    let path = req.uri().path(); let query = req.uri().query();
+    if req.method() != axum::http::Method::GET { return Err(err(StatusCode::FORBIDDEN, "deletion receipt is read-only")); }
+    if path == "/api/me" && query.is_none() { return Ok(j(json!({"env_scope":env}))); }
+    if path == format!("/api/envs/{}/meta",env) && query.is_none() { return Ok(j(json!({"id":env,"name":db::s(receipt,"env_name"),"app":db::s(receipt,"app_name"),"workspace":db::s(receipt,"workspace_name")}))); }
+    if path == format!("/api/envs/{}/export",env) && (query.is_none() || query == Some("base=1")) { return Err(err_code(StatusCode::NOT_FOUND, "environment_deleted", "environment deleted")); }
+    Err(err(StatusCode::FORBIDDEN, "deletion receipt cannot access this route"))
+}
+
 async fn emergency_session(st: &S, h: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
     if h.contains_key("authorization") { return Err(err(StatusCode::FORBIDDEN, "a browser cookie session is required")); }
     let token = cookie_val(h, "ow_session");
@@ -6308,7 +6611,7 @@ async fn emergency_request_app(st: &S, path: &str) -> Result<Option<String>, (St
         "webhooks" => "SELECT app_id FROM webhook_subscriptions WHERE id=?",
         "incoming-webhooks" => "SELECT e.app_id FROM incoming_webhooks w JOIN envs e ON e.id=w.env_id WHERE w.id=?",
         "webhook-deliveries" => "SELECT s.app_id FROM webhook_deliveries d JOIN webhook_subscriptions s ON s.id=d.webhook_id WHERE d.id=?",
-        "tokens" => "SELECT app_id FROM tokens WHERE id=?",
+        "tokens" => "SELECT app_id FROM (SELECT id,app_id FROM tokens UNION ALL SELECT token_id AS id,app_id FROM deleted_env_receipts) t WHERE id=?",
         _ => return Ok(None),
     };
     Ok(st.db.one(sql, &[json!(parts[2])]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r, "app_id")).filter(|a| !a.is_empty())) }
@@ -6331,7 +6634,7 @@ async fn emergency_request_org(st: &S, path: &str, query: &str) -> Result<Option
         "rotations" => "SELECT a.org_id FROM rotation_schedules s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
         "proposals" => "SELECT a.org_id FROM proposals s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
         "access-requests" => "SELECT a.org_id FROM access_requests s JOIN envs e ON e.id=s.env_id JOIN apps a ON a.id=e.app_id WHERE s.id=?",
-        "tokens" => "SELECT COALESCE(NULLIF(t.org_id,''),i.org_id) AS org_id FROM tokens t LEFT JOIN identities i ON i.id=t.created_by WHERE t.id=?",
+        "tokens" => "SELECT COALESCE(NULLIF(t.org_id,''),i.org_id) AS org_id FROM (SELECT id,org_id,created_by FROM tokens UNION ALL SELECT token_id AS id,org_id,created_by FROM deleted_env_receipts) t LEFT JOIN identities i ON i.id=t.created_by WHERE t.id=?",
         "pki" | "ssh" if parts.len() > 3 => {
             // Devices and groups are looked up in their own tables; reading the
             // request id from pki_certs would miss them and skip lockdown.
@@ -6421,6 +6724,8 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
     let path = match canonical_policy_path(&raw_path) {Ok(v)=>v,Err(_)=>return bad("invalid path encoding").into_response()};
     let protected = path.starts_with("/api/") || path == "/mcp" || path.starts_with("/scim/");
     if !protected || path.starts_with("/api/auth/login") || path.starts_with("/api/auth/register") || path.starts_with("/api/auth/oidc/") || path.starts_with("/api/v1/machine") { return next.run(req).await; }
+    // Account proof carries no workspace data; the retried action still enforces its own IP policy.
+    if req.method()==axum::http::Method::POST && matches!(path.as_str(),"/api/auth/step-up/start"|"/api/auth/step-up/verify") { return next.run(req).await; }
     let headers = req.headers().clone(); let uid = st.token_user(&headers).await.ok();
     let trust_proxy = crate::envcfg::var("OPENWARP_TRUST_PROXY").map(|v| v == "1").unwrap_or(false);
     let conn_ip = req.extensions().get::<PeerAddr>().map(|c| c.0.to_string());
@@ -6432,8 +6737,12 @@ async fn ip_middleware(State(st): State<S>, req: axum::extract::Request, next: N
     let forwarded = if trust_proxy && proxy_ok { headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()) } else { None };
     let client_ip = forwarded.or(conn_ip).unwrap_or_default();
     let query = req.uri().query().unwrap_or("").to_string();
-    let allowed = if client_ip.is_empty() { false } else { match request_org(&st, &path, &query).await {
-        Some(oid) => { let list = st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(oid)]).await.ok().flatten().map(|r| db::s(&r, "ip_allowlist")).unwrap_or_default();
+    let target_org = if path.starts_with("/api/tokens/") { match emergency_request_org(&st,&path,&query).await { Ok(org)=>org, Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"token administration policy unavailable").into_response() } } else { request_org(&st,&path,&query).await };
+    let allowed = if client_ip.is_empty() { false } else { match target_org {
+        Some(oid) => { let row = match st.db.one("SELECT ip_allowlist FROM orgs WHERE id=?", &[json!(oid)]).await {
+                Ok(Some(row))=>row, Ok(None)=>return err(StatusCode::FORBIDDEN,"workspace policy no longer exists").into_response(),
+                Err(_)=>return err(StatusCode::SERVICE_UNAVAILABLE,"workspace IP policy unavailable").into_response(),
+            }; let list = db::s(&row,"ip_allowlist");
             list.trim().is_empty() || list.split(',').any(|c| ip_in_cidr(&client_ip, c)) }
         None => {
             // User and machine-identity credentials resolve through token_user and
@@ -6580,7 +6889,18 @@ async fn logout(State(st): State<S>, h: HeaderMap) -> Result<(HeaderMap, Json<Va
     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
     let mut token = auth.strip_prefix("Bearer ").unwrap_or("").to_string();
     if token.is_empty() { token = cookie_val(&h, "ow_session"); }
-    let hash = oc::hash_token(&token); let _ = st.db.exec("DELETE FROM sessions WHERE token_hash=?", &[json!(hash)]).await;
+    let hash = oc::hash_token(&token);
+    let parent = st.db.one("SELECT COALESCE(NULLIF(t.org_id,''),i.org_id) AS org_id,t.app_id FROM tokens t LEFT JOIN identities i ON i.id=t.created_by WHERE t.token_hash=? UNION ALL SELECT org_id,app_id FROM deleted_env_receipts WHERE token_hash=?", &[json!(&hash),json!(&hash)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"credential revocation unavailable"))?;
+    if let Some(parent) = parent {
+        let org = db::s(&parent,"org_id"); let app = db::s(&parent,"app_id"); let mut statements = Vec::new();
+        if !org.is_empty() { statements.push(("UPDATE orgs SET name=name WHERE id=?".into(),vec![json!(&org)])); }
+        if !app.is_empty() { statements.push(("UPDATE apps SET name=name WHERE id=? AND org_id=?".into(),vec![json!(&app),json!(&org)])); }
+        // Sharing deletion's parent locks also removes a receipt created while logout waited.
+        statements.push(("DELETE FROM tokens WHERE token_hash=?".into(),vec![json!(&hash)]));
+        statements.push(("DELETE FROM deleted_env_receipts WHERE token_hash=?".into(),vec![json!(&hash)]));
+        st.db.batch_checked(&statements,&[]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"credential revocation unavailable"))?;
+    }
+    let _ = st.db.exec("DELETE FROM sessions WHERE token_hash=?", &[json!(hash)]).await;
     // An OAuth access or refresh token is a credential too: revoke its whole pair.
     if let Ok(Some(row)) = st.db.one("SELECT pair_id FROM oauth_tokens WHERE token_hash=?", &[json!(&hash)]).await {
         let pair = db::s(&row, "pair_id");
@@ -6592,17 +6912,31 @@ async fn logout(State(st): State<S>, h: HeaderMap) -> Result<(HeaderMap, Json<Va
     Ok((headers, j(json!({"ok": true})))) }
 async fn list_tokens(State(st): State<S>, h: HeaderMap, Path(aid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let app = st.db.one("SELECT org_id FROM apps WHERE id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("app not found"))?; let org = db::s(&app,"org_id"); st.require_org(&org,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
-    let rows = st.db.query("SELECT id,app_id,env_id,name,kind,expires_at,scopes,last_used_at,created_at,created_by FROM tokens WHERE app_id=?", &[json!(aid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
+    let rows = st.db.query("SELECT id,app_id,env_id,name,kind,expires_at,scopes,last_used_at,created_at,created_by FROM tokens WHERE app_id=?", &[json!(&aid)]).await.map_err(|e| bad(&e))?;
+    let mut out: Vec<Value> = rows.iter().map(db::obj).collect();
+    let receipts = st.db.query("SELECT token_id,env_id,expires_at,deleted_at FROM deleted_env_receipts WHERE app_id=?", &[json!(&aid)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"deletion receipts unavailable"))?;
+    out.extend(receipts.iter().map(|r| json!({"id":db::s(r,"token_id"),"env_id":db::s(r,"env_id"),"kind":"deleted_env_receipt","expires_at":db::n(r,"expires_at"),"deleted_at":db::n(r,"deleted_at")})));
+    Ok(j(json!(out))) }
 async fn revoke_token(State(st): State<S>, h: HeaderMap, Path(tid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT created_by,org_id FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"token not found"))?;
-    // Admin revocation is a workspace action, so a locked membership is
-    // rejected here with the coded workspace_locked denial.
-    let org = db::s(&row,"org_id");
-    if db::s(&row,"created_by") != uid {
-        st.require_org(&org,&uid).await?;
-        if st.org_role(&org,&uid).await.as_deref() != Some("owner") && st.org_role(&org,&uid).await.as_deref() != Some("admin") { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
-    }
-    st.db.exec("DELETE FROM tokens WHERE id=?", &[json!(tid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"revoked": tid}))) }
+    let row = st.db.one("SELECT t.created_by,COALESCE(NULLIF(t.org_id,''),i.org_id) AS org_id,t.app_id FROM tokens t LEFT JOIN identities i ON i.id=t.created_by WHERE t.id=? UNION ALL SELECT created_by,org_id,app_id FROM deleted_env_receipts WHERE token_id=?", &[json!(&tid),json!(&tid)]).await.map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE,"token administration unavailable"))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"token not found"))?;
+    let org = db::s(&row,"org_id"); let app = db::s(&row,"app_id"); let creator = db::s(&row,"created_by");
+    let role = st.require_org(&org,&uid).await?;
+    if creator != uid && !matches!(role.as_str(),"owner"|"admin") { return Err(err(StatusCode::FORBIDDEN,"token owner or org admin required")); }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
+    st.token_user(&h).await?;
+    let hash = oc::hash_token(&bearer_token_or_cookie(&h));
+    // Revocation and environment deletion take parent locks in the same order.
+    let mut statements = vec![
+        ("UPDATE orgs SET name=name WHERE id=?".into(),vec![json!(&org)]),
+    ];
+    if !app.is_empty() { statements.push(("UPDATE apps SET name=name WHERE id=? AND org_id=?".into(),vec![json!(&app),json!(&org)])); }
+    let mut checked: Vec<usize> = (0..statements.len()).collect();
+    checked.push(statements.len());
+    statements.push(("UPDATE orgs SET name=name WHERE id=? AND (EXISTS (SELECT 1 FROM org_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=? AND m.user_id=? AND m.locked=0 AND u.active=1 AND u.email_verified=1 AND (?=? OR m.role IN ('owner','admin'))) OR EXISTS (SELECT 1 FROM identities i WHERE i.org_id=? AND i.id=? AND (?=? OR i.role IN ('owner','admin')))) AND (EXISTS (SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND created_at>OW_NOW()-604800) OR EXISTS (SELECT 1 FROM oauth_tokens WHERE token_hash=? AND user_id=? AND kind='access' AND expires_at>OW_NOW()) OR EXISTS (SELECT 1 FROM tokens WHERE token_hash=? AND created_by=? AND (expires_at=0 OR expires_at>OW_NOW()) AND (kind<>'machine' OR created_at>=OW_NOW()-3600)))".into(),vec![json!(&org),json!(&org),json!(&uid),json!(&creator),json!(&uid),json!(&org),json!(&uid),json!(&creator),json!(&uid),json!(&hash),json!(&uid),json!(&hash),json!(&uid),json!(&hash),json!(&uid)]));
+    statements.push(("DELETE FROM tokens WHERE id=?".into(),vec![json!(&tid)]));
+    statements.push(("DELETE FROM deleted_env_receipts WHERE token_id=?".into(),vec![json!(&tid)]));
+    st.db.batch_checked(&statements,&checked).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::CONFLICT,"token authority or parent changed; refresh and try again")} else {err(StatusCode::SERVICE_UNAVAILABLE,"token revocation unavailable")})?;
+    Ok(j(json!({"revoked": tid}))) }
 
 
 // ---------- private-network workers ----------
@@ -6737,7 +7071,7 @@ async fn create_role(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>,
     st.check_admin(&oid,&uid).await?;
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(""); if name.is_empty() || ["owner","admin","developer"].contains(&name) { return Err(bad("role name required and cannot shadow managed roles")); }
     let perms = body.get("permissions").cloned().unwrap_or(json!([]));
-    let rid = id(); st.db.exec("INSERT INTO roles(id,org_id,name,permissions) VALUES(?,?,?,?)", &[json!(rid), json!(oid), json!(name), json!(perms.to_string())]).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let rid = id(); st.db.exec("INSERT INTO roles(id,org_id,name,permissions) VALUES(?,?,?,?)", &[json!(rid), json!(oid), json!(name), json!(perms.to_string())]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": rid, "name": name, "permissions": perms}))) }
 async fn list_roles(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.require_org(&oid,&uid).await?;
     let rows = st.db.query("SELECT id,name,permissions FROM roles WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?;
@@ -6814,7 +7148,7 @@ async fn create_stream(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     let master = st.master();
     let secret_enc = if secret.is_empty() { String::new() } else { oc::encrypt_symmetric(&master, secret.as_bytes()) };
     let sid = id();
-    st.epoch_write(&[("INSERT INTO log_streams(id,org_id,name,url,secret,created_at) VALUES(?,?,?,?,?,?)".into(), vec![json!(sid), json!(oid), json!(body.get("name").and_then(|v|v.as_str()).unwrap_or("stream")), json!(url), json!(secret_enc), json!(now())])], &[], master).await.map_err(|e| if e==webhooks::EPOCH_STALE {webhooks::epoch_stale()} else {bad(&e)})?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.epoch_write(&[("INSERT INTO log_streams(id,org_id,name,url,secret,created_at) VALUES(?,?,?,?,?,?)".into(), vec![json!(sid), json!(oid), json!(body.get("name").and_then(|v|v.as_str()).unwrap_or("stream")), json!(url), json!(secret_enc), json!(now())])], &[], master).await.map_err(|e| if e==webhooks::EPOCH_STALE {webhooks::epoch_stale()} else {bad(&e)})?;
     Ok(j(json!({"id": sid}))) }
 async fn list_streams(State(st): State<S>, h: HeaderMap, Path(oid): Path<String>) -> Res { let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let rows = st.db.query("SELECT id,org_id,name,url,created_at FROM log_streams WHERE org_id=?", &[json!(oid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
@@ -6823,11 +7157,36 @@ async fn list_deliveries(State(st): State<S>, h: HeaderMap, Path(oid): Path<Stri
 
 // ---------- lease renew + rotation schedules (T09) ----------
 async fn renew_lease(State(st): State<S>, h: HeaderMap, Path(lid): Path<String>, Json(body): Json<Value>) -> Res { let uid = st.token_user(&h).await?;
-    let row = st.db.one("SELECT env_id,revoked FROM leases WHERE id=?", &[json!(lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
-    if db::n(&row,"revoked") == 1 { return Err(bad("lease revoked")); }
-    let (org, _) = st.require_env(&db::s(&row,"env_id"), &uid).await?; st.check_perm(&org, &uid, "leases:write").await?;
+    let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(&lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
+    let eid = db::s(&row,"env_id"); st.check_scope(&h, &eid).await?;
+    let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "leases:write").await?;
     let ttl = body.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(60, 30 * 86400);
-    st.db.exec("UPDATE leases SET expires_at=? WHERE id=?", &[json!(now()+ttl), json!(lid)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"id": lid, "expires_at": now()+ttl}))) }
+    let lock = lease_operation_lock(&st, &lid).await?; let mut remote_started = false;
+    let result = async {
+        let row = st.db.one("SELECT * FROM leases WHERE id=?", &[json!(&lid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"lease not found"))?;
+        if db::s(&row,"env_id") != eid { return Err(err(StatusCode::CONFLICT,"lease environment changed")); }
+        if db::n(&row,"revoked") != 0 { return Err(bad("lease revoked")); }
+        let old_expiry = db::n(&row,"expires_at");
+        if old_expiry <= now() { return Err(bad("lease expired")); }
+        let (_, target) = lease_renewal_target(&st, &row).await;
+        let target = target.map_err(|e| bad(&e))?;
+        require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?;
+        let expires_at = now()+ttl;
+        if let Some(conn) = target {
+            st.db.batch_checked(&[lease_operation_guard(&lock), ("UPDATE leases SET attempted_at=attempted_at WHERE id=? AND expires_at=? AND revoked=0 AND expires_at>OW_NOW()".into(), vec![json!(&lid),json!(old_expiry)])], &[0,1]).await.map_err(|_| err(StatusCode::CONFLICT,"lease expired or changed before remote renewal"))?;
+            remote_started = true;
+            if let Err(e) = crate::pglease::renew_role(&conn, &db::s(&row,"username"), expires_at).await {
+                if matches!(e, crate::pglease::RenewError::NotSent) { remote_started = false; return Err(bad("PostgreSQL renewal failed before sending ALTER ROLE")); }
+                return Err(err(StatusCode::CONFLICT,"PostgreSQL renewal outcome unresolved; operation claim retained, operator reconciliation required"));
+            }
+        }
+        let statements = [lease_operation_guard(&lock), ("UPDATE leases SET expires_at=? WHERE id=? AND expires_at=? AND revoked=0 AND expires_at>OW_NOW()".into(), vec![json!(expires_at),json!(&lid),json!(old_expiry)])];
+        st.audited_batch(&statements, &[0,1], [&org,&app,&eid,&uid,"lease.renew",&lid]).await.map_err(|_| err(StatusCode::CONFLICT, if remote_started { "PostgreSQL acknowledged renewal but local commit failed; operation claim retained, operator reconciliation required" } else { "lease expired or changed before renewal committed" }))?;
+        Ok(j(json!({"id":lid,"expires_at":expires_at})))
+    }.await;
+    if result.is_ok() || !remote_started { lease_operation_release(&st, &lock).await?; }
+    result
+}
 fn password_target(stype: &str) -> bool { matches!(stype, "" | "secret" | "config") }
 // Record the failure without claiming a candidate was retained when the schedule
 // never created one (for example, rejected target type or transport).
@@ -6856,19 +7215,20 @@ async fn create_rotation(State(st): State<S>, h: HeaderMap, Path(eid): Path<Stri
         if !password_target(&db::s(&target,"secret_type")) { return Err(bad("postgres-static target must be an unsealed secret or config value, not an SSH key or sealed value")); }
     }
     let static_target = if kind == "postgres-static" { json!(crate::pglease::static_target(config["connection"].as_str().unwrap_or(""),config["username"].as_str().unwrap_or("")).map_err(|e| bad(&e))?) } else { Value::Null };
-    let rid = id(); st.db.exec("INSERT INTO rotation_schedules(id,env_id,key_name,path,interval_secs,next_run,config_enc,created_at,static_target) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(rid), json!(eid), json!(key_name), json!(path), json!(interval), json!(now()+interval), json!(&config_enc), json!(now()), static_target]).await.map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let rid = id(); st.db.exec("INSERT INTO rotation_schedules(id,env_id,key_name,path,interval_secs,next_run,config_enc,created_at,static_target) VALUES(?,?,?,?,?,?,?,?,?)", &[json!(rid), json!(eid), json!(key_name), json!(path), json!(interval), json!(now()+interval), json!(&config_enc), json!(now()), static_target]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"id": rid, "next_run": now()+interval, "provider_rotation": !config_enc.is_empty(), "kind": kind}))) }
 async fn list_rotations(State(st): State<S>, h: HeaderMap, Path(eid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let (org, _) = st.require_env(&eid,&uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     let rows = st.db.query("SELECT id,env_id,key_name,path,interval_secs,next_run,enabled,created_at, CASE WHEN config_enc='' THEN 0 ELSE 1 END AS provider_rotation FROM rotation_schedules WHERE env_id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?; Ok(j(json!(rows.iter().map(db::obj).collect::<Vec<_>>()))) }
 async fn delete_rotation(State(st): State<S>, h: HeaderMap, Path(rid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM rotation_schedules WHERE id=?", &[json!(rid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"schedule not found"))?;
     let (org, _) = st.require_env(&db::s(&row,"env_id"),&uid).await?; st.check_perm(&org, &uid, "rotations:write").await?;
-    if !st.db.rotation_batch("SELECT id FROM rotation_schedules WHERE id=? AND (pending_enc<>'' OR execution_token<>'')", &[json!(rid)], &[("DELETE FROM rotation_schedules WHERE id=?".into(),vec![json!(rid)])]).await.map_err(|e| bad(&e))? { return Err(err(StatusCode::CONFLICT,"rotation pending or executing; reconcile before deletion")); } Ok(j(json!({"deleted": rid}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; if !st.db.rotation_batch("SELECT id FROM rotation_schedules WHERE id=? AND (pending_enc<>'' OR execution_token<>'')", &[json!(rid)], &[("DELETE FROM rotation_schedules WHERE id=?".into(),vec![json!(rid)])]).await.map_err(|e| bad(&e))? { return Err(err(StatusCode::CONFLICT,"rotation pending or executing; reconcile before deletion")); } Ok(j(json!({"deleted": rid}))) }
 pub async fn try_leader(st: &S, name: &str, owner: &str, ttl: i64) -> bool {
     let current = now(); let expires = current + ttl;
     if st.db.exec("UPDATE instance_leases SET owner=?,expires_at=? WHERE name=? AND (owner=? OR expires_at<?)", &[json!(owner), json!(expires), json!(name), json!(owner), json!(current)]).await.unwrap_or(0) > 0 { return true; }
     st.db.exec("INSERT INTO instance_leases(name,owner,expires_at) VALUES(?,?,?)", &[json!(name), json!(owner), json!(expires)]).await.is_ok() }
 pub async fn process_maintenance(st: &S) {
+    #[cfg(target_arch="wasm32")] let _key_guard=st.key_gate.read().await;
     #[cfg(not(target_arch="wasm32"))] let _guard=st.lifecycle.read().await;
     process_rotations_inner(st).await;
     // Legacy delivery history is retained without unsigned dispatch.
@@ -6883,21 +7243,21 @@ pub async fn process_webhooks(st: &S) { if st.epoch_ok().await.is_err() { return
 // A failed remote delete leaves the lease active and is retried after a minute.
 async fn reap_expired_leases(st: &S) {
     if st.epoch_ok().await.is_err() { return; }
-    // Skip halted scopes in the query itself: a per-row skip after LIMIT lets
-    // expired leases in a locked project occupy the page and starve siblings.
-    let rows = st.db.query("SELECT l.* FROM leases l JOIN envs e ON e.id=l.env_id JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE l.revoked=0 AND l.expires_at<=? AND l.attempted_at<=? AND a.emergency_locked=0 AND o.emergency_locked=0 ORDER BY l.expires_at LIMIT 50", &[json!(now()), json!(now() - 60)]).await.unwrap_or_default();
+    // Filter halted scopes and claimed leases before LIMIT to avoid starving siblings.
+    #[cfg(not(target_arch = "wasm32"))]
+    let claim_name = if st.db.backend() == db::Backend::Mysql { "CONCAT('lease-op:',l.id)" } else { "'lease-op:' || l.id" };
+    #[cfg(target_arch = "wasm32")]
+    let claim_name = "'lease-op:' || l.id";
+    let sql = format!("SELECT l.* FROM leases l JOIN envs e ON e.id=l.env_id JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id WHERE l.revoked=0 AND l.expires_at<=? AND l.attempted_at<=? AND a.emergency_locked=0 AND o.emergency_locked=0 AND NOT EXISTS (SELECT 1 FROM instance_leases op WHERE op.name={}) ORDER BY l.expires_at LIMIT 50", claim_name);
+    let rows = st.db.query(&sql, &[json!(now()), json!(now() - 60)]).await.unwrap_or_default();
     for row in &rows {
         if st.require_env_running(&db::s(row, "env_id")).await.is_err() { continue; }
         let lid = db::s(row, "id"); let eid = db::s(row, "env_id"); let name = db::s(row, "name");
-        let claimed = st.db.exec("UPDATE leases SET attempted_at=? WHERE id=? AND revoked=0 AND expires_at=? AND attempted_at=?", &[json!(now()), json!(&lid), json!(db::n(row, "expires_at")), json!(db::n(row, "attempted_at"))]).await.unwrap_or(0);
-        if claimed == 0 { continue; }
         let org_app = st.env_org_app(&eid).await.ok();
-        let result = if let Some((org, app)) = &org_app { revoke_lease_remote_audited(st, &lid, [org, app, &eid, "lease-scheduler", "lease.expire", &name]).await }
-            else { revoke_lease_remote(st, &lid).await };
+        let audit = org_app.as_ref().map(|(org, app)| [org.as_str(), app.as_str(), eid.as_str(), "lease-scheduler", "lease.expire", name.as_str()]);
+        let result = revoke_lease_remote_inner(st, &lid, audit, Some(db::n(row,"expires_at"))).await;
         match result {
-            Ok(()) => {
-                if org_app.is_none() { let _ = st.db.exec("UPDATE leases SET revoked=1 WHERE id=?", &[json!(&lid)]).await; }
-            }
+            Ok(()) => {}
             Err(_) => {
                 // A concurrent manual revoke may have completed first; its own
                 // response already reported the outcome.
@@ -6913,7 +7273,7 @@ pub async fn process_rotations(st: &S) { #[cfg(not(target_arch="wasm32"))] let _
 async fn process_rotations_inner(st: &S) {
     if st.epoch_ok().await.is_err() { return; }
     #[cfg(feature = "pki")]
-    if try_leader(st,"pki-expiry",&st.instance_id,3600).await { pki_expiry_alerts(st).await; }    let _ = st.db.exec("DELETE FROM instance_leases WHERE expires_at<?", &[json!(now() - 3600)]).await;
+    if try_leader(st,"pki-expiry",&st.instance_id,3600).await { pki_expiry_alerts(st).await; }    let _ = st.db.exec("DELETE FROM instance_leases WHERE expires_at<? AND name NOT LIKE 'lease-op:%'", &[json!(now() - 3600)]).await;
     let _ = st.db.exec("DELETE FROM saml_pending WHERE created_at<?", &[json!(now() - 600)]).await;
     let _ = st.db.exec("DELETE FROM saml_replay WHERE expires_at<?", &[json!(now() - 3600)]).await;
     let _ = st.db.exec("DELETE FROM rate_limits WHERE window_start<?", &[json!(now() - 86400)]).await;
@@ -6941,6 +7301,7 @@ async fn process_rotations_inner(st: &S) {
                 if let Ok((org, app)) = st.env_org_app(&eid).await { st.audit(&org,&app,&eid,"rotation-scheduler","rotation.skipped_sealed",&key_name).await; }
                 continue;
             }
+            Some(row) if wallet_type(&db::s(&row,"secret_type")) => { continue; }
             Some(row) => { let t = db::s(&row,"secret_type"); if t.is_empty() { "secret".to_string() } else { t } }
             None => {
                 if let Ok((org, app)) = st.env_org_app(&eid).await { st.audit(&org,&app,&eid,"rotation-scheduler","rotation.missing",&key_name).await; }
@@ -7958,6 +8319,7 @@ pub fn worker_routes() -> Router<S> {
 pub fn router(state: S) -> Router {
     let mcp = Router::new().route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), deleted_env_receipt_middleware))
         .layer(axum::middleware::from_fn(peer_middleware)).with_state(state.clone());
     api_router(state).merge(mcp)
 }
@@ -8009,6 +8371,7 @@ fn api_router(state: S) -> Router {
         .route("/api/orgs/{oid}/audit", get(audit_list)).route("/api/orgs/{oid}/audit/verify", get(audit_verify)).route("/api/orgs/{oid}/roles", get(list_roles).post(create_role)).route("/api/orgs/{oid}/log-streams", get(list_streams).post(create_stream)).route("/api/orgs/{oid}/log-streams/deliveries", get(list_deliveries)).route("/api/orgs/{oid}/settings", get(get_org_settings).put(org_settings)).route("/api/orgs/{oid}/features", get(org_features)).route("/api/orgs/{oid}/rotation-hook", get(get_rotation_hook).put(put_rotation_hook).delete(delete_rotation_hook)).route("/api/orgs/{oid}/teams", get(list_teams).post(create_team)).route("/api/orgs/{oid}/teams/{tid}/members", get(list_team_members).post(add_team_member)).route("/api/orgs/{oid}/teams/{tid}/members/{uid}", delete(remove_team_member))
         .route("/api/apps/{aid}", axum::routing::patch(update_app).delete(delete_app)).route("/api/apps/{aid}/settings", get(get_app_settings).put(put_app_settings)).route("/api/apps/{aid}/envs", get(list_envs).post(create_env)).route("/api/apps/{aid}/envs/e2e", post(create_e2e_env)).route("/api/apps/{aid}/tokens", get(list_tokens).post(create_token)).route("/api/tokens/{tid}", delete(revoke_token)).route("/api/orgs/{oid}/identities", get(list_identities).post(create_identity)).route("/api/orgs/{oid}/identities/{iid}", delete(delete_identity)).route("/api/orgs/{oid}/identities/{iid}/rotate", post(rotate_identity)).route("/api/orgs/{oid}/runners", get(list_runners).post(create_runner)).route("/api/orgs/{oid}/runners/{rid}", delete(delete_runner)).route("/api/runner/jobs", get(runner_jobs)).route("/api/runner/jobs/{jid}/result", post(runner_job_result)).route("/api/v1/machine/auth/universal/login", post(universal_login))
         .route("/api/envs/{eid}", delete(delete_env).patch(update_env)).route("/api/envs/{eid}/policy", put(set_env_policy)).route("/api/envs/{eid}/clone", post(clone_env)).route("/api/envs/{eid}/compare", get(compare_envs)).route("/api/envs/{eid}/team-grants", get(list_team_grants).post(add_team_grant)).route("/api/envs/{eid}/team-grants/{tid}", delete(remove_team_grant))
+        .route("/api/envs/{eid}/secrets/{sid}/reveal", get(reveal_wallet))
         .route("/api/envs/{eid}/secrets", get(list_secrets).put(deploy_secrets)).route("/api/envs/{eid}/tags", get(list_tags)).route("/api/envs/{eid}/secrets/reuse-check", post(reuse_check)).route("/api/envs/{eid}/e2e/secrets", get(e2e_get).put(e2e_put)).route("/api/envs/{eid}/e2e/meta", get(e2e_meta)).route("/api/envs/{eid}/e2e/rekey", post(e2e_rekey)).route("/api/envs/{eid}/e2e/grant", post(e2e_grant)).route("/api/envs/{eid}/e2e/grants", get(e2e_grants)).route("/api/envs/{eid}/e2e/grants/{uid}", delete(e2e_revoke)).route("/api/users/lookup", get(user_lookup))
         .route("/api/envs/{eid}/export", get(export_env)).route("/api/envs/{eid}/import", post(deploy_secrets)).route("/api/envs/{eid}/scan", get(scan_env)).route("/api/envs/{eid}/meta", get(env_meta)).route("/api/envs/{eid}/wrap", post(create_wrap)).route("/api/unwrap", get(lookup_wrap).post(consume_wrap))
         .route("/api/envs/{eid}/integrations", get(list_integrations).post(create_integration))
@@ -8067,6 +8430,7 @@ fn api_router(state: S) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), emergency_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), deleted_env_receipt_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), lifecycle_middleware))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(metrics_middleware))
@@ -8079,6 +8443,7 @@ fn api_router(state: S) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), emergency_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), oauth_scope_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), deleted_env_receipt_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), lifecycle_middleware))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(metrics_middleware))
@@ -8090,46 +8455,61 @@ fn api_router(state: S) -> Router {
        .layer(axum::middleware::from_fn_with_state(state, key_middleware))
 }
 
-// ---------- step-up verification ----------
-// This is the same protocol as the auth-hardening branch (428 plus an
-// X-OpenWarp-Step-Up grant), kept to the minimum SSH issuance needs so the two
-// implementations collapse when that branch merges. Only privileged SSH
-// principals enforce it here.
+// Step-up is an additional human-session check, not authorization. Each
+// sensitive HTTP handler calls it after its own policy and input checks.
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum StepUpRisk { Ok, TwoFactor, VeryRisky }
+pub(crate) enum StepUpRisk { Ok, TwoFactor, VeryRisky }
 impl StepUpRisk {
     fn as_str(self) -> &'static str { match self { StepUpRisk::Ok => "ok", StepUpRisk::TwoFactor => "two_factor", StepUpRisk::VeryRisky => "very_risky" } }
     fn parse(s: &str) -> Self { match s { "very_risky" => StepUpRisk::VeryRisky, "two_factor" => StepUpRisk::TwoFactor, _ => StepUpRisk::Ok } }
-    #[cfg(feature = "ssh-ca")]
-    fn rank(self) -> u8 { match self { StepUpRisk::Ok => 0, StepUpRisk::TwoFactor => 1, StepUpRisk::VeryRisky => 2 } } }
+}
 
 fn six_digit_code() -> String { use rand_core::RngCore; let mut b = [0u8; 4]; rand_core::OsRng.fill_bytes(&mut b); format!("{:06}", u32::from_le_bytes(b) % 1_000_000) }
 
-/// Only a real account can satisfy a second factor. A machine identity has no
-/// TOTP secret and no mailbox, so it must never look like a stepped-up human.
+// Credential class comes from the presented session row, never the account
+// behind a service or OAuth token. Authentication still runs before this lookup.
 async fn step_up_user(st: &S, h: &HeaderMap) -> Option<String> {
     let uid = st.token_user(h).await.ok()?;
-    st.db.one("SELECT id FROM users WHERE id=?", &[json!(&uid)]).await.ok().flatten().map(|_| uid) }
+    let bearer = bearer_token(h); let token = if bearer.is_empty() { cookie_val(h, "ow_session") } else { bearer };
+    st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=?", &[json!(oc::hash_token(&token)), json!(&uid)]).await.ok().flatten().map(|_| uid) }
 
-async fn has_totp(st: &S, uid: &str) -> bool { meta_get(st, &format!("totp_enabled:{}", uid)).await == "1" }
+async fn has_totp(st: &S, uid: &str) -> Result<bool, (StatusCode, Json<Value>)> {
+    Ok(st.db.one("SELECT v FROM meta WHERE k=?", &[json!(format!("totp_enabled:{}", uid))]).await.map_err(|e| bad(&e))?.map(|r| db::s(&r,"v") == "1").unwrap_or(false)) }
 
-#[cfg(feature = "ssh-ca")]
-async fn consume_step_up_grant(st: &S, uid: &str, risk: StepUpRisk, raw: &str) -> bool {
-    let hash = oc::hash_token(raw.trim());
-    let Ok(Some(row)) = st.db.one("SELECT risk FROM step_up_grants WHERE token_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(uid), json!(now())]).await else { return false };
-    if StepUpRisk::parse(&db::s(&row, "risk")).rank() < risk.rank() { return false; }
-    st.db.exec("UPDATE step_up_grants SET used=1 WHERE token_hash=? AND used=0", &[json!(&hash)]).await.unwrap_or(0) > 0 }
+async fn consume_step_up_grant(st: &S, h: &HeaderMap, uid: &str, risk: StepUpRisk, raw: &str) -> Result<bool, (StatusCode, Json<Value>)> {
+    let bearer = bearer_token(h); let token = if bearer.is_empty() { cookie_val(h, "ow_session") } else { bearer };
+    let allowed = if risk == StepUpRisk::VeryRisky { "very_risky" } else { "two_factor" };
+    Ok(st.db.exec("UPDATE step_up_grants SET used=1 WHERE token_hash=? AND user_id=? AND used=0 AND expires_at>? AND (risk=? OR risk='very_risky') AND EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.user_id=? AND s.created_at>=? AND u.active=1 AND u.email_verified=1)",
+        &[json!(oc::hash_token(raw.trim())), json!(uid), json!(now()), json!(allowed), json!(oc::hash_token(&token)), json!(uid), json!(now()-7*86400)]).await.map_err(|e| bad(&e))? == 1) }
 
-#[cfg(feature = "ssh-ca")]
-async fn require_step_up(st: &S, h: &HeaderMap, uid: &str, risk: StepUpRisk) -> Result<(), (StatusCode, Json<Value>)> {
-    let totp = has_totp(st, uid).await;
+#[derive(Debug, PartialEq, Eq)]
+enum StepUpCredential { Session, Automation, Unknown }
+async fn step_up_credential(st: &S, hash: &str, uid: &str) -> Result<StepUpCredential, (StatusCode, Json<Value>)> {
+    if st.db.one("SELECT user_id FROM sessions WHERE token_hash=? AND user_id=? AND created_at>=?", &[json!(hash), json!(uid), json!(now()-7*86400)]).await.map_err(|e| bad(&e))?.is_some() { return Ok(StepUpCredential::Session); }
+    if st.db.one("SELECT user_id FROM oauth_tokens WHERE token_hash=? AND user_id=? AND kind='access' AND expires_at>?", &[json!(hash), json!(uid), json!(now())]).await.map_err(|e| bad(&e))?.is_some() { return Ok(StepUpCredential::Automation); }
+    if st.db.one("SELECT created_by FROM tokens WHERE token_hash=? AND created_by=?", &[json!(hash), json!(uid)]).await.map_err(|e| bad(&e))?.is_some() { return Ok(StepUpCredential::Automation); }
+    Ok(StepUpCredential::Unknown)
+}
+
+// Call only after the handler's authorization and input validation, before its
+// first write or external effect. Automation keeps its existing scope checks.
+pub(crate) async fn require_step_up(st: &S, h: &HeaderMap, uid: &str, risk: StepUpRisk) -> Result<(), (StatusCode, Json<Value>)> {
+    let current = st.token_user(h).await?;
+    if current != uid { return Err(err(StatusCode::UNAUTHORIZED, "credential changed")); }
+    let bearer = bearer_token(h); let token = if bearer.is_empty() { cookie_val(h, "ow_session") } else { bearer };
+    match step_up_credential(st, &oc::hash_token(&token), uid).await? {
+        StepUpCredential::Session => {},
+        StepUpCredential::Automation => return Ok(()),
+        StepUpCredential::Unknown => return Err(err(StatusCode::UNAUTHORIZED, "credential changed")),
+    }
+    let totp = has_totp(st, uid).await?;
     let email = mailer::MailConfig::from_env().enabled();
     if risk == StepUpRisk::TwoFactor && !totp { return Ok(()); }
     if risk == StepUpRisk::VeryRisky && !email {
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "this action needs an emailed verification code, but no email provider is configured")); }
     if let Some(raw) = h.get("x-openwarp-step-up").and_then(|v| v.to_str().ok()) {
-        if consume_step_up_grant(st, uid, risk, raw).await { return Ok(()); } }
+        if consume_step_up_grant(st, h, uid, risk, raw).await? { return Ok(()); } }
     Err((StatusCode::PRECONDITION_REQUIRED, Json(json!({
         "error": "step-up verification required",
         "step_up_required": true,
@@ -8149,7 +8529,7 @@ async fn step_up_start(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpSt
     let key = format!("stepup-start:{}", uid);
     if !st.rate_ok(&key, 5, 900).await { return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many verification requests; try again later")); }
     st.rate_fail(&key, 900).await;
-    let totp = has_totp(&st, &uid).await;
+    let totp = has_totp(&st, &uid).await?;
     if risk == StepUpRisk::TwoFactor && !totp { return Ok(j(json!({"not_required": true, "methods": []}))); }
     let need_email = risk == StepUpRisk::VeryRisky;
     if need_email && !mailer::MailConfig::from_env().enabled() {
@@ -8177,7 +8557,10 @@ async fn step_up_verify(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpV
     let row = st.db.one("SELECT * FROM step_up_challenges WHERE challenge_hash=? AND user_id=? AND used=0 AND expires_at>?", &[json!(&hash), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?
         .ok_or_else(|| bad("verification request is invalid or expired"))?;
     let risk = StepUpRisk::parse(&db::s(&row, "risk"));
-    let need_totp = db::n(&row, "need_totp") == 1; let need_email = db::n(&row, "need_email") == 1;
+    let snapshot_totp = db::n(&row, "need_totp") == 1; let need_email = db::n(&row, "need_email") == 1;
+    let current_totp = has_totp(&st, &uid).await?;
+    if snapshot_totp && !current_totp { return Err(bad("verification request is invalid or expired")); }
+    let need_totp = snapshot_totp || (risk == StepUpRisk::VeryRisky && current_totp);
     let mut ok = true;
     if need_email {
         let expected = db::s(&row, "email_code_hash");
@@ -8185,13 +8568,13 @@ async fn step_up_verify(State(st): State<S>, h: HeaderMap, Json(r): Json<StepUpV
     if ok && need_totp { match otp_ok(&st, &uid, &r.totp).await { Ok(v)=>{ if !v { ok=false; } }, Err(e)=>return Err(mfa_failure(e)) } }
     if !ok {
         st.rate_fail(&key, 900).await;
-        let attempts = db::n(&row, "attempts") + 1;
-        let _ = st.db.exec("UPDATE step_up_challenges SET attempts=?,used=CASE WHEN ?>=5 THEN 1 ELSE used END WHERE challenge_hash=?", &[json!(attempts), json!(attempts), json!(&hash)]).await;
+        st.db.exec("UPDATE step_up_challenges SET used=CASE WHEN attempts>=4 THEN 1 ELSE used END,attempts=attempts+1 WHERE challenge_hash=? AND user_id=? AND used=0 AND attempts<5 AND expires_at>?", &[json!(&hash), json!(&uid), json!(now())]).await.map_err(|e| bad(&e))?;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid verification code")); }
-    let _ = st.db.exec("UPDATE step_up_challenges SET used=1 WHERE challenge_hash=?", &[json!(&hash)]).await;
     let grant = oc::random_token("stepupg");
-    st.db.exec("INSERT INTO step_up_grants(token_hash,user_id,risk,created_at,expires_at,used) VALUES(?,?,?,?,?,0)",
-        &[json!(oc::hash_token(&grant)), json!(&uid), json!(risk.as_str()), json!(now()), json!(now() + 300)]).await.map_err(|e| bad(&e))?;
+    st.db.batch_checked(&[
+        ("UPDATE step_up_challenges SET used=1 WHERE challenge_hash=? AND user_id=? AND used=0 AND attempts<5 AND expires_at>?".into(), vec![json!(&hash), json!(&uid), json!(now())]),
+        ("INSERT INTO step_up_grants(token_hash,user_id,risk,created_at,expires_at,used) VALUES(?,?,?,?,?,0)".into(), vec![json!(oc::hash_token(&grant)), json!(&uid), json!(risk.as_str()), json!(now()), json!(now()+300)]),
+    ], &[0,1]).await.map_err(|_| bad("verification request is invalid or expired"))?;
     st.audit("", "", "", &uid, "auth.step_up", risk.as_str()).await;
     Ok(j(json!({"token": grant, "risk": risk.as_str(), "expires_in": 300}))) }
 
@@ -8219,7 +8602,7 @@ async fn create_ssh_ca(State(st): State<S>, h: HeaderMap, Path(oid): Path<String
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let name = if name.is_empty() { "ssh-ca".to_string() } else { name };
     let forwarding = body.get("allow_forwarding").and_then(|v| v.as_bool()).unwrap_or(false);
-    let (secret, public) = ssh_ca::generate_ca().map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; let (secret, public) = ssh_ca::generate_ca().map_err(|e| bad(&e))?;
     let cid = id();
     statements.push((("INSERT INTO pki_cas(id,org_id,name,cert_pem,key_enc,serial,kind,allow_forwarding,created_at) VALUES(?,?,?,?,?,?,?,?,?)").to_string(), ([json!(&cid), json!(oid), json!(&name), json!(&public), json!(oc::encrypt_symmetric(&master, secret.as_bytes())), json!(""), json!("ssh"), json!(if forwarding { 1 } else { 0 }), json!(now())]).to_vec()));
     st.audited_batch_master(&statements, &[], [&oid, "", "", &uid, "ssh.ca.create", &name], master).await.map_err(master_write_error)?;
@@ -8287,7 +8670,7 @@ async fn put_ssh_grants(State(st): State<S>, h: HeaderMap, Path(caid): Path<Stri
         granted.push(role);
     }
     for (sql, params) in &stmts { statements.push((sql.clone(),params.clone())); }
-    st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.ca.grants", &format!("{} role(s): {}", granted.len(), granted.join(","))]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.ca.grants", &format!("{} role(s): {}", granted.len(), granted.join(","))]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"ca_id": caid, "roles": granted}))) }
 
 #[cfg(feature = "ssh-ca")]
@@ -8309,10 +8692,8 @@ async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, J
     // root, or any principal admitted by a bare * grant, is root-equivalent on
     // every host that trusts this CA, so it needs a fresh second factor.
     let privileged = principal == "root" || patterns.iter().any(|p| p == "*");
-    if privileged {
-        if step_up_user(&st, &h).await.is_none() {
-            return Err(err(StatusCode::FORBIDDEN, "a machine identity cannot request a privileged principal; an admin must sign it from a signed-in session")); }
-        require_step_up(&st, &h, &uid, StepUpRisk::VeryRisky).await?; }
+    if privileged && step_up_user(&st, &h).await.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "a machine identity cannot request a privileged principal; an admin must sign it from a signed-in session")); }
     let ttl = ssh_ca::clamp_ttl(body.get("ttl").and_then(|v| v.as_i64()), db::n(&grant, "max_ttl"));
     let key = oc::decrypt_symmetric(&st.master(), &db::s(&ca, "key_enc")).map_err(|e| bad(&e))?;
     let cert_id = id();
@@ -8323,6 +8704,7 @@ async fn ssh_sign(State(st): State<S>, h: HeaderMap, Path(caid): Path<String>, J
     // Read the certificate back before storing it: if what we minted does not
     // parse, the caller gets an error rather than an unusable credential.
     let verified = ssh_ca::describe(&signed.certificate).map_err(|e| bad(&format!("the minted certificate did not parse back: {}", e)))?;
+    require_step_up(&st, &h, &uid, if privileged { StepUpRisk::VeryRisky } else { StepUpRisk::TwoFactor }).await?;
     statements.push((("INSERT INTO ssh_certs(id,ca_id,key_id,principal,public_key,cert,serial,actor,revoked,valid_after,valid_before,created_at) VALUES(?,?,?,?,?,?,?,?,0,?,?,?)").to_string(), [json!(&cert_id), json!(&caid), json!(&key_id), json!(&principal), json!(&public_key), json!(&signed.certificate),
           json!(signed.serial as i64), json!(&uid), json!(signed.valid_after), json!(signed.valid_before), json!(now())].to_vec()));
     st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.sign", &format!("{} principal={} serial={} ttl={}s", key_id, principal, signed.serial, ttl)]).await.map_err(|e|bad(&e))?;
@@ -8346,7 +8728,7 @@ async fn revoke_ssh_cert(State(st): State<S>, h: HeaderMap, Path(cid): Path<Stri
     let org = db::s(&ca, "org_id");
     st.check_admin(&org, &uid).await?;
     statements.push((("UPDATE ssh_certs SET revoked=1 WHERE id=?").to_string(), ([json!(&cid)]).to_vec()));
-    st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.revoke", &cid]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.revoke", &cid]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"revoked": cid}))) }
 
 // sshd's RevokedKeys file. There is no KRL writer, so this plus the short
@@ -8400,7 +8782,7 @@ async fn add_ssh_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<String
         return Ok(j(json!({"id": db::s(&row, "id"), "hostname": hostname, "fingerprint": fingerprint, "existing": true}))); }
     let hid = id();
     statements.push((("INSERT INTO ssh_hosts(id,ca_id,hostname,public_key,fingerprint,created_at) VALUES(?,?,?,?,?,?)").to_string(), ([json!(&hid), json!(&caid), json!(&hostname), json!(&public_key), json!(&fingerprint), json!(now())]).to_vec()));
-    st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.host.add", &format!("{} {}", hostname, fingerprint)]).await.map_err(|e|bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&statements, &[], [&org, "", "", &uid, "ssh.host.add", &format!("{} {}", hostname, fingerprint)]).await.map_err(|e|bad(&e))?;
     Ok(j(json!({"id": hid, "hostname": hostname, "fingerprint": fingerprint}))) }
 
 #[cfg(feature = "ssh-ca")]
@@ -8419,7 +8801,7 @@ async fn delete_ssh_host(State(st): State<S>, h: HeaderMap, Path((caid, hid)): P
     let ca = ssh_ca_row(&st, &caid).await?;
     let org = db::s(&ca, "org_id");
     st.check_admin(&org, &uid).await?;
-    st.audited_batch(&[("DELETE FROM ssh_hosts WHERE id=? AND ca_id=?".into(), vec![json!(&hid), json!(&caid)])], &[0], [&org, "", "", &uid, "ssh.host.remove", &hid]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::NOT_FOUND, "host not found")} else {bad(&e)})?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; st.audited_batch(&[("DELETE FROM ssh_hosts WHERE id=? AND ca_id=?".into(), vec![json!(&hid), json!(&caid)])], &[0], [&org, "", "", &uid, "ssh.host.remove", &hid]).await.map_err(|e| if e.contains("version conflict") {err(StatusCode::NOT_FOUND, "host not found")} else {bad(&e)})?;
     Ok(j(json!({"deleted": hid}))) }
 
 #[cfg(feature = "ssh-ca")]
@@ -8440,7 +8822,7 @@ async fn ssh_sign_host(State(st): State<S>, h: HeaderMap, Path(caid): Path<Strin
     let key = oc::decrypt_symmetric(&st.master(), &db::s(&ca, "key_enc")).map_err(|e| bad(&e))?;
     let cert_id = id();
     let key_id = format!("{}{}", ssh_ca::KEY_ID_PREFIX, cert_id);
-    let signed = ssh_ca::sign_host_cert(&String::from_utf8_lossy(&key), &hostname, &public_key, &key_id, ttl, now()).map_err(|e| bad(&e))?;
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; let signed = ssh_ca::sign_host_cert(&String::from_utf8_lossy(&key), &hostname, &public_key, &key_id, ttl, now()).map_err(|e| bad(&e))?;
     let verified = ssh_ca::describe(&signed.certificate).map_err(|e| bad(&format!("the minted certificate did not parse back: {}", e)))?;
     statements.push((("INSERT INTO ssh_certs(id,ca_id,key_id,principal,public_key,cert,serial,actor,revoked,cert_type,valid_after,valid_before,created_at) VALUES(?,?,?,?,?,?,?,?,0,'host',?,?,?)").to_string(), [json!(&cert_id), json!(&caid), json!(&key_id), json!(&hostname), json!(&public_key), json!(&signed.certificate),
           json!(signed.serial as i64), json!(&uid), json!(signed.valid_after), json!(signed.valid_before), json!(now())].to_vec()));
@@ -8612,6 +8994,25 @@ mod tests {
         for (method, path) in [(Method::POST, "/api/apps/a1/envs"), (Method::POST, "/api/apps/a1/envs/e2e"), (Method::GET, "/api/apps/a1/settings"), (Method::PATCH, "/api/envs/e1")] {
             assert!(!admin_scope_path(&method, path), "{} {}", method, path);
         }
+    }
+    #[tokio::test]
+    async fn step_up_credential_classifies_live_revoked_and_service_credentials() {
+        let db = Db::open_memory().await.unwrap(); let st = test_state(db);
+        st.db.exec("INSERT INTO users(id,email,pass_hash,pubkey,wrapped_privkey,created_at) VALUES('u1','stepup@example.test','','','',1)", &[]).await.unwrap();
+        let session = oc::hash_token("stepup-session");
+        st.db.exec("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,'u1',?)", &[json!(&session), json!(now())]).await.unwrap();
+        st.db.exec("INSERT INTO meta(k,v) VALUES('totp_enabled:u1','1')", &[]).await.unwrap();
+        let mut h = HeaderMap::new(); h.insert("authorization", "Bearer stepup-session".parse().unwrap());
+        assert_eq!(step_up_credential(&st, &session, "u1").await.unwrap(), StepUpCredential::Session);
+        assert_eq!(require_step_up(&st, &h, "u1", StepUpRisk::TwoFactor).await.unwrap_err().0, StatusCode::PRECONDITION_REQUIRED);
+        st.db.exec("DELETE FROM sessions WHERE token_hash=?", &[json!(&session)]).await.unwrap();
+        assert_eq!(step_up_credential(&st, &session, "u1").await.unwrap(), StepUpCredential::Unknown);
+        assert_eq!(require_step_up(&st, &h, "u1", StepUpRisk::TwoFactor).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        let token = oc::hash_token("stepup-service");
+        st.db.exec("INSERT INTO tokens(id,name,token_hash,created_at,created_by) VALUES('t1','service',?,?,'u1')", &[json!(&token), json!(now())]).await.unwrap();
+        h.insert("authorization", "Bearer stepup-service".parse().unwrap());
+        assert_eq!(step_up_credential(&st, &token, "u1").await.unwrap(), StepUpCredential::Automation);
+        assert!(require_step_up(&st, &h, "u1", StepUpRisk::TwoFactor).await.is_ok());
     }
     #[tokio::test]
     async fn workspace_delete_preserves_pending_leases_then_allows_confirmed_revocation() {

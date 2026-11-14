@@ -39,7 +39,9 @@ curl --fail-with-body --silent --show-error \
   "${OPENWARP_HOST}/api/me"
 ```
 
-A successful response includes identity fields such as `id`, `email` and `pubkey`, plus `env_scope`. An environment-scoped token cannot be assumed to list all workspaces or applications. Use `GET /api/envs/{env_id}/meta` for metadata about the environment it is permitted to access.
+An ordinary successful response includes identity fields such as `id`, `email` and `pubkey`, plus `env_scope`. An environment-scoped token cannot be assumed to list all workspaces or applications. Use `GET /api/envs/{env_id}/meta` for metadata about the environment it is permitted to access.
+
+Deleting an environment removes its ordinary tokens. Eligible live, static human-owned read tokens retain a separate deletion receipt for at most 30 days, capped by the original expiry. A receipt accepts only the exact Bearer credential and `GET /api/me` (only `{"env_scope":"original-id"}`), `GET /api/envs/{original-id}/meta` (only `id`, `name`, `app`, `workspace` snapshots), and `GET /api/envs/{original-id}/export` with no query or exactly `?base=1`. Export returns 404 `{"error":"environment deleted","code":"environment_deleted"}`. Other paths, methods, HEAD and queries return 403; receipts cannot authenticate normal API or MCP operations or cookie sessions. Current creator status, unlocked membership, read permission, surviving parents, IP policy and emergency policy are checked before every receipt response. Invalid, expired or revoked receipts return 401; policy denials and unavailable checks are not deletion signals. Ordinary authenticated app token lists mark retained entries with `kind: "deleted_env_receipt"`; authorised creators or workspace owners/admins revoke them by original ID through `DELETE /api/tokens/{id}`, subject to current authentication and step-up checks.
 
 The examples require a curl version with `--fail-with-body`. This preserves error bodies while returning a failing exit code for HTTP errors. Those bodies can contain sensitive details; do not copy them into public logs without review.
 
@@ -56,6 +58,31 @@ For an identity permitted to enumerate the corresponding resources:
 | `GET /api/envs/{env_id}/secrets` | Read secrets subject to permissions and secret type |
 
 Encode identifiers as URL path segments. Prefer a client library over building URLs from untrusted strings. A path and a secret key together may be needed to disambiguate names within an environment.
+
+## Wallet storage and reveal
+
+In SSE environments, ordinary secret PUT accepts `wallet_private_key` and
+`wallet_recovery_phrase`. Values are opaque UTF-8 strings: whitespace and
+`${...}` text are preserved exactly. An existing wallet requires its exact
+current type on every edit; omitted types, downgrades and switching wallet kinds
+return 400. Ordinary records can be promoted to a wallet type.
+
+Lists return wallet metadata with `value: null`. History masks all versions of a
+current wallet, including versions before promotion, and always masks wallet-typed
+versions. Export (including `base=1`), clone, wrapping, references, provider sync,
+runner jobs and local AI value matching exclude wallet values. Personal overrides
+are refused. Restore and point-in-time recovery refuse wallet type mismatches.
+
+`GET /api/envs/{eid}/secrets/{sid}/reveal` returns `{"value":"..."}` for the
+current shared wallet value only. It requires a live cookie or Bearer account
+session, current environment and path access, `secrets:read`, and a single-use
+`very_risky` grant in `X-OpenWarp-Step-Up`. Obtain that grant through the existing
+step-up start/verify endpoints using emailed proof plus configured TOTP. Missing
+proof returns 428; missing mail configuration returns 503. OAuth, service, machine
+and workload credentials cannot reveal wallets, even with another account's
+grant. Audit failure denies the response; successful reveals record
+`wallet.reveal` without values or proof material. There is no signing endpoint
+or server-side E2E wallet decryption.
 
 ## Export shared values
 
@@ -101,7 +128,30 @@ Many errors use `{"error":"message"}`. Some authentication and verification flow
 | `501` | Feature unavailable on this build or deployment target |
 | `503` from `/health` | Database connectivity or query failure |
 
-A step-up response can include `step_up_required: true`. Supported interactive flows obtain a short-lived grant and send it as `X-OpenWarp-Step-Up`. This is not a signal to retry with a more privileged automation token. See [security](SECURITY.md) for protected actions and [troubleshooting](TROUBLESHOOTING.md) for access diagnosis.
+A protected human-session action returns `428` with `step_up_required: true`,
+`risk` (`two_factor` or `very_risky`), `totp_required` and `email_required`.
+POST `{"risk":"very_risky"}` (or `two_factor`) to
+`/api/auth/step-up/start` using the same account session. Its response names a
+`challenge` and the required `methods`. POST that challenge plus `totp` and/or
+`email_code` to `/api/auth/step-up/verify`. The returned `token` goes in
+`X-OpenWarp-Step-Up` on one retry of the original action. Challenges last ten
+minutes and allow five failed code attempts; grants last five minutes and are
+consumed once. A very risky grant can satisfy a major action, not the reverse.
+
+Both cookie and Bearer account sessions use this contract. Service, OAuth and
+machine credentials cannot complete it and retain their existing scopes and
+policy restrictions. A grant does not replace authorization or revive a revoked
+session. Handler authorization and local input validation precede consumption;
+an operation can still fail afterwards on a concurrent conflict or external
+provider failure, so do not retry effects blindly. A very risky action returns
+`503` if mail is unconfigured. See [deployment](DEPLOY.md#step-up-verification)
+for the action tiers and [troubleshooting](TROUBLESHOOTING.md) for access diagnosis.
+
+## Dynamic lease renewal
+
+`GET /api/leases/{id}` retains lease metadata and reports `renewable` only for an active, resolved local generic lease or a directly managed PostgreSQL lease with a permitted target. Expired, revoked, pending, corrupt, unsupported and worker-delivered leases report false. Provider credentials, including AWS STS sessions and OpenRouter keys, cannot be renewed in place.
+
+`POST /api/leases/{id}/renew` requires the caller's environment scope, environment access and `leases:write` permission, plus the normal account-session step-up when applicable. `ttl_secs` follows issuance: an integer defaults to 3600 when absent or not an integer and is clamped to 60 through 2592000 seconds. The deadline is measured from renewal time. A successful response contains `id` and the exact committed `expires_at`; it does not replace the issued credential. PostgreSQL success requires acknowledgement of `ALTER ROLE ... VALID UNTIL` before the checked local update and audit commit. A conflict after that acknowledgement is an error requiring reconciliation, not proof that the remote change was undone. See [lease operation recovery](SECURITY.md#dynamic-lease-operation-recovery).
 
 ## Protocol and specialised surfaces
 

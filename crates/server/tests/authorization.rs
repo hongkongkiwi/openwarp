@@ -131,6 +131,25 @@ impl Server {
         self.finish(req.send().await).await
     }
 
+    async fn call_stepped_up(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Resp {
+        let r = self.call(method.clone(), path, token, body.clone()).await;
+        if r.status != 428 || r.body["step_up_required"] != true { return r; }
+        let Some(token) = token else { return r; };
+        let Some(risk) = r.body["risk"].as_str() else { return r; };
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": risk}))).await;
+        if start.status != 200 || start.body["email_sent"] != true { return r; }
+        let Some(challenge) = start.body["challenge"].as_str() else { return r; };
+        let text = wait_for_new_proof_mail(&self.inbox, before).await;
+        let Some(code) = six_digit(&text) else { return r; };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        if verified.status != 200 { return r; }
+        let Some(grant) = verified.body["token"].as_str() else { return r; };
+        let mut req = self.client.request(method, self.url(path)).bearer_auth(token).header("x-openwarp-step-up", grant);
+        if let Some(body) = body { req = req.json(&body); }
+        self.finish(req.send().await).await
+    }
+
     async fn call_with_headers(&self, path: &str, token: &str, body: Value, headers: &[(&str, &str)]) -> Resp {
         let mut req = self.client.post(self.url(path)).bearer_auth(token).json(&body);
         for (k, v) in headers {
@@ -202,6 +221,16 @@ async fn wait_for_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str) -> String {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("no email containing {:?} arrived", needle);
+}
+
+async fn wait_for_new_proof_mail(inbox: &Arc<Mutex<Vec<Value>>>, before: usize) -> String {
+    for _ in 0..60 {
+        { let guard = inbox.lock().unwrap();
+          if let Some(m) = guard.iter().skip(before).rev().find(|m| m["subject"] == "Your OpenWarp verification code" && m["text"].as_str().unwrap_or("").contains("Your verification code is ")) {
+              return m["text"].as_str().unwrap_or("").to_string(); } }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no new step-up verification email arrived");
 }
 
 fn extract_link(text: &str, needle: &str) -> String {
@@ -487,7 +516,7 @@ async fn changing_the_oidc_issuer_requires_a_new_client_secret() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     let r = s
-        .call(
+        .call_stepped_up(
             Method::PUT,
             &format!("/api/orgs/{}/settings", org),
             Some(token),
@@ -496,7 +525,7 @@ async fn changing_the_oidc_issuer_requires_a_new_client_secret() {
         .await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s
-        .call(
+        .call_stepped_up(
             Method::PUT,
             &format!("/api/orgs/{}/settings", org),
             Some(token),
@@ -837,7 +866,7 @@ async fn settings_round_trip_preserves_the_oidc_secret() {
     let u = register(&s, "settings@test.invalid").await;
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({
         "oidc_issuer": "https://idp.example",
         "oidc_client_id": "client",
         "oidc_client_secret": "top-secret-value",
@@ -852,7 +881,7 @@ async fn settings_round_trip_preserves_the_oidc_secret() {
     assert_eq!(r.body["oidc_client_secret_set"], true);
     assert!(!r.text.contains("top-secret-value"), "the client secret must never be returned: {}", r.text);
 
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"ip_allowlist": "127.0.0.1/32"}))).await;
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"ip_allowlist": "127.0.0.1/32"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/orgs/{}/settings", org), Some(token), None).await;
     assert_eq!(r.body["oidc_issuer"], "https://idp.example", "a partial update must not clear OIDC: {}", r.text);
@@ -1039,7 +1068,7 @@ async fn ownership_can_be_transferred_and_a_member_can_leave() {
 
     let r = s.call(Method::PATCH, &format!("/api/orgs/{}/members/{}", org, mid), Some(ot), Some(json!({"role": "admin"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/transfer", org), Some(ot), Some(json!({"user_id": mid}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/transfer", org), Some(ot), Some(json!({"user_id": mid}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, "/api/orgs", Some(mt), None).await;
     assert!(r.body.as_array().unwrap().iter().any(|o| o["id"] == org && o["role"] == "owner"), "the grantee must own the org: {}", r.text);
@@ -1184,7 +1213,7 @@ async fn crl_lists_revoked_certificates() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     grant_features(&s, token, org, &["pki"]).await;
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "test-ca"}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "test-ca"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let ca = r.body["id"].as_str().unwrap().to_string();
     let r = s.call(Method::POST, &format!("/api/pki/cas/{}/issue", ca), Some(token), Some(json!({"cn": "service"}))).await;
@@ -1206,10 +1235,10 @@ async fn master_key_rotation_keeps_existing_data_readable() {
     let org = u["org_id"].as_str().unwrap();
     let (_, envs) = app_with_envs(&s, token, org).await;
     set_secret(&s, token, &envs[0], "KEEP", "value").await;
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"oidc_issuer": "https://idp.example", "oidc_client_id": "c", "oidc_client_secret": "s"}))).await;
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(token), Some(json!({"oidc_issuer": "https://idp.example", "oidc_client_id": "c", "oidc_client_secret": "s"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let new_key = { use base64ct::{Base64, Encoding}; Base64::encode_string(&[7u8; 32]) };
-    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token), Some(json!({"new_key": new_key}))).await;
+    let r = s.call_stepped_up(Method::POST, "/api/instance/rotate-master", Some(token), Some(json!({"new_key": new_key}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/envs/{}/secrets", envs[0]), Some(token), None).await;
     assert!(r.body["secrets"].as_array().unwrap().iter().any(|x| x["key"] == "KEEP" && x["value"] == "value"), "{}", r.text);
@@ -1226,7 +1255,7 @@ async fn ocsp_reports_good_then_revoked() {
     let token = u["token"].as_str().unwrap();
     let org = u["org_id"].as_str().unwrap();
     grant_features(&s, token, org, &["pki"]).await;
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "ocsp-ca"}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": "ocsp-ca"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let ca = r.body["id"].as_str().unwrap().to_string();
     let ca_pem = r.body["certificate"].as_str().unwrap().to_string();
@@ -1289,7 +1318,7 @@ async fn saml_sp_round_trip_signs_validates_and_provisions() {
         .build().unwrap()).unwrap();
     let idp_metadata = idp.metadata_xml().to_string();
 
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/saml", org), Some(token), Some(json!({
         "idp_entity_id": idp_entity,
         "metadata_xml": idp_metadata,
         "allow_unsigned_metadata": true,
@@ -1456,7 +1485,7 @@ async fn reuse_check_survives_master_key_rotation() {
 
     // 32 bytes of 0x01, base64. The value is irrelevant as long as it is not
     // the generated key already in use.
-    let r = s.call(Method::POST, "/api/instance/rotate-master", Some(token),
+    let r = s.call_stepped_up(Method::POST, "/api/instance/rotate-master", Some(token),
         Some(json!({"new_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}))).await;
     assert_eq!(r.status, 200, "rotation failed: {}", r.text);
 
@@ -1620,13 +1649,13 @@ async fn reuse_check_respects_workspace_and_project_switches() {
     let app_row = r.body.as_array().expect("app array").iter().find(|a| a["id"] == json!(&app)).expect("app row");
     assert_eq!(app_row["reuse_check"], json!(true), "the app list carries the switch: {}", r.text);
 
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": false}))).await;
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": false}))).await;
     assert_eq!(r.status, 200, "disable workspace check failed: {}", r.text);
     let r = reuse_check(&s, ot, &envs[1], candidates.clone(), json!([])).await;
     assert_eq!(enabled(&r), json!(false), "{}", r.text);
     assert_eq!(match_count(&r), 0, "{}", r.text);
 
-    let r = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": true}))).await;
+    let r = s.call_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(ot), Some(json!({"reuse_check": true}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::PUT, &format!("/api/apps/{}/settings", app), Some(ot), Some(json!({"reuse_check": false}))).await;
     assert_eq!(r.status, 200, "disable project check failed: {}", r.text);
@@ -1817,7 +1846,7 @@ async fn ssh_ca_principals_are_gated_by_role_grants() {
     let org = owner["org_id"].as_str().unwrap().to_string();
     grant_features(&s, &ot, &org, &["ssh-ca", "pki"]).await;
 
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "ssh-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
     let ca = r.body["id"].as_str().expect("ca id").to_string();
     assert!(r.body["public_key"].as_str().unwrap().starts_with("ssh-ed25519 "), "the CA must be an OpenSSH key, not PEM: {}", r.text);
@@ -1930,7 +1959,7 @@ async fn ssh_host_certificates_need_a_registered_name_and_key() {
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
     grant_features(&s, &ot, &org, &["ssh-ca"]).await;
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "hosts-ca"}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "hosts-ca"}))).await;
     assert_eq!(r.status, 200, "create ssh ca: {}", r.text);
     let ca = r.body["id"].as_str().expect("ca id").to_string();
 
@@ -1992,7 +2021,6 @@ async fn ssh_host_certificates_need_a_registered_name_and_key() {
     assert_eq!(r.header("content-type"), "application/octet-stream");
 }
 
-#[cfg(feature = "ssh-ca")]
 fn six_digit(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_digit()).filter(|t| t.len() == 6).map(|t| t.to_string()).next()
 }
@@ -2005,7 +2033,7 @@ async fn a_root_equivalent_certificate_needs_a_second_factor() {
     let ot = owner["token"].as_str().unwrap().to_string();
     let org = owner["org_id"].as_str().unwrap().to_string();
     grant_features(&s, &ot, &org, &["ssh-ca"]).await;
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "step-ca"}))).await;
+    let r = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/ssh/cas", org), Some(&ot), Some(json!({"name": "step-ca"}))).await;
     let ca = r.body["id"].as_str().expect("ca id").to_string();
     let r = ssh_grants(&s, &ca, &ot, json!({"grants": [{"role": "owner", "principals": ["*"]}]})).await;
     assert_eq!(r.status, 200, "grant the star pattern: {}", r.text);
@@ -2145,7 +2173,7 @@ async fn enterprise_features_need_a_build_and_a_workspace_grant() {
         let granted = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["pki"]}))).await;
         assert_eq!(granted.status, 200, "grant failed: {}", granted.text);
         assert_eq!(granted.body["features"], json!(["pki"]));
-        let open = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "internal-ca"}))).await;
+        let open = s.call_stepped_up(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "internal-ca"}))).await;
         assert_eq!(open.status, 200, "a granted workspace must create a CA: {}", open.text);
 
         go_ungranted(&s, &token, &org).await;

@@ -21,13 +21,13 @@ Methods:
 
 - `me()`, `orgs()`, `apps(org)`, `envs(app)`
 - `secrets(env)`: returns the list inside the `secrets` response field.
-- `get_secret(env, key)`: returns the first matching secret dictionary, ignoring key case.
+- `get_secret(env, key, path=None)`: returns the unique matching secret dictionary, ignoring key case and matching an optional path exactly.
 - `set_secret(env, key, value, path="/", type="secret", comment="")`: sends a one-secret PUT with empty tags; returns the deployment response, including `sync_errors`.
-- `delete_secret(env, key)`: looks up the secret ID, then deletes it.
+- `delete_secret(env, key, path=None)`: resolves the unique secret ID, then deletes it.
 - `export(env)`: returns the dictionary containing `text` and `secrets`.
 - `leases(env)`, `create_lease(env, name, ttl_secs=3600)`, `audit(org)`
 
-Other methods return decoded JSON unchanged. Empty successful responses return `None`. Missing keys raise `OpenWarpError` with status 404 and an empty body. Duplicate keys across paths resolve to the first match in the server response.
+Other methods return decoded JSON unchanged. Empty successful responses return `None`. Get and delete without a path remain compatible for keys unique across paths. A supplied path is verbatim: `/team/`, `/team`, and `/TEAM/` are distinct. Missing matches raise `OpenWarpError` with status 404 and an empty body; multiple matches raise status 409, including multiple records at an explicitly selected path. Neither error sends a delete request. These methods read every reported page and reject invalid pagination or more than 100,000 records with status 0. A legacy initial response with only `total` is accepted when it equals the returned count; other incomplete metadata is rejected. Pages are not a snapshot, so concurrent changes can affect selection. `secrets(env)` still returns the first page.
 
 HTTP failures retain the status, parsed error message when available, and raw text body in `OpenWarpError`. Transport failures use status 0. Invalid JSON responses raise the same error with the response status. There are no retries. Error bodies and returned secrets are sensitive.
 

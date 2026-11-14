@@ -118,12 +118,44 @@ class OpenWarp:
     def secrets(self, env):
         return self._request("GET", f"/api/envs/{self._segment(env)}/secrets")["secrets"]
 
-    def get_secret(self, env, key):
-        """Return the first case-insensitive key match, or raise a 404 error."""
-        for secret in self.secrets(env):
-            if secret["key"].casefold() == key.casefold():
-                return secret
-        raise OpenWarpError(404, f"Secret not found: {key}", "")
+    def _complete_secrets(self, env):
+        url = f"/api/envs/{self._segment(env)}/secrets"
+        offset, total, secrets = 0, None, []
+        while True:
+            page = self._request("GET", url if offset == 0 else f"{url}?offset={offset}")
+            if not isinstance(page, dict) or not isinstance(page.get("secrets"), list):
+                raise OpenWarpError(0, "Invalid secret pagination response", "")
+            items = page["secrets"]
+            fields = ("total", "limit", "offset")
+            if offset == 0 and "limit" not in page and "offset" not in page:
+                if (len(items) > 100_000 or ("total" in page
+                        and (type(page["total"]) is not int or page["total"] != len(items)))):
+                    raise OpenWarpError(0, "Invalid secret pagination response", "")
+                return items
+            if any(type(page.get(field)) is not int for field in fields):
+                raise OpenWarpError(0, "Invalid secret pagination response", "")
+            page_total, limit, page_offset = (page[field] for field in fields)
+            if (page_total < 0 or page_total > 100_000 or limit < 1 or limit > 1000
+                    or page_offset != offset or (total is not None and total != page_total)
+                    or len(items) > limit or offset > page_total or len(items) > page_total - offset
+                    or (offset < page_total and not items)):
+                raise OpenWarpError(0, "Invalid secret pagination response", "")
+            total = page_total
+            offset += len(items)
+            secrets.extend(items)
+            if offset == total:
+                return secrets
+
+    def get_secret(self, env, key, path=None):
+        """Return a unique case-insensitive key match at the optional exact path."""
+        matches = [secret for secret in self._complete_secrets(env)
+                   if secret["key"].casefold() == key.casefold()
+                   and (path is None or secret["path"] == path)]
+        if len(matches) > 1:
+            raise OpenWarpError(409, f"Ambiguous secret: {key} matches multiple records", "")
+        if not matches:
+            raise OpenWarpError(404, f"Secret not found: {key}", "")
+        return matches[0]
 
     def set_secret(self, env, key, value, path="/", type="secret", comment=""):
         return self._request("PUT", f"/api/envs/{self._segment(env)}/secrets", {
@@ -131,8 +163,8 @@ class OpenWarp:
                          "type": type, "comment": comment, "tags": ""}]
         })
 
-    def delete_secret(self, env, key):
-        secret = self.get_secret(env, key)
+    def delete_secret(self, env, key, path=None):
+        secret = self.get_secret(env, key, path)
         return self._request("DELETE", f"/api/secrets/{self._segment(secret['id'])}")
 
     def export(self, env):

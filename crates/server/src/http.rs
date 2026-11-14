@@ -30,6 +30,64 @@ pub async fn provider_post_bounded(request: RequestBuilder, limit: usize) -> Res
     read_bounded(response, limit).await
 }
 
+#[cfg(feature = "saml")]
+pub(crate) async fn saml_metadata_get(raw: &str) -> Result<String, String> {
+    const LIMIT: usize = 2_000_000;
+    let timeout = std::time::Duration::from_secs(10);
+    crate::integration_http::validate_integration_url(raw).map_err(|_| "invalid SAML metadata URL")?;
+    let url = reqwest::Url::parse(raw).map_err(|_| "invalid SAML metadata URL")?;
+    let restrict = crate::integration_http::restricted();
+    let host = url.host_str().ok_or("invalid SAML metadata URL")?.trim_start_matches('[').trim_end_matches(']');
+    if restrict && (host.trim_end_matches('.').eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| !crate::integration_http::ip_allowed(ip))) {
+        return Err("SAML metadata URL blocked by egress policy".into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let bytes = {
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(timeout)
+            .dns_resolver(std::sync::Arc::new(crate::integration_http::Resolver { restrict, blocked: Default::default() }))
+            .build().map_err(|_| "SAML metadata transport unavailable")?;
+        let operation = async {
+            let response = client.get(url).send().await.map_err(|_| "SAML metadata request failed")?;
+            if !response.status().is_success() { return Err("SAML metadata request failed".to_string()); }
+            read_bounded(response, LIMIT).await.map_err(|_| "SAML metadata response unreadable or too large".to_string())
+        };
+        tokio::time::timeout(timeout, operation).await.map_err(|_| "SAML metadata request timed out")??
+    };
+    #[cfg(target_arch = "wasm32")]
+    let bytes = SendFuture::new(async move {
+        use futures_util::StreamExt;
+        // Fetch cannot enforce connector DNS policy; protected deployments use metadata_xml.
+        if restrict { return Err("SAML metadata URL fetch requires native DNS enforcement; supply metadata_xml".to_string()); }
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Get).with_redirect(worker::RequestRedirect::Manual);
+        let request = worker::Request::new_with_init(url.as_str(), &init).map_err(|_| "invalid SAML metadata URL")?;
+        struct AbortOnDrop(Option<worker::AbortController>);
+        impl Drop for AbortOnDrop { fn drop(&mut self) { if let Some(controller) = self.0.take() { controller.abort(); } } }
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let _abort = AbortOnDrop(Some(controller));
+        let operation = async {
+            let mut response = worker::Fetch::Request(request).send_with_signal(&signal).await.map_err(|_| "SAML metadata request failed")?;
+            if !(200..300).contains(&response.status_code()) { return Err("SAML metadata request failed".to_string()); }
+            let mut stream = response.stream().map_err(|_| "SAML metadata response unreadable")?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| "SAML metadata response unreadable")?;
+                if chunk.len() > LIMIT - bytes.len() { return Err("SAML metadata response too large".into()); }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        };
+        let deadline = worker::Delay::from(timeout);
+        futures_util::pin_mut!(operation, deadline);
+        match futures_util::future::select(deadline, operation).await {
+            futures_util::future::Either::Left(_) => Err("SAML metadata request timed out".into()),
+            futures_util::future::Either::Right((result, _)) => result,
+        }
+    }).await?;
+    String::from_utf8(bytes).map_err(|_| "SAML metadata must be UTF-8".into())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod inner {
     pub use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -44,7 +102,7 @@ mod inner {
     /// Unsafe `Send` for a future that must stay on one thread. A Worker
     /// isolate is single-threaded, so this cannot be observed.
     pub struct SendFuture<F>(F);
-    impl<F> SendFuture<F> { fn new(f: F) -> Self { Self(f) } }
+    impl<F> SendFuture<F> { pub(crate) fn new(f: F) -> Self { Self(f) } }
     unsafe impl<F> Send for SendFuture<F> {}
     impl<F: std::future::Future> std::future::Future for SendFuture<F> {
         type Output = F::Output;

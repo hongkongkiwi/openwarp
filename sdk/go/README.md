@@ -43,15 +43,15 @@ Methods, with the context argument omitted here:
 - `Me()` returns `map[string]any`.
 - `Orgs()`, `Apps(org)`, `Envs(app)` return `[]Org`, `[]App`, `[]Env`.
 - `Secrets(env)` returns `[]Secret` from the response envelope.
-- `GetSecret(env, key)` returns the first case-insensitive key match as `Secret`.
+- `GetSecret(env, key)` returns the unique case-insensitive key match as `Secret`. `GetSecretAtPath(env, key, path)` also matches the exact path.
 - `SetSecret(env, key, value, path, secretType, comment)` returns the deployment response as `map[string]any`, including `sync_errors`. Empty path and type use `/` and `secret`. Tags are sent as an empty string.
-- `DeleteSecret(env, key)` resolves the ID first, then returns the deletion response as `map[string]any` (nil for an empty response).
+- `DeleteSecret(env, key)` resolves the ID first, then returns the deletion response as `map[string]any` (nil for an empty response). `DeleteSecretAtPath(env, key, path)` selects the exact path.
 - `Export(env)` returns `map[string]any` containing `text` and `secrets`.
 - `Leases(env)` returns `[]Lease`.
 - `CreateLease(env, name, ttlSecs)` returns `Lease`. Pass `3600` for a one-hour lease.
 - `Audit(org)` returns `[]map[string]any`.
 
-Missing keys return `*APIError` with status 404 and an empty body. Duplicate keys across paths resolve to the first match in the server response. HTTP failures return `*APIError` with `Status`, `Message`, and raw text `Body`. Invalid JSON also returns `*APIError` with the response status. Use `errors.As` to inspect it. Transport and context failures retain their standard Go errors. There are no retries. Do not log error bodies or secret values.
+Get and delete without a path remain compatible for keys unique across paths. AtPath methods match paths verbatim: `/team/`, `/team`, and `/TEAM/` are distinct. Missing matches return `*APIError` with status 404 and an empty body; multiple matches return status 409, including multiple records at an explicitly selected path. Neither error sends a delete request. These methods read every reported page and reject invalid pagination or more than 100,000 records with status 0. A legacy initial response with only `total` is accepted when it equals the returned count; other incomplete metadata is rejected. Pages are not a snapshot, so concurrent changes can affect selection. `Secrets(env)` still returns the first page. HTTP failures return `*APIError` with `Status`, `Message`, and raw text `Body`. Invalid JSON also returns `*APIError` with the response status. Use `errors.As` to inspect it. Transport and context failures retain their standard Go errors. There are no retries. Do not log error bodies or secret values.
 
 Run the local HTTP mock tests from this directory:
 

@@ -66,6 +66,27 @@ impl Server {
         let r = r.send().await.expect("HTTP request"); let status = r.status().as_u16();
         let text = r.text().await.unwrap(); Resp { status, body: serde_json::from_str(&text).unwrap_or(Value::Null) }
     }
+    async fn create_root_ca(&self, org: &str, session: &str) -> Value {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.ok(Method::POST, "/api/auth/step-up/start", session, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start["methods"], json!(["email"]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            let text = self.inbox.lock().unwrap().iter().skip(before).find_map(|m| {
+                if m["subject"] == "Your OpenWarp verification code" { m["text"].as_str().map(str::to_string) } else { None }
+            });
+            if let Some(text) = text { break text; }
+            assert!(Instant::now() < deadline, "fresh step-up email missing");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let code = text.split(|c: char| !c.is_ascii_digit()).find(|v| v.len() == 6).expect("emailed verification code");
+        let verified = self.ok(Method::POST, "/api/auth/step-up/verify", session, Some(json!({"challenge": start["challenge"], "email_code": code}))).await;
+        let grant = verified["token"].as_str().expect("step-up grant");
+        let r = self.client.post(format!("{}/api/orgs/{}/pki/cas", self.base, org)).bearer_auth(session)
+            .header("x-openwarp-step-up", grant).json(&json!({"name": "group-root"})).send().await.expect("create root CA");
+        let status = r.status().as_u16(); let body: Value = r.json().await.expect("root CA response");
+        assert_eq!(status, 200, "root CA must succeed: {}", body); body
+    }
     async fn ok(&self, method: Method, path: &str, session: &str, body: Option<Value>) -> Value {
         let r = self.call(method.clone(), path, Some(session), body).await;
         assert_eq!(r.status, 200, "{} {} must succeed: {}", method, path, r.body); r.body
@@ -95,7 +116,7 @@ async fn setup(s: &Server) -> Fixture {
     let envs = s.ok(Method::GET, &format!("/api/apps/{}/envs", app["id"].as_str().unwrap()), &owner, None).await;
     let env = envs.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
     s.ok(Method::PUT, &format!("/api/envs/{}/policy", env), &owner, Some(json!({"restricted": true}))).await;
-    let ca = s.ok(Method::POST, &format!("/api/orgs/{}/pki/cas", org), &owner, Some(json!({"name": "group-root"}))).await;
+    let ca = s.create_root_ca(&org, &owner).await;
     let ca = ca["id"].as_str().unwrap().to_string();
     let group = s.ok(Method::POST, &format!("/api/pki/cas/{}/groups", ca), &owner, Some(json!({"name": "unscoped-fleet"}))).await;
     assert_eq!(group["env_id"], ""); let group = group["id"].as_str().unwrap().to_string();

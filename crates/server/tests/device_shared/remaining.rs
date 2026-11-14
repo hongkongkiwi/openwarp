@@ -71,6 +71,29 @@ impl Server {
         let r = r.send().await.expect("HTTP request"); let status = r.status().as_u16();
         let text = r.text().await.unwrap(); Resp { status, body: serde_json::from_str(&text).unwrap_or(Value::Null) }
     }
+    async fn create_root_ca(&self, org: &str, token: &str) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.post("/api/auth/step-up/start", Some(token), json!({"risk": "very_risky"})).await;
+        assert_eq!(start.status, 200, "start email proof: {}", start.body);
+        assert_eq!(start.body["methods"], json!(["email"]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            let text = self.inbox.lock().unwrap().iter().skip(before).find_map(|m| {
+                if m["subject"] == "Your OpenWarp verification code" { m["text"].as_str().map(str::to_string) } else { None }
+            });
+            if let Some(text) = text { break text; }
+            assert!(Instant::now() < deadline, "fresh step-up email missing");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let code = text.split(|c: char| !c.is_ascii_digit()).find(|v| v.len() == 6).expect("emailed verification code");
+        let verified = self.post("/api/auth/step-up/verify", Some(token), json!({"challenge": start.body["challenge"], "email_code": code})).await;
+        assert_eq!(verified.status, 200, "verify email proof: {}", verified.body);
+        let grant = verified.body["token"].as_str().expect("step-up grant");
+        let r = self.client.post(format!("{}/api/orgs/{}/pki/cas", self.base, org)).bearer_auth(token)
+            .header("x-openwarp-step-up", grant).json(&json!({"name": "renew-root"})).send().await.expect("create root CA");
+        let status = r.status().as_u16(); let text = r.text().await.unwrap();
+        Resp { status, body: serde_json::from_str(&text).unwrap_or(Value::Null) }
+    }
     async fn post(&self, path: &str, token: Option<&str>, body: Value) -> Resp { self.call(Method::POST, path, token, Some(body)).await }
     async fn get(&self, device: &str, token: &str) -> Value {
         let r = self.call(Method::GET, &format!("/api/pki/devices/{}", device), Some(token), None).await;
@@ -108,7 +131,7 @@ async fn setup(s: &Server) -> (String, String, String) {
     assert_eq!(r.status, 200, "login"); let token = r.body["token"].as_str().unwrap().to_string();
     let g = s.call(Method::PUT, "/api/instance/features", Some(&token), Some(json!({"org": org, "features": ["pki"]}))).await;
     assert_eq!(g.status, 200, "grant pki: {:?}", g.body);
-    let r = s.post(&format!("/api/orgs/{}/pki/cas", org), Some(&token), json!({"name": "renew-root"})).await;
+    let r = s.create_root_ca(&org, &token).await;
     assert_eq!(r.status, 200, "CA"); (token, org, r.body["id"].as_str().unwrap().to_string())
 }
 async fn device(s: &Server, token: &str, ca: &str) -> String {

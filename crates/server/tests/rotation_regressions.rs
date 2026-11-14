@@ -1,15 +1,41 @@
-use axum::{body::{to_bytes, Body}, http::Request, Router};
+use axum::{body::{to_bytes, Body}, extract::State, http::Request, routing::post, Json, Router};
 use openwarp_crypto as oc;
 use openwarp_server::{db::Db, new_state, process_maintenance, router, S};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const OLD: &str = "openwarp-regression-old-password";
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
+type Inbox = Arc<Mutex<Vec<Value>>>;
+async fn capture_mail(State(inbox): State<Inbox>, Json(body): Json<Value>) -> Json<Value> {
+    inbox.lock().unwrap().push(body); Json(json!({}))
+}
+async fn read_mail(State(inbox): State<Inbox>) -> Json<Value> { Json(json!(inbox.lock().unwrap().clone())) }
+struct MailRelay(tokio::task::JoinHandle<()>);
+impl Drop for MailRelay { fn drop(&mut self) { self.0.abort(); } }
+async fn isolated_case(name: &'static str, target: &str) {
+    if std::env::var("OPENWARP_ROTATION_REGRESSION_CHILD").as_deref() == Ok(name) {
+        pending_password_blocks_delete(target).await; return;
+    }
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mail", socket.local_addr().unwrap());
+    let app = Router::new().route("/mail", post(capture_mail).get(read_mail)).with_state(Inbox::default());
+    let _relay = MailRelay(tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); }));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Isolate mail configuration in this exact test's child, never the shared test process.
+    for (key, _) in std::env::vars_os() {
+        let key_name = key.to_string_lossy();
+        if (key_name.starts_with("OPENWARP_") && key_name != "OPENWARP_TEST_STATIC_PG") || matches!(key_name.as_ref(), "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY" | "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy") { command.env_remove(key); }
+    }
+    command.args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("OPENWARP_ROTATION_REGRESSION_CHILD", name).env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", url);
+    let output = tokio::task::spawn_blocking(move || command.output().expect("run isolated rotation fixture")).await.unwrap();
+    assert!(output.status.success(), "isolated rotation fixture failed ({:?})\n{}\n{}", output.status.code(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
 struct Allow(Option<String>);
 impl Drop for Allow {
     fn drop(&mut self) { match &self.0 { Some(v) => std::env::set_var("OPENWARP_ALLOWED_DB_HOSTS", v), None => std::env::remove_var("OPENWARP_ALLOWED_DB_HOSTS") } }
@@ -50,10 +76,12 @@ impl Fixture {
         assert_eq!(f.call("PUT", "/api/envs/env/secrets", json!({"secrets":[{"key":"DB_PASSWORD","value":OLD,"path":"/"}]})).await.0, 200);
         f
     }
-    async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        let request = Request::builder().method(method).uri(path).header("authorization", "Bearer owner")
-            .header("content-type", "application/json").extension(openwarp_server::PeerAddr(std::net::IpAddr::from([127,0,0,1])))
-            .body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
+    async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) { self.call_with_grant(method, path, body, None).await }
+    async fn call_with_grant(&self, method: &str, path: &str, body: Value, grant: Option<&str>) -> (u16, Value) {
+        let mut request = Request::builder().method(method).uri(path).header("authorization", "Bearer owner")
+            .header("content-type", "application/json").extension(openwarp_server::PeerAddr(std::net::IpAddr::from([127,0,0,1])));
+        if let Some(grant) = grant { request = request.header("x-openwarp-step-up", grant); }
+        let request = request.body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
         let r = self.app.clone().oneshot(request).await.unwrap(); let status = r.status().as_u16();
         let bytes = to_bytes(r.into_body(), 1024*1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
@@ -68,8 +96,26 @@ impl Fixture {
         self.state.db().one("SELECT pending_enc FROM rotation_schedules WHERE id=?", &[json!(rid)]).await.unwrap()
             .map(|r| r["pending_enc"].as_str().unwrap().into())
     }
+    async fn export_grant(&self) -> String {
+        let relay = std::env::var("OPENWARP_EMAIL_WEBHOOK").expect("isolated mail relay");
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+        let before: Vec<Value> = client.get(&relay).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let (status, started) = self.call("POST", "/api/auth/step-up/start", json!({"risk":"very_risky"})).await;
+        assert_eq!(status, 200, "start positive export email proof");
+        assert_eq!(started["email_sent"], true, "export proof must send email");
+        let inbox: Vec<Value> = client.get(&relay).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let mail = inbox.get(before.len()).expect("fresh verification email");
+        assert_eq!(mail["to"], "owner@test.invalid", "proof belongs to the exporting owner");
+        let text = mail["text"].as_str().unwrap();
+        let code = text.split_once("Your verification code is ").expect("email verification code").1
+            .split(|c: char| !c.is_ascii_digit()).next().filter(|s| s.len() == 6).expect("six-digit email proof");
+        let (status, verified) = self.call("POST", "/api/auth/step-up/verify", json!({"challenge":started["challenge"],"email_code":code})).await;
+        assert_eq!(status, 200, "verify positive export email proof");
+        verified["token"].as_str().filter(|s| !s.is_empty()).expect("fresh export grant").into()
+    }
     async fn value(&self) -> String {
-        let (status, body) = self.call("GET", "/api/envs/env/export?base=1", Value::Null).await;
+        let grant = self.export_grant().await;
+        let (status, body) = self.call_with_grant("GET", "/api/envs/env/export?base=1", Value::Null, Some(&grant)).await;
         assert_eq!(status,200,"{}",body);
         body["secrets"].as_array().unwrap().iter().find(|s| s["key"]=="DB_PASSWORD").unwrap()["value"].as_str().unwrap().into()
     }
@@ -118,8 +164,8 @@ async fn pending_password_blocks_delete(target: &str) {
 }
 
 #[tokio::test]
-async fn pending_remote_password_blocks_schedule_deletion() { pending_password_blocks_delete("schedule").await; }
+async fn pending_remote_password_blocks_schedule_deletion() { isolated_case("pending_remote_password_blocks_schedule_deletion", "schedule").await; }
 #[tokio::test]
-async fn pending_remote_password_blocks_environment_deletion() { pending_password_blocks_delete("envs/env").await; }
+async fn pending_remote_password_blocks_environment_deletion() { isolated_case("pending_remote_password_blocks_environment_deletion", "envs/env").await; }
 #[tokio::test]
-async fn pending_remote_password_blocks_application_deletion() { pending_password_blocks_delete("apps/app").await; }
+async fn pending_remote_password_blocks_application_deletion() { isolated_case("pending_remote_password_blocks_application_deletion", "apps/app").await; }

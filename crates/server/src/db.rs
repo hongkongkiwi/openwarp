@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(db.version().await.unwrap(), crate::migrate::MIGRATIONS.last().map(|m| m.version).unwrap_or(0), "a fresh database lands on the current version");
         db.migrate().await.unwrap();
         let row = db.one("SELECT COUNT(*) AS n FROM schema_migrations", &[]).await.unwrap().unwrap();
-        assert_eq!(n(&row, "n"), 38, "each migration must be recorded exactly once");
+        assert_eq!(n(&row, "n"), 39, "each migration must be recorded exactly once");
         let squashed = db.one("SELECT COUNT(*) AS n FROM schema_migrations WHERE checksum='squashed'", &[]).await.unwrap().unwrap();
         assert_eq!(n(&squashed, "n"), 16, "the baseline replaces versions 2 through 17");
     }
@@ -853,6 +853,26 @@ mod tests {
         assert_eq!(mysql_sql("INSERT INTO saml_replay(key,expires_at) VALUES(?,?)"), "INSERT INTO saml_replay(`key`,expires_at) VALUES(?,?)");
         assert_eq!(mysql_sql("SELECT count FROM rate_limits WHERE key=?"), "SELECT count FROM rate_limits WHERE `key`=?");
         assert_eq!(mysql_sql("INSERT INTO rate_limits(key,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)"), "INSERT INTO rate_limits(`key`,window_start,count) VALUES(?,?,1) ON DUPLICATE KEY UPDATE count = IF(window_start <= ?, 1, count + 1)");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test] fn deleted_env_receipt_ddl_preserves_keys_and_payloads() {
+        let migration = crate::migrate::MIGRATIONS.iter().find(|m| m.version == 39).expect("migration 39 defines deleted environment receipts");
+        let statements = crate::migrate::split_sql(migration.sql);
+        let receipt = statements.iter().find(|sql| sql.starts_with("CREATE TABLE deleted_env_receipts(")).expect("the receipt table is created");
+        let ddl = mysql_sql(receipt);
+        assert!(ddl.contains("`token_id` VARCHAR(255) PRIMARY KEY"), "the original token ID remains the primary key: {}", ddl);
+        assert!(ddl.contains("`token_hash` VARCHAR(255) NOT NULL UNIQUE"), "credential hashes must stay unique and indexable: {}", ddl);
+        for column in ["created_by", "org_id", "app_id"] {
+            assert!(ddl.contains(&format!("`{}` VARCHAR(255) NOT NULL", column)), "receipt cleanup indexes require indexable columns: {}", ddl);
+        }
+        for column in ["env_name", "app_name", "workspace_name", "scopes"] {
+            assert!(ddl.contains(&format!("`{}` TEXT NOT NULL", column)), "receipt metadata must not be truncated to an indexable identifier: {}", ddl);
+        }
+        assert!(ddl.ends_with("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"), "receipt identifiers must compare case-sensitively: {}", ddl);
+        for sql in &statements {
+            assert_eq!(pg_sql(sql), *sql, "canonical receipt DDL must pass through PostgreSQL unchanged");
+            if sql.starts_with("CREATE INDEX ") { assert_eq!(mysql_sql(sql), *sql, "receipt indexes must survive MySQL adaptation"); }
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test] fn mysql_ddl_promotes_inline_unique_columns() {

@@ -42,6 +42,8 @@ pub struct MailMessage {
 
 impl MailConfig {
     pub fn from_env() -> Self {
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        if let Ok(cfg) = test_mail::CONFIG.try_with(Clone::clone) { return cfg; }
         let env = |k: &str| crate::envcfg::var(k).unwrap_or_default();
         let smtp_host = env("OPENWARP_SMTP_HOST");
         let resend_key = env("OPENWARP_RESEND_API_KEY");
@@ -290,6 +292,63 @@ async fn check(resp: crate::http::Response) -> Result<(), String> {
     if status.is_success() { return Ok(()); }
     let body = resp.text().await.unwrap_or_default();
     Err(format!("email provider returned HTTP {}: {}", status, body.chars().take(400).collect::<String>()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod test_mail {
+    use super::*;
+
+    tokio::task_local! { pub(super) static CONFIG: MailConfig; }
+
+    pub(crate) async fn scope<F: std::future::Future>(cfg: MailConfig, future: F) -> F::Output {
+        CONFIG.scope(cfg, future).await
+    }
+
+    pub(crate) struct Relay {
+        config: MailConfig,
+        mail: tokio::sync::mpsc::UnboundedReceiver<Value>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Relay {
+        pub(crate) async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, mail) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().route("/mail", axum::routing::post(move |axum::Json(message): axum::Json<Value>| async move {
+                tx.send(message).expect("mail fixture receiver");
+                axum::http::StatusCode::OK
+            }));
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let config = MailConfig { provider: "webhook".into(), webhook_url: format!("http://{addr}/mail"), ..Default::default() };
+            Self { config, mail, task }
+        }
+        pub(crate) fn config(&self) -> MailConfig { self.config.clone() }
+        pub(crate) async fn code(&mut self, recipient: &str) -> String {
+            let message = tokio::time::timeout(Duration::from_secs(5), self.mail.recv()).await.expect("local verification mail timeout").expect("local verification mail");
+            assert_eq!(message["to"], recipient);
+            message["text"].as_str().expect("mail text").split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6).expect("emailed six-digit code").to_string()
+        }
+    }
+    impl Drop for Relay { fn drop(&mut self) { self.task.abort(); } }
+
+    #[tokio::test]
+    async fn configuration_is_isolated_between_concurrent_tasks_and_not_inherited() {
+        let baseline = MailConfig::from_env();
+        let mut first = Relay::start().await; let mut second = Relay::start().await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let send = |cfg: MailConfig, barrier: std::sync::Arc<tokio::sync::Barrier>| tokio::spawn(scope(cfg.clone(), async move {
+            barrier.wait().await; tokio::task::yield_now().await;
+            let current = MailConfig::from_env(); assert!(current.enabled()); assert_eq!(current.webhook_url, cfg.webhook_url);
+            let child = tokio::spawn(async { let cfg = MailConfig::from_env(); (cfg.provider, cfg.webhook_url) }).await.unwrap();
+            super::send(&current, &render("stepup", "fixture@example.test", &[("code", "123456")])).await.unwrap();
+            child
+        }));
+        let (a, b) = tokio::join!(send(first.config(), barrier.clone()), send(second.config(), barrier));
+        for child in [a.unwrap(), b.unwrap()] { assert_eq!(child, (baseline.provider.clone(), baseline.webhook_url.clone())); }
+        assert_eq!(first.code("fixture@example.test").await, "123456");
+        assert_eq!(second.code("fixture@example.test").await, "123456");
+        let restored = MailConfig::from_env(); assert_eq!((restored.provider, restored.webhook_url), (baseline.provider, baseline.webhook_url));
+    }
 }
 
 #[cfg(test)]

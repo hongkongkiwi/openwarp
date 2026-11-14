@@ -5,5 +5,5 @@
   "description": "Export OpenWarp environment secrets in GitHub Actions",
   "main": "index.js",
   "engines": { "node": ">=20" },
-  "scripts": { "check": "node --check index.js" }
+  "scripts": { "check": "node --check index.js", "test": "node --test action.test.cjs" }
 }

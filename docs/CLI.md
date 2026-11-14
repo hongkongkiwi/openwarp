@@ -85,9 +85,9 @@ openwarp init --app APP_ID --env ENV_ID
 | --- | --- |
 | `secrets [--env ENV_ID]` | List secrets, redacting values |
 | `secrets [--env ENV_ID] --show` | List readable plaintext values |
-| `get [--env ENV_ID] KEY` | Print a value selected by key |
+| `get [--env ENV_ID] [--path PATH] KEY` | Print a value selected by key and optional path |
 | `set [--env ENV_ID] KEY VALUE` | Write a secret at the root path |
-| `delete [--env ENV_ID] KEY` | Delete the secret selected by key |
+| `delete [--env ENV_ID] [--path PATH] KEY` | Delete the secret selected by key and optional path |
 | `import [--env ENV_ID] FILE` | Import dotenv text |
 | `export [--env ENV_ID] [--base] --format FORMAT` | Print exported secrets; `--base` skips your personal overrides |
 | `run [--env ENV_ID] -- COMMAND...` | Launch a child with secret environment variables |
@@ -104,7 +104,7 @@ openwarp secrets --show
 
 Standard secret names are normalised to uppercase. Server validation accepts 1-128 characters from letters, digits, underscore, dot, and hyphen. A secret's identity also includes its path.
 
-The CLI's standard `get` and `delete` commands select by key, not by path. If the same name exists in several paths, use the console or an API operation on the exact secret ID. `set` and the E2E CLI write at `/`; there is no documented CLI `--path` selector.
+Standard `get` and `delete` match keys case-insensitively. Without `--path`, they succeed only when the key has one match across all paths. Use `--path /team/` to select an exact path; `/team`, `/TEAM/` and `/team/` are distinct. Multiple matches are rejected even with a path, and a missing path does not fall back to another folder. Selection reads every reported page and rejects invalid pagination or more than 100,000 records. A legacy initial response with only `total` is accepted when it equals the returned count; other incomplete metadata is rejected. Pages are not a snapshot, so concurrent changes can affect selection. `set` and the E2E CLI write at `/`.
 
 Names accepted by the secret store are not necessarily valid shell variable names or valid at every integration destination. For process injection, use conventional names such as `DATABASE_URL`.
 

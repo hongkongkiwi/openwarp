@@ -23,6 +23,32 @@ const LOGIN: &str = "/api/v1/machine/auth/workload/login";
 const TRUSTS: &str = "/api/orgs/org-a/identities/identity-a/workload-trust";
 const KEYS: &str = "/api/orgs/org-a/transit/keys";
 
+async fn product_mail_child(name: &str) -> bool {
+    const MARKER: &str = "OPENWARP_PRODUCT_MAIL_CHILD";
+    if let Ok(selected) = std::env::var(MARKER) { assert_eq!(selected, name, "isolated child must run exactly its selected test"); return false; }
+    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let incoming = messages.clone();
+    let relay = Router::new().route("/mail", axum::routing::post(move |axum::Json(mail): axum::Json<Value>| {
+        let messages = incoming.clone(); async move { messages.lock().unwrap().push(mail); axum::Json(json!({})) }
+    }).get(move || { let messages = messages.clone(); async move { axum::Json(messages.lock().unwrap().clone()) } }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("private mail relay");
+    let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
+    struct Relay(tokio::task::JoinHandle<()>);
+    impl Drop for Relay { fn drop(&mut self) { self.0.abort(); } }
+    let _relay = Relay(tokio::spawn(async move { axum::serve(listener, relay).await.unwrap(); }));
+    // This source is included by three other targets; re-execute their own binary.
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", name, "--test-threads=1"]).env_clear().env(MARKER, name)
+        .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url)
+        .env("NO_PROXY", "127.0.0.1,localhost").kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output()).await
+        .expect("bounded isolated product test").expect("run isolated product test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "isolated product assertions failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;") && stdout.contains(&format!("test {name} ... ok")), "isolated child must execute exactly one passing test");
+    true
+}
+
 struct Fixture { st: S, app: Router }
 struct Reply { status: u16, body: Value }
 impl Fixture {
@@ -75,9 +101,11 @@ impl Fixture {
         f
     }
     async fn sql(&self, sql: &str, params: &[Value]) { self.st.db().exec(sql, params).await.expect("seed fixture"); }
-    async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Reply {
+    async fn call(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Reply { self.call_with_proof(method, path, token, body, None).await }
+    async fn call_with_proof(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>, grant: Option<&str>) -> Reply {
         let mut req = Request::builder().method(method).uri(path).header("host", "openwarp.test.invalid");
         if let Some(token) = token { req = req.header("authorization", format!("Bearer {}", token)); }
+        if let Some(grant) = grant { req = req.header("x-openwarp-step-up", grant); }
         if body.is_some() { req = req.header("content-type", "application/json"); }
         let mut req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty)).unwrap();
         req.extensions_mut().insert(PeerAddr("192.0.2.10".parse().unwrap()));
@@ -91,6 +119,23 @@ impl Fixture {
         assert_eq!(r.status, status, "{} {}: error={}", method, path, r.body["error"]);
         if status >= 400 { assert!(r.body["error"].is_string(), "denial must be an API error, not a route fallback"); }
         r.body
+    }
+    async fn rotate_with_email_proof(&self, body: Value) {
+        let url = std::env::var("OPENWARP_EMAIL_WEBHOOK").expect("child-only mail relay");
+        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+        let before: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let started = self.expect(Method::POST, "/api/auth/step-up/start", Some(OWNER), Some(json!({"risk":"very_risky"})), 200).await;
+        assert_eq!(started["email_sent"], true);
+        let messages: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(messages.len(), before.len() + 1, "one fresh rotation verification email must be delivered");
+        let mail = messages.last().unwrap();
+        assert_eq!(mail["to"], "owner@test.invalid");
+        assert_eq!(mail["subject"], "Your OpenWarp verification code");
+        let code = mail["text"].as_str().unwrap().split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6).expect("delivered six-digit code");
+        let verified = self.expect(Method::POST, "/api/auth/step-up/verify", Some(OWNER), Some(json!({"challenge":started["challenge"],"email_code":code})), 200).await;
+        let grant = verified["token"].as_str().expect("authentic rotation grant");
+        let reply = self.call_with_proof(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(body), Some(grant)).await;
+        assert_eq!(reply.status, 200, "POST /api/instance/rotate-master: error={}", reply.body["error"]);
     }
     async fn put(&self, env: &str, secrets: Value) {
         self.expect(Method::PUT, &format!("/api/envs/{}/secrets", env), Some(OWNER), Some(json!({"secrets": secrets})), 200).await;
@@ -437,6 +482,7 @@ async fn workload_replay_spans_trusts_and_live_identity_and_peer_policy_are_enfo
 #[tokio::test]
 async fn transit_versions_rewrap_without_plaintext_and_survive_master_rotation() {
     if !suite_gated() { return; }
+    if product_mail_child("transit_versions_rewrap_without_plaintext_and_survive_master_rotation").await { return; }
     let f = Fixture::new().await;
     let key = f.transit_key("payments.primary", "org-a", OWNER).await;
     let plain = oc::b64(b"transit fixture payload\0with binary");
@@ -461,7 +507,7 @@ async fn transit_versions_rewrap_without_plaintext_and_survive_master_rotation()
     let metadata = entries.iter().find(|v| v["id"] == key).expect("created key in list");
     assert_eq!(metadata["name"], "payments.primary"); assert_eq!(metadata["current_version"], 2);
     assert_eq!(metadata.as_object().unwrap().len(), 3, "only id, name, current_version are public");
-    f.expect(Method::POST, "/api/instance/rotate-master", Some(OWNER), Some(json!({"new_key":oc::b64(&[9;32])})), 200).await;
+    f.rotate_with_email_proof(json!({"new_key":oc::b64(&[9;32])})).await;
     assert_eq!(f.transit(&key, "decrypt", OWNER, old, 200).await["plaintext"], plain);
     assert_eq!(f.transit(&key, "decrypt", OWNER, latest, 200).await["plaintext"], plain);
     let audits = f.st.db().query("SELECT detail FROM audit", &[]).await.unwrap();
