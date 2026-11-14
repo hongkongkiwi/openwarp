@@ -128,6 +128,23 @@ impl Server {
         let (status, body) = self.response(method, path, token, body).await;
         assert_eq!(status, 200, "HTTP fixture request {} failed: {}", path, body); body
     }
+    async fn export(&self, env: &str, token: &str) -> Value {
+        let before = self.mail.calls().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", token, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.mail.calls().iter().skip(before).filter_map(|c| c.body["text"].as_str()).find_map(|text|
+                text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", token, Some(json!({"challenge": start["challenge"], "email_code": code}))).await;
+        let response = self.client.get(format!("{}/api/envs/{}/export?base=1", self.base, env)).bearer_auth(token)
+            .header("x-openwarp-step-up", field(&verified, "token")).send().await.unwrap();
+        let status = response.status(); let body: Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "base export failed: {}", body); body
+    }
     async fn environment(&self) -> (String, String) {
         let credentials = json!({"email": "sync-review@test.invalid", "password": "dummy-review-password"});
         let registered = self.call(Method::POST, "/api/auth/register", "", Some(credentials.clone())).await;
@@ -159,7 +176,7 @@ async fn gcp_http_duplicate_names_keep_first_shared_value_and_its_tags() {
         {"key": "CONTROL_KEY", "path": "/alpha/", "value": "dummy-control", "tags": "owner=control"}
     ]}))).await;
     assert_eq!(deployed["deployed"], 3); assert_eq!(deployed["sync_errors"], json!([]));
-    let exported = s.call(Method::GET, &format!("/api/envs/{}/export?base=1", env), &token, None).await;
+    let exported = s.export(&env, &token).await;
     let duplicates: Vec<_> = exported["secrets"].as_array().expect("base records").iter().filter(|r| r["key"] == "API_KEY").collect();
     assert_eq!(duplicates.len(), 2);
     // Base export exposes sync's stable ordering without assuming an insertion order for encrypted keys.

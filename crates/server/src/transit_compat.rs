@@ -1,6 +1,6 @@
 use super::*;
 
-fn wrapping_aad(org: &str, kid: &str) -> Vec<u8> { json!(["openwarp-transit-wrap-v1",org,kid]).to_string().into_bytes() }
+pub(super) fn wrapping_aad(org: &str, kid: &str) -> Vec<u8> { json!(["openwarp-transit-wrap-v1",org,kid]).to_string().into_bytes() }
 fn aad(org: &str, kid: &str, version: i64, context: &str) -> Vec<u8> { json!(["openwarp-transit-v1",org,kid,version,context]).to_string().into_bytes() }
 async fn authorize(st: &S, h: &HeaderMap, oid: &str, action: &str) -> Result<String, (StatusCode, Json<Value>)> {
     let uid = st.token_user(h).await?;
@@ -95,13 +95,4 @@ pub(super) async fn rewrap(State(st): State<S>, h: HeaderMap, Path((oid,kid)): P
     #[cfg(not(target_arch="wasm32"))] let _guard=st.transit_gate.lock().await;
     let c = context(&body)?; let r = row(&st,&oid,&kid).await?; let wrap = unwrap(&st,&r)?;
     let plain = open(&st,&oid,&kid,&wrap,&body,c).await?; seal(&st,&oid,&kid,&wrap,&plain,c).await
-}
-#[cfg(not(target_arch="wasm32"))]
-pub(super) fn rewrap_master_tx(tx: &db::WebhookTx<'_>, old: &[u8;32], new: &[u8;32]) -> Result<(), String> {
-    for r in tx.query("SELECT id,org_id,wrapping_key FROM compat_transit_keys", &[])? {
-        let kid=db::s(&r,"id"); let wrapped=db::s(&r,"wrapping_key"); let a=wrapping_aad(&db::s(&r,"org_id"),&kid);
-        let plain=oc::decrypt_symmetric_aad(old,&a,&wrapped).map_err(|_| "transit wrapping key unavailable; refusing root rotation")?;
-        if tx.exec("UPDATE compat_transit_keys SET wrapping_key=? WHERE id=? AND wrapping_key=?", &[json!(oc::encrypt_symmetric_aad(new,&a,&plain)),json!(kid),json!(wrapped)])? != 1 { return Err("transit wrapping key changed during rotation".into()); }
-    }
-    Ok(())
 }

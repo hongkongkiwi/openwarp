@@ -6,16 +6,17 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const KINDS: &[&str] = &["github","gitlab","vercel","netlify","cloudflare","cloudflare_pages","trigger","supabase","nomad","coolify","aws_secrets_manager","aws_parameter_store","gcp_secret_manager","azure_key_vault","azure_app_configuration","digitalocean","railway","render","flyio","heroku","kubernetes","hashicorp_vault","webhook","instabox","boat","daytona","1password","dokploy","caprover","portainer","docker_swarm","bitbucket","circleci","teamcity","travisci","terraform_cloud","qovery","laravel_forge","openwarp","devin","cloudflare_secrets_store","octopus_deploy","azure_devops","cursor","northflank","spacelift","rundeck","cloud66","humanitec","ovh_kms","scaleway_secret_manager","vultr","hetzner","linode","digitalocean_ssh","ssh","keeper","oci_vault","huggingface"];
 
-#[cfg(not(target_arch = "wasm32"))]
-fn http_client() -> crate::http::Client { reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| reqwest::Client::builder().build().expect("http client")) }
-#[cfg(target_arch = "wasm32")]
-fn http_client() -> crate::http::Client { crate::http::Client::new() }
+fn http_client() -> crate::integration_http::Client { crate::integration_http::Client::new() }
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
 fn base(c: &Value, default: &str) -> String { let b = cfg(c, "base_url"); if b.is_empty() { default.to_string() } else { b.trim_end_matches('/').to_string() } }
-async fn req(r: crate::http::RequestBuilder) -> Result<String, String> {
+async fn req(r: crate::integration_http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }
+}
+async fn response_error(resp: crate::integration_http::Response) -> String {
+    let status = resp.status(); let text = resp.text().await.unwrap_or_default();
+    format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())
 }
 fn map_json(secrets: &[(String, String)]) -> Value { let mut m = serde_json::Map::new(); for (k, v) in secrets { m.insert(k.clone(), json!(v)); } Value::Object(m) }
 
@@ -71,6 +72,7 @@ pub async fn sync_with_tags(kind: &str, config: &Value, secrets: &[(String, Stri
             for (k, v) in secrets { let url = format!("{}/projects/{}/variables", base, cfg(config,"project_id"));
                 let r = client.post(&url).header("PRIVATE-TOKEN", cfg(config,"token")).json(&json!({"key":k,"value":v,"masked":true})).send().await.map_err(|e| e.to_string())?;
                 if r.status().as_u16() == 400 { req(client.put(format!("{}/{}", url, k)).header("PRIVATE-TOKEN", cfg(config,"token")).json(&json!({"value":v}))).await?; }
+                else if !r.status().is_success() { return Err(response_error(r).await); }
             } Ok(format!("pushed {} secrets to GitLab", secrets.len())) }
         "github" => { // GitHub requires libsodium sealed-box; done by CLI-side helper if configured via `gh` compatible endpoint is not plain REST.
             // We fetch the repo key and encrypt with openwarp sealed box helper (see server note in README).
@@ -122,6 +124,7 @@ pub async fn sync_with_tags(kind: &str, config: &Value, secrets: &[(String, Stri
             let url = format!("{}/api/v1/namespaces/{}/secrets/{}", server, ns, cfg(config,"secret_name"));
             let r = client.put(&url).bearer_auth(cfg(config,"token")).json(&body).send().await.map_err(|e| e.to_string())?;
             if r.status().as_u16() == 404 { req(client.post(format!("{}/api/v1/namespaces/{}/secrets", server, ns)).bearer_auth(cfg(config,"token")).json(&body)).await?; }
+            else if !r.status().is_success() { return Err(response_error(r).await); }
             Ok("pushed to Kubernetes".into()) }
         "hashicorp_vault" => { req(client.post(format!("{}/v1/{}", cfg(config,"addr").trim_end_matches('/'), cfg(config,"path"))).header("X-Vault-Token", cfg(config,"token")).json(&json!({"data": map_json(secrets)}))).await?; Ok("pushed to HashiCorp Vault".into()) }
         "digitalocean" => { let app_id = cfg(config,"app_id");
@@ -294,7 +297,7 @@ fn name_template(config: &Value) -> &str {
     let template = cfg(config, "name_template");
     if template.is_empty() { cfg(config, "key_schema") } else { template }
 }
-pub(crate) fn desired_name(config: &Value, key: &str) -> String {
+pub fn desired_name(config: &Value, key: &str) -> String {
     let environment = cfg(config, "_environment");
     let key = cased_key(config, key);
     let template = name_template(config);
@@ -439,6 +442,24 @@ fn trigger_desired(config: &Value, secrets: &[(String, String)]) -> Vec<(String,
     secrets.iter().filter(|(k, _)| (include.is_empty() || include.contains(k)) && !exclude.contains(k)).map(|(k, v)| (desired_name(config, k), v.clone())).filter(|(n, _)| seen.insert(n.clone())).collect()
 }
 pub fn desired_names(config: &Value, secrets: &[(String, String)]) -> Vec<String> { trigger_desired(config, secrets).into_iter().map(|(n, _)| n).collect() }
+/// Hash the same selected values and ownership names the managed adapters use.
+pub fn managed_value_hashes(kind: &str, config: &Value, secrets: &[(String, String, String, String)]) -> Result<HashMap<String, String>, String> {
+    if kind == "ssh" {
+        #[cfg(not(target_arch = "wasm32"))]
+        { let mut hashes = HashMap::new();
+            for (file, pairs) in ssh_plan(config, secrets)? { for (name, value) in pairs { hashes.insert(format!("{}|{}", file.path, name), openwarp_crypto::hash_token(&value)); } }
+            return Ok(hashes); }
+        #[cfg(target_arch = "wasm32")]
+        return Err("SSH file sync needs the native runner".into());
+    }
+    let ssh_keys = matches!(kind, "vultr" | "hetzner" | "linode" | "digitalocean_ssh");
+    let pairs = if ssh_keys { super::ssh_keys::only_ssh_keys(&secrets.iter().map(|(_, k, v, t)| (k.clone(), v.clone(), t.clone())).collect::<Vec<_>>()) } else { secret_keys(secrets) };
+    Ok(trigger_desired(config, &pairs).into_iter().map(|(name, value)| {
+        let name = if kind == "aws_parameter_store" { ssm_full_name(config, &name) } else { name };
+        let value = if ssh_keys { value.trim() } else { &value };
+        (name, openwarp_crypto::hash_token(value))
+    }).collect())
+}
 /// The sync caller hands over `(path, key, value, type)`. Every other adapter
 /// ignores the path and the type; the SSH file adapter groups by path.
 pub fn secret_keys(secrets: &[(String, String, String, String)]) -> Vec<(String, String)> { secrets.iter().map(|(_, k, v, _)| (k.clone(), v.clone())).collect() }
@@ -496,7 +517,7 @@ fn instabox_config(config: &Value) -> Result<(String, String, reqwest::Url), Str
     Ok((key.to_string(), org.to_string(), url))
 }
 
-async fn instabox_list(client: &crate::http::Client, root: &reqwest::Url, key: &str) -> Result<Vec<String>, String> {
+async fn instabox_list(client: &crate::integration_http::Client, root: &reqwest::Url, key: &str) -> Result<Vec<String>, String> {
     let text = req(client.get(root.clone()).header("X-API-Key", key)).await.map_err(|e| format!("Instabox list failed: {}", e))?;
     let response: Value = serde_json::from_str(&text).map_err(|e| format!("Instabox invalid list response: {}", e))?;
     let items = response.get("items").and_then(Value::as_array).ok_or("Instabox invalid list response: missing items array")?;
@@ -588,7 +609,7 @@ fn dotenv_map(text: &str) -> std::collections::HashMap<String, String> {
 fn env_names_ok(names: &[&str]) -> Option<String> {
     let bad: Vec<&str> = names.iter().copied().filter(|n| { let b = n.as_bytes(); b.is_empty() || (!b[0].is_ascii_alphabetic() && b[0] != b'_') || b.iter().any(|c| !c.is_ascii_alphanumeric() && *c != b'_') }).collect();
     if bad.is_empty() { None } else { Some(bad.join(", ")) } }
-async fn boat_find_env(client: &crate::http::Client, api: &str, key: &str, want: &str, org: &str) -> Result<(String, String, Value), String> {
+async fn boat_find_env(client: &crate::integration_http::Client, api: &str, key: &str, want: &str, org: &str) -> Result<(String, String, Value), String> {
     let url = if org.is_empty() { format!("{}/environments", api) } else { format!("{}/environments?org={}", api, enc(org)) };
     let text = req(client.get(&url).bearer_auth(key)).await.map_err(|e| format!("Boat list environments failed: {}", e))?;
     let list: Value = serde_json::from_str(&text).map_err(|e| format!("Boat invalid environment list: {}", e))?;
@@ -636,10 +657,10 @@ pub async fn boat_test(config: &Value) -> Result<String, String> {
     Ok(format!("Boat connection OK: environment {} currently has {} variables", ename, vars)) }
 
 // ---------- Daytona vault secrets ----------
-async fn daytona_send(key: &str, org: &str, r: crate::http::RequestBuilder) -> Result<String, String> {
+async fn daytona_send(key: &str, org: &str, r: crate::integration_http::RequestBuilder) -> Result<String, String> {
     let r = if org.is_empty() { r.bearer_auth(key) } else { r.bearer_auth(key).header("X-Daytona-Organization-ID", org) };
     req(r).await }
-async fn daytona_secret_list(client: &crate::http::Client, key: &str, org: &str, api: &str) -> Result<Vec<Value>, String> {
+async fn daytona_secret_list(client: &crate::integration_http::Client, key: &str, org: &str, api: &str) -> Result<Vec<Value>, String> {
     let text = match daytona_send(key, org, client.get(format!("{}/secret/paginated?limit=200", api))).await {
         Ok(t) => t,
         Err(_) => daytona_send(key, org, client.get(format!("{}/secret", api))).await.map_err(|e| format!("Daytona list secrets failed: {}", e))?,
@@ -693,7 +714,7 @@ pub async fn daytona_test(config: &Value) -> Result<String, String> {
     let list = daytona_secret_list(&http_client(), key, org, &api).await?;
     Ok(format!("Daytona connection OK: organisation currently has {} vault secrets", list.len())) }
 
-async fn github_sync(client: &crate::http::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
+async fn github_sync(client: &crate::integration_http::Client, config: &Value, secrets: &[(String, String)]) -> Result<String, String> {
     // Use GitHub public-key endpoint; sealed-box encryption is performed with crypto_box SalsaBox via helper binary if present.
     // Fallback: if config contains pre-encrypted payloads, push them; otherwise report precise blocker per secret.
     let owner = cfg(config, "owner"); let repo = cfg(config, "repo");
@@ -774,7 +795,7 @@ fn config_i64(config: &Value, key: &str) -> Option<i64> {
 
 // ---------- AWS SigV4 ----------
 struct AwsReq<'a> { service: &'a str, region: &'a str, ak: &'a str, sk: &'a str, session_token: &'a str, target: &'a str, payload: &'a str, endpoint: &'a str }
-async fn aws_signed(client: &crate::http::Client, r: AwsReq<'_>) -> Result<String, String> {
+async fn aws_signed(client: &crate::integration_http::Client, r: AwsReq<'_>) -> Result<String, String> {
     let host_default = format!("{}.{}.amazonaws.com", r.service, r.region); let url_default = format!("https://{}", host_default);
     let (host, url, uri) = if r.endpoint.is_empty() { (host_default, url_default, "/".to_string()) } else {
         let parsed = reqwest::Url::parse(r.endpoint).map_err(|e| format!("invalid AWS endpoint: {}", e))?;
@@ -801,7 +822,7 @@ async fn aws_signed(client: &crate::http::Client, r: AwsReq<'_>) -> Result<Strin
     req(request.body(r.payload.to_string())).await
 }
 #[allow(clippy::too_many_arguments)]
-async fn aws_call(client: &crate::http::Client, config: &Value, service: &str, region: &str, ak: &str, sk: &str, target: &str, payload: &Value) -> Result<Value, String> {
+async fn aws_call(client: &crate::integration_http::Client, config: &Value, service: &str, region: &str, ak: &str, sk: &str, target: &str, payload: &Value) -> Result<Value, String> {
     let body = payload.to_string();
     let text = aws_signed(client, AwsReq { service, region, ak, sk, session_token: cfg(config, "session_token"), target, payload: &body, endpoint: cfg(config, "endpoint") }).await?;
     if text.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str(&text).map_err(|e| format!("AWS {} returned invalid JSON: {}", target, e)) }
@@ -830,7 +851,7 @@ fn ssm_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 1011 && !name.contains(' ') && !name.contains("//") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
 }
 
-async fn aws_sm_list(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+async fn aws_sm_list(client: &crate::integration_http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new(); let mut token = String::new();
     loop {
         let mut payload = json!({"MaxResults": 100});
@@ -845,7 +866,7 @@ async fn aws_sm_list(client: &crate::http::Client, config: &Value, region: &str,
     Ok(out)
 }
 
-async fn aws_sm_tag(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str, tags: &[(String, String)]) -> Result<(), String> {
+async fn aws_sm_tag(client: &crate::integration_http::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str, tags: &[(String, String)]) -> Result<(), String> {
     if tags.is_empty() { return Ok(()); }
     let list: Vec<Value> = tags.iter().map(|(key, value)| json!({"Key": key, "Value": value})).collect();
     aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.TagResource", &json!({"SecretId": id, "Tags": list})).await.map(|_| ())
@@ -930,7 +951,7 @@ fn ssm_path(config: &Value) -> String {
     let path = cfg(config, "path_prefix").trim_end_matches('/');
     if path.is_empty() { String::new() } else if path.starts_with('/') { path.to_string() } else { format!("/{}", path) }
 }
-async fn ssm_list(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
+async fn ssm_list(client: &crate::integration_http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<String>, String> {
     let path = ssm_path(config);
     let mut out = Vec::new(); let mut token = String::new();
     loop {
@@ -999,7 +1020,7 @@ pub async fn aws_parameter_store_test(config: &Value) -> Result<String, String> 
 
 // ---------- Azure Key Vault ----------
 fn azure_secret_name(name: &str) -> String { name.to_lowercase().replace('_', "-") }
-async fn azure_disable_versions(client: &crate::http::Client, root: &str, target: &str, token: &str) -> Result<bool, String> {
+async fn azure_disable_versions(client: &crate::integration_http::Client, root: &str, target: &str, token: &str) -> Result<bool, String> {
     let list = reqwest::Url::parse(&format!("{}/secrets/{}/versions?api-version=7.4", root, target)).map_err(|_| "invalid Azure versions URL")?;
     let version_prefix = format!("{}/", list.path().strip_suffix("/versions").ok_or("invalid Azure versions path")?);
     let mut page = list.clone();
@@ -1112,7 +1133,7 @@ fn onepassword_config(config: &Value) -> Result<(String, String, String, String,
     let category = { let v = cfg(config, "category"); if v.is_empty() { "API_CREDENTIAL" } else { v } };
     Ok((base, token.to_string(), vault.to_string(), label.to_string(), category.to_string()))
 }
-async fn onepassword_items(client: &crate::http::Client, base: &str, token: &str, vault: &str) -> Result<Vec<Value>, String> {
+async fn onepassword_items(client: &crate::integration_http::Client, base: &str, token: &str, vault: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/v1/vaults/{}/items", base, vault)).bearer_auth(token)).await.map_err(|e| format!("1Password list items failed: {}", e))?;
     if let Ok(items) = serde_json::from_str::<Vec<Value>>(&text) { return Ok(items); }
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("1Password invalid item list: {}", e))?;
@@ -1237,7 +1258,7 @@ pub async fn dokploy_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- CapRover ----------
-async fn caprover_auth(client: &crate::http::Client, config: &Value) -> Result<(String, String), String> {
+async fn caprover_auth(client: &crate::integration_http::Client, config: &Value) -> Result<(String, String), String> {
     let base = cfg(config, "base_url").trim_end_matches('/').to_string();
     if base.is_empty() { return Err("CapRover requires base_url".into()); }
     let api = format!("{}/api/v2", base);
@@ -1249,7 +1270,7 @@ async fn caprover_auth(client: &crate::http::Client, config: &Value) -> Result<(
     } };
     Ok((api, token))
 }
-async fn caprover_apps(client: &crate::http::Client, api: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn caprover_apps(client: &crate::integration_http::Client, api: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/user/apps/appDefinitions", api)).header("x-captain-auth", token)).await.map_err(|e| format!("CapRover list apps failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("CapRover invalid app list: {}", e))?;
     value.get("data").and_then(|d| d.get("appDefinitions")).and_then(Value::as_array).cloned().ok_or("CapRover invalid app list: missing data.appDefinitions".into())
@@ -1289,7 +1310,7 @@ fn portainer_auth(config: &Value) -> Result<(String, String), String> {
     if base.is_empty() || key.is_empty() { return Err("Portainer requires base_url and api_key".into()); }
     Ok((base, key.to_string()))
 }
-async fn portainer_stacks(client: &crate::http::Client, base: &str, key: &str) -> Result<Vec<Value>, String> {
+async fn portainer_stacks(client: &crate::integration_http::Client, base: &str, key: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/api/stacks", base)).header("X-API-Key", key)).await.map_err(|e| format!("Portainer list stacks failed: {}", e))?;
     serde_json::from_str(&text).map_err(|e| format!("Portainer invalid stack list: {}", e))
 }
@@ -1329,14 +1350,14 @@ pub async fn portainer_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Docker Swarm ----------
-fn docker_client(config: &Value) -> Result<crate::http::Client, String> {
+fn docker_client(config: &Value) -> Result<crate::integration_http::Client, String> {
     let cert = cfg(config, "client_cert"); let key = cfg(config, "client_key"); let ca = cfg(config, "ca_cert");
     if !cert.is_empty() || !key.is_empty() || !ca.is_empty() {
         #[cfg(target_arch = "wasm32")]
         { let _ = (cert, key, ca); return Err("Docker client certificates are unavailable on Workers".into()); }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+            let mut builder = reqwest::Client::builder();
             if !cert.is_empty() || !key.is_empty() {
                 if cert.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
                 if key.is_empty() { return Err("Docker requires both client_cert and client_key".into()); }
@@ -1345,7 +1366,7 @@ fn docker_client(config: &Value) -> Result<crate::http::Client, String> {
             }
             if !ca.is_empty() { builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).map_err(|e| format!("Docker CA certificate is invalid: {}", e))?); }
             if config.get("insecure").and_then(Value::as_bool).unwrap_or(false) { builder = builder.danger_accept_invalid_certs(true); }
-            return builder.build().map_err(|e| e.to_string());
+            return crate::integration_http::Client::from_builder(builder);
         }
     }
     Ok(http_client())
@@ -1406,7 +1427,7 @@ fn auth_value(config: &Value) -> Result<String, String> {
     if secret.is_empty() { return Err("token is required".into()); }
     if user.is_empty() { Ok(format!("Bearer {}", secret)) } else { Ok(format!("Basic {}", openwarp_crypto::b64(format!("{}:{}", user, secret).as_bytes()))) }
 }
-async fn bitbucket_list(client: &crate::http::Client, base: &str, workspace: &str, repo: &str, auth: &str) -> Result<Vec<Value>, String> {
+async fn bitbucket_list(client: &crate::integration_http::Client, base: &str, workspace: &str, repo: &str, auth: &str) -> Result<Vec<Value>, String> {
     let mut url = format!("{}/repositories/{}/{}/pipelines_config/variables/?pagelen=100", base, enc(workspace), enc(repo));
     let mut out = Vec::new();
     loop {
@@ -1456,7 +1477,7 @@ pub async fn bitbucket_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- CircleCI ----------
-async fn circleci_list(client: &crate::http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn circleci_list(client: &crate::integration_http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/project/{}/envvar", base, slug.trim_matches('/'))).header("Circle-Token", token)).await.map_err(|e| format!("CircleCI list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("CircleCI invalid env var list: {}", e))?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1503,7 +1524,7 @@ fn teamcity_scope(config: &Value) -> (String, String) {
     if !cfg(config, "build_type_locator").is_empty() { ("buildTypes".into(), cfg(config, "build_type_locator").to_string()) }
     else { ("projects".into(), { let p = cfg(config, "project_locator"); if p.is_empty() { "_Root".to_string() } else { p.to_string() } }) }
 }
-async fn teamcity_list(client: &crate::http::Client, base: &str, auth: &str, kind: &str, locator: &str) -> Result<Vec<Value>, String> {
+async fn teamcity_list(client: &crate::integration_http::Client, base: &str, auth: &str, kind: &str, locator: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/{}/{}/parameters", base, kind, enc(locator))).header("Authorization", auth).header("Accept", "application/json")).await.map_err(|e| format!("TeamCity list parameters failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("TeamCity invalid parameter list: {}", e))?;
     Ok(value.get("property").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1538,7 +1559,7 @@ pub async fn teamcity_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Travis CI ----------
-async fn travis_list(client: &crate::http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn travis_list(client: &crate::integration_http::Client, base: &str, slug: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/repo/{}/env_vars", base, slug)).header("Travis-API-Version", "3").header("Authorization", format!("token {}", token))).await.map_err(|e| format!("Travis CI list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Travis CI invalid env var list: {}", e))?;
     Ok(value.get("env_vars").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1575,7 +1596,7 @@ pub async fn travisci_test(config: &Value) -> Result<String, String> {
 }
 
 // ---------- Terraform Cloud ----------
-async fn tfcloud_list(client: &crate::http::Client, base: &str, token: &str, workspace_id: &str) -> Result<Vec<Value>, String> {
+async fn tfcloud_list(client: &crate::integration_http::Client, base: &str, token: &str, workspace_id: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(format!("{}/workspaces/{}/vars", base, workspace_id)).bearer_auth(token)).await.map_err(|e| format!("Terraform Cloud list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Terraform Cloud invalid variable list: {}", e))?;
     Ok(value.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
@@ -1621,7 +1642,7 @@ fn qovery_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || org.is_empty() || project.is_empty() || env.is_empty() { return Err("Qovery requires token, organization_id, project_id and environment_id".into()); }
     Ok((format!("{}/organization/{}/project/{}/environment/{}/variable", base, org, project, env), token.to_string()))
 }
-async fn qovery_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn qovery_list(client: &crate::integration_http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let text = req(client.get(root).bearer_auth(token)).await.map_err(|e| format!("Qovery list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Qovery invalid variable list: {}", e))?;
     Ok(value.get("results").and_then(Value::as_array).or_else(|| value.as_array()).cloned().unwrap_or_default())
@@ -1668,7 +1689,7 @@ fn forge_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || org.is_empty() || server.is_empty() || site.is_empty() { return Err("Laravel Forge requires token, organization, server_id and site_id".into()); }
     Ok((format!("{}/orgs/{}/servers/{}/sites/{}/environment", base, enc(org), enc(&server), enc(&site)), token.to_string()))
 }
-async fn forge_env(client: &crate::http::Client, root: &str, token: &str) -> Result<String, String> {
+async fn forge_env(client: &crate::integration_http::Client, root: &str, token: &str) -> Result<String, String> {
     let text = req(client.get(root).bearer_auth(token).header("Accept", "application/vnd.api+json")).await.map_err(|e| format!("Laravel Forge read environment failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Laravel Forge invalid environment response: {}", e))?;
     Ok(value.get("data").and_then(|d| d.get("attributes")).and_then(|a| a.get("content")).and_then(Value::as_str).unwrap_or("").to_string())
@@ -1695,7 +1716,7 @@ fn openwarp_remote(config: &Value) -> Result<(String, String, String), String> {
     if base.is_empty() || token.is_empty() || env.is_empty() { return Err("OpenWarp sync requires base_url, token and env_id".into()); }
     Ok((base, token.to_string(), env.to_string()))
 }
-async fn openwarp_list(client: &crate::http::Client, base: &str, token: &str, env: &str) -> Result<Vec<Value>, String> {
+async fn openwarp_list(client: &crate::integration_http::Client, base: &str, token: &str, env: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut offset = 0;
     loop {
         let text = req(client.get(format!("{}/api/envs/{}/secrets?limit=1000&offset={}", base, env, offset)).bearer_auth(token)).await.map_err(|e| format!("OpenWarp list secrets failed: {}", e))?;
@@ -1739,7 +1760,7 @@ fn devin_parts(config: &Value) -> Result<(String, String, String), String> {
     if token.is_empty() || org.is_empty() { return Err("Devin requires token and org_id".into()); }
     Ok((base, token.to_string(), org.to_string()))
 }
-async fn devin_list(client: &crate::http::Client, base: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
+async fn devin_list(client: &crate::integration_http::Client, base: &str, token: &str, org: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut after = String::new();
     loop {
         let mut url = format!("{}/v3/organizations/{}/secrets?first=200", base, enc(org));
@@ -1786,7 +1807,7 @@ fn cf_store_root(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || account.is_empty() || store.is_empty() { return Err("Cloudflare Secrets Store requires token, account_id and store_id".into()); }
     Ok((format!("{}/accounts/{}/secrets_store/stores/{}/secrets", base, enc(account), enc(store)), token.to_string()))
 }
-async fn cf_store_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn cf_store_list(client: &crate::integration_http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1;
     loop {
         let text = req(client.get(format!("{}?per_page=100&page={}", root, page)).bearer_auth(token)).await.map_err(|e| format!("Cloudflare Secrets Store list failed: {}", e))?;
@@ -1918,7 +1939,7 @@ fn cursor_parts(config: &Value) -> Result<(String, String, String, bool), String
     Ok((base, token.to_string(), env.to_string(), is_env))
 }
 fn cursor_auth(token: &str) -> String { format!("Basic {}", openwarp_crypto::b64(format!("{}:", token).as_bytes())) }
-async fn cursor_list(client: &crate::http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn cursor_list(client: &crate::integration_http::Client, root: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut cursor = String::new();
     loop {
         let mut url = format!("{}?limit=100", root);
@@ -1969,7 +1990,7 @@ fn northflank_parts(config: &Value) -> Result<(String, String), String> {
     if token.is_empty() || project.is_empty() || group.is_empty() { return Err("Northflank requires token, project_id and secret_group_id".into()); }
     Ok((format!("{}/projects/{}/secrets/{}", base, enc(project), enc(group)), token.to_string()))
 }
-async fn northflank_variables(client: &crate::http::Client, root: &str, token: &str) -> Result<HashMap<String, String>, String> {
+async fn northflank_variables(client: &crate::integration_http::Client, root: &str, token: &str) -> Result<HashMap<String, String>, String> {
     let text = req(client.get(format!("{}/details", root)).bearer_auth(token)).await.map_err(|e| format!("Northflank read secret group failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Northflank invalid secret group response: {}", e))?;
     Ok(value.get("data").and_then(|d| d.get("secrets")).and_then(|s| s.get("variables")).and_then(Value::as_object).map(|vars| vars.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default())
@@ -1998,7 +2019,7 @@ fn spacelift_endpoint(config: &Value) -> Result<String, String> {
     let account = cfg(config, "account"); if account.is_empty() { return Err("Spacelift requires base_url or account".into()); }
     Ok(format!("https://{}.app.spacelift.io/graphql", enc(account)))
 }
-async fn spacelift_auth(client: &crate::http::Client, endpoint: &str, config: &Value) -> Result<String, String> {
+async fn spacelift_auth(client: &crate::integration_http::Client, endpoint: &str, config: &Value) -> Result<String, String> {
     let token = cfg(config, "token"); if !token.is_empty() { return Ok(token.to_string()); }
     let id = cfg(config, "api_key_id"); let secret = cfg(config, "api_key_secret");
     if id.is_empty() || secret.is_empty() { return Err("Spacelift requires token, or api_key_id and api_key_secret".into()); }
@@ -2006,7 +2027,7 @@ async fn spacelift_auth(client: &crate::http::Client, endpoint: &str, config: &V
     let data = spacelift_graphql(client, endpoint, None, query, json!({"id": id, "secret": secret})).await?;
     data.get("apiKeyUser").and_then(|u| u.get("jwt")).and_then(Value::as_str).map(str::to_string).ok_or_else(|| "Spacelift did not return a JWT".to_string())
 }
-async fn spacelift_graphql(client: &crate::http::Client, endpoint: &str, token: Option<&str>, query: &str, variables: Value) -> Result<Value, String> {
+async fn spacelift_graphql(client: &crate::integration_http::Client, endpoint: &str, token: Option<&str>, query: &str, variables: Value) -> Result<Value, String> {
     let mut request = client.post(endpoint);
     if let Some(token) = token { request = request.bearer_auth(token); }
     let text = req(request.json(&json!({"query": query, "variables": variables}))).await.map_err(|e| format!("Spacelift GraphQL request failed: {}", e))?;
@@ -2014,7 +2035,7 @@ async fn spacelift_graphql(client: &crate::http::Client, endpoint: &str, token: 
     if let Some(errors) = value.get("errors") { return Err(format!("Spacelift GraphQL error: {}", errors)); }
     Ok(value.get("data").cloned().unwrap_or(json!({})))
 }
-async fn spacelift_element(client: &crate::http::Client, endpoint: &str, token: &str, stack: &str, name: &str) -> Result<Option<Value>, String> {
+async fn spacelift_element(client: &crate::integration_http::Client, endpoint: &str, token: &str, stack: &str, name: &str) -> Result<Option<Value>, String> {
     let query = "query($stack: ID!, $id: ID!) { stack(id: $stack) { configElement(id: $id) { id type value writeOnly description } } }";
     let data = spacelift_graphql(client, endpoint, Some(token), query, json!({"stack": stack, "id": name})).await?;
     Ok(data.get("stack").and_then(|s| s.get("configElement")).filter(|v| !v.is_null()).cloned())
@@ -2072,7 +2093,7 @@ fn rundeck_parts(config: &Value) -> Result<(String, String), String> {
     let base = format!("{}/api/19/storage/keys/project/{}", instance, enc(project));
     Ok((if encoded.is_empty() { base } else { format!("{}/{}", base, encoded) }, token.to_string()))
 }
-async fn rundeck_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<String>, String> {
+async fn rundeck_keys(client: &crate::integration_http::Client, base: &str, token: &str) -> Result<Vec<String>, String> {
     match req(client.get(base).header("X-Rundeck-Auth-Token", token)).await {
         Ok(text) => { let value: Value = serde_json::from_str(&text).map_err(|e| format!("Rundeck invalid key list: {}", e))?;
             Ok(value.get("resources").and_then(Value::as_array).map(|items| items.iter().filter(|r| r.get("type").and_then(Value::as_str) == Some("file")).filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_string)).collect()).unwrap_or_default()) }
@@ -2110,7 +2131,7 @@ fn cloud66_parts(config: &Value) -> Result<(String, String, String), String> {
     if token.is_empty() || stack.is_empty() { return Err("Cloud 66 requires access_token and stack_id".into()); }
     Ok((base, token.to_string(), stack.to_string()))
 }
-async fn cloud66_list(client: &crate::http::Client, base: &str, token: &str, stack: &str) -> Result<Vec<Value>, String> {
+async fn cloud66_list(client: &crate::integration_http::Client, base: &str, token: &str, stack: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let text = req(client.get(format!("{}/3/stacks/{}/environments?page={}&per_page=100", base, enc(stack), page)).bearer_auth(token)).await.map_err(|e| format!("Cloud 66 list failed: {}", e))?;
@@ -2167,7 +2188,7 @@ fn humanitec_parts(config: &Value) -> Result<(String, String, String, String, St
 fn humanitec_values_url(base: &str, org: &str, app: &str, scope: &str, env: &str) -> String {
     if scope == "environment" { format!("{}/orgs/{}/apps/{}/envs/{}/values", base, enc(org), enc(app), enc(env)) } else { format!("{}/orgs/{}/apps/{}/values", base, enc(org), enc(app)) }
 }
-async fn humanitec_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
+async fn humanitec_list(client: &crate::integration_http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (base, token, org, app, scope, env) = humanitec_parts(config)?;
     let text = req(client.get(humanitec_values_url(&base, &org, &app, &scope, &env)).bearer_auth(&token).header("Accept", "application/json")).await.map_err(|e| format!("Humanitec list failed: {}", e))?;
     serde_json::from_str(&text).map_err(|e| format!("Humanitec invalid values response: {}", e))
@@ -2224,7 +2245,7 @@ fn scaleway_parts(config: &Value) -> Result<(String, String, String, String, Str
     Ok((base(config, "https://api.scaleway.com"), region.to_string(), token.to_string(), project.to_string(), cfg(config, "path").trim_matches('/').to_string()))
 }
 fn scaleway_root(base: &str, region: &str) -> String { format!("{}/secret-manager/v1beta1/regions/{}", base, region) }
-async fn scaleway_list(client: &crate::http::Client, root: &str, token: &str, project: &str, path: &str) -> Result<Vec<Value>, String> {
+async fn scaleway_list(client: &crate::integration_http::Client, root: &str, token: &str, project: &str, path: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let mut url = format!("{}/secrets?project_id={}&scheduled_for_deletion=false&page={}&page_size=100", root, enc(project), page);
@@ -2241,7 +2262,7 @@ async fn scaleway_list(client: &crate::http::Client, root: &str, token: &str, pr
     }
     Ok(out)
 }
-async fn scaleway_latest(client: &crate::http::Client, root: &str, token: &str, id: &str) -> Result<Option<String>, String> {
+async fn scaleway_latest(client: &crate::integration_http::Client, root: &str, token: &str, id: &str) -> Result<Option<String>, String> {
     match req(client.get(format!("{}/secrets/{}/versions/latest/access", root, enc(id))).header("X-Auth-Token", token)).await {
         Ok(text) => { let value: Value = serde_json::from_str(&text).map_err(|e| format!("Scaleway invalid version: {}", e))?;
             let data = value.get("data").and_then(Value::as_str).unwrap_or("");
@@ -2315,7 +2336,7 @@ fn appconfig_sign(method: &str, path_and_query: &str, host: &str, body: &str, id
         ("Authorization".into(), format!("HMAC-SHA256 Credential={}&SignedHeaders=x-ms-date;host;x-ms-content-sha256&Signature={}", id, signature)),
     ])
 }
-fn appconfig_request(client: &crate::http::Client, method: reqwest::Method, url: &str, host: &str, body: &str, id: &str, secret: &str) -> Result<crate::http::RequestBuilder, String> {
+fn appconfig_request(client: &crate::integration_http::Client, method: reqwest::Method, url: &str, host: &str, body: &str, id: &str, secret: &str) -> Result<crate::integration_http::RequestBuilder, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     let path_and_query = match parsed.query() { Some(q) => format!("{}?{}", parsed.path(), q), None => parsed.path().to_string() };
     let mut request = client.request(method.clone(), url);
@@ -2323,7 +2344,7 @@ fn appconfig_request(client: &crate::http::Client, method: reqwest::Method, url:
     if !body.is_empty() { request = request.header("Content-Type", "application/vnd.microsoft.appconfig.kv+json"); }
     Ok(request.body(body.to_string()))
 }
-async fn appconfig_list(client: &crate::http::Client, endpoint: &str, host: &str, id: &str, secret: &str, label: &str) -> Result<Vec<Value>, String> {
+async fn appconfig_list(client: &crate::integration_http::Client, endpoint: &str, host: &str, id: &str, secret: &str, label: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     let mut path = format!("/kv?key=*&label={}&api-version=1.0", if label.is_empty() { "%00".to_string() } else { enc(label) });
     for _ in 0..100 {
@@ -2382,7 +2403,7 @@ fn ovh_kms_parts(config: &Value) -> Result<(String, String, String), String> {
     }
     Ok((domain, id.to_string(), path.to_string()))
 }
-fn ovh_kms_client(config: &Value) -> Result<crate::http::Client, String> {
+fn ovh_kms_client(config: &Value) -> Result<crate::integration_http::Client, String> {
     let cert = cfg(config, "certificate"); let key = cfg(config, "private_key");
     if cert.is_empty() && key.is_empty() { return Ok(http_client()); }
     if cert.is_empty() || key.is_empty() { return Err("OVHcloud KMS requires both certificate and private_key".into()); }
@@ -2390,16 +2411,15 @@ fn ovh_kms_client(config: &Value) -> Result<crate::http::Client, String> {
     { let _ = (cert, key); Err("OVHcloud KMS client certificates are unavailable on Workers".into()) }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
-            .identity(reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("OVHcloud KMS client certificate is invalid: {}", e))?)
-            .build().map_err(|e| e.to_string())
+        crate::integration_http::Client::from_builder(reqwest::Client::builder()
+            .identity(reqwest::Identity::from_pem(format!("{}\n{}", cert, key).as_bytes()).map_err(|e| format!("OVHcloud KMS client certificate is invalid: {}", e))?))
     }
 }
-fn ovh_auth(request: crate::http::RequestBuilder, config: &Value) -> crate::http::RequestBuilder {
+fn ovh_auth(request: crate::integration_http::RequestBuilder, config: &Value) -> crate::integration_http::RequestBuilder {
     let token = cfg(config, "token");
     if token.is_empty() { request } else { request.bearer_auth(token) }
 }
-async fn ovh_kms_bundle(client: &crate::http::Client, config: &Value) -> Result<(bool, HashMap<String, String>, Option<i64>), String> {
+async fn ovh_kms_bundle(client: &crate::integration_http::Client, config: &Value) -> Result<(bool, HashMap<String, String>, Option<i64>), String> {
     let (domain, id, path) = ovh_kms_parts(config)?;
     let response = ovh_auth(client.get(format!("{}/api/{}/v2/secret/{}?includeData=true", domain, enc(&id), enc(&path))), config).send().await.map_err(|e| format!("OVHcloud KMS read failed: {}", e))?;
     let status = response.status(); let text = response.text().await.unwrap_or_default();
@@ -2540,7 +2560,7 @@ fn oci_sign(config: &Value, canonical: &str) -> Result<String, String> {
     let signature = signing_key.sign(canonical.as_bytes());
     Ok(openwarp_crypto::b64(&signature.to_bytes()))
 }
-async fn oci_request(client: &crate::http::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
+async fn oci_request(client: &crate::integration_http::Client, config: &Value, method: &str, path_query: &str, body: Option<&Value>) -> Result<Value, String> {
     let base = oci_endpoint(config)?; let url = format!("{}{}", base, path_query);
     let parsed = reqwest::Url::parse(&url).map_err(|e| format!("OCI endpoint is invalid: {}", e))?;
     let host = match parsed.port() { Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(""), port), None => parsed.host_str().unwrap_or("").to_string() };
@@ -2567,12 +2587,12 @@ fn oci_config_ready(config: &Value) -> Result<(String, String), String> {
     Ok((compartment.to_string(), vault.to_string()))
 }
 fn oci_name_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) }
-async fn oci_list(client: &crate::http::Client, config: &Value) -> Result<Vec<Value>, String> {
+async fn oci_list(client: &crate::integration_http::Client, config: &Value) -> Result<Vec<Value>, String> {
     let (compartment, vault) = oci_config_ready(config)?;
     let value = oci_request(client, config, "GET", &format!("/20180608/secrets?compartmentId={}&vaultId={}&lifecycleState=ACTIVE&limit=1000", enc(&compartment), enc(&vault)), None).await?;
     Ok(value.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
 }
-async fn oci_bundle(client: &crate::http::Client, config: &Value, id: &str) -> Result<String, String> {
+async fn oci_bundle(client: &crate::integration_http::Client, config: &Value, id: &str) -> Result<String, String> {
     let value = oci_request(client, config, "GET", &format!("/20180608/secretBundles/{}", enc(id)), None).await?;
     let content = value.get("secretBundleContent").and_then(|c| c.get("content")).and_then(Value::as_str).unwrap_or("");
     let bytes = openwarp_crypto::unb64(content).map_err(|e| format!("OCI secret content is invalid: {}", e))?;
@@ -2621,7 +2641,7 @@ fn huggingface_space(config: &Value) -> Result<(String, String, String), String>
     Ok((base(config, "https://huggingface.co"), token.to_string(), format!("/api/spaces/{}/{}/{}", enc(namespace), enc(repo), kind)))
 }
 fn huggingface_key_ok(name: &str) -> bool { !name.is_empty() && name.len() <= 128 && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') }
-async fn huggingface_space_list(client: &crate::http::Client, base_url: &str, token: &str, path: &str) -> Result<HashMap<String, Option<String>>, String> {
+async fn huggingface_space_list(client: &crate::integration_http::Client, base_url: &str, token: &str, path: &str) -> Result<HashMap<String, Option<String>>, String> {
     let text = req(client.get(format!("{}{}", base_url, path)).bearer_auth(token)).await.map_err(|e| format!("Hugging Face list failed: {}", e))?;
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("Hugging Face invalid list response: {}", e))?;
     let object = value.as_object().ok_or("Hugging Face list response is not an object")?;
@@ -3007,7 +3027,7 @@ fn vultr_token(config: &Value) -> Result<String, String> {
     if token.is_empty() { return Err("Vultr requires api_key".into()); }
     Ok(token.to_string())
 }
-async fn vultr_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn vultr_keys(client: &crate::integration_http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut cursor = String::new();
     for _ in 0..100 {
         let url = format!("{}/ssh-keys?per_page=100{}", base, if cursor.is_empty() { String::new() } else { format!("&cursor={}", enc(&cursor)) });
@@ -3053,7 +3073,7 @@ fn hetzner_token(config: &Value) -> Result<String, String> {
     Ok(token.to_string())
 }
 fn hetzner_id(value: &Value) -> Option<String> { value.get("id").and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string))).filter(|s| !s.is_empty()) }
-async fn hetzner_keys(client: &crate::http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
+async fn hetzner_keys(client: &crate::integration_http::Client, base: &str, token: &str) -> Result<Vec<Value>, String> {
     let mut out = Vec::new(); let mut page = 1i64;
     loop {
         let text = req(client.get(format!("{}/ssh_keys?page={}&per_page=50", base, page)).bearer_auth(token)).await.map_err(|e| format!("Hetzner list SSH keys failed: {}", e))?;
@@ -3109,11 +3129,11 @@ fn strip_remote_prefix(config: &Value, name: &str, path_prefix: &str) -> String 
     let without_path = if path_prefix.is_empty() { name } else { name.strip_prefix(path_prefix).map(|s| s.trim_start_matches('/')).unwrap_or(name) };
     local_name(config, without_path)
 }
-async fn aws_sm_value(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str) -> Result<Option<String>, String> {
+async fn aws_sm_value(client: &crate::integration_http::Client, config: &Value, region: &str, ak: &str, sk: &str, id: &str) -> Result<Option<String>, String> {
     let value = aws_call(client, config, "secretsmanager", region, ak, sk, "secretsmanager.GetSecretValue", &json!({"SecretId": id})).await?;
     Ok(value.get("SecretString").and_then(Value::as_str).map(str::to_string))
 }
-async fn ssm_values(client: &crate::http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<(String, String)>, String> {
+async fn ssm_values(client: &crate::integration_http::Client, config: &Value, region: &str, ak: &str, sk: &str) -> Result<Vec<(String, String)>, String> {
     let path = ssm_path(config);
     let mut out = Vec::new();
     if path.is_empty() {
@@ -3461,31 +3481,7 @@ fn probe_target(url: &str) -> String {
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn probe_ip_allowed(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => probe_ip_allowed(v6.to_ipv4_mapped().unwrap().into()),
-        std::net::IpAddr::V4(v4) => { let [a,b,_,_]=v4.octets(); !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || a==0 || a>=240 || (a==100 && (64..=127).contains(&b)) || (a==192 && (b==0 || b==2 || b==168)) || (a==198 && (b==18 || b==19 || b==51)) || (a==203 && b==0)) },
-        std::net::IpAddr::V6(v6) => { let n=v6.segments(); (n[0]&0xe000)==0x2000 && n[0]!=0x2002 && !(n[0]==0x2001 && (n[1]<0x0200 || n[1]==0x0db8)) && !(n[0]==0x3fff && (n[1]&0xf000)==0) },
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct ProbeResolver { restrict: bool, blocked: std::sync::Arc<std::sync::atomic::AtomicBool> }
-#[cfg(not(target_arch = "wasm32"))]
-impl reqwest::dns::Resolve for ProbeResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let restrict = self.restrict; let blocked = self.blocked.clone();
-        Box::pin(async move {
-            let addrs: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            if addrs.is_empty() { return Err(std::io::Error::other("empty DNS response").into()); }
-            if restrict && addrs.iter().any(|addr| !probe_ip_allowed(addr.ip())) {
-                blocked.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Err(std::io::Error::other("blocked by egress policy").into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
+use crate::integration_http::{ip_allowed as probe_ip_allowed, Resolver as ProbeResolver};
 
 async fn generic_test(kind: &str, config: &Value) -> Result<String, String> {
     let root = probe_base(kind, config)?;
@@ -3601,7 +3597,7 @@ mod probe_tests {
     fn probe_ip_denies_non_public_destinations() {
         let denied = [
             "0.0.0.0", "0.1.2.3", "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254",
-            "100.64.0.0", "100.100.100.200", "100.127.255.255", "192.0.0.1", "192.0.2.1", "192.2.0.1",
+            "100.64.0.0", "100.100.100.200", "100.127.255.255", "192.0.0.1", "192.0.2.1",
             "198.18.0.1", "198.19.255.255", "198.51.100.1", "203.0.113.1", "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255",
             "::", "::1", "fc00::1", "fe80::1", "ff02::1", "64:ff9b::808:808", "64:ff9b:1::1", "2002:0808:0808::1",
             "2001::1", "2001:100::1", "2001:db8::1", "3fff::1",
@@ -3614,7 +3610,7 @@ mod probe_tests {
     #[test]
     fn probe_ip_allows_public_destinations() {
         let allowed = [
-            "1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.0", "198.17.255.255", "198.20.0.1",
+            "1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.0", "192.2.0.1", "198.17.255.255", "198.20.0.1",
             "2001:4860:4860::8888", "2606:4700:4700::1111", "2001:200::1", "3fff:1000::1", "::ffff:8.8.8.8",
         ];
         let unexpected: Vec<_> = allowed.iter().copied().filter(|raw| !probe_ip_allowed(raw.parse().unwrap())).collect();
@@ -3634,22 +3630,37 @@ fn xml_tag(text: &str, name: &str) -> String {
         text[start..].find(&close).map(|j| text[start..start + j].to_string())
     }).unwrap_or_default().replace("&amp;", "&")
 }
-/// Exchange an IAM role for temporary STS credentials.
-pub async fn sts_assume_role(config: &Value) -> Result<Value, String> {
-    let region = cfg(config, "region"); let ak = cfg(config, "access_key_id"); let sk = cfg(config, "secret_access_key");
-    let role_arn = cfg(config, "role_arn"); let session = { let s = cfg(config, "session_name"); if s.is_empty() { "openwarp" } else { s } };
-    if region.is_empty() || ak.is_empty() || sk.is_empty() || role_arn.is_empty() {
+fn aws_lease_endpoint(config: &Value) -> Result<Option<reqwest::Url>, String> {
+    let endpoint = { let e = cfg(config, "sts_endpoint"); if e.is_empty() { cfg(config, "endpoint") } else { e } };
+    if endpoint.is_empty() { return Ok(None); }
+    let u = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid STS endpoint: {}", e))?;
+    if !matches!(u.scheme(), "http" | "https") { return Err("STS endpoint must be an http(s) URL".into()); }
+    u.host_str().ok_or("STS endpoint has no host")?;
+    Ok(Some(u))
+}
+pub fn validate_aws_lease_config(config: &Value) -> Result<(), String> {
+    if ["region", "access_key_id", "secret_access_key", "role_arn"].iter().any(|field| cfg(config, field).is_empty()) {
         return Err("aws_iam lease requires region, access_key_id, secret_access_key and role_arn".into());
     }
+    let endpoint = { let e = cfg(config, "sts_endpoint"); if e.is_empty() { cfg(config, "endpoint") } else { e } };
+    let url = if endpoint.is_empty() { format!("https://sts.{}.amazonaws.com", cfg(config, "region")) } else { endpoint.trim_end_matches('/').to_string() };
+    crate::integration_http::validate_integration_url(&url)?;
+    aws_lease_endpoint(config)?;
+    Ok(())
+}
+/// Exchange an IAM role for temporary STS credentials.
+pub async fn sts_assume_role(config: &Value) -> Result<Value, String> {
+    validate_aws_lease_config(config)?;
+    let region = cfg(config, "region"); let ak = cfg(config, "access_key_id"); let sk = cfg(config, "secret_access_key");
+    let role_arn = cfg(config, "role_arn"); let session = { let s = cfg(config, "session_name"); if s.is_empty() { "openwarp" } else { s } };
     let duration = config.get("duration_secs").and_then(|v| v.as_i64()).unwrap_or(3600).clamp(900, 43200);
     let endpoint = { let e = cfg(config, "sts_endpoint"); if e.is_empty() { cfg(config, "endpoint") } else { e } };
-    let (url, host_header, path) = if endpoint.is_empty() {
-        (format!("https://sts.{}.amazonaws.com", region), format!("sts.{}.amazonaws.com", region), "/".to_string())
-    } else {
-        let u = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid STS endpoint: {}", e))?;
+    let (url, host_header, path) = if let Some(u) = aws_lease_endpoint(config)? {
         let host = u.host_str().ok_or("STS endpoint has no host")?;
         let host_header = match u.port() { Some(p) => format!("{}:{}", host, p), None => host.to_string() };
         (endpoint.trim_end_matches('/').to_string(), host_header, if u.path().is_empty() { "/".into() } else { u.path().to_string() })
+    } else {
+        (format!("https://sts.{}.amazonaws.com", region), format!("sts.{}.amazonaws.com", region), "/".to_string())
     };
     let mut body = format!("Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={}&DurationSeconds={}",
         form_encode(role_arn), form_encode(session), duration);
@@ -3686,6 +3697,7 @@ pub async fn sts_assume_role(config: &Value) -> Result<Value, String> {
 }
 fn lease_base(config: &Value, default: &str) -> Result<String, String> {
     let raw = { let b = cfg(config, "base_url"); if b.is_empty() { default } else { b } };
+    crate::integration_http::validate_integration_url(raw)?;
     let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid base_url: {}", e))?;
     if url.scheme() != "https" && url.scheme() != "http" { return Err("base_url must be an http(s) URL".into()); }
     let host = url.host_str().ok_or("base_url has no host")?;
@@ -3702,17 +3714,23 @@ fn key_ref_ok(value: &str) -> bool {
 }
 /// Create a short-lived OpenRouter inference key from a management key.
 /// `https://openrouter.ai/docs/api/api-reference/api-keys/create-a-new-api-key`
-pub async fn openrouter_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
-    let management_key = cfg(config, "management_key");
-    if management_key.is_empty() { return Err("openrouter lease requires config.management_key".into()); }
+pub fn validate_openrouter_lease(config: &Value, name: &str) -> Result<(), String> {
+    if cfg(config, "management_key").is_empty() { return Err("openrouter lease requires config.management_key".into()); }
     if name.is_empty() || name.len() > 256 { return Err("openrouter key name must be 1 to 256 characters".into()); }
+    lease_base(config, "https://openrouter.ai/api/v1")?;
+    let reset = cfg(config, "limit_reset");
+    if !reset.is_empty() && !matches!(reset, "daily" | "weekly" | "monthly") { return Err("openrouter limit_reset must be daily, weekly or monthly".into()); }
+    Ok(())
+}
+pub async fn openrouter_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    validate_openrouter_lease(config, name)?;
+    let management_key = cfg(config, "management_key");
     let base = lease_base(config, "https://openrouter.ai/api/v1")?;
     let mut body = serde_json::Map::new();
     body.insert("name".into(), json!(name));
     if let Some(limit) = config.get("limit").filter(|v| v.is_number()) { body.insert("limit".into(), limit.clone()); }
     let reset = cfg(config, "limit_reset");
     if !reset.is_empty() {
-        if !matches!(reset, "daily" | "weekly" | "monthly") { return Err("openrouter limit_reset must be daily, weekly or monthly".into()); }
         body.insert("limit_reset".into(), json!(reset));
     }
     let workspace = cfg(config, "workspace_id");
@@ -3737,16 +3755,22 @@ pub async fn openrouter_revoke_key(base_url: &str, management_key: &str, hash: &
     Ok(())
 }
 /// Issue a Resend sending key. `https://resend.com/docs/api-reference/api-keys/create-api-key`
-pub async fn resend_create_key(config: &Value, name: &str) -> Result<Value, String> {
-    let api_key = cfg(config, "api_key");
-    if api_key.is_empty() { return Err("resend lease requires config.api_key".into()); }
+pub fn validate_resend_lease(config: &Value, name: &str) -> Result<(), String> {
+    if cfg(config, "api_key").is_empty() { return Err("resend lease requires config.api_key".into()); }
     if name.is_empty() || name.len() > 50 { return Err("resend key name must be 1 to 50 characters".into()); }
     let permission = { let p = cfg(config, "permission"); if p.is_empty() { "sending_access" } else { p } };
     if !matches!(permission, "sending_access" | "full_access") { return Err("resend permission must be sending_access or full_access".into()); }
+    if !cfg(config, "domain_id").is_empty() && permission != "sending_access" { return Err("resend domain_id is only valid with sending_access".into()); }
+    lease_base(config, "https://api.resend.com")?;
+    Ok(())
+}
+pub async fn resend_create_key(config: &Value, name: &str) -> Result<Value, String> {
+    validate_resend_lease(config, name)?;
+    let api_key = cfg(config, "api_key");
+    let permission = { let p = cfg(config, "permission"); if p.is_empty() { "sending_access" } else { p } };
     let mut body = serde_json::Map::new(); body.insert("name".into(), json!(name)); body.insert("permission".into(), json!(permission));
     let domain_id = cfg(config, "domain_id");
     if !domain_id.is_empty() {
-        if permission != "sending_access" { return Err("resend domain_id is only valid with sending_access".into()); }
         body.insert("domain_id".into(), json!(domain_id));
     }
     let base = lease_base(config, "https://api.resend.com")?;
@@ -3767,13 +3791,18 @@ pub async fn resend_revoke_key(base_url: &str, api_key: &str, id: &str) -> Resul
 }
 /// Issue an OpenAI project service-account key.
 /// `https://developers.openai.com/api/reference/resources/admin` service-account key create.
+pub fn validate_openai_lease(config: &Value) -> Result<(), String> {
+    if cfg(config, "admin_key").is_empty() || !key_ref_ok(cfg(config, "project_id")) || !key_ref_ok(cfg(config, "service_account_id")) {
+        return Err("openai lease requires config.admin_key, project_id and service_account_id".into());
+    }
+    lease_base(config, "https://api.openai.com/v1")?;
+    Ok(())
+}
 pub async fn openai_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    validate_openai_lease(config)?;
     let admin_key = cfg(config, "admin_key");
     let project_id = cfg(config, "project_id");
     let service_account_id = cfg(config, "service_account_id");
-    if admin_key.is_empty() || !key_ref_ok(project_id) || !key_ref_ok(service_account_id) {
-        return Err("openai lease requires config.admin_key, project_id and service_account_id".into());
-    }
     let mut body = serde_json::Map::new();
     if !name.is_empty() { body.insert("name".into(), json!(name)); }
     body.insert("expires_in_seconds".into(), json!(ttl_secs.clamp(60, 31_536_000)));
@@ -3798,21 +3827,29 @@ pub async fn openai_revoke_key(base_url: &str, admin_key: &str, project_id: &str
 const HF_PERMISSIONS: &[&str] = &["repo.content.read","repo.contribute.write","repo.write","inference.serverless.write","inference.endpoints.infer.write","inference.endpoints.write","org.read","org.write","collection.read","collection.write","resourceGroup.write","job.write","org.serviceAccounts.read","org.serviceAccounts.write","org.auditLog.write"];
 /// Issue a fine-grained token for a Hugging Face organization service account.
 /// `POST /api/organizations/{org}/service-accounts/{id}/tokens` (Hub OpenAPI).
-pub async fn huggingface_create_token(config: &Value, name: &str) -> Result<Value, String> {
-    let token = cfg(config, "token");
-    let org = cfg(config, "org");
-    let service_account_id = cfg(config, "service_account_id");
-    if token.is_empty() || !key_ref_ok(org) || !key_ref_ok(service_account_id) {
+pub fn validate_huggingface_lease(config: &Value, name: &str) -> Result<(), String> {
+    if cfg(config, "token").is_empty() || !key_ref_ok(cfg(config, "org")) || !key_ref_ok(cfg(config, "service_account_id")) {
         return Err("huggingface lease requires config.token, org and service_account_id".into());
     }
     let display = if name.is_empty() { "openwarp" } else { name };
     if display.len() > 100 { return Err("huggingface token name must be 1 to 100 characters".into()); }
-    let mut body = serde_json::Map::new();
-    body.insert("displayName".into(), json!(display));
     if let Some(permissions) = config.get("permissions").and_then(|v| v.as_array()) {
         if permissions.iter().any(|p| !HF_PERMISSIONS.contains(&p.as_str().unwrap_or(""))) {
             return Err("huggingface permissions contain a value the Hub API does not accept".into());
         }
+    }
+    lease_base(config, "https://huggingface.co")?;
+    Ok(())
+}
+pub async fn huggingface_create_token(config: &Value, name: &str) -> Result<Value, String> {
+    validate_huggingface_lease(config, name)?;
+    let token = cfg(config, "token");
+    let org = cfg(config, "org");
+    let service_account_id = cfg(config, "service_account_id");
+    let display = if name.is_empty() { "openwarp" } else { name };
+    let mut body = serde_json::Map::new();
+    body.insert("displayName".into(), json!(display));
+    if let Some(permissions) = config.get("permissions").and_then(|v| v.as_array()) {
         body.insert("permissions".into(), json!(permissions));
     }
     let base = lease_base(config, "https://huggingface.co")?;
@@ -3832,7 +3869,7 @@ pub async fn huggingface_revoke_token(base_url: &str, token: &str, org: &str, se
         .map_err(|e| format!("Hugging Face token revocation failed: {}", e))?;
     Ok(())
 }
-async fn req_allow_missing(r: crate::http::RequestBuilder) -> Result<(), String> {
+async fn req_allow_missing(r: crate::integration_http::RequestBuilder) -> Result<(), String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     // Repeating a revoke is success: a credential the provider already removed
@@ -3853,16 +3890,24 @@ fn path_segment(value: &str, what: &str) -> Result<(), String> {
 /// endpoint, Postgres the roles endpoint; both take a server-side `ttl` and
 /// return the plaintext once.
 /// `https://planetscale.com/docs/api/reference/create_password.md`
-pub async fn planetscale_create_password(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
-    let token = cfg(config, "service_token");
-    if token.is_empty() { return Err("planetscale lease requires config.service_token".into()); }
+pub fn validate_planetscale_lease(config: &Value, name: &str) -> Result<(), String> {
+    if cfg(config, "service_token").is_empty() { return Err("planetscale lease requires config.service_token".into()); }
     if name.is_empty() || name.len() > 255 { return Err("planetscale password name must be 1 to 255 characters".into()); }
-    let organization = cfg(config, "organization"); let database = cfg(config, "database"); let branch = cfg(config, "branch");
-    path_segment(organization, "planetscale organization")?;
-    path_segment(database, "planetscale database")?;
-    path_segment(branch, "planetscale branch")?;
+    path_segment(cfg(config, "organization"), "planetscale organization")?;
+    path_segment(cfg(config, "database"), "planetscale database")?;
+    path_segment(cfg(config, "branch"), "planetscale branch")?;
     let engine = { let e = cfg(config, "engine"); if e.is_empty() { "mysql" } else { e } };
     if !matches!(engine, "mysql" | "postgres") { return Err("planetscale engine must be mysql or postgres".into()); }
+    let role = { let r = cfg(config, "role"); if r.is_empty() { "readwriter" } else { r } };
+    if !matches!(role, "reader" | "writer" | "admin" | "readwriter") { return Err(format!("planetscale role {} is not supported; use reader, writer, readwriter or admin", role)); }
+    lease_base(config, "https://api.planetscale.com/v1")?;
+    Ok(())
+}
+pub async fn planetscale_create_password(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    validate_planetscale_lease(config, name)?;
+    let token = cfg(config, "service_token");
+    let organization = cfg(config, "organization"); let database = cfg(config, "database"); let branch = cfg(config, "branch");
+    let engine = { let e = cfg(config, "engine"); if e.is_empty() { "mysql" } else { e } };
     let role = { let r = cfg(config, "role"); if r.is_empty() { "readwriter" } else { r } };
     let ttl = ttl_secs.clamp(60, 30 * 86400);
     let mut body = serde_json::Map::new();
@@ -3875,11 +3920,10 @@ pub async fn planetscale_create_password(config: &Value, name: &str, ttl_secs: i
             "reader" => vec!["pg_read_all_data"],
             "writer" | "readwriter" => vec!["pg_read_all_data", "pg_write_all_data"],
             "admin" => vec!["pg_read_all_data", "pg_write_all_data", "pg_monitor"],
-            other => return Err(format!("planetscale role {} is not supported; use reader, writer, readwriter or admin", other)),
+            _ => unreachable!(),
         };
         body.insert("inherited_roles".into(), json!(inherited));
     } else {
-        if !matches!(role, "reader" | "writer" | "admin" | "readwriter") { return Err(format!("planetscale role {} is not supported; use reader, writer, readwriter or admin", role)); }
         body.insert("role".into(), json!(role));
     }
     let base = lease_base(config, "https://api.planetscale.com/v1")?;
@@ -3915,12 +3959,17 @@ pub async fn planetscale_revoke_password(config: &Value, password_id: &str) -> R
 }
 /// Issue a per-sandbox Instabox SSH token, used as the SSH user name.
 /// `POST /v1/machines/{id}/ssh-tokens` in the published OpenAPI document.
-pub async fn instabox_create_ssh_token(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
-    let api_key = cfg(config, "api_key");
-    if api_key.is_empty() { return Err("instabox lease requires config.api_key".into()); }
+pub fn validate_instabox_lease(config: &Value, name: &str) -> Result<(), String> {
+    if cfg(config, "api_key").is_empty() { return Err("instabox lease requires config.api_key".into()); }
     if name.is_empty() || name.len() > 100 { return Err("instabox token name must be 1 to 100 characters".into()); }
+    path_segment(cfg(config, "machine_id"), "instabox machine_id")?;
+    lease_base(config, "https://api.instabox.sh/v1")?;
+    Ok(())
+}
+pub async fn instabox_create_ssh_token(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
+    validate_instabox_lease(config, name)?;
+    let api_key = cfg(config, "api_key");
     let machine = cfg(config, "machine_id");
-    path_segment(machine, "instabox machine_id")?;
     let base = lease_base(config, "https://api.instabox.sh/v1")?;
     let body = json!({"name": name, "ttlSeconds": ttl_secs.clamp(1, 2_592_000)});
     let text = req(http_client().post(format!("{}/machines/{}/ssh-tokens", base, machine)).header("X-API-Key", api_key).json(&body)).await

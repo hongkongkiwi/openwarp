@@ -60,6 +60,7 @@ pub(super) async fn create(State(st): State<S>, h: HeaderMap, Path((oid, iid)): 
         if !valid { return Err(bad("bound claims must be strings or string arrays")); }
     }
     let jwks = body.get("jwks").ok_or_else(|| bad("inline JWKS required"))?; validate_jwks(jwks).map_err(|e| bad(&e))?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let tid = id(); let scopes = scopes.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ");
     st.db.exec("INSERT INTO workload_trusts(id,org_id,identity_id,env_id,issuer,audience,subject,jwks,scopes,ttl,bound_claims,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", &[json!(tid), json!(oid), json!(iid), json!(eid), body["issuer"].clone(), body["audience"].clone(), body["subject"].clone(), json!(jwks.to_string()), json!(scopes), json!(ttl), json!(bound.to_string()), json!(now())]).await.map_err(|e| bad(&e))?;
     st.audit(&oid, "", eid, &uid, "workload.trust.create", &tid).await;
@@ -72,6 +73,8 @@ pub(super) async fn list(State(st): State<S>, h: HeaderMap, Path((oid, iid)): Pa
 }
 pub(super) async fn revoke(State(st): State<S>, h: HeaderMap, Path((oid, iid, tid)): Path<(String, String, String)>) -> Res {
     let uid = authority(&st, &h, &oid, &iid).await?;
+    if st.db.one("SELECT id FROM workload_trusts WHERE id=? AND org_id=? AND identity_id=?", &[json!(&tid),json!(&oid),json!(&iid)]).await.map_err(|e| bad(&e))?.is_none() { return Err(err(StatusCode::NOT_FOUND,"trust not found")); }
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let n = st.db.exec("UPDATE workload_trusts SET revoked=1 WHERE id=? AND org_id=? AND identity_id=?", &[json!(tid), json!(oid), json!(iid)]).await.map_err(|e| bad(&e))?;
     if n == 0 { return Err(err(StatusCode::NOT_FOUND, "trust not found")); }
     // Live policy checks deny existing tokens even if cleanup fails.

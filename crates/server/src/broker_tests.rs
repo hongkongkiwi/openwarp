@@ -74,9 +74,19 @@ impl Fixture {
         let r = f.call(Method::GET,&format!("/api/envs/{}/secrets",f.env),&f.owner,Value::Null).await; assert_eq!(r.status,200); f.secret=r.body["secrets"][0]["id"].as_str().unwrap().into(); f
     }
     async fn call(&self, method: Method, path: &str, token: &str, body: Value) -> Resp {
-        let req = Request::builder().method(method).uri(path).extension(axum::extract::ConnectInfo("127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap())).header("authorization",format!("Bearer {token}")).header("content-type","application/json")
-            .body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
+        self.call_with_grant(method,path,token,body,None).await
+    }
+    async fn call_with_grant(&self, method: Method, path: &str, token: &str, body: Value, grant: Option<&str>) -> Resp {
+        let mut req = Request::builder().method(method).uri(path).extension(axum::extract::ConnectInfo("127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap())).header("authorization",format!("Bearer {token}")).header("content-type","application/json");
+        if let Some(grant) = grant { req = req.header("x-openwarp-step-up",grant); }
+        let req = req.body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
         let r = self.app.clone().oneshot(req).await.unwrap(); let status=r.status().as_u16(); let text=String::from_utf8(to_bytes(r.into_body(),1024*1024).await.unwrap().to_vec()).unwrap(); let body=serde_json::from_str(&text).unwrap_or(Value::Null); Resp { status,body,text }
+    }
+    async fn settings_grant(&self, mail: &mut crate::mailer::test_mail::Relay) -> String {
+        let r=self.call(Method::POST,"/api/auth/step-up/start",&self.owner,json!({"risk":"very_risky"})).await; assert_eq!(r.status,200); assert_eq!(r.body["methods"],json!(["email"]));
+        let code=mail.code("owner@broker.test.invalid").await;
+        let r=self.call(Method::POST,"/api/auth/step-up/verify",&self.owner,json!({"challenge":r.body["challenge"],"email_code":code})).await; assert_eq!(r.status,200);
+        r.body["token"].as_str().unwrap().into()
     }
     fn service(&self, kind: &str, fields: Value) -> Value {
         let entry=json!({"id":"lookup","url":"https://service.example/lookup","method":"POST","privileged":false,"input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":[],"additionalProperties":false},"response_fields":fields});
@@ -140,6 +150,8 @@ async fn remote_mcp_handshake_maps_exact_tool_and_projects_structured_content() 
 
 #[tokio::test]
 async fn live_credential_deletion_and_issuer_access_changes_prevent_dispatch() {
+    let mut mail=crate::mailer::test_mail::Relay::start().await;
+    crate::mailer::test_mail::scope(mail.config(),async {
     let upstream=Upstream::start(); let f=Fixture::new().await;
     super::with_test_client(upstream.client.clone(),async {
         let config=f.service("http",json!({"answer":"/answer"}));
@@ -150,16 +162,21 @@ async fn live_credential_deletion_and_issuer_access_changes_prevent_dispatch() {
         let token=f.token(f.service("http",json!({"answer":"/answer"}))).await; assert_eq!(f.execute(&token).await.status,200);
         let r=f.call(Method::DELETE,&format!("/api/secrets/{}",f.secret),&f.owner,Value::Null).await; assert_eq!(r.status,200,"delete credential: {}",r.text);
         let count=upstream.requests.lock().unwrap().len(); let r=f.execute(&token).await; assert!(matches!(r.status,403|409),"deleted credential must fail: {}",r.text); assert_eq!(upstream.requests.lock().unwrap().len(),count);
-        let r=f.call(Method::PUT,&format!("/api/orgs/{}/settings",f.org),&f.owner,json!({"ip_allowlist":"192.0.2.0/24"})).await; assert_eq!(r.status,200); let r=f.execute(&token).await; assert_eq!(r.status,403); assert_eq!(upstream.requests.lock().unwrap().len(),count);
+        let grant=f.settings_grant(&mut mail).await;
+        let r=f.call_with_grant(Method::PUT,&format!("/api/orgs/{}/settings",f.org),&f.owner,json!({"ip_allowlist":"192.0.2.0/24"}),Some(&grant)).await; assert_eq!(r.status,200); let r=f.execute(&token).await; assert_eq!(r.status,403); assert_eq!(upstream.requests.lock().unwrap().len(),count);
+    }).await;
     }).await;
 }
 
 #[tokio::test]
 async fn broker_review_mixed_cookie_cannot_bypass_control_ip_allowlist() {
+    let mut mail=crate::mailer::test_mail::Relay::start().await;
+    crate::mailer::test_mail::scope(mail.config(),async {
     let f=Fixture::new().await; let _token=f.token(f.service("http",json!({"answer":"/answer"}))).await;
     let path=format!("/api/orgs/{}/broker/services",f.org);
     let r=f.call(Method::GET,&path,&f.owner,Value::Null).await; assert_eq!(r.status,200); assert_eq!(r.body.as_array().unwrap().len(),1);
-    let r=f.call(Method::PUT,&format!("/api/orgs/{}/settings",f.org),&f.owner,json!({"ip_allowlist":"192.0.2.0/24"})).await; assert_eq!(r.status,200);
+    let grant=f.settings_grant(&mut mail).await;
+    let r=f.call_with_grant(Method::PUT,&format!("/api/orgs/{}/settings",f.org),&f.owner,json!({"ip_allowlist":"192.0.2.0/24"}),Some(&grant)).await; assert_eq!(r.status,200);
     let r=f.call(Method::GET,&path,&f.owner,Value::Null).await; assert_eq!(r.status,403,"human bearer alone must respect the IP allowlist");
     let req=Request::builder().method(Method::GET).uri(&path)
         .extension(axum::extract::ConnectInfo("127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap()))
@@ -168,6 +185,7 @@ async fn broker_review_mixed_cookie_cannot_bypass_control_ip_allowlist() {
     let text=String::from_utf8(to_bytes(r.into_body(),1024*1024).await.unwrap().to_vec()).unwrap();
     assert!(matches!(status,401|403),"mixed human bearer and broker cookie must not bypass the IP allowlist: status {status}");
     for sensitive in [SECRET,f.owner.as_str(),f.secret.as_str(),"credential_secret_id","allowed_member_ids"] { assert!(!text.contains(sensitive),"denial must not disclose broker configuration or credentials"); }
+    }).await;
 }
 
 #[tokio::test]

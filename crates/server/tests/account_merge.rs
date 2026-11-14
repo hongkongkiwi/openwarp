@@ -97,6 +97,30 @@ impl Server {
         Self::response(req.send().await.expect("HTTP request")).await
     }
 
+    async fn call_with_email_proof(&self, method: Method, path: &str, token: &str, email: &str, body: Option<Value>) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", token, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start.status, 200, "start ownership transfer verification");
+        assert_eq!(start.body["email_sent"], true);
+        let mut code = None;
+        for _ in 0..60 {
+            code = self.inbox.lock().unwrap().iter().skip(before).rev()
+                .filter(|m| m["to"] == email && m["subject"] == "Your OpenWarp verification code")
+                .filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6).map(str::to_string));
+            if code.is_some() { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let code = code.expect("fresh ownership transfer verification email");
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", token,
+            Some(json!({"challenge": field(&start.body, "challenge"), "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify ownership transfer email code");
+        let mut req = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(token)
+            .header("x-openwarp-step-up", field(&verified.body, "token"));
+        if let Some(body) = body { req = req.json(&body); }
+        Self::response(req.send().await.expect("verified HTTP request")).await
+    }
+
     async fn form(&self, path: &str, token: &str, form: &[(&str, String)]) -> Resp {
         let mut req = self.client.post(format!("{}{}", self.base, path)).form(form);
         if !token.is_empty() { req = req.bearer_auth(token); }
@@ -192,7 +216,7 @@ async fn account_delete_refuses_even_a_co_owner_until_transfer() {
     assert_eq!(r.status, 409, "owning any workspace blocks deletion, even with another owner");
     assert!(r.body["workspaces"].as_array().expect("owned workspace list").iter().any(|w| w["id"] == second.org));
     assert_eq!(s.call(Method::GET, "/api/me", &second.session, None).await.status, 200, "refusal preserves session");
-    assert_eq!(s.call(Method::POST, &format!("/api/orgs/{}/transfer", second.org), &second.session, Some(json!({"user_id": first.id}))).await.status, 200);
+    assert_eq!(s.call_with_email_proof(Method::POST, &format!("/api/orgs/{}/transfer", second.org), &second.session, "second@test.invalid", Some(json!({"user_id": first.id}))).await.status, 200);
     assert_eq!(s.call(Method::DELETE, "/api/me", &second.session, None).await.status, 200, "transfer releases account");
     let orgs = s.call(Method::GET, "/api/orgs", &first.session, None).await;
     assert!(orgs.body.as_array().unwrap().iter().any(|o| o["id"] == second.org && o["role"] == "owner"), "transferred workspace survives");
@@ -221,7 +245,7 @@ async fn account_delete_warns_then_revokes_all_personal_credentials() {
     let first = s.register("owner@test.invalid").await;
     let second = s.register("departing@test.invalid").await;
     s.add_member(&second, "owner@test.invalid", "developer").await;
-    assert_eq!(s.call(Method::POST, &format!("/api/orgs/{}/transfer", second.org), &second.session, Some(json!({"user_id": first.id}))).await.status, 200);
+    assert_eq!(s.call_with_email_proof(Method::POST, &format!("/api/orgs/{}/transfer", second.org), &second.session, "departing@test.invalid", Some(json!({"user_id": first.id}))).await.status, 200);
     let app = s.app(&second, &second.org).await;
     let key = s.call(Method::POST, &format!("/api/apps/{}/tokens", app), &second.session, Some(json!({"name": "ci"}))).await;
     assert_eq!(key.status, 200);

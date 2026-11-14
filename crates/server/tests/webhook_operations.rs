@@ -93,7 +93,7 @@ impl Server {
         std::fs::create_dir_all(&dir).unwrap(); let mail = Receiver::start();
         let mut command = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
         command.env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display())).env("ADDR", addr.to_string())
-            .env("OPENWARP_PUBLIC_URL", &base).env("OPENWARP_EMAIL_WEBHOOK", &mail.url).env("TOKIO_WORKER_THREADS", "1")
+            .env("OPENWARP_PUBLIC_URL", &base).env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", &mail.url).env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS").env_remove("OPENWARP_TRUST_PROXY").env_remove("OPENWARP_ALLOWED_DB_HOSTS");
         if loopback_delivery { command.env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1"); }
@@ -115,6 +115,23 @@ impl Server {
         if !token.is_empty() { req = req.bearer_auth(token); }
         if let Some(body) = body { req = req.json(&body); }
         let r = req.send().await.unwrap(); let status = r.status().as_u16(); let text = r.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(json!({"raw":text})))
+    }
+    async fn call_stepped_up(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> (u16, Value) {
+        let before = self.mail.calls.lock().unwrap().len();
+        let start = success(self.call(Method::POST, "/api/auth/step-up/start", token, Some(json!({"risk":"very_risky"}))).await);
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.mail.calls.lock().unwrap().iter().skip(before).filter_map(|c| serde_json::from_slice::<Value>(&c.body).ok())
+                .find_map(|m| m["text"].as_str()?.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = success(self.call(Method::POST, "/api/auth/step-up/verify", token, Some(json!({"challenge":start["challenge"],"email_code":code}))).await);
+        let mut request = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(token).header("x-openwarp-step-up", verified["token"].as_str().unwrap());
+        if let Some(body) = body { request = request.json(&body); }
+        let response = request.send().await.unwrap(); let status = response.status().as_u16(); let text = response.text().await.unwrap();
         (status, serde_json::from_str(&text).unwrap_or(json!({"raw":text})))
     }
     async fn register(&self, email: &str) -> Value {
@@ -259,7 +276,7 @@ async fn incoming_ip_policy_and_mcp_cannot_be_bypassed_by_forwarded_headers() {
     let s = Server::start().await; let u = s.register("ip@test.invalid").await; let t = u["token"].as_str().unwrap(); let org = u["org_id"].as_str().unwrap();
     let (_,eid) = s.app(t,org).await; let iid = s.integration(t,&eid,"http://127.0.0.1:9/never").await; let (hid,key) = s.incoming(t,&iid).await;
     assert_eq!(s.signed(&hid,&key,"before_ip_change",b"{}").await.0,202);
-    success(s.call(Method::PUT,&format!("/api/orgs/{org}/settings"),t,Some(json!({"ip_allowlist":"192.0.2.0/24"}))).await);
+    success(s.call_stepped_up(Method::PUT,&format!("/api/orgs/{org}/settings"),t,Some(json!({"ip_allowlist":"192.0.2.0/24"}))).await);
     assert_eq!(s.signed(&hid,&key,"after_ip_change",b"{}").await.0,403);
     let r = s.client.post(format!("{}/mcp",s.base)).bearer_auth(t).header("X-Forwarded-For","192.0.2.5")
         .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"api_request","arguments":{"method":"GET","path":format!("/api/envs/{eid}/integrations")}}})).send().await.unwrap();
@@ -316,7 +333,7 @@ async fn incoming_signing_key_survives_instance_master_rotation() {
     let iid = s.integration(t,&eid,"http://127.0.0.1:9/never").await; let (hid,key) = s.incoming(t,&iid).await;
     assert_eq!(s.signed(&hid,&key,"before_master_rotation",b"{}").await.0,202);
     let new_key = Base64::encode_string(&openwarp_crypto::random_key());
-    success(s.call(Method::POST,"/api/instance/rotate-master",t,Some(json!({"new_key":new_key}))).await);
+    success(s.call_stepped_up(Method::POST,"/api/instance/rotate-master",t,Some(json!({"new_key":new_key}))).await);
     assert_eq!(s.signed(&hid,&key,"after_master_rotation",b"{}").await.0,202,"master rotation must preserve the externally issued signing key");
     let rows = s.history(t,&hid,true).await; assert_eq!(rows.as_array().unwrap().len(),2);
     for marker in [key.as_str(),new_key.as_str(),"body_hash","raw_body"] { assert!(!rows.to_string().contains(marker)); }

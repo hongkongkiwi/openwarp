@@ -127,7 +127,7 @@ Each provider needs both its ID and secret, except the custom OIDC provider, whi
 
 Proxy trust requires both enabling the flag and matching the connection peer. It does not make all client-supplied forwarding headers trustworthy.
 
-Private egress is an intentional exception, not a general recommendation. Do not assume one setting constrains every provider-specific request. Apply network-layer egress policy and give integrations only the credentials they need.
+Private egress is an intentional exception, not a general recommendation. Integration-owned HTTP uses the production egress policy for every request, including secondary token endpoints and custom TLS clients, on both the native server and standalone sync runner. It rejects non-public literals and DNS answers at the native connector, disables ambient proxies and never follows redirects. Outside production, or with `OPENWARP_ALLOW_PRIVATE_EGRESS=1`, private destinations are permitted. Workers cannot verify connector DNS and refuse production integration HTTP without the override; development and override-enabled requests use Fetch with manual redirects and no DNS enforcement. Operator-configured email delivery and other non-integration clients are unchanged. See [integration limits](INTEGRATIONS.md#create-and-sync). Apply network-layer egress policy and give integrations only the credentials they need.
 
 ## AI endpoints
 

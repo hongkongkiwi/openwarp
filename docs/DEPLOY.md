@@ -173,6 +173,29 @@ network with `OPENWARP_URL`, `OPENWARP_RUNNER_TOKEN` and `OPENWARP_RUNNER_KEY`
 runs one pass and `OPENWARP_RUNNER_INTERVAL` sets the poll interval. Provider
 configs are sealed to the runner, and sealed secrets are never sent.
 
+Deploy the server and runner together when upgrading this protocol. Managed
+ownership results require an explicit `persist_managed` boolean and the specific
+`job_id`, in addition to the current claim token. Dry-runs, connection tests and
+preparation failures leave ownership unchanged. Successful managed writes can
+replace it, including clearing an empty managed set. Failed managed dispatches
+use `managed_mode: "merge_only"` with `persist_managed: false` to retain previous
+and desired candidate names without deleting previous ownership or replacing its
+hashes. A later successful mirror can prune those candidates. An uncertain
+write's hash is advisory, not confirmation of remote contents.
+
+Results and local runner logs omit raw provider responses and transport errors.
+The server selects constant job and audit diagnostics from closed result codes
+and ignores freeform detail even from older runners. Legacy results without an
+ownership policy can complete only without managed names and never change
+ownership. A legacy runner reporting managed names is rejected and must be upgraded.
+
+The server cannot open sealed configs to verify a dry-run independently. It
+trusts the authenticated runner's job-bound persistence report. Protect runner
+tokens and keys as provider credentials. Delegated initial imports are unsupported
+and rejected before provider access; use client-side deployment instead. Source
+paths and tags are decrypted only in the runner, using the same managed adapters
+and provider-specific capabilities as server-managed sync.
+
 ## Workspace OIDC group mapping
 
 Workspace settings accept `oidc_groups_claim` (default `groups`) and
@@ -230,6 +253,28 @@ risk, and sends the emailed code through `POST /api/auth/step-up/verify`. The
 verified grant is valid for one action and five minutes and is sent on the
 retry as `X-OpenWarp-Step-Up`. Challenges expire after ten minutes and allow
 five code attempts. Other clients can follow the same contract.
+
+The handler catalog covers the following route families after their existing
+authorization and local input checks, before writes or provider dispatch:
+
+| Risk | Actions |
+| --- | --- |
+| Very risky | `GET /api/envs/{eid}/export`; workspace settings, SAML and LDAP configuration; workspace and instance ownership transfer; root X.509 and SSH CA creation; native and Worker master rotation; privileged SSH user signing |
+| Major | Workspace/app/environment deletion and workspace leave; secret deploy/import, delete/destroy/undelete/restore and overrides; E2E writes, grants, revocation and rekey; environment and path policies; clone and restore-point; team creation, grants and members; membership, invitations, roles and locks; service tokens, machine identities and workload trusts; leases and renewals; rotation schedules, manual runs and hooks; integration creation/update/deletion/test/sync and AI integration-draft execution/deletion; proposal, access and change-request decisions; X.509 issue and certificate/device/group/CA revocation; intermediate CA creation; SSH principal grants, host registration/signing and revocation; lockbox creation; identity unlink; instance signup policy and feature grants |
+
+Standard app/environment creation, proposal/access-request creation, public
+authentication, MFA setup, device enrollment and self-renewal remain outside
+this gate. Emergency activation and restoration retain their owner-session
+checks without an email dependency. Autonomous maintenance and internal provider
+sync do not prompt. SCIM mutation step-up integration is pending the separate
+SCIM atomicity repair; do not treat interactive SCIM writes as covered by this
+catalog. Broker-session issuance retains its separate approval protocol.
+
+Proof does not grant access. A denied tenant, role, scope or invalid local input
+must be rejected before the grant is consumed. Conflicts and provider errors
+can still occur after that point. The console keeps the grant in memory and
+replays the original request only once; cancellation or a changed account,
+workspace or lockdown context prevents replay.
 
 ## Back-channel logout
 
@@ -479,13 +524,22 @@ when the lease URL sets `require_ssl=true`. MySQL is a lease target only on
 Workers: the deployment's own storage stays in the Durable Object, and a
 `DATABASE_URL` of `mysql://` is native-only.
 
-SAML and passkeys share the native verification libraries. The vendored clock
-patches select the Workers clock without replacing signature verification.
-OCSP and CRL generation use portable timestamps and Rust signing libraries.
-Use `scripts/worker-protocol-smoke.mjs` to exercise passkey assertions and
-independently verify OCSP and CRL signatures with OpenSSL. Run
-`scripts/worker-saml-smoke.sh` for signed SAML login, invalid-signature rejection
-and replay rejection against workerd. `scripts/worker-key-smoke.mjs` checks KMS
+SAML requires a Worker built with `worker-build --release --no-default-features
+--features saml`, an applicable license, and a per-workspace SAML feature grant.
+It uses the shared RustCrypto verification and PKI signing helpers; the vendored
+clock selects Workers time without replacing signature verification. Run
+`scripts/worker-saml-smoke.sh` against a fresh feature bundle for signed SAML
+login, invalid-signature rejection and replay rejection against workerd.
+SAML `metadata_url` fetches reject redirects and URL credentials, require a 2xx
+response, and limit the response to 2,000,000 bytes within ten seconds. Native
+production fetches enforce public addresses on the actual DNS connector and do
+not use ambient proxies. Workers cannot enforce connector DNS, so production
+Workers reject `metadata_url` unless `OPENWARP_ALLOW_PRIVATE_EGRESS=1` explicitly
+relaxes the policy. Supply `metadata_xml` instead to retain that policy.
+Passkey assertions are exercised by `scripts/worker-protocol-smoke.mjs`.
+OCSP responses and CRL generation remain native-only; their Worker endpoints
+return 501 when PKI is compiled in. The protocol smoke's OpenSSL OCSP/CRL
+checks do not establish Worker support. `scripts/worker-key-smoke.mjs` checks KMS
 outage recovery, rotation failure safety and restart key validation. OCI Vault uses the shared Rust RSA
 signer.
 
@@ -499,9 +553,16 @@ LDAP routes are compiled out. SSH file sync, SMTP and integrations that need
 client TLS certificates return errors rather than running native implementations.
 
 The KMS bridge uses asynchronous HTTP on both deployments. A configured bridge
-must unwrap the existing root successfully before requests are served. Master
-rotation validates encrypted records and commits their replacements together;
-update the external master-key setting before restarting. A stale setting fails
+must unwrap the existing root successfully before requests are served. Startup
+also verifies the full root-encrypted inventory, even when a root verifier is
+present. Worker master rotation drains in-flight HTTP and maintenance work with
+the existing key gate, verifies a KMS replacement root by wrap/unwrap roundtrip,
+then snapshots the inventory without further network awaits. A checked storage
+transaction replaces every root-encrypted record, including persisted native
+feature stores, and advances the webhook and main Transit fences. Store-count,
+old-ciphertext and custody-row guards reject an incomplete or changed snapshot.
+The in-memory root changes only after commit; update the external master-key
+setting before restarting. A stale setting fails
 the persisted key check. Rotation is disabled on shared PostgreSQL and MySQL/MariaDB because
 replicas do not yet reload a changed master key.
 

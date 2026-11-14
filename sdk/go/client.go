@@ -203,16 +203,71 @@ func (c *Client) Secrets(ctx context.Context, env string) ([]Secret, error) {
 }
 
 func (c *Client) GetSecret(ctx context.Context, env, key string) (Secret, error) {
-	secrets, err := c.Secrets(ctx, env)
+	return c.resolveSecret(ctx, env, key, nil)
+}
+
+// GetSecretAtPath selects a secret using its exact path and case-insensitive key.
+func (c *Client) GetSecretAtPath(ctx context.Context, env, key, path string) (Secret, error) {
+	return c.resolveSecret(ctx, env, key, &path)
+}
+
+func (c *Client) completeSecrets(ctx context.Context, env string) ([]Secret, error) {
+	path := "/api/envs/" + url.PathEscape(env) + "/secrets"
+	offset, total := 0, -1
+	var secrets []Secret
+	invalid := func() ([]Secret, error) { return nil, &APIError{Status: 0, Message: "Invalid secret pagination response"} }
+	for {
+		var page struct {
+			Secrets json.RawMessage `json:"secrets"`
+			Total json.RawMessage `json:"total"`
+			Limit json.RawMessage `json:"limit"`
+			Offset json.RawMessage `json:"offset"`
+		}
+		requestPath := path
+		if offset != 0 { requestPath += fmt.Sprintf("?offset=%d", offset) }
+		if err := c.request(ctx, http.MethodGet, requestPath, nil, &page); err != nil { return nil, err }
+		var items []Secret
+		if len(page.Secrets) == 0 || string(page.Secrets) == "null" || json.Unmarshal(page.Secrets, &items) != nil { return invalid() }
+		if offset == 0 && page.Limit == nil && page.Offset == nil {
+			if len(items) > 100_000 { return invalid() }
+			if page.Total != nil {
+				var total int
+				if string(page.Total) == "null" || json.Unmarshal(page.Total, &total) != nil || total != len(items) { return invalid() }
+			}
+			return items, nil
+		}
+		var pageTotal, limit, pageOffset int
+		if len(page.Total) == 0 || len(page.Limit) == 0 || len(page.Offset) == 0 || string(page.Total) == "null" || string(page.Limit) == "null" || string(page.Offset) == "null" ||
+			json.Unmarshal(page.Total, &pageTotal) != nil || json.Unmarshal(page.Limit, &limit) != nil || json.Unmarshal(page.Offset, &pageOffset) != nil { return invalid() }
+		if pageTotal < 0 || pageTotal > 100_000 || limit < 1 || limit > 1000 || pageOffset != offset ||
+			(total >= 0 && total != pageTotal) || len(items) > limit || offset > pageTotal || len(items) > pageTotal-offset ||
+			(offset < pageTotal && len(items) == 0) { return invalid() }
+		total = pageTotal
+		offset += len(items)
+		secrets = append(secrets, items...)
+		if offset == total { return secrets, nil }
+	}
+}
+
+func (c *Client) resolveSecret(ctx context.Context, env, key string, path *string) (Secret, error) {
+	secrets, err := c.completeSecrets(ctx, env)
 	if err != nil {
 		return Secret{}, err
 	}
+	var match Secret
+	found := false
 	for _, secret := range secrets {
-		if strings.EqualFold(secret.Key, key) {
-			return secret, nil
+		if strings.EqualFold(secret.Key, key) && (path == nil || secret.Path == *path) {
+			if found {
+				return Secret{}, &APIError{Status: 409, Message: "Ambiguous secret: " + key + " matches multiple records"}
+			}
+			match, found = secret, true
 		}
 	}
-	return Secret{}, &APIError{Status: 404, Message: "Secret not found: " + key}
+	if !found {
+		return Secret{}, &APIError{Status: 404, Message: "Secret not found: " + key}
+	}
+	return match, nil
 }
 
 // SetSecret uses path "/" and type "secret" when their arguments are empty.
@@ -230,7 +285,16 @@ func (c *Client) SetSecret(ctx context.Context, env, key, value, path, secretTyp
 }
 
 func (c *Client) DeleteSecret(ctx context.Context, env, key string) (map[string]any, error) {
-	secret, err := c.GetSecret(ctx, env, key)
+	return c.deleteSecret(ctx, env, key, nil)
+}
+
+// DeleteSecretAtPath deletes the unique secret at the exact path and key.
+func (c *Client) DeleteSecretAtPath(ctx context.Context, env, key, path string) (map[string]any, error) {
+	return c.deleteSecret(ctx, env, key, &path)
+}
+
+func (c *Client) deleteSecret(ctx context.Context, env, key string, path *string) (map[string]any, error) {
+	secret, err := c.resolveSecret(ctx, env, key, path)
 	if err != nil {
 		return nil, err
 	}

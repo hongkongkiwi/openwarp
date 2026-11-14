@@ -20,6 +20,52 @@ const USER: &str = "epoch-oauth-user";
 const EMAIL: &str = "epoch-v2@test.invalid";
 const REDIRECT: &str = "http://127.0.0.1:8917/callback";
 
+async fn isolated_mail_child(name: &str) -> bool {
+    const MARKER: &str = "OPENWARP_EPOCH_TEST_CHILD";
+    if let Ok(selected) = std::env::var(MARKER) { assert_eq!(selected, name, "isolated child must run exactly its selected test"); return false; }
+    let dir = std::env::temp_dir().join(format!("openwarp-epoch-mail-{}-{}", std::process::id(), oc::random_token("fixture")));
+    std::fs::create_dir(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf, tokio::task::JoinHandle<()>);
+    impl Drop for Cleanup { fn drop(&mut self) { self.1.abort(); let _ = std::fs::remove_dir_all(&self.0); } }
+    let mail_path = dir.join("mail.json"); let sink = mail_path.clone();
+    let relay = axum::Router::new().route("/mail", axum::routing::post(move |axum::Json(mail): axum::Json<Value>| {
+        let sink = sink.clone(); async move { std::fs::write(sink, mail.to_string()).unwrap(); axum::Json(json!({})) }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
+    let relay = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap(); });
+    let _cleanup = Cleanup(dir.clone(), relay);
+    let log_path = dir.join("child.log"); let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1"])
+        .env(MARKER, name).env("OPENWARP_EPOCH_MAIL_FILE", &mail_path)
+        .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url)
+        .env_remove("OPENWARP_ENV").env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_KMS_URL").env_remove("OPENWARP_KMS_TOKEN")
+        .stdout(std::process::Stdio::from(log.try_clone().unwrap())).stderr(std::process::Stdio::from(log)).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() { break status; }
+        if std::time::Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); panic!("isolated epoch test timed out"); }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let output = std::fs::read_to_string(log_path).unwrap();
+    assert!(status.success(), "isolated epoch assertions failed: {output}");
+    assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;") && output.contains(&format!("test {name} ... ok")), "isolated epoch child must execute exactly one passing test");
+    true
+}
+
+async fn rotation_proof(state: &S) -> String {
+    let (status, started) = call(state, "POST", "/api/auth/step-up/start", Some(json!({"risk":"very_risky"}))).await;
+    assert_eq!(status, 200, "start rotation verification");
+    let mail: Value = serde_json::from_slice(&std::fs::read(std::env::var("OPENWARP_EPOCH_MAIL_FILE").unwrap()).expect("delivered rotation email")).unwrap();
+    assert_eq!(mail["to"], EMAIL, "rotation code must be delivered to the session owner");
+    let code = mail["text"].as_str().unwrap().split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+        .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).expect("emailed six-digit code");
+    let (status, verified) = call(state, "POST", "/api/auth/step-up/verify", Some(json!({"challenge":started["challenge"],"email_code":code}))).await;
+    assert_eq!(status, 200, "verify emailed rotation code");
+    verified["token"].as_str().expect("rotation grant").to_string()
+}
+
 struct Rotated {
     dir: std::path::PathBuf,
     stale: Option<S>,
@@ -61,7 +107,8 @@ impl Rotated {
     }
 
     async fn rotate(&self) {
-        let (status, body) = call(self.fresh(), "POST", "/api/instance/rotate-master", Some(json!({"new_key": oc::b64(&self.new)}))).await;
+        let proof = rotation_proof(self.fresh()).await;
+        let (status, body) = call_with_grant(self.fresh(), "POST", "/api/instance/rotate-master", Some(json!({"new_key": oc::b64(&self.new)})), Some(&proof)).await;
         assert_eq!(status, 200, "master rotation failed: {body}");
         assert_eq!(body["ok"], json!(true), "rotation response: {body}");
     }
@@ -75,9 +122,12 @@ impl Drop for Rotated {
     }
 }
 
-async fn call(state: &S, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+async fn call(state: &S, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) { call_with_grant(state, method, uri, body, None).await }
+
+async fn call_with_grant(state: &S, method: &str, uri: &str, body: Option<Value>, grant: Option<&str>) -> (u16, Value) {
     let mut b = axum::http::Request::builder().method(method).uri(uri)
         .header("authorization", format!("Bearer {TOKEN}"));
+    if let Some(grant) = grant { b = b.header("x-openwarp-step-up", grant); }
     if body.is_some() { b = b.header("content-type", "application/json"); }
     let mut req = match body {
         Some(v) => b.body(axum::body::Body::from(v.to_string())).unwrap(),
@@ -134,6 +184,7 @@ fn proof_for(auth_key: &[u8; 32], challenge: &str, cid: &str) -> String {
 
 #[tokio::test]
 async fn stale_replica_oauth_v2_proof_fails_closed_without_consuming_challenge() {
+    if isolated_mail_child("stale_replica_oauth_v2_proof_fails_closed_without_consuming_challenge").await { return; }
     let r = Rotated::seed().await;
 
     // Register a real client, then create the v2 proof challenge rows.

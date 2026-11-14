@@ -133,6 +133,7 @@ pub(super) async fn revoke(State(st): State<S>, h: HeaderMap, Path((oid,iid)): P
     let uid = st.token_user(&h).await?; st.check_admin(&oid,&uid).await?;
     let row = st.db.one("SELECT role FROM invites WHERE org_id=? AND id=? AND accepted=0", &[json!(&oid),json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"invitation not found"))?;
     grant(&st,&oid,&uid,&db::s(&row,"role")).await?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     st.db.exec("DELETE FROM invites WHERE org_id=? AND id=? AND accepted=0", &[json!(&oid),json!(&iid)]).await.map_err(|e| bad(&e))?;
     st.audit(&oid,"","",&uid,"invite.revoke",&iid).await; Ok(j(json!({"ok":true})))
 }
@@ -141,6 +142,7 @@ pub(super) async fn resend(State(st): State<S>, h: HeaderMap, Path((oid,iid)): P
     let row = st.db.one("SELECT role FROM invites WHERE org_id=? AND id=? AND accepted=0", &[json!(&oid),json!(&iid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND,"invitation not found"))?;
     grant(&st,&oid,&uid,&db::s(&row,"role")).await?;
     let token = oc::random_token("inv"); let expires = now()+7*86400;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     st.db.batch_checked(&[("UPDATE invites SET token_hash=?,expires_at=?,invited_by=? WHERE org_id=? AND id=? AND accepted=0".into(),vec![json!(oc::hash_token(&token)),json!(expires),json!(&uid),json!(&oid),json!(&iid)])],&[0]).await.map_err(|e| bad(&e))?;
     st.audit(&oid,"","",&uid,"invite.resend",&iid).await; Ok(j(share(&st,&iid,&token,expires)))
 }

@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createTcpServer } from "node:net";
-import { OpenWarpClient } from "../dist/index.js";
+import { OpenWarpClient, OpenWarpError } from "../dist/index.js";
 
 const binary = process.env.OPENWARP_BIN || "../../target/debug/openwarp-server";
 
@@ -151,7 +151,26 @@ test("live server round trip", { timeout: 45000 }, async t => {
   const deployed = await client.setSecret(env, "SDK_TOKEN", "v1");
   assert.equal(deployed.deployed, 1);
   assert.equal((await client.getSecret(env, "sdk_token")).value, "v1");
-  assert.equal((await client.export(env)).secrets.find(secret => secret.key === "SDK_TOKEN").value, "v1");
+  await assert.rejects(client.export(env), error => {
+    assert.ok(error instanceof OpenWarpError);
+    assert.equal(error.status, 428);
+    assert.equal(error.body.step_up_required, true);
+    assert.equal(error.body.risk, "very_risky");
+    assert.equal(error.body.email_required, true);
+    assert.equal(error.body.totp_required, false);
+    return true;
+  });
+  const challenge = await client.api("POST", ["auth", "step-up", "start"], { risk: "very_risky" });
+  assert.ok(challenge.challenge);
+  const stepUpMail = await inbox.next();
+  const emailCode = stepUpMail.match(/\b\d{6}\b/)?.[0];
+  assert.ok(emailCode, "step-up verification code missing from mail");
+  const grant = await client.api("POST", ["auth", "step-up", "verify"], {
+    challenge: challenge.challenge,
+    email_code: emailCode,
+  });
+  assert.ok(grant.token);
+  assert.equal((await client.api("GET", ["envs", env, "export"], undefined, undefined, grant.token)).secrets.find(secret => secret.key === "SDK_TOKEN").value, "v1");
   await client.setSecret(env, "SDK_TOKEN", "v2");
   assert.equal((await client.getSecret(env, "SDK_TOKEN")).value, "v2");
   await client.deleteSecret(env, "SDK_TOKEN");
