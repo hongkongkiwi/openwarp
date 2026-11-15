@@ -106,6 +106,39 @@ The response is a JSON object:
 
 Do not execute exported text as a shell script. The text representation is not a shell-escaping contract and may not fit multiline values or duplicate names across paths. Parse the structured `secrets` field where those distinctions matter. Normal plaintext export is not the client-decryption path for E2E environments.
 
+## Client key rotation
+
+`GET /api/envs/{id}/e2e/secrets` returns ciphertext, the caller's wrapped key and
+`key_generation` from one transaction. Ordinary E2E PUT and grant requests must
+send `expected_generation` from that same key response. A stale generation or
+pending rotation returns 409; do not pair a cached key with newly fetched metadata.
+
+`GET /api/envs/{id}/e2e/meta` returns `key_generation`, `membership_version`,
+`snapshot_token` and `rekey_required`. For `POST /api/envs/{id}/e2e/rekey`, send
+the returned `key_generation` as `expected_generation`, and send
+`membership_version` and `snapshot_token` unchanged. These three request fields
+are mandatory. Include every live secret exactly once with its
+`id`, `version`, `key_hash`, and replacement `key_enc`, `value_enc`, `path_enc`.
+An empty secrets array is valid for an empty environment. Include a new wrap for
+every eligible existing holder, including the caller, except explicit
+`remove_user`. Duplicate entries are rejected. Stale state returns 409 without
+partial ciphertext, wrap or audit changes.
+
+These operations require a current account member holder with the appropriate
+permissions and independent approval, step-up, path and emergency checks.
+`PUT /api/envs/{id}/e2e/policy` accepts `runner_rekey_authorized` only from actual
+owner/admin accounts. False is the default and controls replacement wrapping,
+not existing delegated sync access. A true policy requires the account client to
+supply `runner_wrapped_key`; false omits it and removes the runner grant during
+rekey. Runner credentials never acquire account rekey authority.
+
+Revocation durably marks pending; ordinary writes, export, sync and runner jobs
+remain blocked until a remaining holder completes client-side rotation. Reads of
+that holder's ciphertext and wrap remain available for completion. The server
+never generates the replacement key or decrypts these secrets. Successful rekey
+replaces old history, removes deleted records and invalidates old runner jobs.
+See [key recovery](ENCRYPTION.md#recovery-and-revocation).
+
 ## Writes and remote effects
 
 Secret deployments, proposals, rotations and integration changes have different request schemas and permissions. Read the relevant operation in the specification before writing. Use [batched change requests](CHANGE-REQUESTS.md) when changes need review across environments.

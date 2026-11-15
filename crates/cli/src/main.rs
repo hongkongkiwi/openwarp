@@ -209,12 +209,12 @@ fn refresh_tokens(client: &reqwest::blocking::Client, host: &str, cfg: &Value) -
     let d: Value = client.post(format!("{}/oauth/token", host)).form(&[("grant_type", "refresh_token"), ("refresh_token", rt), ("client_id", cid)]).send().ok()?.json().ok()?;
     Some((d["access_token"].as_str()?.to_string(), d["refresh_token"].as_str().unwrap_or(rt).to_string())) }
 
-fn e2e_env_key(client: &reqwest::blocking::Client, host: &str, token: &str, env: &str, privkey: &str) -> ([u8;32], openwarp_crypto::Keypair) {
+fn e2e_env_key(client: &reqwest::blocking::Client, host: &str, token: &str, env: &str, privkey: &str) -> ([u8;32], openwarp_crypto::Keypair, i64) {
     let kp = openwarp_crypto::Keypair::from_secret_b64(privkey).expect("bad privkey (recovery kit)");
     let d: Value = client.get(format!("{}/api/envs/{}/e2e/secrets", host, env)).bearer_auth(token).send().expect("req").json().expect("json");
     let wrapped = d["wrapped_key"].as_str().unwrap_or_else(|| panic!("no wrapped key: {}", d));
     let raw = kp.decrypt(wrapped).expect("decrypt wrapped env key");
-    (raw.try_into().expect("env key len"), kp)
+    (raw.try_into().expect("env key len"), kp, d["key_generation"].as_i64().expect("key generation required"))
 }
 
 fn parse_ttl(raw: &str) -> i64 {
@@ -595,17 +595,17 @@ fn main() {
             let env_key = openwarp_crypto::random_key();
             let wrapped = openwarp_crypto::encrypt_to(me["pubkey"].as_str().expect("public key"), &env_key).expect("wrap env key");
             let d: Value = client.post(format!("{}/api/apps/{}/envs/e2e", host, app)).bearer_auth(&token).json(&json!({"name": name, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
-        Cmd::E2ePut { env, key, value, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
+        Cmd::E2ePut { env, key, value, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _, generation) = e2e_env_key(&client, &host, &token, &env, privkey);
             let kname = key.to_uppercase(); let khash = openwarp_crypto::hash_token(&format!("/:{}", kname));
-            let payload = json!({"secrets": [{"key_enc": openwarp_crypto::encrypt_symmetric(&ek, kname.as_bytes()), "value_enc": openwarp_crypto::encrypt_symmetric(&ek, value.as_bytes()), "key_hash": khash, "path": "/"}]});
-            let d: Value = client.put(format!("{}/api/envs/{}/e2e/secrets", host, env)).bearer_auth(&token).json(&payload).send().expect("req").json().expect("json"); println!("{}", d); }
-        Cmd::E2eGet { env, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
+            let payload = json!({"expected_generation": generation, "secrets": [{"key_enc": openwarp_crypto::encrypt_symmetric(&ek, kname.as_bytes()), "value_enc": openwarp_crypto::encrypt_symmetric(&ek, value.as_bytes()), "key_hash": khash, "path": "/"}]});
+            let response = client.put(format!("{}/api/envs/{}/e2e/secrets", host, env)).bearer_auth(&token).json(&payload).send().expect("req"); let status = response.status(); let d: Value = response.json().expect("json"); if !status.is_success() { eprintln!("{}: {}", status, d); std::process::exit(1); } println!("{}", d); }
+        Cmd::E2eGet { env, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _, _) = e2e_env_key(&client, &host, &token, &env, privkey);
             let d = get(&format!("{}/api/envs/{}/e2e/secrets", host, env));
             for s in d["secrets"].as_array().cloned().unwrap_or_default() { let k = openwarp_crypto::decrypt_symmetric(&ek, s["key_enc"].as_str().unwrap_or("")).unwrap(); let v = openwarp_crypto::decrypt_symmetric(&ek, s["value_enc"].as_str().unwrap_or("")).unwrap(); println!("{}={}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v)); } }
-        Cmd::E2eGrant { env, email, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _) = e2e_env_key(&client, &host, &token, &env, privkey);
+        Cmd::E2eGrant { env, email, privkey } => { let env = pick(env, &local, "env_id", "--env"); let (ek, _, generation) = e2e_env_key(&client, &host, &token, &env, privkey);
             let u = get(&format!("{}/api/users/lookup?email={}", host, email));
             let wrapped = openwarp_crypto::encrypt_to(u["pubkey"].as_str().expect("grantee pubkey"), &ek).expect("wrap");
-            let d: Value = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped})).send().expect("req").json().expect("json"); println!("{}", d); }
+            let response = client.post(format!("{}/api/envs/{}/e2e/grant", host, env)).bearer_auth(&token).json(&json!({"email": email, "wrapped_key": wrapped, "expected_generation": generation})).send().expect("req"); let status = response.status(); let d: Value = response.json().expect("json"); if !status.is_success() { eprintln!("{}: {}", status, d); std::process::exit(1); } println!("{}", d); }
         Cmd::Completion { shell } => { use clap::CommandFactory; let mut cmd = Cli::command(); let sh = match shell.as_str() { "zsh" => clap_complete::Shell::Zsh, "fish" => clap_complete::Shell::Fish, "powershell" => clap_complete::Shell::PowerShell, _ => clap_complete::Shell::Bash }; clap_complete::generate(sh, &mut cmd, "openwarp", &mut std::io::stdout()); }
     }
 }

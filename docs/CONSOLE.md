@@ -232,7 +232,11 @@ Legacy audit log streams no longer send. Their old delivery history remains read
 
 E2E environments show a dedicated decrypt panel rather than the ordinary SSE editing flow. Supply the recovery kit only in the trusted client. Browser decryption happens locally, but you still trust the JavaScript delivered by the instance.
 
-Use the [CLI's E2E commands](CLI.md#end-to-end-environments) to create, write, read, and grant wrapped keys. Removing a grant prevents future access to that wrapped key through the server; it cannot erase plaintext or keys that a recipient already copied.
+Use Access to grant or remove an environment key grant. After removal, an unlocked authorized holder's console rotates automatically if there are no staged changes. A pending environment also rotates after recovery-kit unlock on a later visit. Offline or locked clients leave rotation pending; writes, exports and runner delivery stay blocked. Deploy or discard drafts before rotation. An empty environment can rotate without adding a secret.
+
+The console creates and wraps the replacement key locally, submits a snapshot-checked ciphertext batch, and updates its key cache only after success. Delegated environments use the same holder flow. A runner receives the new wrap only under explicit owner/admin replacement-wrap policy; it does not rotate autonomously. See [encryption and revocation](ENCRYPTION.md#recovery-and-revocation).
+
+The [CLI's E2E commands](CLI.md#end-to-end-environments) create, write, read and grant wrapped keys. Removing a grant cannot erase plaintext, ciphertext or keys that a recipient already copied.
 
 ## Assistant and insights
 

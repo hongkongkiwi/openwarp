@@ -160,9 +160,11 @@ async fn a_delegated_environment_syncs_through_the_customer_runner() {
     assert_eq!(r.status, 200, "delegated env create failed: {} {}", r.status, r.text);
     let env = r.body["id"].as_str().unwrap().to_string();
 
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&token), None).await.body["key_generation"].clone();
     let key_enc = oc::encrypt_symmetric(&env_key, b"API_KEY");
     let value_enc = oc::encrypt_symmetric(&env_key, b"secret-value");
     let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), Some(json!({
+        "expected_generation": generation,
         "secrets": [{"key_enc": key_enc, "value_enc": value_enc, "key_hash": oc::hash_token("API_KEY"), "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")}]
     }))).await;
     assert_eq!(r.status, 200, "client-side deploy failed: {} {}", r.status, r.text);
@@ -412,13 +414,20 @@ async fn a_delegated_rekey_replaces_the_runner_key_grant() {
     assert_eq!(r.status, 200, "{}", r.text);
     let env = r.body["id"].as_str().unwrap().to_string();
     let key_hash = oc::hash_token("/:API_KEY");
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&token), None).await.body["key_generation"].clone();
     let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), Some(json!({
+        "expected_generation": generation,
         "secrets": [{"key_enc": oc::encrypt_symmetric(&old_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&old_key, b"one"), "key_hash": key_hash, "path_enc": oc::encrypt_symmetric(&old_key, b"/")}]
     }))).await;
     assert_eq!(r.status, 200, "{}", r.text);
 
+    let policy = s.call(Method::PUT, &format!("/api/envs/{}/e2e/policy", env), Some(&token), Some(json!({"runner_rekey_authorized": true}))).await;
+    assert_eq!(policy.status, 200, "owner must explicitly authorize the runner for rekey: {} {}", policy.status, policy.text);
+    let snapshot = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&token), None).await.body;
+    let current = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&token), None).await.body;
     let new_key = oc::random_key();
     let secrets = json!([{
+        "id": current["secrets"][0]["id"], "version": current["secrets"][0]["version"],
         "key_hash": key_hash,
         "key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"),
         "value_enc": oc::encrypt_symmetric(&new_key, b"two"),
@@ -427,10 +436,10 @@ async fn a_delegated_rekey_replaces_the_runner_key_grant() {
     let grants = json!([{"user_id": uid, "wrapped_key": oc::encrypt_to(&user_pub, &new_key).unwrap()}]);
     // A delegated rotation without the runner grant would leave the runner
     // unable to sync, so the server must refuse it.
-    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"secrets": secrets, "grants": grants}))).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"expected_generation": snapshot["key_generation"], "membership_version": snapshot["membership_version"], "snapshot_token": snapshot["snapshot_token"], "secrets": secrets, "grants": grants}))).await;
     assert_eq!(r.status, 400, "a delegated rekey needs runner_wrapped_key: {} {}", r.status, r.text);
     let runner_wrapped = oc::encrypt_to(&runner_key.public, &new_key).unwrap();
-    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"secrets": secrets, "grants": grants, "runner_wrapped_key": runner_wrapped}))).await;
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&token), Some(json!({"expected_generation": snapshot["key_generation"], "membership_version": snapshot["membership_version"], "snapshot_token": snapshot["snapshot_token"], "secrets": secrets, "grants": grants, "runner_wrapped_key": runner_wrapped}))).await;
     assert_eq!(r.status, 200, "rekey failed: {} {}", r.status, r.text);
 
     let conn = rusqlite::Connection::open(s.dir.join("test.db")).unwrap();

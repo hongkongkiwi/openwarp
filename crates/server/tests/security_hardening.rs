@@ -281,9 +281,11 @@ async fn e2e_rekey_needs_approval() {
     let key = oc::random_key();
     let env = s.ok(Method::POST, &format!("/api/apps/{}/envs/e2e", app), ot, Some(json!({"name": "encrypted", "wrapped_key": oc::encrypt_to(u["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
     let eid = env["id"].as_str().unwrap();
-    s.ok(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), ot, Some(json!({"email": "member@test.invalid", "wrapped_key": oc::encrypt_to(member["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
+    let meta = s.ok(Method::GET, &format!("/api/envs/{}/e2e/meta", eid), ot, None).await;
+    let generation = meta["key_generation"].as_i64().unwrap();
+    s.ok(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), ot, Some(json!({"email": "member@test.invalid", "wrapped_key": oc::encrypt_to(member["public_key"].as_str().unwrap(), &key).unwrap(), "expected_generation": generation}))).await;
     let path = format!("/api/envs/{}/e2e/secrets", eid);
-    let body = json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
+    let body = json!({"expected_generation": generation, "secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
     s.ok(Method::PUT, &path, mt, Some(body.clone())).await;
     s.ok(Method::PUT, &format!("/api/envs/{}/policy", eid), ot, Some(json!({"require_approval": true}))).await;
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", eid), mt, Some(json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": "x", "value_enc": "attacker-replacement", "path_enc": "x"}], "grants": [{"user_id": member["user_id"], "wrapped_key": "x"}]}))).await;
@@ -344,9 +346,11 @@ async fn e2e_developer_with_a_key_still_needs_approval() {
     let key = oc::random_key();
     let env = s.ok(Method::POST, &format!("/api/apps/{}/envs/e2e", app), ot, Some(json!({"name": "encrypted", "wrapped_key": oc::encrypt_to(u["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
     let eid = env["id"].as_str().unwrap();
-    s.ok(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), ot, Some(json!({"email": "member@test.invalid", "wrapped_key": oc::encrypt_to(member["public_key"].as_str().unwrap(), &key).unwrap()}))).await;
+    let meta = s.ok(Method::GET, &format!("/api/envs/{}/e2e/meta", eid), ot, None).await;
+    let generation = meta["key_generation"].as_i64().unwrap();
+    s.ok(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), ot, Some(json!({"email": "member@test.invalid", "wrapped_key": oc::encrypt_to(member["public_key"].as_str().unwrap(), &key).unwrap(), "expected_generation": generation}))).await;
     let path = format!("/api/envs/{}/e2e/secrets", eid);
-    let body = json!({"secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
+    let body = json!({"expected_generation": generation, "secrets": [{"key_hash": oc::hash_token("KEY"), "key_enc": oc::encrypt_symmetric(&key, b"KEY"), "value_enc": oc::encrypt_symmetric(&key, b"original")}]});
     s.ok(Method::PUT, &path, mt, Some(body.clone())).await;
     s.ok(Method::PUT, &format!("/api/envs/{}/policy", eid), ot, Some(json!({"require_approval": true}))).await;
     let before = s.ok(Method::GET, &path, mt, None).await;

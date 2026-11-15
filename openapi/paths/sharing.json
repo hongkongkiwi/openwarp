@@ -248,7 +248,7 @@
   },
   "/api/envs/{eid}/e2e/grant": {
     "post": {
-      "description": "Requires environment access. Environment-scoped tokens may only target their own environment. Requires secrets:write and an existing caller key grant. The key must be wrapped client-side for the target email; this handler does not grant organisation membership.",
+      "description": "Current account member holder with secrets:write and step-up required. Target must be an active verified eligible current workspace member. Wrapped key is client-generated. Mandatory expected_generation binds it to the key actually unwrapped; stale generation or pending rotation returns 409. Advances membership version atomically.",
       "parameters": [
         {
           "in": "path",
@@ -319,6 +319,9 @@
             }
           },
           "description": "Not found"
+        },
+        "409": {
+          "description": "Stale generation or pending rotation"
         }
       },
       "security": [

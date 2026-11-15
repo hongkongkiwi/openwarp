@@ -371,7 +371,9 @@ async fn emergency_blocks_owner_and_token_secret_reads_and_workspace_mutations()
     let wrapped = openwarp_crypto::encrypt_to(owner["public_key"].as_str().unwrap(), &key).unwrap();
     let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&ot), Some(json!({"name": "e2e", "wrapped_key": wrapped}))).await;
     assert_eq!(r.status, 200); let e2e = field(&r.body, "id");
-    let ciphertext = json!({"secrets": [{"key_hash": openwarp_crypto::hash_token("PASSWORD"), "key_enc": openwarp_crypto::encrypt_symmetric(&key, b"PASSWORD"), "value_enc": openwarp_crypto::encrypt_symmetric(&key, SECRET.as_bytes())}]});
+    let meta = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", e2e), Some(&ot), None).await;
+    assert_eq!(meta.status, 200);
+    let ciphertext = json!({"expected_generation": meta.body["key_generation"], "secrets": [{"key_hash": openwarp_crypto::hash_token("PASSWORD"), "key_enc": openwarp_crypto::encrypt_symmetric(&key, b"PASSWORD"), "value_enc": openwarp_crypto::encrypt_symmetric(&key, SECRET.as_bytes())}]});
     assert_eq!(s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", e2e), Some(&ot), Some(ciphertext.clone())).await.status, 200);
     let original_e2e = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", e2e), Some(&ot), None).await;
     assert_eq!(original_e2e.status, 200); assert_eq!(original_e2e.body["wrapped_key"], json!(wrapped));

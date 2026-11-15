@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {test, expect, register, enter, appFixture, good} from '../fixture.mjs';
+import {test, expect, register, enter, appFixture, good, poll} from '../fixture.mjs';
 
 async function openApp(page, stack, actor, app, org) {
   await page.context().addCookies([{name: 'ow_session', value: actor.cookie, url: stack.base, httpOnly: true, sameSite: 'Lax'}]);
@@ -100,16 +100,43 @@ test('client-keyed E2E write, reload unlock, member grant and revoke @critical',
     } catch (error) { if (memberFailure) throw new AggregateError([memberFailure, error], 'member journey and cleanup failed'); throw error; }
     finally { clearTimeout(timer); }
   }
+  const beforeRotation = good(await stack.call('GET', `/api/envs/${created.id}/e2e/meta`, owner.token), 'generation before revocation');
+  assert.equal(beforeRotation.rekey_required, false, 'granted environment starts without pending rotation');
+  const clientRotations = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === `/api/envs/${created.id}/e2e/rekey`) {
+      const body = JSON.parse(request.postData());
+      clientRotations.push({generation: body.expected_generation, plaintext: [key, value, owner.kit, member.kit].some(secret => request.postData().includes(secret))});
+    }
+  });
   await page.getByRole('button', {name: 'Access', exact: true}).click();
-  const confirmed = page.waitForEvent('dialog').then(async dialog => { assert.match(dialog.message(), /Rotate/); await dialog.accept(); });
+  const confirmed = page.waitForEvent('dialog').then(async dialog => {
+    assert.equal(dialog.type(), 'confirm'); assert.match(dialog.message(), /rotate the environment key/); await dialog.accept();
+  });
   await access.getByRole('button', {name: 'Remove access', exact: true}).click(); await confirmed;
-  await expect(page.getByText('Access removed; rotate the key next', {exact: true})).toBeVisible();
-  await access.getByRole('button', {name: 'Close', exact: true}).click();
-  await expect(page.getByRole('button', {name: 'Rotate key now', exact: true})).toBeVisible();
-  assert.equal(good(await stack.call('GET', `/api/envs/${created.id}/e2e/meta`, owner.token), 'rotation warning').rekey_required, true);
+  const rotation = await poll(async () => {
+    const meta = good(await stack.call('GET', `/api/envs/${created.id}/e2e/meta`, owner.token), 'automatic rotation metadata');
+    return meta.key_generation === beforeRotation.key_generation + 1 && meta.rekey_required === false && meta;
+  }, 'automatic rotation after grant revocation');
+  assert.equal(rotation.rekey_required, false, 'automatic rotation clears pending state');
+  await expect(access).toBeHidden();
+  await expect(page.getByRole('button', {name: 'Rotate key now', exact: true})).toBeHidden();
   assert.equal((await stack.call('GET', `/api/envs/${created.id}/e2e/secrets`, member.token)).status, 403, 'removed grant denies new reads');
   assert.equal((await stack.call('GET', `/api/envs/${created.id}/e2e/secrets`, outsider.token)).status, 403, 'outsider denied');
-  // Revocation is not rotation and cannot erase keys or plaintext already copied.
-  const after = good(await stack.call('GET', `/api/envs/${created.id}/e2e/secrets`, owner.token), 'ciphertext after revoke');
-  assert.equal(JSON.stringify(after.secrets), JSON.stringify(ciphertext.secrets), 'revocation does not pretend to re-encrypt');
+  assert.equal(clientRotations.length, 1, 'unlocked browser submits exactly one automatic re-encryption');
+  assert.equal(clientRotations[0].generation, beforeRotation.key_generation, 'client rotation is generation-fenced');
+  assert.equal(clientRotations[0].plaintext, false, 'automatic rekey request contains no secret or recovery-kit plaintext');
+  const audit = good(await stack.call('GET', `/api/orgs/${owner.org}/audit`, owner.token), 'rotation audit');
+  assert.equal(audit.filter(row => row.env_id === created.id && row.action === 'e2e.rekey' && row.actor === owner.id).length, 1, 'one client rekey is audited for the remaining holder');
+  // The browser re-encrypts after revocation; copied old ciphertext and keys cannot be erased.
+  const after = good(await stack.call('GET', `/api/envs/${created.id}/e2e/secrets`, owner.token), 'ciphertext after automatic rotation');
+  assert.equal(after.secrets.length, ciphertext.secrets.length, 'automatic rotation preserves every secret');
+  for (const old of ciphertext.secrets) {
+    const current = after.secrets.find(row => row.id === old.id);
+    assert.ok(current, 'automatic rotation preserves record identity');
+    assert.equal(current.version, old.version + 1, 'client rotation increments each secret version once');
+    for (const field of ['key_enc', 'value_enc', 'path_enc']) assert.notEqual(current[field], old[field], 'client rotation replaces stored ciphertext');
+  }
+  assert.equal([key, value, owner.kit].some(plaintext => JSON.stringify(after).includes(plaintext)), false, 'rotated API response remains ciphertext only');
+  assert.equal(outboundLeak, false, 'no plaintext in E2E requests including automatic rotation');
 });

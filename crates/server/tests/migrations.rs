@@ -127,7 +127,8 @@ async fn sqlite_v38_upgrade_creates_empty_receipts_without_changing_tokens_or_en
     let envs = db.query("SELECT * FROM envs ORDER BY id", &[]).await.unwrap();
     let ledger = db.query("SELECT * FROM schema_migrations WHERE version<=38 ORDER BY version", &[]).await.unwrap();
 
-    let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
+    let receipt_migrations = &MIGRATIONS[..39];
+    let report = migrate::apply(&db, receipt_migrations, Options::default()).await.unwrap();
     assert_eq!(report.applied, vec![39], "an existing v38 database applies only the receipt migration");
     assert!(!report.squashed);
     assert_eq!(db.version().await.unwrap(), 39);
@@ -136,7 +137,7 @@ async fn sqlite_v38_upgrade_creates_empty_receipts_without_changing_tokens_or_en
     assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=38 ORDER BY version", &[]).await.unwrap(), ledger, "old checksums and ledger metadata remain immutable");
     let receipts = db.one("SELECT COUNT(*) AS n FROM deleted_env_receipts", &[]).await.unwrap().unwrap();
     assert_eq!(n(&receipts, "n"), 0, "upgrading must not invent deletion receipts for existing tokens");
-    let status = migrate::status(&db, MIGRATIONS).await.unwrap();
+    let status = migrate::status(&db, receipt_migrations).await.unwrap();
     assert!(status.problems.is_empty());
     assert!(status.pending().is_empty());
 }
@@ -216,11 +217,13 @@ async fn sqlite_upgrades_a_legacy_ledger_without_data() {
     // the binary is behind the current one.
     db.exec("UPDATE schema_migrations SET checksum='', name=''", &[]).await.unwrap();
     db.exec("DELETE FROM schema_migrations WHERE version > 9", &[]).await.unwrap();
-    // Remove post-v9 objects created without IF NOT EXISTS by migrations 32
-    // and 39 so strict replay sees the schema represented by the rewound ledger.
+    // Strict replay needs the schema represented by the rewound ledger.
     db.exec("DROP INDEX IF EXISTS idx_sessions_id", &[]).await.unwrap();
     db.exec("ALTER TABLE sessions DROP COLUMN id", &[]).await.unwrap();
     db.exec("DROP TABLE deleted_env_receipts", &[]).await.unwrap();
+    for column in ["key_generation", "membership_version", "rekey_pending", "runner_rekey_authorized"] {
+        db.exec(&format!("ALTER TABLE envs DROP COLUMN {column}"), &[]).await.unwrap();
+    }
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
     assert_eq!(report.applied, (10i64..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>());

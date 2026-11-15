@@ -986,7 +986,10 @@ async fn e2e_grants_can_be_listed_and_revoked() {
     assert_eq!(r.status, 200, "{}", r.text);
     let eid = r.body["id"].as_str().unwrap().to_string();
 
-    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), Some(ot), Some(json!({"email": "e2e-member@test.invalid", "wrapped_key": "AAAA"}))).await;
+    let meta = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", eid), Some(ot), None).await;
+    assert_eq!(meta.status, 200, "{}", meta.text);
+    let generation = meta.body["key_generation"].as_i64().unwrap();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", eid), Some(ot), Some(json!({"email": "e2e-member@test.invalid", "wrapped_key": "AAAA", "expected_generation": generation}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let r = s.call(Method::GET, &format!("/api/envs/{}/e2e/grants", eid), Some(ot), None).await;
     assert!(r.body.as_array().unwrap().iter().any(|g| g["user_id"] == mid), "{}", r.text);
