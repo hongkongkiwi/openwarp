@@ -73,7 +73,7 @@ customer-run sync runner. The server stores only ciphertext:
 
 Same client-side encryption as delegated, without a runner grant. Humans decrypt
 with their recovery kit in the CLI or browser. Server-side integrations are not
-available. Use the console's key rotation or `openwarp e2e rekey` after removing
+available. Use the console's client-side key rotation after removing
 a member; revocation alone cannot erase a key the removed member already saved.
 
 ## Key hierarchy
@@ -197,14 +197,27 @@ a startup key value as a substitute for re-encrypting stored key material.
 - There is no vendor or instance escrow key. That is intentional. An
   organisation that needs escrow should hold a recovery key split between
   administrators, not store it in OpenWarp.
-- Removing a member deletes their wrapped key and sets `rekey_required`. Rotate
-  the environment key from the console or with the CLI in one request so there
-  is no window where the grant is gone but the ciphertext is not rotated.
-  Rotation generates a new environment key, re-encrypts every secret, and
-  rewraps the new key to every remaining grantee and the runner. The rewrite
-  runs in one database transaction; a failed grant write rolls the whole
-  rotation back. A rekey may remove grantees but cannot add one: grant access
-  first, then rotate.
+- Removing an environment key grant deletes its wrap and durably marks rotation
+  pending. Ordinary writes, exports, sync and runner delivery stop until an
+  authorized remaining holder completes rotation. That holder can still fetch
+  ciphertext and its own wrap. Offline revocation does not rotate by itself.
+- The unlocked console automatically rotates after revocation or when loading a
+  pending environment, provided there are no staged changes. It generates the
+  replacement key, decrypts and re-encrypts locally, and wraps the key for every
+  eligible remaining holder. Empty environments can rotate too. Keep a remaining
+  holder's recovery kit; the server cannot recover the client key.
+- A mandatory generation, membership version and snapshot token reject stale
+  rekey commits with 409. Ciphertext, wraps, generation, pending state and audit
+  commit together. Rotation replaces old-key history and removes deleted records;
+  it cannot erase ciphertext or keys previously copied by a removed holder.
+  Ordinary ciphertext PUT and grant requests also require the generation returned
+  with the key they actually unwrapped, not metadata fetched after using a cache.
+- Delegated runners receive a replacement wrap only when an owner/admin explicitly
+  enables `runner_rekey_authorized` through `PUT /api/envs/{id}/e2e/policy`.
+  The default is false. Disabling this policy retains existing delegated sync
+  access until rotation; the next rekey removes that runner's wrap and invalidates
+  old jobs. An authorized account performs the local wrapping. Runner credentials
+  cannot act as account holders, and autonomous runner rekey is not implemented.
 - A password reset does not bypass an enrolled second factor; it returns an MFA
   challenge instead of a session.
 
@@ -289,8 +302,8 @@ The CLI's [encrypted-file commands](CLI.md#encrypted-files) use a separate file 
 - A client-derived console registration and sign-in flow; the API and OAuth
   consent page support it, the console forms do not yet.
 - Signed native clients and a reproducible console build.
-- Automatic rekey on revoke; it is an explicit action because the server never
-  holds the key.
+- Autonomous runner participation in client rekey. The console's automatic
+  rotation requires an unlocked authorized account holder.
 - KMS key rotation orchestration beyond `POST /api/instance/rewrap`.
 
 Report security issues privately to the maintainers rather than opening a

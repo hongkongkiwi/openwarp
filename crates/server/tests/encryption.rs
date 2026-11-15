@@ -231,17 +231,21 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
     assert_eq!(r.status, 200, "{}", r.text);
     let env = r.body["id"].as_str().unwrap().to_string();
     let key_hash = oc::hash_token("/:API_KEY");
-    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"secrets": [{
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&t), None).await.body["key_generation"].clone();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"expected_generation": generation, "secrets": [{
         "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"),
         "value_enc": oc::encrypt_symmetric(&env_key, b"old-value"),
         "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")
     }]}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
 
+    let snapshot = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&t), None).await.body;
+    let current = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), None).await.body;
     let new_key = oc::random_key();
     let new_wrapped = oc::encrypt_to(&pubkey, &new_key).unwrap();
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
-        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
+        "expected_generation": snapshot["key_generation"], "membership_version": snapshot["membership_version"], "snapshot_token": snapshot["snapshot_token"],
+        "secrets": [{"id": current["secrets"][0]["id"], "version": current["secrets"][0]["version"], "key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
         "grants": [{"user_id": uid, "wrapped_key": new_wrapped}]
     }))).await;
     assert_eq!(r.status, 200, "rekey failed: {} {}", r.status, r.text);
@@ -261,7 +265,8 @@ async fn e2e_rekey_rotates_the_environment_key_and_secret_ciphertext() {
     let bad_key = oc::random_key();
     let bad_wrapped = oc::encrypt_to(&pubkey, &bad_key).unwrap();
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&t), Some(json!({
-        "secrets": [{"key_enc": oc::encrypt_symmetric(&bad_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&bad_key, b"bad-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&bad_key, b"/")}],
+        "expected_generation": meta.body["key_generation"], "membership_version": meta.body["membership_version"], "snapshot_token": meta.body["snapshot_token"],
+        "secrets": [{"id": d.body["secrets"][0]["id"], "version": d.body["secrets"][0]["version"], "key_enc": oc::encrypt_symmetric(&bad_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&bad_key, b"bad-value"), "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&bad_key, b"/")}],
         "grants": [{"user_id": uid, "wrapped_key": bad_wrapped}, {"user_id": uid, "wrapped_key": bad_wrapped}]
     }))).await;
     assert!(r.status >= 400, "a broken rekey must fail: {} {}", r.status, r.text);
@@ -351,8 +356,9 @@ async fn e2e_paths_can_be_stored_as_client_ciphertext() {
     let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&t), Some(json!({"name": "vault", "wrapped_key": wrapped}))).await;
     assert_eq!(r.status, 200, "{}", r.text);
     let env = r.body["id"].as_str().unwrap().to_string();
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&t), None).await.body["key_generation"].clone();
     let path_enc = oc::encrypt_symmetric(&env_key, b"/prod/billing");
-    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"secrets": [{
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&t), Some(json!({"expected_generation": generation, "secrets": [{
         "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"),
         "value_enc": oc::encrypt_symmetric(&env_key, b"secret"),
         "key_hash": oc::hash_token("/:API_KEY"), "path": "/prod/billing", "path_enc": path_enc
@@ -389,10 +395,12 @@ async fn rekey_can_remove_a_grantee_atomically() {
     let wrapped = oc::encrypt_to(&owner_pub, &env_key).unwrap();
     let r = s.call(Method::POST, &format!("/api/apps/{}/envs/e2e", app), Some(&ot), Some(json!({"name": "vault", "wrapped_key": wrapped}))).await;
     let env = r.body["id"].as_str().unwrap().to_string();
-    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", env), Some(&ot), Some(json!({"email": "member-remove@test.invalid", "wrapped_key": oc::encrypt_to(&member_pub, &env_key).unwrap()}))).await;
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&ot), None).await.body["key_generation"].clone();
+    let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/grant", env), Some(&ot), Some(json!({"expected_generation": generation, "email": "member-remove@test.invalid", "wrapped_key": oc::encrypt_to(&member_pub, &env_key).unwrap()}))).await;
     assert_eq!(r.status, 200, "grant failed: {} {}", r.status, r.text);
     let key_hash = oc::hash_token("/:API_KEY");
-    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&ot), Some(json!({"secrets": [{
+    let generation = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&ot), None).await.body["key_generation"].clone();
+    let r = s.call(Method::PUT, &format!("/api/envs/{}/e2e/secrets", env), Some(&ot), Some(json!({"expected_generation": generation, "secrets": [{
         "key_enc": oc::encrypt_symmetric(&env_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&env_key, b"old"),
         "key_hash": key_hash, "path": "/", "path_enc": oc::encrypt_symmetric(&env_key, b"/")
     }]}))).await;
@@ -400,9 +408,11 @@ async fn rekey_can_remove_a_grantee_atomically() {
     let before = s.call(Method::GET, &format!("/api/envs/{}/e2e/secrets", env), Some(&mt), None).await;
     assert_eq!(before.status, 200, "the member should have a grant before removal: {} {}", before.status, before.text);
 
+    let snapshot = s.call(Method::GET, &format!("/api/envs/{}/e2e/meta", env), Some(&ot), None).await.body;
     let new_key = oc::random_key();
     let r = s.call(Method::POST, &format!("/api/envs/{}/e2e/rekey", env), Some(&ot), Some(json!({
-        "secrets": [{"key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new"), "key_hash": key_hash, "path": "", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
+        "expected_generation": snapshot["key_generation"], "membership_version": snapshot["membership_version"], "snapshot_token": snapshot["snapshot_token"],
+        "secrets": [{"id": before.body["secrets"][0]["id"], "version": before.body["secrets"][0]["version"], "key_enc": oc::encrypt_symmetric(&new_key, b"API_KEY"), "value_enc": oc::encrypt_symmetric(&new_key, b"new"), "key_hash": key_hash, "path": "", "path_enc": oc::encrypt_symmetric(&new_key, b"/")}],
         "grants": [{"user_id": owner_id, "wrapped_key": oc::encrypt_to(&owner_pub, &new_key).unwrap()}],
         "remove_user": member_id
     }))).await;

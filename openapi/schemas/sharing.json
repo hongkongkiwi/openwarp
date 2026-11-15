@@ -30,13 +30,18 @@
       "email": {
         "type": "string"
       },
+      "expected_generation": {
+        "minimum": 1,
+        "type": "integer"
+      },
       "wrapped_key": {
         "type": "string"
       }
     },
     "required": [
       "email",
-      "wrapped_key"
+      "wrapped_key",
+      "expected_generation"
     ],
     "type": "object"
   },

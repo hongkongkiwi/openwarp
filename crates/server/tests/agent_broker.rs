@@ -175,7 +175,8 @@ async fn broker_policy_rejects_destination_schema_and_credential_escapes() {
     for mode in ["e2e","delegated"] {
         let (path,body)=if mode == "e2e" { (format!("/api/apps/{}/envs/e2e",f.app),json!({"name":"broker-e2e","wrapped_key":openwarp_crypto::b64(&[8u8; 64])})) } else { (format!("/api/apps/{}/envs",f.app),json!({"name":"broker-delegated","mode":"delegated","runner_id":runner.body["id"],"wrapped_key":openwarp_crypto::b64(&[8u8; 64]),"runner_wrapped_key":openwarp_crypto::b64(&[9u8; 64])})) };
         let r=f.s.call(Method::POST,&path,&f.owner,Some(body)).await; assert_eq!(r.status,200); let env=id(&r.body,"id");
-        let r=f.s.call(Method::PUT,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,Some(json!({"secrets":[{"key_enc":"ciphertext-key","key_hash":"fixture-key-hash","value_enc":"ciphertext-value"}]}))).await; assert_eq!(r.status,200,"{} -> {}", r.status, r.text);
+        let meta=f.s.call(Method::GET,&format!("/api/envs/{env}/e2e/meta"),&f.owner,None).await; assert_eq!(meta.status,200);
+        let r=f.s.call(Method::PUT,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,Some(json!({"expected_generation":meta.body["key_generation"],"secrets":[{"key_enc":"ciphertext-key","key_hash":"fixture-key-hash","value_enc":"ciphertext-value"}]}))).await; assert_eq!(r.status,200,"{} -> {}", r.status, r.text);
         let r=f.s.call(Method::GET,&format!("/api/envs/{env}/e2e/secrets"),&f.owner,None).await; assert_eq!(r.status,200);
         let mut v=f.service(); v["env_id"]=json!(env); v["credential_secret_id"]=r.body["secrets"][0]["id"].clone(); denied(&f.s.call(Method::POST,&f.path("services"),&f.owner,Some(v)).await,409);
     }

@@ -187,8 +187,10 @@ async fn repair_latest_interrupted_migration_can_be_removed_and_reapplied() {
     let db = fresh(&scratch).await;
     let latest = MIGRATIONS.last().unwrap().version;
     db.exec("UPDATE schema_migrations SET success=0 WHERE version=?", &[json!(latest)]).await.unwrap();
-    // Repair removes only the ledger row; the fixture must restore the pre-39 schema before replay.
-    db.exec("DROP TABLE deleted_env_receipts", &[]).await.unwrap();
+    // Repair removes only the ledger row; restore the pre-40 schema before replay.
+    for column in ["key_generation", "membership_version", "rekey_pending", "runner_rekey_authorized"] {
+        db.exec(&format!("ALTER TABLE envs DROP COLUMN {column}"), &[]).await.unwrap();
+    }
     let earlier = db.query("SELECT * FROM schema_migrations WHERE version<? ORDER BY version", &[json!(latest)]).await.unwrap();
 
     migrate::repair(&db, MIGRATIONS, Repair::Remove(latest)).await.expect("latest interrupted migration can be retried");

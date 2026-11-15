@@ -140,7 +140,12 @@ async fn shipped_main17_legacy_ledger_upgrade_preserves_data() {
         "INSERT INTO wrap_tokens(token_hash,env_id,payload_enc,created_by,created_at,expires_at,used) VALUES('dummy-used-wrap-hash','merge-env','dummy-preserved-payload','dummy-actor',16,999,1)",
         "INSERT INTO wrap_tokens(token_hash,env_id,payload_enc,created_by,created_at,expires_at,used) VALUES('dummy-unused-wrap-hash','merge-env','dummy-unread-payload','dummy-actor',17,1000,0)",
     ] { db.exec(sql, &[]).await.unwrap(); }
-    let before = main_data(&db).await;
+    let mut before = main_data(&db).await;
+    for env in &mut before[2] {
+        for (column, value) in [("key_generation", 1), ("membership_version", 0), ("rekey_pending", 0), ("runner_rekey_authorized", 0)] {
+            env.insert(column.into(), serde_json::json!(value));
+        }
+    }
     let ledger = db.query("SELECT version,applied_at FROM schema_migrations ORDER BY version", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.expect("upgrade the real main17 legacy ledger without checksum repair");
