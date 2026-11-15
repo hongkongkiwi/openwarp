@@ -607,7 +607,7 @@ async function renderEnv(){VIEW='env';scopeBar();$('topaction').style.display='n
   drawSecrets();updateDeployBar()}
 function envTabs(){return `<div class="envtabs">${ENVS.map(e=>`<button class="envtab ${e.id===ENV.id?'on':''}" onclick="switchEnv('${e.id}')">${esc(e.name)}${isE2E(e)?owHTML(' · E2E'):''}${e.mode==='delegated'?owHTML(' · delegated'):''}</button>`).join('')}<button class="envtab" onclick="newEnv()" data-i18n="+ Environment">+ Environment</button><button class="envtab" onclick="newE2eEnv()" data-i18n="+ E2E environment">+ E2E environment</button></div>`}
 async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';owDataText($('pagetitle'),APP?.name||'App');owText($('crumb'),'/ environments');
-  let id=ENV.id;
+  let id=ENV.id,epoch=SECRET_EPOCH;
   if(!E2E_DATA[id]&&E2E_LOADING[id]){$('view').innerHTML=envTabs()+'<div class="empty"><div class="big" data-i18n="Unlocking…">Unlocking…</div><span data-i18n="Decrypting this environment in the browser.">Decrypting this environment in the browser.</span></div>';updateDeployBar();return}
   if(!E2E_DATA[id]&&E2E_KIT&&!E2E_LOCKED[id]&&!E2E_LOADING[id]){
     $('view').innerHTML=envTabs()+'<div class="empty"><div class="big" data-i18n="Unlocking…">Unlocking…</div><span data-i18n="Decrypting this environment with the key from your session.">Decrypting this environment with the key from your session.</span></div>';
@@ -623,10 +623,11 @@ async function renderE2eEnv(){VIEW='env';$('topaction').style.display='none';owD
       <button class="primary" onclick="unlockE2EEnv()" data-i18n="Unlock environment">Unlock environment</button>
       <p class="small mut" data-i18n="The kit and the decrypted key stay in this tab and are never sent to the server. A reload locks the environment again.">The kit and the decrypted key stay in this tab and are never sent to the server. A reload locks the environment again.</p></div>`;
     updateDeployBar();return}
-  if(ENV?.id!==id)return;
+  if(ENV?.id!==id||epoch!==SECRET_EPOCH||E2E_LOCKED[id])return;
   let meta=E2E_META[id]||{};
-  if(E2E_KIT&&!E2E_LOCKED[id])try{meta=await api('GET',`/api/envs/${id}/e2e/meta`);if(ENV?.id!==id)return;E2E_META[id]=meta}catch(e){E2E_ERR[id]=e.message}
-  if(meta.rekey_required&&E2E_KIT&&!Object.keys(E2E_DRAFTS[id]||{}).length&&!E2E_REKEYING[id]){await e2eRekey(true);if(ENV?.id!==id)return;meta=E2E_META[id]||{}}
+  if(E2E_KIT&&!E2E_LOCKED[id])try{meta=await api('GET',`/api/envs/${id}/e2e/meta`);if(ENV?.id!==id||epoch!==SECRET_EPOCH||E2E_LOCKED[id])return;E2E_META[id]=meta}catch(e){E2E_ERR[id]=e.message}
+  if(E2E_KIT&&!E2E_LOCKED[id]&&meta.key_generation!==E2E_GENERATIONS[id]&&!Object.keys(E2E_DRAFTS[id]||{}).length){await e2eLoad(id,E2E_KIT);if(ENV?.id!==id||epoch!==SECRET_EPOCH||E2E_LOCKED[id])return;meta=E2E_META[id]||{}}
+  if(meta.rekey_required&&E2E_KIT&&!Object.keys(E2E_DRAFTS[id]||{}).length&&!E2E_REKEYING[id]){await e2eRekey(true);if(ENV?.id!==id||epoch!==SECRET_EPOCH||E2E_LOCKED[id])return;meta=E2E_META[id]||{}}
   let banner=meta.rekey_required?`<div class="card" style="border-color:var(--bad)"><h3 data-i18n="Access changed">Access changed</h3>
     <p data-i18n="A member&#39;s key grant was removed, but the stored ciphertext is still encrypted under the old environment key. Rotate the key to re-encrypt every secret under a new key and wrap that key to the current members. Rotation cannot take back ciphertext someone already copied.">A member's key grant was removed, but the stored ciphertext is still encrypted under the old environment key. Rotate the key to re-encrypt every secret under a new key and wrap that key to the current members. Rotation cannot take back ciphertext someone already copied.</p>
     <button class="primary" onclick="e2eRekey()" data-i18n="Rotate key now">Rotate key now</button></div>`:'';
@@ -741,7 +742,7 @@ async function unlockE2EEnv(){let kit=($('e2e-kit')?.value||'').trim()||E2E_KIT;
   if(!kit){toastUI('Paste the recovery kit for this account', true);return}
   try{await e2eLoad(ENV.id,kit);E2E_KIT=kit;delete E2E_LOCKED[ENV.id];toastUI('Environment unlocked', false);await renderE2eEnv()}catch(e){toastUI('Could not unlock: {x}',{x:e.message}, true)}}
 function lockE2E(){if(e2eDraftList().length&&!confirm(owT('Discard staged changes and lock this environment?')))return;
-  E2E_LOCKED[ENV.id]=true;delete E2E_KEYS[ENV.id];delete E2E_DATA[ENV.id];delete E2E_DRAFTS[ENV.id];delete E2E_ERR[ENV.id];renderE2eEnv()}
+  SECRET_EPOCH++;E2E_LOCKED[ENV.id]=true;delete E2E_KEYS[ENV.id];delete E2E_DATA[ENV.id];delete E2E_DRAFTS[ENV.id];delete E2E_ERR[ENV.id];renderE2eEnv()}
 function drawE2E(){
   let id=ENV.id,data=E2E_DATA[id]||[],dmap=e2eDrafts();
   let rows=data.map(s=>({s,st:dmap[s.id]})).filter(x=>matchesFilter(x.st?x.st.key:x.s.key,x.st?x.st.path:x.s.path));
@@ -764,38 +765,39 @@ function drawE2E(){
         <button class="iconbtn" title="Edit" data-i18n-title="Edit" aria-label="Edit" data-i18n-aria-label="Edit" onclick="e2eEditRow('${jsq(s.id)}')">✎</button>
         <button class="iconbtn" title="Delete" data-i18n-title="Delete" aria-label="Delete" data-i18n-aria-label="Delete" onclick="e2eDelRow('${jsq(s.id)}','${jsq(key)}')">🗑</button>`}</td></tr>`}).join('')}
   </tbody></table>`}
-function e2eAddRow(){if(!E2E_DATA[ENV.id]){toastUI('Unlock the environment first', true);return}let id='new-'+Date.now();
+function e2eAddRow(){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}if(!E2E_DATA[ENV.id]){toastUI('Unlock the environment first', true);return}let id='new-'+Date.now();
   modal(`<h3 data-i18n="New secret">New secret</h3>
     <div class="field"><label for="ns-key" data-i18n="Key">Key</label><input id="ns-key" placeholder="DATABASE_URL"></div>
     <div class="field"><label for="ns-val" data-i18n="Value">Value</label><textarea id="ns-val" rows="3"></textarea></div>
     <div class="field"><label for="ns-path" data-i18n="Path">Path</label><input id="ns-path" value="/"></div>
     <div class="row"><button class="primary" onclick="e2eStageNew('${id}')" data-i18n="Stage secret">Stage secret</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>
     <p class="small mut" data-i18n="Encrypted in this browser on deploy. There is no server-readable history for this environment.">Encrypted in this browser on deploy. There is no server-readable history for this environment.</p>`,'New secret')}
-function e2eStageNew(id){let k=$('ns-key').value.trim().toUpperCase(),path=$('ns-path').value||'/';
+function e2eStageNew(id){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}let k=$('ns-key').value.trim().toUpperCase(),path=$('ns-path').value||'/';
   if(!/^[A-Za-z0-9_.-]{1,128}$/.test(k)){toastUI('Key must match [A-Za-z0-9_.-]{1,128}', true);return}
   let dup=(E2E_DATA[ENV.id]||[]).some(s=>s.key===k&&s.path===path)||Object.values(e2eDrafts()).some(d=>!d.deleted&&d.key===k&&d.path===path);
   if(dup){toastUI('A secret with that key and path already exists', true);return}
   if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};
   E2E_DRAFTS[ENV.id][id]={id,key:k,value:$('ns-val').value,path,isNew:true};
   closeModal();drawE2E();updateDeployBar()}
-function e2eEditRow(id){let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
+function e2eEditRow(id){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
   modal(`<h3>${owHTML('Edit {x}',{x:s.key})}</h3><div class="field"><label for="ed-val" data-i18n="Value">Value</label><textarea id="ed-val" rows="4">${esc(s.value??'')}</textarea></div>
     <div class="row"><button class="primary" onclick="e2eStageEdit('${jsq(id)}')" data-i18n="Stage change">Stage change</button><button class="ghost" onclick="closeModal()" data-i18n="Cancel">Cancel</button></div>
     <p class="small mut" data-i18n="Renaming is not staged here: delete the secret and add it under the new key. Rotate the key after a delete if the old value must stop being readable.">Renaming is not staged here: delete the secret and add it under the new key. Rotate the key after a delete if the old value must stop being readable.</p>`,'Edit secret')}
-function e2eStageEdit(id){let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
+function e2eStageEdit(id){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}let d=e2eDrafts()[id];let s=d||(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
   if(d){d.value=$('ed-val').value;d.deleted=false}
   else{if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};E2E_DRAFTS[ENV.id][id]={id,key:s.key,value:$('ed-val').value,path:s.path,key_hash:s.key_hash}}
   closeModal();drawE2E();updateDeployBar();toastUI('Change staged, deploy when ready', false)}
-function e2eDelRow(id,key){let d=e2eDrafts()[id];
+function e2eDelRow(id,key){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}let d=e2eDrafts()[id];
   if(d&&d.isNew){delete e2eDrafts()[id];drawE2E();updateDeployBar();return}
   if(!confirm(owT('Delete {x}? The console keeps no history for this environment, so the value cannot be restored here.',{x:key})))return;
   let s=(E2E_DATA[ENV.id]||[]).find(x=>x.id===id);if(!s)return;
   if(!E2E_DRAFTS[ENV.id])E2E_DRAFTS[ENV.id]={};
   E2E_DRAFTS[ENV.id][id]={id,key:s.key,value:s.value,path:s.path,key_hash:s.key_hash,deleted:true};
   drawE2E();updateDeployBar()}
-function e2eUndoDelete(id){delete e2eDrafts()[id];drawE2E();updateDeployBar()}
+function e2eUndoDelete(id){if(E2E_REKEYING[ENV.id]){toast('Client key rotation in progress',true);return}delete e2eDrafts()[id];drawE2E();updateDeployBar()}
 async function deployE2E(){
-  let id=ENV.id,key=E2E_KEYS[id];if(!key){toastUI('Unlock the environment first', true);return}
+  let id=ENV.id,key=E2E_KEYS[id],generation=E2E_GENERATIONS[id],epoch=SECRET_EPOCH;if(!key){toastUI('Unlock the environment first', true);return}
+  let current=()=>ENV?.id===id&&SECRET_EPOCH===epoch&&E2E_KEYS[id]===key&&E2E_GENERATIONS[id]===generation&&!E2E_LOCKED[id]&&!E2E_REKEYING[id];
   let list=e2eDraftList();if(!list.length)return;
   let dels=list.filter(d=>d.deleted&&!d.isNew),puts=list.filter(d=>!d.deleted);
   let seen=new Set();
@@ -812,9 +814,11 @@ async function deployE2E(){
     }
     // Writes go first: if they fail, the staged deletes are still unapplied and
     // the user can retry. A delete is only issued once every put is stored.
-    if(items.length){let r=await api('PUT',`/api/envs/${id}/e2e/secrets`,{secrets:items,expected_generation:E2E_GENERATIONS[id]});
+    if(!current())throw new Error('Environment key changed; refresh before deploying');
+    if(items.length){let r=await api('PUT',`/api/envs/${id}/e2e/secrets`,{secrets:items,expected_generation:generation});
       if(r.deployed!==items.length)throw new Error(owT('the server stored {n} of {m} secrets',{n:r.deployed,m:items.length}))}
-    for(const d of dels)await api('DELETE',`/api/secrets/${d.id}`);
+    for(const d of dels){if(!current())throw new Error('Environment key changed; refresh before deploying');await api('DELETE',`/api/secrets/${d.id}`)}
+    if(!current())return;
     await e2eLoad(id,E2E_KIT);
     for(const [kh,[k,v]] of expected){let row=(E2E_DATA[id]||[]).find(r=>r.key_hash===kh);
       if(!row)throw new Error(owT('the deploy was stored but read-back could not find {x}',{x:k}));
@@ -837,13 +841,14 @@ async function e2eGrantsModal(){
     <div class="row"><button class="primary" onclick="e2eGrant()" data-i18n="Grant access">Grant access</button><button class="ghost" onclick="closeModal()" data-i18n="Close">Close</button></div>
     ${meta.rekey_required?'<p class="small" style="color:var(--bad)" data-i18n="A grant was removed. Rotate the key from the environment banner so future secrets are not readable to the old grantee.">A grant was removed. Rotate the key from the environment banner so future secrets are not readable to the old grantee.</p>':''}`,'Environment access')}
 async function e2eGrant(){
-  let id=ENV.id,key=E2E_KEYS[id];if(!key)return;let email=$('eg-email').value.trim();
+  let id=ENV.id,key=E2E_KEYS[id],generation=E2E_GENERATIONS[id],epoch=SECRET_EPOCH;if(!key)return;let email=$('eg-email').value.trim();
   if(!email){toastUI('Enter the email of an existing member', true);return}
   try{
     let u=await api('GET',`/api/users/lookup?email=${encodeURIComponent(email)}`);
     if(!u.pubkey)throw new Error('that account has no public key');
     let wrapped=await OW.encryptAsymmetric(u.pubkey,key);
-    await api('POST',`/api/envs/${id}/e2e/grant`,{email:u.email,wrapped_key:wrapped,expected_generation:E2E_GENERATIONS[id]});
+    if(ENV?.id!==id||SECRET_EPOCH!==epoch||E2E_KEYS[id]!==key||E2E_GENERATIONS[id]!==generation||E2E_LOCKED[id]||E2E_REKEYING[id])throw new Error('Environment key changed; refresh before granting access');
+    await api('POST',`/api/envs/${id}/e2e/grant`,{email:u.email,wrapped_key:wrapped,expected_generation:generation});
     let grants=await api('GET',`/api/envs/${id}/e2e/grants`);E2E_GRANTS[id]=grants;
     if(!grants.some(g=>g.user_id===u.id))throw new Error('the grant was not stored');
     toastUI('Access granted to {x}',{x:u.email}, false);await e2eGrantsModal();

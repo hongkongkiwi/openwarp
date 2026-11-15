@@ -1579,12 +1579,12 @@ async fn prune_versions(st: &S, eid: &str, sid: &str, current: i64) -> Result<()
 fn parse_env(text: &str) -> Vec<SecretIn> { let mut out = Vec::new(); let mut pending_comment = String::new();
     for line in text.lines() { let l = line.trim(); if l.is_empty() { continue; } else if l.starts_with('#') { pending_comment = l.trim_start_matches('#').trim().to_string(); continue; }
         if let Some((k, v)) = l.trim_start_matches("export ").split_once('=') { out.push(SecretIn{ key: k.trim().to_string(), value: v.trim().trim_matches('"').trim_matches('\'').to_string(), path: "/".into(), comment: pending_comment.clone(), tags: "".into(), secret_type: "".into(), expected_version: None }); pending_comment.clear(); } } out }
-async fn rotation_secret_batch(st: &S, eid: &str, sid: &str, statements: &[(String,Vec<Value>)], fields: [&str;6], master: Option<[u8;32]>) -> Result<(),(StatusCode,Json<Value>)> {
+async fn rotation_secret_batch(st: &S, eid: &str, sid: &str, statements: &[(String,Vec<Value>)], fields: [&str;6], master: Option<[u8;32]>, source_generation: Option<i64>) -> Result<(),(StatusCode,Json<Value>)> {
     let mut blocked="SELECT id FROM rotation_schedules WHERE env_id=? AND static_target IS NOT NULL AND (pending_enc<>'' OR execution_token<>'')".to_string();
     let mut params=vec![json!(eid)];
     if !sid.is_empty() {
-        let row=st.db.one("SELECT * FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
-        if db::n(&row,"e2e")!=0 { return client_rekey::lifecycle(st,eid,sid,statements,fields).await; }
+        let row=st.db.one("SELECT s.*,e.key_generation FROM secrets s JOIN envs e ON e.id=s.env_id WHERE s.id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
+        if db::n(&row,"e2e")!=0 { return client_rekey::lifecycle(st,eid,sid,statements,fields,source_generation.unwrap_or_else(||db::n(&row,"key_generation"))).await; }
         if db::n(&row,"e2e")==0 {
             let key=st.env_key(eid).await?;
             let name=oc::decrypt_symmetric_compat(&key,&secret_aad(eid,sid,"key"),&db::s(&row,"key_enc")).map_err(|e| bad(&e))?;
@@ -1599,12 +1599,12 @@ async fn rotation_secret_batch(st: &S, eid: &str, sid: &str, statements: &[(Stri
 async fn delete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?;
     let eid = db::s(&row, "env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:delete").await?; st.check_secret_path(&sid, &uid, "delete").await?;
-    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?".into(), vec![json!(now()),json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.delete",&sid], None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=1,deleted_at=?,updated_at=? WHERE id=?".into(), vec![json!(now()),json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.delete",&sid], None,None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
 async fn undelete_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| err(StatusCode::NOT_FOUND, "secret not found"))?;
     let eid = db::s(&row, "env_id"); st.check_scope(&h, &eid).await?; let (org, app) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:write").await?;
     require_approval_for_write(&st, &eid, &org, &uid).await?;
-    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=0,deleted_at=0,updated_at=? WHERE id=? AND deleted=1".into(),vec![json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.undelete",&sid],None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[("UPDATE secrets SET deleted=0,deleted_at=0,updated_at=? WHERE id=? AND deleted=1".into(),vec![json!(now()),json!(sid)])], [&org,&app,&eid,&uid,"secret.undelete",&sid],None,None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok": true}))) }
 // Unlike delete (a recoverable tombstone), destroy removes the value and its
 // history permanently. Point-in-time recovery cannot bring it back.
 async fn destroy_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?; let mut statements = Vec::new();
@@ -1614,7 +1614,7 @@ async fn destroy_secret(State(st): State<S>, h: HeaderMap, Path(sid): Path<Strin
     statements.push((("DELETE FROM secret_versions WHERE secret_id=?").to_string(), ([json!(sid)]).to_vec()));
     statements.push((("DELETE FROM overrides WHERE secret_id=?").to_string(), ([json!(sid)]).to_vec()));
     statements.push((("DELETE FROM secrets WHERE id=?").to_string(), ([json!(sid)]).to_vec()));
-    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&statements,[&org, &app, &eid, &uid, "secret.destroy", &sid],None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"destroyed": true}))) }
+    require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&statements,[&org, &app, &eid, &uid, "secret.destroy", &sid],None,None).await?; let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"destroyed": true}))) }
 async fn history(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>) -> Res { let uid = st.token_user(&h).await?;
     let row = st.db.one("SELECT env_id,secret_type FROM secrets WHERE id=?", &[json!(sid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("secret not found"))?; let eid = db::s(&row, "env_id"); let (org, _) = st.require_env(&eid, &uid).await?; st.check_perm(&org, &uid, "secrets:read").await?;
     st.check_scope(&h, &eid).await?; st.check_secret_path(&sid, &uid, "read").await?;
@@ -1630,7 +1630,7 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     // An E2E environment has no server-side key; restoring its ciphertext
     // still works, it just cannot produce a reusable fingerprint.
     let key = st.env_key(&eid).await.ok();
-    let v = st.db.one("SELECT * FROM secret_versions WHERE secret_id=? AND version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
+    let v = st.db.one("SELECT v.*,e.key_generation FROM secret_versions v JOIN secrets s ON s.id=v.secret_id JOIN envs e ON e.id=s.env_id WHERE v.secret_id=? AND v.version=?", &[json!(sid), json!(ver)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("version not found"))?;
     let current_type = db::s(&row,"secret_type"); let version_type = db::s(&v,"secret_type");
     if (wallet_type(&current_type) || wallet_type(&version_type)) && current_type != version_type { return Err(bad("wallet restore cannot change type")); }
     st.check_path(&eid, &uid, &db::s(&v,"path"), "read").await?;
@@ -1656,7 +1656,7 @@ async fn restore(State(st): State<S>, h: HeaderMap, Path((sid, ver)): Path<(Stri
     require_step_up(&st, &h, &uid, StepUpRisk::TwoFactor).await?; rotation_secret_batch(&st,&eid,&sid,&[
         ("UPDATE secrets SET value_enc=?,value_fp=?,comment_enc=?,tags=?,tags_enc=?,version=?,deleted=0,deleted_at=0,updated_at=?,updated_by=? WHERE id=? AND secret_type=?".into(), vec![json!(value_enc), json!(&restored_fp), json!(comment_enc), json!(tags_plain), json!(tags_enc), json!(new_ver), json!(now()), json!(uid), json!(sid), json!(current_type)]),
         ("INSERT INTO secret_versions(id,secret_id,version,key_enc,value_enc,comment_enc,secret_type,path,tags,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)".into(), vec![json!(id()), json!(sid), json!(new_ver), json!(db::s(&v,"key_enc")), json!(value_enc), json!(comment_enc), json!(db::s(&v,"secret_type")), json!(vpath), json!(db::s(&v,"tags")), json!(now()), json!(uid)]),
-    ], [&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)], Some(master)).await?;
+    ], [&org,&app,&eid,&uid,"secret.restore",&format!("{}->v{}",sid,ver)], Some(master),Some(db::n(&v,"key_generation"))).await?;
     prune_versions(&st, &eid, &sid, new_ver).await?;
     let _ = trigger_sync(&st, &eid, &uid).await; Ok(j(json!({"ok":true,"version":new_ver}))) }
 async fn set_override(State(st): State<S>, h: HeaderMap, Path(sid): Path<String>, Json(r): Json<DeployReq>) -> Res { let uid = st.token_user(&h).await?;
@@ -7965,7 +7965,7 @@ async fn mcp_call(st: &S, uid: &str, h: &HeaderMap, params: &Value) -> Result<Va
         "delete_secret" => { let eid = arg("env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, app) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "secrets:delete").await.map_err(|_| "forbidden".to_string())?;
             let items = st.list_secrets_decrypted(&eid, uid).await.map_err(|_| "read failed".to_string())?; let sid = items.iter().find(|(k, _, _)| k == &arg("key").to_uppercase()).map(|(_, _, raw)| raw["id"].as_str().unwrap_or("").to_string()).ok_or("secret not found")?;
             st.check_secret_path(&sid,uid,"delete").await.map_err(|_| "path policy denies delete".to_string())?;
-            rotation_secret_batch(st,&eid,&sid,&[("UPDATE secrets SET deleted=1,updated_at=? WHERE id=?".into(), vec![json!(now()), json!(sid)])], [&org, &app, &eid, uid, "mcp.delete_secret", &arg("key")],None).await.map_err(|e| e.1.0.to_string())?; Ok(text(json!({"ok": true}))) }
+            rotation_secret_batch(st,&eid,&sid,&[("UPDATE secrets SET deleted=1,updated_at=? WHERE id=?".into(), vec![json!(now()), json!(sid)])], [&org, &app, &eid, uid, "mcp.delete_secret", &arg("key")],None,None).await.map_err(|e| e.1.0.to_string())?; Ok(text(json!({"ok": true}))) }
         "create_lease" => { let eid = arg("env_id"); mcp_env_check(st, uid, h, &eid).await?; let (org, app) = st.env_org_app(&eid).await.map_err(|_| "forbidden".to_string())?; st.check_perm(&org, uid, "leases:write").await.map_err(|_| "forbidden".to_string())?; let key = st.env_key(&eid).await.map_err(|_| "env key failed".to_string())?;
             let value = oc::random_token("dyn"); let lid = id();
             st.audited_batch(&[("INSERT INTO leases(id,env_id,name,value_enc,expires_at,created_at) VALUES(?,?,?,?,?,?)".into(), vec![json!(lid), json!(eid), json!(arg("name")), json!(oc::encrypt_symmetric_aad(&key, &lease_aad(&eid, &lid, "value"), value.as_bytes())), json!(now()+3600), json!(now())])], &[], [&org, &app, &eid, uid, "mcp.create_lease", &lid]).await.map_err(|e| e.to_string())?;

@@ -114,8 +114,10 @@ send `expected_generation` from that same key response. A stale generation or
 pending rotation returns 409; do not pair a cached key with newly fetched metadata.
 
 `GET /api/envs/{id}/e2e/meta` returns `key_generation`, `membership_version`,
-`snapshot_token` and `rekey_required`. All three preconditions are mandatory for
-`POST /api/envs/{id}/e2e/rekey`. Include every live secret exactly once with its
+`snapshot_token` and `rekey_required`. For `POST /api/envs/{id}/e2e/rekey`, send
+the returned `key_generation` as `expected_generation`, and send
+`membership_version` and `snapshot_token` unchanged. These three request fields
+are mandatory. Include every live secret exactly once with its
 `id`, `version`, `key_hash`, and replacement `key_enc`, `value_enc`, `path_enc`.
 An empty secrets array is valid for an empty environment. Include a new wrap for
 every eligible existing holder, including the caller, except explicit

@@ -164,10 +164,7 @@ pub(super) async fn policy(State(st): State<S>,h: HeaderMap,Path(eid): Path<Stri
         } Ok(())
     }).await.map_err(failure)?; st.drain_outbox().await; Ok(j(json!({"runner_rekey_authorized":allow})))
 }
-pub(super) async fn lifecycle(st: &S,eid: &str,sid: &str,statements: &[(String,Vec<Value>)],fields: [&str;6]) -> Result<(),(StatusCode,Json<Value>)> {
-    let e=st.db.one("SELECT mode,key_generation FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e|bad(&e))?.ok_or_else(||bad("environment not found"))?;
-    if db::s(&e,"mode")=="sse" { return Err(bad("client lifecycle called for SSE")); }
-    let generation=db::n(&e,"key_generation"); let eid=eid.to_string(); let sid=sid.to_string(); let sql=statements.to_vec(); let event=AuditEvent::new(fields); let action=fields[4].to_string(); let uid=fields[3].to_string();
+pub(super) async fn lifecycle(st: &S,eid: &str,sid: &str,statements: &[(String,Vec<Value>)],fields: [&str;6],generation: i64) -> Result<(),(StatusCode,Json<Value>)> { let eid=eid.to_string(); let sid=sid.to_string(); let sql=statements.to_vec(); let event=AuditEvent::new(fields); let action=fields[4].to_string(); let uid=fields[3].to_string();
     st.db.webhook_atomic(move |tx| { let e=env(tx,&eid)?; ready(&e)?;
         if db::n(&e,"key_generation")!=generation { return Err("stale:key generation changed".into()); }
         if db::n(&e,"app_locked")!=0 || db::n(&e,"org_locked")!=0 { return Err("denied:emergency lockdown".into()); }
@@ -191,7 +188,7 @@ pub(super) async fn enqueue(st: &S,eid: &str,iid: &str,kind: &str) -> Result<(),
 pub(super) async fn runner_payloads(st: &S,rid: String,hash: String) -> Res {
     let jobs=st.db.webhook_atomic(move |tx| {
         if tx.one("SELECT id FROM runners WHERE id=? AND token_hash=?", &[json!(rid),json!(hash)])?.is_none() { return Err("denied:runner credential revoked".into()); }
-        let rows=tx.query("SELECT * FROM sync_jobs WHERE runner_id=? AND (status='pending' OR (status='claimed' AND claimed_at<?)) ORDER BY created_at LIMIT 10", &[json!(rid),json!(now()-600)])?;
+        let rows=tx.query("SELECT j.* FROM sync_jobs j JOIN envs e ON e.id=j.env_id JOIN apps a ON a.id=e.app_id JOIN orgs o ON o.id=a.org_id JOIN runner_env_keys k ON k.env_id=e.id AND k.runner_id=j.runner_id WHERE j.runner_id=? AND e.runner_id=j.runner_id AND e.rekey_pending=0 AND a.emergency_locked=0 AND o.emergency_locked=0 AND (j.status='pending' OR (j.status='claimed' AND j.claimed_at<?)) ORDER BY j.created_at LIMIT 10", &[json!(rid),json!(now()-600)])?;
         let mut jobs=Vec::new();
         for job in rows { let eid=db::s(&job,"env_id"); let iid=db::s(&job,"integration_id");
             let e=env(tx,&eid)?;
@@ -215,7 +212,7 @@ pub(super) async fn require_ready(st: &S,eid: &str) -> Result<(),(StatusCode,Jso
 pub(super) async fn put(State(st): State<S>,h: HeaderMap,Path(eid): Path<String>,Json(body): Json<Value>) -> Res {
     let (uid,org,app)=preflight(&st,&h,&eid,true).await?; let hash=(oc::hash_token(&secret_health_token(&h)),issuer(&st,&h));
     let generation=body["expected_generation"].as_i64().filter(|n|*n>=1).ok_or_else(||bad("expected_generation required"))?;
-    let inputs=body["secrets"].as_array().cloned().unwrap_or_default();
+    let inputs=body["secrets"].as_array().cloned().ok_or_else(||bad("secrets required"))?;
     require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     let count=st.db.webhook_atomic(move |tx| { let e=env(tx,&eid)?; authorize(tx,&e,&uid,&hash,true,true)?; ready(&e)?;
         if db::n(&e,"key_generation")!=generation { return Err("stale:key generation changed".into()); }
