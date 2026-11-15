@@ -92,6 +92,25 @@ impl Server {
         Self::response(req.send().await.expect("HTTP request")).await
     }
 
+    async fn verified_export(&self, path: &str, session: &str) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let started = self.call(Method::POST, "/api/auth/step-up/start", session, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(started.status, 200, "start export verification");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "export verification email did not arrive");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", session, Some(json!({"challenge": started.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify emailed export code");
+        Self::response(self.client.get(format!("{}{}", self.base, path)).bearer_auth(session)
+            .header("x-openwarp-step-up", field(&verified.body, "token")).send().await.expect("verified export")).await
+    }
+
     async fn form(&self, path: &str, token: &str, form: &[(&str, String)]) -> Resp {
         let mut req = self.client.post(format!("{}{}", self.base, path)).form(form);
         if !token.is_empty() { req = req.bearer_auth(token); }
@@ -181,7 +200,7 @@ async fn session_reader_can_delete_only_own_override_without_shared_write_permis
     let listed = s.call(Method::GET, &format!("/api/envs/{}/secrets", env), &reader.token, None).await;
     assert_eq!(listed.status, 200); assert_eq!(listed.body["total"], 1);
     assert_eq!(listed.body["secrets"][0]["id"], sid); assert_eq!(listed.body["secrets"][0]["value"], "base-value", "reader falls back to unchanged shared value");
-    let base = s.call(Method::GET, &format!("/api/envs/{}/export?base=1", env), &owner.token, None).await;
+    let base = s.verified_export(&format!("/api/envs/{}/export?base=1", env), &owner.token).await;
     assert_eq!(base.status, 200); assert_eq!(base.body["secrets"][0]["value"], "base-value");
 }
 

@@ -23,9 +23,15 @@
 
 # Agent, editor and OS state
 /.agents/state/
+/.agents/tools/
 /.serena/
 .DS_Store
 *.log
+
+# Browser acceptance dependencies and disposable runner output
+/tests/e2e/node_modules/
+/tests/e2e/test-results/
+/tests/e2e/playwright-report/
 
 # Worker build output and local Wrangler state
 /crates/server/build/

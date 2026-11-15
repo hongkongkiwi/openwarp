@@ -94,6 +94,30 @@ impl Server {
         Resp { status, text, body }
     }
 
+    async fn verified_call(&self, method: Method, path: &str, session: &str, body: Option<Value>) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let started = self.call(Method::POST, "/api/auth/step-up/start", Some(session), Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(started.status, 200, "start sensitive-action verification");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "sensitive-action email did not arrive");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", Some(session), Some(json!({"challenge": started.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify emailed sensitive-action code");
+        let mut req = self.client.request(method, self.url(path)).bearer_auth(session)
+            .header("x-openwarp-step-up", verified.body["token"].as_str().expect("step-up grant"));
+        if let Some(body) = body { req = req.json(&body); }
+        let response = req.send().await.expect("verified HTTP request");
+        let status = response.status().as_u16(); let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Resp { status, text, body }
+    }
+
     async fn get(&self, path: &str) -> Resp { self.call(Method::GET, path, None, None).await }
 }
 
@@ -203,7 +227,7 @@ async fn self_hosted_keeps_core_and_locks_every_enterprise_route() {
     assert_eq!(stream.status, 403, "log streams are enterprise: {} {}", stream.status, stream.text);
     assert_eq!(stream.body["feature"], json!("audit_streaming"));
 
-    let core_settings = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&token), Some(json!({"ip_allowlist": "203.0.113.0/24"}))).await;
+    let core_settings = s.verified_call(Method::PUT, &format!("/api/orgs/{}/settings", org), &token, Some(json!({"ip_allowlist": "203.0.113.0/24"}))).await;
     assert_eq!(core_settings.status, 200, "core settings still save: {}", core_settings.text);
 }
 
@@ -235,7 +259,7 @@ async fn enterprise_license_unlocks_the_same_routes() {
         if compiled && feature != "scim" { assert_eq!(response.body["configured"], json!(false)); }
     }
 
-    let oidc = s.call(Method::PUT, &format!("/api/orgs/{}/settings", org), Some(&token), Some(json!({"oidc_issuer": "https://idp.example"}))).await;
+    let oidc = s.verified_call(Method::PUT, &format!("/api/orgs/{}/settings", org), &token, Some(json!({"oidc_issuer": "https://idp.example"}))).await;
     assert_eq!(oidc.status, 200, "workspace OIDC saves with a license: {}", oidc.text);
 
     let stream = s.call(Method::POST, &format!("/api/orgs/{}/log-streams", org), Some(&token), Some(json!({"name": "SIEM", "url": "https://example.com/hook"}))).await;

@@ -28,17 +28,25 @@ impl Database {
         Self { dir, db }
     }
 }
-struct Server { child: Child, base: String, log: PathBuf, client: Client }
+struct Server { child: Child, base: String, log: PathBuf, client: Client, mail: Arc<Mutex<Vec<Value>>>, _mail_server: Mock }
 impl Drop for Server { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
 impl Server {
     fn start(data: &Database, kms: Option<&str>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap(); drop(listener);
         let base = format!("http://{}", addr);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); listener.set_nonblocking(true).unwrap();
+        let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
+        let mail = Arc::new(Mutex::new(Vec::new())); let sink = mail.clone();
+        let app = Router::new().route("/mail", post(move |Json(body): Json<Value>| { let sink = sink.clone(); async move { sink.lock().unwrap().push(body); Json(json!({})) } }));
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let mail_server = Mock { url: mail_url, task };
         let log = data.dir.join(format!("server-{}.log", addr.port()));
         let mut command = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
         command.env("DATABASE_URL", format!("sqlite://{}", data.dir.join("test.db").display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_PUBLIC_URL", &base)
+            .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", &mail_server.url)
             .env("OPENWARP_ENV", if kms.is_some() { "production" } else { "test" })
             .env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1").env("TOKIO_WORKER_THREADS", "2")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("REDIS_URL")
@@ -47,7 +55,7 @@ impl Server {
         if let Some(url) = kms { command.env("OPENWARP_KMS_URL", url); } else { command.env_remove("OPENWARP_KMS_URL"); }
         let child = command.spawn().unwrap();
         let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(20)).build().unwrap();
-        Self { child, base, log, client }
+        Self { child, base, log, client, mail, _mail_server: mail_server }
     }
     async fn healthy(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(25);
@@ -66,6 +74,22 @@ impl Server {
         let text = r.text().await.unwrap();
         let body = serde_json::from_str(&text).unwrap_or_else(|_| json!({"raw":text}));
         (status, body)
+    }
+    async fn rotate_master(&self, next: &str) {
+        let before = self.mail.lock().unwrap().len();
+        let start = self.ok("POST", "/api/auth/step-up/start", json!({"risk":"very_risky"})).await;
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.mail.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.ok("POST", "/api/auth/step-up/verify", json!({"challenge":start["challenge"],"email_code":code})).await;
+        let response = self.client.post(format!("{}/api/instance/rotate-master", self.base)).bearer_auth("owner")
+            .header("x-openwarp-step-up", verified["token"].as_str().unwrap()).json(&json!({"new_key":next})).send().await.unwrap();
+        let status = response.status(); let body: Value = response.json().await.unwrap(); assert_eq!(status, 200, "master rotation: {}", body);
     }
     async fn ok(&self, method: &str, path: &str, input: Value) -> Value {
         let (status, body) = self.call(method, path, "owner", input).await;
@@ -133,7 +157,7 @@ async fn transit_old_ciphertext_survives_native_root_rotation_and_restart() {
     let decode = json!({"ciphertext":encrypted["ciphertext"],"context":"persistent"});
     assert_eq!(server.ok("POST", &format!("{}/decrypt", base), decode.clone()).await["plaintext"], payload);
     let next = oc::b64(&[19;32]);
-    server.ok("POST", "/api/instance/rotate-master", json!({"new_key":next})).await;
+    server.rotate_master(&next).await;
     assert_eq!(server.ok("POST", &format!("{}/decrypt", base), decode.clone()).await["plaintext"], payload);
     assert_eq!(data.db.one("SELECT v FROM meta WHERE k='master'", &[]).await.unwrap().unwrap()["v"], next);
     drop(server);

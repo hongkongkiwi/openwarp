@@ -62,9 +62,10 @@ function check(name, condition, detail) {
   console.error(`FAIL ${name}${detail ? `: ${detail}` : ''}`);
 }
 
-async function call(method, path, token, body) {
+async function call(method, path, token, body, grant) {
   const headers = {};
   if (token) headers.authorization = `Bearer ${token}`;
+  if (grant) headers['x-openwarp-step-up'] = grant;
   if (body !== undefined) headers['content-type'] = 'application/json';
   const res = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30000) });
   const text = await res.text();
@@ -299,12 +300,45 @@ check('SCIM absent from the Worker build', scim.status === 404, `${scim.status} 
 // (pure-Rust backend), user provisioning and session creation.
 const idp = await startMockIdp();
 const issuer = `http://127.0.0.1:${idp.address().port}`;
-const settings = await call('PUT', `/api/orgs/${org}/settings`, token, {
+const oidcSettings = {
   oidc_issuer: issuer, oidc_client_id: 'test-oidc', oidc_client_secret: 'secret',
   oidc_redirect_uri: `${base}/api/auth/oidc/callback`,
   oidc_auto_provision: true, oidc_allowed_domains: 'test.invalid',
-});
-check('OIDC settings saved', settings.status === 200, `${settings.status} ${settings.text}`);
+};
+const unprovedSettings = await call('PUT', `/api/orgs/${org}/settings`, token, oidcSettings);
+check('OIDC settings require fresh email proof', unprovedSettings.status === 428 && unprovedSettings.json.step_up_required === true &&
+  unprovedSettings.json.risk === 'very_risky' && unprovedSettings.json.email_required === true && unprovedSettings.json.totp_required === false, `HTTP ${unprovedSettings.status}`);
+const mailBefore = (await (await fetch(`${process.env.OPENWARP_SMOKE_ECHO}/_requests`)).json()).length;
+const proofStart = await call('POST', '/api/auth/step-up/start', token, { risk: 'very_risky' });
+const proofReady = proofStart.status === 200 && proofStart.json.email_sent === true && proofStart.json.risk === 'very_risky' &&
+  typeof proofStart.json.challenge === 'string' && !!proofStart.json.challenge &&
+  Array.isArray(proofStart.json.methods) && proofStart.json.methods.length === 1 && proofStart.json.methods[0] === 'email';
+check('OIDC settings email verification starts', proofReady, `HTTP ${proofStart.status}`);
+if (!proofReady) { idp.close(); process.exit(1); }
+let emailCode = '';
+for (let i = 0; i < 40 && !emailCode; i += 1) {
+  const seen = await (await fetch(`${process.env.OPENWARP_SMOKE_ECHO}/_requests`)).json();
+  for (const message of seen.slice(mailBefore)) {
+    if (message.path !== '/mail') continue;
+    let mail = message.body;
+    if (typeof mail === 'string') { try { mail = JSON.parse(mail); } catch { continue; } }
+    if (mail?.to !== email || mail.subject !== 'Your OpenWarp verification code') continue;
+    emailCode = String(mail.text || '').match(/Your verification code is (\d{6})\./)?.[1] || '';
+    if (emailCode) break;
+  }
+  if (!emailCode) await new Promise(resolve => setTimeout(resolve, 250));
+}
+check('OIDC settings fresh email code delivered', !!emailCode);
+if (!emailCode) { idp.close(); process.exit(1); }
+const proof = await call('POST', '/api/auth/step-up/verify', token, { challenge: proofStart.json.challenge, email_code: emailCode });
+emailCode = '';
+const proofVerified = proof.status === 200 && proof.json.risk === 'very_risky' && typeof proof.json.token === 'string' && !!proof.json.token;
+check('OIDC settings email verification succeeds', proofVerified, `HTTP ${proof.status}`);
+if (!proofVerified) { idp.close(); process.exit(1); }
+const settings = await call('PUT', `/api/orgs/${org}/settings`, token, oidcSettings, proof.json.token);
+check('OIDC settings saved', settings.status === 200, `HTTP ${settings.status}`);
+const replayedSettings = await call('PUT', `/api/orgs/${org}/settings`, token, oidcSettings, proof.json.token);
+check('OIDC settings proof cannot be reused', replayedSettings.status === 428 && replayedSettings.json.step_up_required === true, `HTTP ${replayedSettings.status}`);
 
 const start = await fetch(`${base}/api/auth/oidc/${org}/start`, { redirect: 'manual' });
 const location = start.headers.get('location') || '';

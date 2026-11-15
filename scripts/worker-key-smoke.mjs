@@ -21,9 +21,9 @@ const ensure = (condition, message) => assert.ok(condition, message);
 const pbkdf2 = promisify(crypto.pbkdf2);
 async function listen(server) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return server.address().port; }
 async function freePort() { const server = net.createServer(), port = await listen(server); await new Promise(resolve => server.close(resolve)); return port; }
-async function call(base, route, { method = 'GET', cookie, json } = {}) {
+async function call(base, route, { method = 'GET', cookie, json, grant } = {}) {
   const response = await fetch(base + route, { method, redirect: 'manual', signal: AbortSignal.timeout(30000),
-    headers: { ...(cookie ? { cookie } : {}), ...(json === undefined ? {} : { 'content-type': 'application/json' }) },
+    headers: { ...(cookie ? { cookie } : {}), ...(grant ? { 'x-openwarp-step-up': grant } : {}), ...(json === undefined ? {} : { 'content-type': 'application/json' }) },
     body: json === undefined ? undefined : JSON.stringify(json) });
   const text = await response.text();
   let data; try { data = JSON.parse(text); } catch { data = {}; }
@@ -153,6 +153,34 @@ async function main() {
     ensure(/;\s*Secure(?:;|$)/i.test(response.headers.get('set-cookie') || ''), 'production HTTPS session cookie must be Secure');
     owner.cookie = cookie;
   }
+  async function rotationGrant() {
+    const since = messages.length;
+    const started = ok(await call(base, '/api/auth/step-up/start', { method: 'POST', cookie: owner.cookie,
+      json: { risk: 'very_risky' } }), 'rotation verification start');
+    ensure(started.data.risk === 'very_risky' && started.data.email_sent === true &&
+      Array.isArray(started.data.methods) && started.data.methods.length === 2 &&
+      started.data.methods.includes('email') && started.data.methods.includes('totp'), 'rotation verification must require email and configured TOTP');
+    ensure(typeof started.data.challenge === 'string' && !!started.data.challenge, 'rotation verification must issue a real challenge');
+    let emailCode;
+    for (let i = 0; i < 100 && !emailCode; i++) {
+      for (const message of messages.slice(since)) {
+        if (message.to !== owner.email || message.subject !== 'Your OpenWarp verification code') continue;
+        emailCode = String(message.text || '').match(/Your verification code is (\d{6})\./)?.[1];
+        if (emailCode) break;
+      }
+      if (!emailCode) await sleep(100);
+    }
+    ensure(!!emailCode, 'fresh rotation verification mail must reach the owner mailbox');
+    // Enrollment recovery codes satisfy the configured TOTP factor without replaying a login counter.
+    const recovery = owner.recoveryCodes.shift();
+    ensure(typeof recovery === 'string' && !!recovery, 'each rotation proof must use an unused enrollment recovery code');
+    const verified = ok(await call(base, '/api/auth/step-up/verify', { method: 'POST', cookie: owner.cookie,
+      json: { challenge: started.data.challenge, email_code: emailCode, totp: recovery } }), 'rotation verification');
+    ensure(verified.data.risk === 'very_risky' && typeof verified.data.token === 'string' && !!verified.data.token,
+      'email and configured-factor proof must issue a VeryRisky grant');
+    ensure(!verified.headers.has('set-cookie'), 'step-up proof must not replace the account session');
+    return verified.data.token;
+  }
   const originalMaster = crypto.randomBytes(32).toString('base64'), newMaster = crypto.randomBytes(32).toString('base64');
   const candidateMaster = crypto.randomBytes(32).toString('base64');
   const secret = { key: 'KEY_SMOKE', value: crypto.randomBytes(24).toString('base64'), comment: 'key smoke fixture', path: '/' };
@@ -209,21 +237,38 @@ async function main() {
       await readSecret(); ensure(kms.envUnwraps.has(`env:${env}`), 'secret access must actually unwrap the environment key through KMS');
       const setup = ok(await call(base, '/api/me/totp/setup', { method: 'POST', cookie: owner.cookie, json: {} }), 'TOTP setup');
       ensure(typeof setup.data.secret === 'string' && setup.data.secret.length > 0, 'TOTP setup must return a client-held secret'); owner.totp = setup.data.secret;
+      ensure(Array.isArray(setup.data.recovery_codes) && setup.data.recovery_codes.length >= 2 &&
+        setup.data.recovery_codes.every(code => typeof code === 'string' && !!code) &&
+        new Set(setup.data.recovery_codes).size === setup.data.recovery_codes.length, 'TOTP setup must issue distinct recovery codes for fresh rotation proofs');
+      owner.recoveryCodes = [...setup.data.recovery_codes];
       ensure(ok(await call(base, '/api/me/totp/verify', { method: 'POST', cookie: owner.cookie, json: { code: totp(owner.totp, Math.floor(Date.now() / 30000)) } }), 'TOTP enrollment').data.enabled === true, 'TOTP enrollment must activate the factor');
     });
+    await check('owner rotation without proof requires email and TOTP before contacting KMS', async () => {
+      const rootWraps = kms.rootWraps, rejected = kms.rejected;
+      const response = await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: candidateMaster } });
+      ensure(response.status === 428 && response.data.step_up_required === true && response.data.risk === 'very_risky' &&
+        response.data.email_required === true && response.data.totp_required === true, 'unproved rotation must require both configured factors with HTTP 428');
+      ensure(kms.rootWraps === rootWraps && kms.rejected === rejected, 'unproved rotation must not attempt a KMS root wrap');
+      await readSecret();
+    });
     await check('failed KMS wrap rejects rotation without corrupting existing ciphertext or client auth', async () => {
+      const grant = await rotationGrant();
       const rejected = kms.rejected; kms.failWrap = true;
       try {
-        const response = await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: candidateMaster } });
+        const response = await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: candidateMaster }, grant });
         ensure(response.status === 400 && response.data.ok !== true, `KMS wrap failure must reject rotation with HTTP 400 (got ${response.status})`);
         ensure(kms.rejected === rejected + 1, 'rejected rotation must actually reach the failed KMS wrap');
+        const replay = await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: candidateMaster }, grant });
+        ensure(replay.status === 428 && replay.data.step_up_required === true, 'a KMS wrap failure must still consume its rotation grant');
+        ensure(kms.rejected === rejected + 1, 'replayed rotation grant must not reach the KMS bridge');
       } finally { kms.failWrap = false; }
       // Failure occurs before the SQL batch; this is not a SQL rollback test.
       await readSecret(); await login(); await readSecret();
     });
     await check('owner master rotation completes and preserves a current-instance secret read', async () => {
+      const grant = await rotationGrant();
       const pid = child.pid, rootWraps = kms.rootWraps;
-      const response = ok(await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: newMaster } }), 'master rotation');
+      const response = ok(await call(base, '/api/instance/rotate-master', { method: 'POST', cookie: owner.cookie, json: { new_key: newMaster }, grant }), 'master rotation');
       ensure(response.data.ok === true && response.data.rotated_records >= 2, 'rotation must include encrypted client auth and TOTP state');
       ensure(kms.rootWraps === rootWraps + 1 && child.pid === pid, 'rotation must wrap the replacement root without restarting Wrangler');
       await readSecret(); ok(await call(base, '/health'), 'current-instance health');

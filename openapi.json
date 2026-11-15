@@ -3615,12 +3615,15 @@
             "type": "string"
           },
           "type": {
+            "description": "Wallet kinds are SSE-only opaque values. Existing wallets require the exact same explicit type on edit; omitted type, downgrade or changing wallet kinds returns 400. Ordinary records may be promoted.",
             "enum": [
               "",
               "secret",
               "sealed",
               "ssh_key",
-              "config"
+              "config",
+              "wallet_private_key",
+              "wallet_recovery_phrase"
             ],
             "type": "string"
           },
@@ -10413,6 +10416,127 @@
           }
         ],
         "summary": "Check candidate values for reuse",
+        "tags": [
+          "secrets"
+        ]
+      }
+    },
+    "/api/envs/{eid}/secrets/{sid}/reveal": {
+      "get": {
+        "description": "SSE wallet records only. Requires an actual live cookie or Bearer account session, secrets:read and environment/path access before consuming single-use VeryRisky proof. OAuth, service, machine and workload credentials are refused. Email proof and configured TOTP are required. Returns the exact current shared value without overrides or interpolation. Audit failure denies plaintext. No historical reveal or signing is supported.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "eid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Single-use very_risky grant from account step-up verification.",
+            "in": "header",
+            "name": "X-OpenWarp-Step-Up",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Current wallet value; wallet.reveal audit persisted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not an SSE wallet, or invalid wallet ciphertext"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing, expired or revoked credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Account session, tenant, environment, path or read permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Current wallet not found in the exact environment"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Fresh VeryRisky proof required; response includes risk, email_required and totp_required"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Email verification unavailable or reveal audit could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Reveal the current wallet value with account-session step-up",
         "tags": [
           "secrets"
         ]

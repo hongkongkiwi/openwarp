@@ -26,9 +26,9 @@ struct Cli { #[arg(long, env = "OPENWARP_HOST")] host: Option<String>, #[arg(lon
     Apps { #[arg(long)] org: String },
     Envs { #[arg(long, default_value = "")] app: String },
     Secrets { #[arg(long, default_value = "")] env: String, #[arg(long)] show: bool },
-    Get { #[arg(long, default_value = "")] env: String, key: String },
+    Get { #[arg(long, default_value = "")] env: String, #[arg(long)] path: Option<String>, key: String },
     Set { #[arg(long, default_value = "")] env: String, key: String, value: String },
-    Delete { #[arg(long, default_value = "")] env: String, key: String },
+    Delete { #[arg(long, default_value = "")] env: String, #[arg(long)] path: Option<String>, key: String },
     /// base skips your personal overrides, which is what a deployment wants
     Export { #[arg(long, default_value = "")] env: String, #[arg(long, default_value = "dotenv")] format: String, #[arg(long)] base: bool },
     Import { #[arg(long, default_value = "")] env: String, file: String },
@@ -374,6 +374,40 @@ fn management_api(host: &str, token: &str, method: &str, path: &str, body: Optio
     Ok(())
 }
 
+fn invalid_pagination() -> ! { eprintln!("invalid secret pagination response"); std::process::exit(1) }
+
+fn complete_secrets(get: &impl Fn(&str) -> Value, url: &str) -> Value {
+    let mut offset = 0u64; let mut total = None; let mut secrets = Vec::new();
+    loop {
+        let page = get(&if offset == 0 { url.to_string() } else { format!("{}?offset={}", url, offset) });
+        let items = page["secrets"].as_array().unwrap_or_else(|| invalid_pagination());
+        let fields = [page.get("total"), page.get("limit"), page.get("offset")];
+        if offset == 0 && fields[1].is_none() && fields[2].is_none() {
+            if items.len() > 100_000 || fields[0].is_some_and(|v| v.as_u64() != Some(items.len() as u64)) { invalid_pagination(); }
+            return page;
+        }
+        let values: Option<Vec<u64>> = fields.iter().map(|v| v.and_then(Value::as_u64)).collect();
+        let values = values.unwrap_or_else(|| invalid_pagination());
+        let (page_total, limit, page_offset) = (values[0], values[1], values[2]);
+        if page_total > 100_000 || limit == 0 || limit > 1000 || page_offset != offset
+            || total.is_some_and(|t| t != page_total) || items.len() as u64 > limit
+            || offset > page_total || items.len() as u64 > page_total - offset
+            || (offset < page_total && items.is_empty()) { invalid_pagination(); }
+        total = Some(page_total); offset += items.len() as u64; secrets.extend(items.iter().cloned());
+        if offset == page_total { return json!({"secrets": secrets}); }
+    }
+}
+
+fn select_secret<'a>(data: &'a Value, key: &str, path: Option<&str>) -> &'a Value {
+    let mut matches = data["secrets"].as_array().into_iter().flatten().filter(|s| {
+        s["key"].as_str().map(|k| k.to_uppercase() == key.to_uppercase()).unwrap_or(false)
+            && path.map(|p| s["path"].as_str() == Some(p)).unwrap_or(true)
+    });
+    let secret = matches.next().unwrap_or_else(|| { eprintln!("secret not found: {}", key); std::process::exit(1) });
+    if matches.next().is_some() { eprintln!("ambiguous secret: {} matches multiple records", key); std::process::exit(1); }
+    secret
+}
+
 fn reference_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client")
 }
@@ -463,12 +497,12 @@ fn main() {
         Cmd::Envs { app } => { let app = pick(app, &local, "app_id", "--app"); println!("{}", serde_json::to_string_pretty(&get(&format!("{}/api/apps/{}/envs", host, app))).unwrap()); }
         Cmd::Secrets { env, show } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
             for s in d["secrets"].as_array().cloned().unwrap_or_default() { println!("{}={}", s["key"].as_str().unwrap_or(""), if *show { s["value"].as_str().unwrap_or("") } else { "[REDACTED]" }); } }
-        Cmd::Get { env, key } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
-            match d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))) { Some(s) => println!("{}", s["value"].as_str().unwrap_or("")), None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
+        Cmd::Get { env, key, path } => { let env = pick(env, &local, "env_id", "--env"); let d = complete_secrets(&get, &format!("{}/api/envs/{}/secrets", host, env));
+            let s = select_secret(&d, key, path.as_deref()); println!("{}", s["value"].as_str().unwrap_or("")); }
         Cmd::Set { env, key, value } => { let env = pick(env, &local, "env_id", "--env"); let d: Value = client.put(format!("{}/api/envs/{}/secrets", host, env)).bearer_auth(&token).json(&json!({"secrets": [{"key": key, "value": value}]})).send().expect("req").json().expect("json"); let _ = &post;
             println!("{}", if d.get("deployed").is_some() { format!("Set {} (deployed {})", key.to_uppercase(), d["deployed"]) } else { d.to_string() }); }
-        Cmd::Delete { env, key } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/secrets", host, env));
-            let sid = d["secrets"].as_array().and_then(|a| a.iter().find(|s| s["key"].as_str() == Some(&key.to_uppercase()))).and_then(|s| s["id"].as_str().map(|x| x.to_string()));
+        Cmd::Delete { env, key, path } => { let env = pick(env, &local, "env_id", "--env"); let d = complete_secrets(&get, &format!("{}/api/envs/{}/secrets", host, env));
+            let sid = select_secret(&d, key, path.as_deref())["id"].as_str().map(|x| x.to_string());
             match sid { Some(id) => { let r: Value = client.delete(format!("{}/api/secrets/{}", host, id)).bearer_auth(&token).send().expect("req").json().expect("json"); println!("{}", r); } None => { eprintln!("secret not found: {}", key); std::process::exit(1); } } }
         Cmd::Export { env, format, base } => { let env = pick(env, &local, "env_id", "--env"); let d = get(&format!("{}/api/envs/{}/export{}", host, env, if *base { "?base=1" } else { "" }));
             let items = d["secrets"].as_array().cloned().unwrap_or_default();

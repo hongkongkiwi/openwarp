@@ -1,4 +1,5 @@
-use openwarp_sdk::Client as OpenWarpClient;
+use openwarp_sdk::{Client as OpenWarpClient, Error, Export};
+use reqwest::Method;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -198,7 +199,24 @@ async fn live_server_round_trip() {
     let deployed = client.set_secret(env, "SDK_TOKEN", "v1", "/", "secret", "").await.expect("set secret");
     assert_eq!(deployed.deployed, 1);
     assert_eq!(client.get_secret(env, "sdk_token").await.expect("get secret").expect("secret").value, "v1");
-    let exported = client.export(env).await.expect("export");
+    match client.export(env).await {
+        Err(Error::Api { status, body, .. }) => {
+            assert_eq!(status, 428);
+            assert_eq!(body["step_up_required"], true);
+            assert_eq!(body["risk"], "very_risky");
+            assert_eq!(body["email_required"], true);
+            assert_eq!(body["totp_required"], false);
+        }
+        _ => panic!("export without a grant must return an HTTP 428 API error"),
+    }
+    let challenge: Value = client.api(Method::POST, &["auth", "step-up", "start"], Some(json!({"risk": "very_risky"})), &[]).await.expect("start step-up");
+    let text = tokio::time::timeout(Duration::from_secs(10), mail.recv())
+        .await
+        .expect("step-up mail timed out")
+        .expect("step-up mail");
+    let email_code = text.split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6).expect("emailed step-up code");
+    let grant: Value = client.api(Method::POST, &["auth", "step-up", "verify"], Some(json!({"challenge": challenge["challenge"].as_str().expect("step-up challenge"), "email_code": email_code})), &[]).await.expect("verify step-up");
+    let exported: Export = client.api_with_step_up(Method::GET, &["envs", env, "export"], None, &[], grant["token"].as_str().expect("step-up grant")).await.expect("export");
     assert_eq!(exported.secrets.iter().find(|secret| secret.key == "SDK_TOKEN").expect("exported secret").value, "v1");
     client.set_secret(env, "SDK_TOKEN", "v2", "/", "secret", "").await.expect("update secret");
     assert_eq!(client.get_secret(env, "SDK_TOKEN").await.expect("get updated").expect("updated secret").value, "v2");

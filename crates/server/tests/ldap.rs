@@ -467,7 +467,42 @@ impl Server {
         (r.body["token"].as_str().expect("token").to_string(), org)
     }
 
+    async fn very_risky_proof(&self, token: &str) -> String {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call(reqwest::Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start.status, 200, "start email proof: {}", start.text);
+        assert_eq!(start.body["methods"], json!(["email"]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            let text = self.inbox.lock().unwrap().iter().skip(before).find_map(|m| {
+                if m["subject"] == "Your OpenWarp verification code" { m["text"].as_str().map(str::to_string) } else { None }
+            });
+            if let Some(text) = text { break text; }
+            assert!(Instant::now() < deadline, "fresh step-up email missing");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let code = text.split(|c: char| !c.is_ascii_digit()).find(|v| v.len() == 6).expect("emailed verification code");
+        let verified = self.call(reqwest::Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": start.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify email proof: {}", verified.text);
+        verified.body["token"].as_str().expect("step-up grant").to_string()
+    }
+
     async fn put_ldap(&self, token: &str, org: &str, dir: &Stub, extra: Value) -> Reply {
+        self.put_ldap_with_proof(token, org, dir, extra, None).await
+    }
+
+    async fn put_ldap_verified(&self, token: &str, org: &str, dir: &Stub, extra: Value) -> Reply {
+        let proof = self.very_risky_proof(token).await;
+        self.put_ldap_with_proof(token, org, dir, extra, Some(&proof)).await
+    }
+
+    async fn delete_ldap_verified(&self, token: &str, org: &str) -> Reply {
+        let proof = self.very_risky_proof(token).await;
+        finish(self.client.delete(self.url(&format!("/api/orgs/{}/ldap", org))).bearer_auth(token)
+            .header("x-openwarp-step-up", &proof).send().await).await
+    }
+
+    async fn put_ldap_with_proof(&self, token: &str, org: &str, dir: &Stub, extra: Value, proof: Option<&str>) -> Reply {
         let mut body = json!({
             "url": format!("ldaps://127.0.0.1:{}", dir.port),
             "bind_dn": SERVICE_DN,
@@ -484,7 +519,9 @@ impl Server {
                 body[k] = v.clone();
             }
         }
-        self.call(reqwest::Method::PUT, &format!("/api/orgs/{}/ldap", org), Some(token), Some(body)).await
+        let mut req = self.client.put(self.url(&format!("/api/orgs/{}/ldap", org))).bearer_auth(token).json(&body);
+        if let Some(proof) = proof { req = req.header("x-openwarp-step-up", proof); }
+        finish(req.send().await).await
     }
 
     async fn ldap_login(&self, org: &str, username: &str, password: &str) -> Reply {
@@ -613,7 +650,7 @@ async fn ldap_config_is_admin_only_and_requires_tls_and_a_placeholder() {
     let no_password = s.put_ldap(&owner, &org, &dir, json!({"bind_password": ""})).await;
     assert_eq!(no_password.status, 400, "empty bind password accepted: {}", no_password.text);
 
-    let ok = s.put_ldap(&owner, &org, &dir, json!({})).await;
+    let ok = s.put_ldap_verified(&owner, &org, &dir, json!({})).await;
     assert_eq!(ok.status, 200, "valid config rejected: {}", ok.text);
     let after = s.call(reqwest::Method::GET, &format!("/api/orgs/{}/ldap", org), Some(&owner), None).await;
     assert_eq!(after.body["configured"], json!(true));
@@ -630,7 +667,7 @@ async fn ldap_login_provisions_the_user_and_applies_group_roles() {
     bob.groups = vec!["CN=Admins,OU=Groups,DC=example,DC=com".to_string()];
     let dir = start_directory(vec![bob]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    let saved = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin", "auto_provision": true, "allowed_domains": "example.com"})).await;
+    let saved = s.put_ldap_verified(&owner, &org, &dir, json!({"group_roles": "Admins=admin", "auto_provision": true, "allowed_domains": "example.com"})).await;
     assert_eq!(saved.status, 200, "config failed: {}", saved.text);
 
     let r = s.ldap_login(&org, "bob", "user-secret").await;
@@ -661,7 +698,7 @@ async fn ldap_login_denies_wrong_unknown_and_empty_credentials() {
     let s = Server::start().await;
     let dir = start_directory(vec![user("bob", "bob@example.com")]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
 
     let wrong = s.ldap_login(&org, "bob", "not-the-password").await;
     assert_eq!(wrong.status, 401, "wrong password accepted: {}", wrong.text);
@@ -680,7 +717,7 @@ async fn ldap_filter_injection_is_escaped() {
     let s = Server::start().await;
     let dir = start_directory(vec![user("bob", "bob@example.com")]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
 
     let hostile = "*)(uid=*";
     let r = s.ldap_login(&org, hostile, "user-secret").await;
@@ -698,7 +735,7 @@ async fn ldap_provisioning_respects_invites_and_allowed_domains() {
     let (owner, org) = s.register("owner@example.com", "password123").await;
 
     // Auto-provisioning off and no invite: refused.
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": false})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": false})).await.status, 200);
     let refused = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(refused.status, 403, "uninvited user provisioned: {}", refused.text);
 
@@ -717,7 +754,7 @@ async fn ldap_provisioning_respects_invites_and_allowed_domains() {
     assert_eq!(role, "developer", "invite role not applied: {}", orgs.text);
 
     // Auto-provisioning on, but the address is outside the allowed domains.
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true, "allowed_domains": "example.com"})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true, "allowed_domains": "example.com"})).await.status, 200);
     let off_domain = s.ldap_login(&org, "carol", "user-secret").await;
     assert_eq!(off_domain.status, 403, "off-domain user provisioned: {}", off_domain.text);
 }
@@ -727,7 +764,7 @@ async fn ldap_login_requires_the_second_factor_when_enrolled() {
     let s = Server::start().await;
     let dir = start_directory(vec![user("bob", "bob@example.com")]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
 
     let first = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(first.status, 200, "provisioning login failed: {}", first.text);
@@ -761,10 +798,10 @@ async fn ldap_sign_in_stops_after_the_configuration_is_removed() {
     let unconfigured = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(unconfigured.status, 400, "login without config: {}", unconfigured.text);
 
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
     assert_eq!(s.ldap_login(&org, "bob", "user-secret").await.status, 200);
 
-    let removed = s.call(reqwest::Method::DELETE, &format!("/api/orgs/{}/ldap", org), Some(&owner), None).await;
+    let removed = s.delete_ldap_verified(&owner, &org).await;
     assert_eq!(removed.status, 200, "delete failed: {}", removed.text);
     let after = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(after.status, 400, "login still worked after removal: {}", after.text);
@@ -775,13 +812,13 @@ async fn changing_the_directory_url_invalidates_existing_bindings() {
     let first_dir = start_directory(vec![user("bob", "bob@example.com")]);
     let s = Server::start().await;
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &first_dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &first_dir, json!({"auto_provision": true})).await.status, 200);
     assert_eq!(s.ldap_login(&org, "bob", "user-secret").await.status, 200);
 
     // A second directory that accepts anything for the same DN must not inherit
     // the binding created against the first one.
     let second_dir = start_directory(vec![user("bob", "bob@example.com")]);
-    assert_eq!(s.put_ldap(&owner, &org, &second_dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &second_dir, json!({"auto_provision": true})).await.status, 200);
     let after = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(after.status, 409, "a binding survived a directory URL change: {}", after.text);
 }
@@ -793,7 +830,7 @@ async fn leaving_a_mapped_group_revokes_the_mapped_role() {
     let dir = start_directory(vec![bob]);
     let s = Server::start().await;
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    let saved = s.put_ldap(&owner, &org, &dir,
+    let saved = s.put_ldap_verified(&owner, &org, &dir,
         json!({"group_roles": "Admins=admin", "auto_provision": true, "default_role": "developer"})).await;
     assert_eq!(saved.status, 200, "config failed: {}", saved.text);
 
@@ -815,7 +852,7 @@ async fn failed_attempts_are_counted_before_the_directory_answers() {
     let dir = start_directory(vec![user("bob", "bob@example.com")]);
     let s = Server::start().await;
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
 
     for attempt in 0..5 {
         let r = s.ldap_login(&org, "bob", "wrong-password").await;
@@ -899,10 +936,10 @@ async fn only_an_owner_can_map_the_owner_or_admin_role() {
     let narrow = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/roles", org), Some(&admin_token),
         Some(json!({"name": "reader", "permissions": ["secrets:read"]}))).await;
     assert_eq!(narrow.status, 200, "narrow role creation failed: {}", narrow.text);
-    let narrow_mapping = s.put_ldap(&admin_token, &org, &dir, json!({"group_roles": "Admins=reader"})).await;
+    let narrow_mapping = s.put_ldap_verified(&admin_token, &org, &dir, json!({"group_roles": "Admins=reader"})).await;
     assert_eq!(narrow_mapping.status, 200, "a read-only custom role was refused: {}", narrow_mapping.text);
 
-    let by_owner = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin"})).await;
+    let by_owner = s.put_ldap_verified(&owner, &org, &dir, json!({"group_roles": "Admins=admin"})).await;
     assert_eq!(by_owner.status, 200, "the owner was refused: {}", by_owner.text);
 }
 
@@ -911,7 +948,7 @@ async fn a_removed_member_cannot_sign_back_in_without_a_new_invite() {
     let s = Server::start().await;
     let dir = start_directory(vec![user("bob", "bob@example.com")]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    assert_eq!(s.put_ldap(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
+    assert_eq!(s.put_ldap_verified(&owner, &org, &dir, json!({"auto_provision": true})).await.status, 200);
 
     let first = s.ldap_login(&org, "bob", "user-secret").await;
     assert_eq!(first.status, 200, "provisioning login failed: {}", first.text);
@@ -936,7 +973,7 @@ async fn ldap_login_keeps_a_locked_membership_frozen() {
     cara.groups = vec!["CN=Admins,OU=Groups,DC=example,DC=com".to_string()];
     let dir = start_directory(vec![cara]);
     let (owner, org) = s.register("owner@example.com", "password123").await;
-    let saved = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=admin", "auto_provision": true, "allowed_domains": "example.com"})).await;
+    let saved = s.put_ldap_verified(&owner, &org, &dir, json!({"group_roles": "Admins=admin", "auto_provision": true, "allowed_domains": "example.com"})).await;
     assert_eq!(saved.status, 200, "config failed: {}", saved.text);
 
     let first = s.ldap_login(&org, "cara", "user-secret").await;
@@ -945,7 +982,7 @@ async fn ldap_login_keeps_a_locked_membership_frozen() {
 
     let lock = s.call(reqwest::Method::POST, &format!("/api/orgs/{}/members/{}/lock", org, uid), Some(&owner), None).await;
     assert_eq!(lock.status, 200, "locking the ldap member failed: {}", lock.text);
-    let remapped = s.put_ldap(&owner, &org, &dir, json!({"group_roles": "Admins=owner", "auto_provision": true, "allowed_domains": "example.com"})).await;
+    let remapped = s.put_ldap_verified(&owner, &org, &dir, json!({"group_roles": "Admins=owner", "auto_provision": true, "allowed_domains": "example.com"})).await;
     assert_eq!(remapped.status, 200, "reconfig failed: {}", remapped.text);
 
     // Sign-in stays open for the locked member, but the membership is frozen:

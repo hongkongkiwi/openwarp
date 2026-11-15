@@ -5,7 +5,7 @@
 use openwarp_crypto as oc;
 use openwarp_server::integrations;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 fn env(name: &str) -> String { std::env::var(name).unwrap_or_default() }
 
@@ -18,11 +18,26 @@ async fn send(client: &reqwest::Client, base: &str, token: &str, method: reqwest
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-fn decrypt_secret(env_key: &[u8;32], enc: &str) -> Result<String, String> {
-    oc::decrypt_symmetric(env_key, enc).map(|b| String::from_utf8_lossy(&b).into_owned())
+fn decrypt_secret(env_key: &[u8;32], eid: &str, secret: &Value, field: &str) -> Result<String, String> {
+    let enc = secret.get(format!("{}_enc", field)).and_then(Value::as_str).ok_or("secret ciphertext missing")?;
+    let sid = secret.get("id").and_then(Value::as_str).unwrap_or("");
+    let aad = format!("ow-secret:v2|{}|{}|{}", eid, sid, field);
+    let raw = if enc.starts_with("ow2:") {
+        let version = secret.get("version").and_then(Value::as_i64).unwrap_or(1);
+        oc::decrypt_symmetric_aad(env_key, format!("{}|v{}", aad, version).as_bytes(), enc)
+            .or_else(|_| oc::decrypt_symmetric_aad(env_key, aad.as_bytes(), enc))?
+    } else { oc::decrypt_symmetric(env_key, enc)? };
+    String::from_utf8(raw).map_err(|_| "secret plaintext is not UTF-8".into())
 }
-
-struct Prepared { config: Value, pairs: Vec<(String, String)> }
+fn metadata(env_key: &[u8;32], eid: &str, secret: &Value, field: &str, legacy: &str) -> Result<String, String> {
+    match secret.get(format!("{}_enc", field)) {
+        None | Some(Value::Null) => Ok(secret.get(field).and_then(Value::as_str).unwrap_or(legacy).to_string()),
+        Some(Value::String(enc)) if enc.is_empty() => Ok(secret.get(field).and_then(Value::as_str).unwrap_or(legacy).to_string()),
+        Some(Value::String(_)) => decrypt_secret(env_key, eid, secret, field),
+        Some(_) => Err("invalid encrypted secret metadata".into()),
+    }
+}
+struct Prepared { config: Value, located: Vec<(String, String, String, String)>, tags_by_name: HashMap<String, String> }
 fn prepare(job: &Value, kp: &oc::Keypair) -> Result<Prepared, String> {
     let wrapped = job.get("wrapped_key").and_then(|v| v.as_str()).ok_or("job has no wrapped_key")?;
     let raw = kp.decrypt(wrapped)?;
@@ -38,41 +53,84 @@ fn prepare(job: &Value, kp: &oc::Keypair) -> Result<Prepared, String> {
     let eid = job.get("env_id").and_then(|v| v.as_str()).unwrap_or("");
     let iid = job.get("integration_id").and_then(|v| v.as_str()).unwrap_or("");
     if ctx != format!("ow-integration|{}|{}", eid, iid) { return Err("integration config context does not match this job".into()); }
-    let config = envelope.get("config").cloned().ok_or("sealed integration config has no config body")?;
-    let mut pairs = Vec::new();
-    for s in job.get("secrets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let key = decrypt_secret(&env_key, s.get("key_enc").and_then(|v| v.as_str()).unwrap_or(""))?;
-        let value = decrypt_secret(&env_key, s.get("value_enc").and_then(|v| v.as_str()).unwrap_or(""))?;
-        pairs.push((key, value));
+    let mut config = envelope.get("config").filter(|v| v.is_object()).cloned().ok_or("sealed integration config must be an object")?;
+    config["_environment"] = json!(job.get("environment").and_then(Value::as_str).unwrap_or(""));
+    if config.get("initial_sync").is_some_and(|v| v.as_str() != Some("overwrite")) { return Err("delegated sync supports initial_sync overwrite only; initial import requires client-side deployment".into()); }
+    for flag in ["dry_run", "auto_sync"] { if config.get(flag).is_some_and(|v| !v.is_boolean()) { return Err(format!("{} must be a boolean", flag)); } }
+    let kind = job.get("kind").and_then(Value::as_str).unwrap_or("");
+    integrations::validate_sync_config(kind, &config)?;
+    let secrets = job.get("secrets").and_then(Value::as_array).ok_or("job has no secrets array")?;
+    let mut located = Vec::new(); let mut tags_by_name = HashMap::new();
+    for s in secrets {
+        let secret_type = s.get("secret_type").and_then(Value::as_str).ok_or("job has no secret type")?;
+        if secret_type == "sealed" { return Err("sealed secrets must not enter runner jobs".into()); }
+        if matches!(secret_type, "wallet_private_key" | "wallet_recovery_phrase") { return Err("wallet secrets must not enter runner jobs".into()); }
+        let path = metadata(&env_key, eid, s, "path", "/")?;
+        if !integrations::path_selected(&config, &path) { continue; }
+        let key = decrypt_secret(&env_key, eid, s, "key")?;
+        let value = decrypt_secret(&env_key, eid, s, "value")?;
+        let tags = metadata(&env_key, eid, s, "tags", "")?;
+        tags_by_name.entry(integrations::desired_name(&config, &key)).or_insert(tags);
+        located.push((path, key, value, secret_type.to_string()));
     }
-    Ok(Prepared { config, pairs })
+    Ok(Prepared { config, located, tags_by_name })
 }
 
-async fn run_sync(kind: &str, config: &Value, pairs: &[(String, String)], previous: &[String]) -> Result<(String, Vec<(String, String)>), String> {
-    let (msg, managed) = match kind {
-        "trigger" => integrations::trigger_sync(config, pairs, previous).await?,
-        "instabox" => integrations::instabox_sync(config, pairs, previous).await?,
-        "boat" => integrations::boat_sync(config, pairs, previous).await?,
-        "daytona" => integrations::daytona_sync(config, pairs, previous).await?,
-        _ => (integrations::sync(kind, config, pairs).await?, Vec::new()),
-    };
-    let hashed = managed.into_iter().map(|name| {
-        let base = integrations::local_name(config, &name);
-        let hash = pairs.iter().find(|(k, _)| k == &base).map(|(_, v)| oc::hash_token(v)).unwrap_or_default();
-        (name, hash)
-    }).collect();
-    Ok((msg, hashed))
+struct Report { ok: bool, code: &'static str, detail: &'static str, managed: Vec<(String, String)>, persist: bool, mode: &'static str }
+impl Report {
+    fn new(ok: bool, code: &'static str, detail: &'static str) -> Self { Self { ok, code, detail, managed: Vec::new(), persist: false, mode: "" } }
+    fn invalid() -> Self { Self::new(false, "config_invalid", "Runner configuration or job preparation failed") }
+    fn sync_failed() -> Self { Self::new(false, "sync_failed", "Provider sync failed") }
 }
 
-async fn run_test(kind: &str, config: &Value) -> Result<(String, Vec<(String, String)>), String> {
-    let msg = match kind {
-        "trigger" => integrations::trigger_test(config).await?,
-        "instabox" => integrations::instabox_test(config).await?,
-        "boat" => integrations::boat_test(config).await?,
-        "daytona" => integrations::daytona_test(config).await?,
-        _ => integrations::test(kind, config).await?,
+async fn run_sync(kind: &str, p: &Prepared, previous: &[String], previous_hashes: &Value) -> Report {
+    let dry = p.config.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+    let success = || if dry { Report::new(true, "dry_run_completed", "Sync dry-run completed") } else { Report::new(true, "sync_completed", "Provider sync completed") };
+    if integrations::is_stateful(kind) {
+        let hashes = match integrations::managed_value_hashes(kind, &p.config, &p.located) { Ok(h) => h, Err(_) => return Report::invalid() };
+        let mut candidates = hashes.clone();
+        for name in previous {
+            if let Some(hash) = previous_hashes.get(name).and_then(Value::as_str).filter(|h| !h.is_empty()) { candidates.insert(name.clone(), hash.to_string()); }
+        }
+        // A failed dispatch can have applied any subset; retain ownership, not a claim of remote value equality.
+        let failed = || {
+            let mut report = Report::sync_failed();
+            if !dry { report.managed = candidates.clone().into_iter().collect(); report.mode = "merge_only"; }
+            report
+        };
+        let managed = match integrations::sync_managed_with_tags(kind, &p.config, &p.located, &p.tags_by_name, previous).await {
+            Some(Ok((_, managed))) => managed,
+            Some(Err(_)) => return failed(),
+            None => return Report::invalid(),
+        };
+        let mut report = success();
+        if dry { return report; }
+        for name in managed {
+            let hash = hashes.get(&name).cloned().or_else(|| {
+                if previous.contains(&name) { previous_hashes.get(&name).and_then(Value::as_str).filter(|h| !h.is_empty()).map(str::to_string) } else { None }
+            });
+            match hash { Some(hash) => report.managed.push((name, hash)), None => return failed() }
+        }
+        report.persist = true;
+        report
+    } else {
+        let pairs = integrations::secret_keys(&p.located);
+        match integrations::sync_with_tags(kind, &p.config, &pairs, &p.tags_by_name).await { Ok(_) => success(), Err(_) => Report::sync_failed() }
+    }
+}
+
+async fn run_test(kind: &str, config: &Value) -> Report {
+    let result = match kind {
+        "trigger" => integrations::trigger_test(config).await,
+        "instabox" => integrations::instabox_test(config).await,
+        "boat" => integrations::boat_test(config).await,
+        "daytona" => integrations::daytona_test(config).await,
+        _ => integrations::test(kind, config).await,
     };
-    Ok((msg, Vec::new()))
+    match result {
+        Ok(_) => Report::new(true, "test_completed", "Provider connection test completed"),
+        Err(_) => Report::new(false, "test_failed", "Provider connection test failed"),
+    }
 }
 
 #[tokio::main]
@@ -84,7 +142,7 @@ async fn main() {
         eprintln!("OPENWARP_URL, OPENWARP_RUNNER_TOKEN and OPENWARP_RUNNER_KEY are required");
         std::process::exit(2);
     }
-    let kp = match oc::Keypair::from_secret_b64(&secret) { Ok(k) => k, Err(e) => { eprintln!("bad OPENWARP_RUNNER_KEY: {}", e); std::process::exit(2); } };
+    let kp = match oc::Keypair::from_secret_b64(&secret) { Ok(k) => k, Err(_) => { eprintln!("invalid OPENWARP_RUNNER_KEY"); std::process::exit(2); } };
     let once = env("OPENWARP_RUNNER_ONCE") == "1";
     let interval = env("OPENWARP_RUNNER_INTERVAL").parse::<u64>().unwrap_or(10).max(1);
     let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().expect("http client");
@@ -99,27 +157,23 @@ async fn main() {
                     let result = match prepare(&job, &kp) {
                         Ok(p) => {
                             if job_kind == "test" { run_test(&kind, &p.config).await }
-                            else {
+                            else if job_kind == "sync" {
                                 let previous: Vec<String> = job.get("previous").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-                                run_sync(&kind, &p.config, &p.pairs, &previous).await
-                            }
+                                run_sync(&kind, &p, &previous, &job["previous_hashes"]).await
+                            } else { Report::invalid() }
                         }
-                        Err(e) => Err(e),
+                        Err(_) => Report::invalid(),
                     };
                     let claim = job.get("claim").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let body = match result {
-                        Ok((detail, managed)) => {
-                            let managed: Vec<Value> = managed.into_iter().map(|(name, value_hash)| json!({"name": name, "value_hash": value_hash})).collect();
-                            json!({"ok": true, "detail": detail, "managed": managed, "claim": claim})
-                        }
-                        Err(e) => json!({"ok": false, "detail": e, "claim": claim}),
-                    };
-                    if let Err(e) = send(&client, &base, &token, reqwest::Method::POST, &format!("/api/runner/jobs/{}/result", jid), Some(body)).await {
-                        eprintln!("could not report job {}: {}", jid, e);
+                    let managed: Vec<Value> = result.managed.into_iter().map(|(name, value_hash)| json!({"name": name, "value_hash": value_hash})).collect();
+                    let body = json!({"ok": result.ok, "code": result.code, "detail": result.detail, "managed": managed,
+                        "claim": claim, "job_id": jid, "persist_managed": result.persist, "managed_mode": result.mode});
+                    if send(&client, &base, &token, reqwest::Method::POST, &format!("/api/runner/jobs/{}/result", jid), Some(body)).await.is_err() {
+                        eprintln!("runner result delivery failed");
                     }
                 }
             }
-            Err(e) => eprintln!("runner poll failed: {}", e),
+            Err(_) => eprintln!("runner poll failed"),
         }
         if once { return; }
         tokio::time::sleep(Duration::from_secs(interval)).await;

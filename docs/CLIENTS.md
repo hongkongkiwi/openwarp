@@ -34,7 +34,7 @@ The direct `sdk/` clients document convenience methods for identity, resources, 
 
 ### Differences that affect correctness
 
-- The documented `sdk/typescript` and `sdk/rust` helpers reject ambiguous key matches across paths. The documented `sdk/python` and `sdk/go` helpers select the first match. Use an explicit path-aware API operation when names are duplicated.
+- The documented `sdk/typescript`, `sdk/rust`, `sdk/python` and `sdk/go` helpers reject ambiguous key matches across paths. Python accepts an optional path for get and delete; Go provides `GetSecretAtPath` and `DeleteSecretAtPath`. These paths match verbatim and keys match case-insensitively; omitted paths work when the key is unique across paths. TypeScript and Rust callers with duplicate names must select the exact record by path from the listing and use its ID through the client's generic API.
 - The `sdk/` convenience setters document sending empty tags, which clears existing tags on update. Do not treat them as metadata-preserving patches.
 - Missing keys, transport errors and invalid JSON do not have identical representations across languages. Use the chosen client's error type.
 - Inspect deployment responses for sync errors even when HTTP succeeds.

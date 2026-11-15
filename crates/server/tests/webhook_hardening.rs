@@ -49,7 +49,7 @@ impl Server {
         #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; stderr_options.mode(0o600); }
         let stderr=stderr_options.open(dir.join("server.stderr")).unwrap();
         let child=Command::new(env!("CARGO_BIN_EXE_openwarp-server")).env("DATABASE_URL",format!("sqlite://{}/test.db",dir.display())).env("ADDR",addr.to_string())
-            .env("OPENWARP_PUBLIC_URL",&base).env("OPENWARP_EMAIL_WEBHOOK",format!("http://{mail_addr}/mail")).env("TOKIO_WORKER_THREADS","1")
+            .env("OPENWARP_PUBLIC_URL",&base).env("OPENWARP_EMAIL_PROVIDER","webhook").env("OPENWARP_EMAIL_WEBHOOK",format!("http://{mail_addr}/mail")).env("TOKIO_WORKER_THREADS","1")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL").env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS").env_remove("OPENWARP_TRUST_PROXY")
             .stdout(Stdio::null()).stderr(Stdio::from(stderr)).spawn().unwrap();
         let client=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(15)).build().unwrap();
@@ -63,6 +63,19 @@ impl Server {
         let r=r.send().await.unwrap(); let status=r.status().as_u16(); let text=r.text().await.unwrap(); (status,serde_json::from_str(&text).unwrap_or(json!({"raw":text})))
     }
     async fn call(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> (u16,Value) { self.request(method,path,token,false,body).await }
+    async fn call_stepped_up(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> (u16,Value) {
+        let before=self.mail.lock().unwrap().len();
+        let start=good(self.call(Method::POST,"/api/auth/step-up/start",token,Some(json!({"risk":"very_risky"}))).await); assert_eq!(start["email_sent"],true);
+        let deadline=Instant::now()+Duration::from_secs(5);
+        let code=loop {
+            let code=self.mail.lock().unwrap().iter().skip(before).filter_map(|m|m["text"].as_str()).find_map(|text|text.split(|c:char|!c.is_ascii_digit()).find(|s|s.len()==6).map(str::to_string));
+            if let Some(code)=code{break code;} assert!(Instant::now()<deadline,"fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified=good(self.call(Method::POST,"/api/auth/step-up/verify",token,Some(json!({"challenge":start["challenge"],"email_code":code}))).await);
+        let mut request=self.client.request(method,format!("{}{}",self.base,path)).bearer_auth(token).header("x-openwarp-step-up",verified["token"].as_str().unwrap());
+        if let Some(body)=body{request=request.json(&body);}
+        let response=request.send().await.unwrap(); let status=response.status().as_u16(); let text=response.text().await.unwrap(); (status,serde_json::from_str(&text).unwrap_or(json!({"raw":text})))
+    }
     async fn login(&self,email:&str)->Value { good(self.call(Method::POST,"/api/auth/login","",Some(json!({"email":email,"password":"correct-horse-battery"}))).await) }
     async fn register(&self,email:&str)->Value {
         let mut u=good(self.call(Method::POST,"/api/auth/register","",Some(json!({"email":email,"password":"correct-horse-battery"}))).await);
@@ -143,7 +156,7 @@ async fn environment_pat_cookie_cannot_administer_workspace_but_session_cookie_c
 #[tokio::test]
 async fn encoded_workspace_path_cannot_escape_ip_allowlist_or_missing_org_denial() {
     let s=Server::start().await; let u=s.register("encoded-ip@test.invalid").await; let t=u["token"].as_str().unwrap(); let org=u["org_id"].as_str().unwrap();
-    good(s.call(Method::PUT,&format!("/api/orgs/{org}/settings"),t,Some(json!({"ip_allowlist":"192.0.2.0/24"}))).await);
+    good(s.call_stepped_up(Method::PUT,&format!("/api/orgs/{org}/settings"),t,Some(json!({"ip_allowlist":"192.0.2.0/24"}))).await);
     let raw=s.call(Method::GET,&format!("/api/orgs/{org}/apps"),t,None).await; assert_eq!(raw.0,403);
     let encoded=s.call(Method::GET,&format!("/api/orgs/{}/apps",encoded(org)),t,None).await;
     assert_eq!(encoded.0,400,"encoded org bypassed policy: {}",encoded.1);

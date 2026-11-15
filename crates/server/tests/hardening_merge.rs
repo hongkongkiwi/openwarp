@@ -91,6 +91,27 @@ impl Server {
         Self::response(req.send().await.expect("HTTP request")).await
     }
 
+    async fn verified_call(&self, method: Method, path: &str, session: &str, body: Option<Value>) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let started = self.call(Method::POST, "/api/auth/step-up/start", session, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(started.status, 200, "start sensitive-action verification");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "sensitive-action email did not arrive");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", session, Some(json!({"challenge": started.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify emailed sensitive-action code");
+        let mut req = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(session)
+            .header("x-openwarp-step-up", field(&verified.body, "token"));
+        if let Some(body) = body { req = req.json(&body); }
+        Self::response(req.send().await.expect("verified HTTP request")).await
+    }
+
     async fn register(&self) -> User {
         let email = "hardening@test.invalid";
         let r = self.call(Method::POST, "/api/auth/register", "", Some(json!({"email": email, "password": PASSWORD}))).await;
@@ -178,7 +199,7 @@ async fn export_omits_sealed_entries_and_reports_the_omission() {
     let listed = s.list(&u, &env, "").await;
     assert_eq!(listed["total"], 2, "sealed secrets must remain stored");
     for query in ["", "?base=1"] {
-        let r = s.call(Method::GET, &format!("/api/envs/{}/export{}", env, query), &u.token, None).await;
+        let r = s.verified_call(Method::GET, &format!("/api/envs/{}/export{}", env, query), &u.token, None).await;
         assert_eq!(r.status, 200, "export readable environment");
         assert_eq!(r.body["omitted_sealed"], 1, "exports must count omitted sealed entries");
         assert_eq!(r.body["text"], "VISIBLE=ordinary", "sealed entries must not become empty assignments");
@@ -246,7 +267,7 @@ async fn personal_override_can_be_read_and_deleted_without_changing_base() {
     let set = s.call(Method::POST, &path, &u.token, Some(json!({"secrets": [{"key": "SHARED", "value": "personal-value"}]}))).await;
     assert_eq!(set.status, 200, "set personal override");
     assert_eq!(s.list(&u, &env, "").await["secrets"][0]["value"], "personal-value");
-    let base = s.call(Method::GET, &format!("/api/envs/{}/export?base=1", env), &u.token, None).await;
+    let base = s.verified_call(Method::GET, &format!("/api/envs/{}/export?base=1", env), &u.token, None).await;
     assert_eq!(base.status, 200); assert_eq!(base.body["secrets"][0]["value"], "base-value", "override must not change shared export");
     let read = s.call(Method::GET, &path, &u.token, None).await;
     assert_eq!(read.status, 200, "read personal override");

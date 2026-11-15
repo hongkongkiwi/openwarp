@@ -22,6 +22,49 @@ const ORG: &str = "ca-epoch-org";
 const USER: &str = "ca-epoch-user";
 const HOOK_URL: &str = "https://example.invalid/hook";
 
+async fn isolated_mail_child(name: &str) -> bool {
+    const MARKER: &str = "OPENWARP_CA_EPOCH_MAIL_CHILD";
+    if let Ok(selected) = std::env::var(MARKER) { assert_eq!(selected, name, "isolated child must run exactly its selected test"); return false; }
+    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let incoming = messages.clone();
+    let relay = axum::Router::new().route("/mail", axum::routing::post(move |axum::Json(mail): axum::Json<Value>| {
+        let messages = incoming.clone(); async move { messages.lock().unwrap().push(mail); axum::Json(json!({})) }
+    }).get(move || { let messages = messages.clone(); async move { axum::Json(messages.lock().unwrap().clone()) } }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("private mail relay");
+    let mail_url = format!("http://{}/mail", listener.local_addr().unwrap());
+    struct Relay(tokio::task::JoinHandle<()>);
+    impl Drop for Relay { fn drop(&mut self) { self.0.abort(); } }
+    let _relay = Relay(tokio::spawn(async move { axum::serve(listener, relay).await.unwrap(); }));
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", name, "--test-threads=1"]).env_clear().env(MARKER, name)
+        .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url)
+        .env("NO_PROXY", "127.0.0.1,localhost").kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output()).await
+        .expect("bounded isolated CA epoch test").expect("run isolated CA epoch test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "isolated CA epoch assertions failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;") && stdout.contains(&format!("test {name} ... ok")), "isolated child must execute exactly one passing test");
+    true
+}
+
+async fn email_proof(state: &S) -> String {
+    let url = std::env::var("OPENWARP_EMAIL_WEBHOOK").expect("child-only mail relay");
+    let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+    let before: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let (status, started) = call(state, "POST", "/api/auth/step-up/start", Some(json!({"risk":"very_risky"}))).await;
+    assert_eq!(status, 200, "start emailed verification: {}", started["error"]);
+    assert_eq!(started["email_sent"], true);
+    let messages: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(messages.len(), before.len() + 1, "one fresh verification email must be delivered");
+    let mail = messages.last().unwrap();
+    assert_eq!(mail["to"], "ca-epoch@test.invalid");
+    assert_eq!(mail["subject"], "Your OpenWarp verification code");
+    let code = mail["text"].as_str().unwrap().split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6).expect("delivered six-digit code");
+    let (status, verified) = call(state, "POST", "/api/auth/step-up/verify", Some(json!({"challenge":started["challenge"],"email_code":code}))).await;
+    assert_eq!(status, 200, "verify delivered code: {}", verified["error"]);
+    verified["token"].as_str().expect("authentic step-up grant").to_string()
+}
+
 struct Rotated {
     dir: std::path::PathBuf,
     stale: Option<S>,
@@ -68,7 +111,8 @@ impl Rotated {
 
         // A root CA that exists across the rotation, created through the real
         // route before the master changes.
-        let (status, body) = call(&fresh, "POST", &format!("/api/orgs/{ORG}/pki/cas"), Some(json!({"name": "epoch-root"}))).await;
+        let proof = email_proof(&fresh).await;
+        let (status, body) = call_with_grant(&fresh, "POST", &format!("/api/orgs/{ORG}/pki/cas"), Some(json!({"name": "epoch-root"})), Some(&proof)).await;
         assert_eq!(status, 200, "root CA seed failed: {body}");
         let root = body["id"].as_str().unwrap().to_string();
 
@@ -76,7 +120,8 @@ impl Rotated {
     }
 
     async fn rotate(&self) {
-        let (status, body) = call(self.fresh(), "POST", "/api/instance/rotate-master", Some(json!({"new_key": oc::b64(&self.new)}))).await;
+        let proof = email_proof(self.fresh()).await;
+        let (status, body) = call_with_grant(self.fresh(), "POST", "/api/instance/rotate-master", Some(json!({"new_key": oc::b64(&self.new)})), Some(&proof)).await;
         assert_eq!(status, 200, "master rotation failed: {body}");
         assert_eq!(body["ok"], json!(true), "rotation response: {body}");
     }
@@ -92,9 +137,12 @@ impl Drop for Rotated {
     }
 }
 
-async fn call(state: &S, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+async fn call(state: &S, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) { call_with_grant(state, method, uri, body, None).await }
+
+async fn call_with_grant(state: &S, method: &str, uri: &str, body: Option<Value>, grant: Option<&str>) -> (u16, Value) {
     let mut b = axum::http::Request::builder().method(method).uri(uri)
         .header("authorization", format!("Bearer {TOKEN}"));
+    if let Some(grant) = grant { b = b.header("x-openwarp-step-up", grant); }
     if body.is_some() { b = b.header("content-type", "application/json"); }
     let mut req = match body {
         Some(v) => b.body(axum::body::Body::from(v.to_string())).unwrap(),
@@ -119,6 +167,7 @@ fn assert_epoch_stale(status: u16, body: &Value, what: &str) {
 
 #[tokio::test]
 async fn stale_replica_intermediate_ca_write_fails_closed_after_master_rotation() {
+    if isolated_mail_child("stale_replica_intermediate_ca_write_fails_closed_after_master_rotation").await { return; }
     let r = Rotated::seed().await;
     r.rotate().await;
 
@@ -142,6 +191,7 @@ async fn stale_replica_intermediate_ca_write_fails_closed_after_master_rotation(
 
 #[tokio::test]
 async fn stale_replica_ca_hook_secret_write_fails_closed_after_master_rotation() {
+    if isolated_mail_child("stale_replica_ca_hook_secret_write_fails_closed_after_master_rotation").await { return; }
     let r = Rotated::seed().await;
     r.rotate().await;
 

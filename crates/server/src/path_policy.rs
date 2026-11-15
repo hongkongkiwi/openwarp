@@ -9,7 +9,7 @@ async fn owner(st: &S, h: &HeaderMap, eid: &str) -> Result<String,(StatusCode,Js
     if st.require_org(&oid,&uid).await?!="owner" { return Err(err(StatusCode::FORBIDDEN,"workspace owner required")); } Ok(uid)
 }
 pub(super) async fn put(State(st): State<S>, h: HeaderMap, Path((eid,role)): Path<(String,String)>, Json(b): Json<Value>) -> Res {
-    owner(&st,&h,&eid).await?;
+    let uid=owner(&st,&h,&eid).await?;
     if role=="owner" || role.is_empty() || role.len()>128 || role.trim()!=role { return Err(bad("role must be canonical and cannot be owner")); }
     let mode=st.db.one("SELECT mode FROM envs WHERE id=?", &[json!(eid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("environment not found"))?;
     if db::s(&mode,"mode")!="sse" { return Err(bad("path policies require an explicit SSE environment")); }
@@ -19,6 +19,7 @@ pub(super) async fn put(State(st): State<S>, h: HeaderMap, Path((eid,role)): Pat
     let sql = "INSERT INTO path_policies(env_id,role,rules) VALUES(?,?,?) ON CONFLICT(env_id,role) DO UPDATE SET rules=excluded.rules";
     #[cfg(not(target_arch = "wasm32"))]
     let sql = if st.db.backend() == db::Backend::Mysql { "INSERT INTO path_policies(env_id,role,rules) VALUES(?,?,?) ON DUPLICATE KEY UPDATE rules=VALUES(rules)" } else { sql };
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     st.db.exec(sql, &[json!(eid),json!(role),json!(raw)]).await.map_err(|e| bad(&e))?;
     Ok(j(json!({"rules":rules})))
 }
@@ -27,7 +28,7 @@ pub(super) async fn get(State(st): State<S>, h: HeaderMap, Path((eid,role)): Pat
     match r { None=>Ok(j(Value::Null)),Some(r)=>Ok(j(json!({"rules":serde_json::from_str::<Value>(&db::s(&r,"rules")).map_err(|_| bad("stored policy invalid"))?}))) }
 }
 pub(super) async fn delete(State(st): State<S>, h: HeaderMap, Path((eid,role)): Path<(String,String)>) -> Res {
-    owner(&st,&h,&eid).await?; st.db.exec("DELETE FROM path_policies WHERE env_id=? AND role=?", &[json!(eid),json!(role)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"ok":true})))
+    let uid=owner(&st,&h,&eid).await?; require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?; st.db.exec("DELETE FROM path_policies WHERE env_id=? AND role=?", &[json!(eid),json!(role)]).await.map_err(|e| bad(&e))?; Ok(j(json!({"ok":true})))
 }
 impl AppState {
     async fn path_rules(&self,eid: &str,uid: &str) -> Result<Option<Vec<Rule>>,(StatusCode,Json<Value>)> {
@@ -75,9 +76,9 @@ pub(super) async fn middleware(State(st): State<S>, req: axum::extract::Request,
     let route=req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("");
     let method=req.method().as_str();
     let allowed=matches!((method,route),
-        ("POST","/mcp") | ("GET","/api/me") | ("POST","/api/auth/logout") |
+        ("POST","/mcp") | ("GET","/api/me") | ("POST","/api/auth/logout" | "/api/auth/step-up/start" | "/api/auth/step-up/verify") |
         ("GET","/api/orgs") | ("POST","/api/orgs/{oid}/leave") | ("GET","/api/orgs/{oid}/apps") | ("GET","/api/apps/{aid}/envs") |
-        ("GET","/api/envs/{eid}/meta") | ("GET","/api/envs/{eid}/secrets") | ("PUT","/api/envs/{eid}/secrets") |
+        ("GET","/api/envs/{eid}/meta") | ("GET","/api/envs/{eid}/secrets") | ("GET","/api/envs/{eid}/secrets/{sid}/reveal") | ("PUT","/api/envs/{eid}/secrets") |
         ("POST","/api/envs/{eid}/import") | ("GET","/api/envs/{eid}/export") | ("GET","/api/envs/{eid}/scan") |
         ("POST","/api/envs/{eid}/secrets/reuse-check") | ("GET","/api/search") |
         ("DELETE","/api/secrets/{sid}") | ("GET","/api/secrets/{sid}/history") |

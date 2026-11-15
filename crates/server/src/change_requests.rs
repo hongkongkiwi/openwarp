@@ -40,7 +40,8 @@ async fn snapshot(st: &S, h: &HeaderMap, uid: &str, org: &str, pid: &str, revisi
                 let after = if field=="deletes" { Value::Null } else {
                     let mut s: SecretIn = serde_json::from_value(input.clone()).map_err(|_| bad("invalid secret input"))?;
                     s.key = name.clone(); s.path = path.to_string(); if s.secret_type.is_empty() { s.secret_type="secret".into(); }
-                    if !matches!(s.secret_type.as_str(),"secret"|"sealed"|"ssh_key"|"config") { return Err(bad("invalid secret type")); }
+                    if !matches!(s.secret_type.as_str(),"secret"|"sealed"|"ssh_key"|"config"|"wallet_private_key"|"wallet_recovery_phrase") { return Err(bad("invalid secret type")); }
+                    if wallet_type(before["secret_type"].as_str().unwrap_or("")) && before["secret_type"]!=s.secret_type { return Err(bad("wallet secrets cannot change type; delete and recreate")); }
                     if s.secret_type=="ssh_key" && ssh_keys::public_key_error(&name,&s.value).is_some() { return Err(bad("invalid SSH public key")); }
                     if before["secret_type"]=="sealed" && s.secret_type!="sealed" { return Err(bad("sealed secrets cannot change type; delete and recreate")); }
                     json!({"key":name,"path":path,"value":s.value,"comment":s.comment,"tags":s.tags,"type":s.secret_type})
@@ -114,7 +115,11 @@ pub(super) async fn detail(State(st): State<S>, h: HeaderMap, Path(pid): Path<St
                 st.decrypt_secret(&key,&raw,None).await
             };
             let mut after = item["after"].clone();
-            if after["type"]=="sealed" || before["type"]=="sealed" {
+            let name = item["key"].as_str().ok_or_else(conflict)?; let path = item["path"].as_str().ok_or_else(conflict)?;
+            let sid = if item["before"].is_null() { "" } else { item["before"]["id"].as_str().ok_or_else(conflict)? };
+            let index = key_index(&key,path,name); let legacy = oc::hash_token(&format!("{}:{}",path,name));
+            let current_wallet = st.db.one("SELECT id FROM secrets WHERE env_id=? AND secret_type IN ('wallet_private_key','wallet_recovery_phrase') AND (id=? OR key_index=? OR key_hash=?) LIMIT 1", &[json!(&eid),json!(sid),json!(index),json!(legacy)]).await.map_err(|e| bad(&e))?.is_some();
+            if current_wallet || after["type"]=="sealed" || before["type"]=="sealed" || wallet_type(after["type"].as_str().unwrap_or("")) || wallet_type(before["type"].as_str().unwrap_or("")) {
                 if after.is_object() { after["value"]=Value::Null; }
                 if before.is_object() { before["value"]=Value::Null; }
             }
@@ -191,6 +196,7 @@ pub(super) async fn action(State(st): State<S>, h: HeaderMap, Path((pid,action))
         }
         statements.extend(mutations);
     }
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     if action=="apply" {
         // Apply keeps checked_batch's original semantics exactly: per-statement
         // expected counts (retention pruning deletes many rows) plus the

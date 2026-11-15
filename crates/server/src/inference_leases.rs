@@ -4,11 +4,8 @@
 use serde_json::{json, Value};
 
 fn cfg<'a>(c: &'a Value, k: &str) -> &'a str { c.get(k).and_then(|v| v.as_str()).unwrap_or("") }
-#[cfg(not(target_arch = "wasm32"))]
-fn http_client() -> crate::http::Client { crate::http::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().unwrap_or_else(|_| crate::http::Client::builder().build().expect("http client")) }
-#[cfg(target_arch = "wasm32")]
-fn http_client() -> crate::http::Client { crate::http::Client::new() }
-async fn req(r: crate::http::RequestBuilder) -> Result<String, String> {
+fn http_client() -> crate::integration_http::Client { crate::integration_http::Client::new() }
+async fn req(r: crate::integration_http::RequestBuilder) -> Result<String, String> {
     let resp = r.send().await.map_err(|e| e.to_string())?;
     let status = resp.status(); let text = resp.text().await.unwrap_or_default();
     if status.is_success() { Ok(text) } else { Err(format!("HTTP {}: {}", status, text.chars().take(400).collect::<String>())) }
@@ -41,16 +38,102 @@ fn expires_at(ttl_secs: i64) -> String {
 }
 fn civil(z: i64) -> (i64, u32, u32) { let z = z + 719468; let era = z.div_euclid(146097); let doe = z.rem_euclid(146097); let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; let y = yoe + era * 400; let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); let mp = (5 * doy + 2) / 153; let d = (doy - (153 * mp + 2) / 5 + 1) as u32; let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; (if m <= 2 { y + 1 } else { y }, m, d) }
 
+pub fn validate_lease(kind: &str, config: &Value, name: &str) -> Result<(), String> {
+    if matches!(kind, "fireworks" | "mistral" | "perplexity" | "xai" | "gemini" | "cloudflare" | "deepgram" | "elevenlabs" | "deepinfra" | "baseten" | "fal" | "speechmatics" | "chutes") && !cfg(config, "base_url").is_empty() {
+        crate::integration_http::validate_integration_url(cfg(config, "base_url"))?;
+    }
+    let display = if name.is_empty() { "openwarp" } else { name };
+    match kind {
+        "fireworks" => {
+            if cfg(config, "api_key").is_empty() || !key_ref_ok(cfg(config, "account_id")) || !key_ref_ok(cfg(config, "user_id")) { return Err("fireworks lease requires config.api_key, account_id and user_id".into()); }
+            if display.len() > 256 { return Err("fireworks key name must be 1 to 256 characters".into()); }
+            lease_base(config, "https://api.fireworks.ai")?;
+        }
+        "mistral" => {
+            if cfg(config, "admin_key").is_empty() || !key_ref_ok(cfg(config, "workspace_id")) { return Err("mistral lease requires config.admin_key and workspace_id".into()); }
+            if name.len() > 256 { return Err("mistral key name must be at most 256 characters".into()); }
+            lease_base(config, "https://api.mistral.ai")?;
+        }
+        "perplexity" => {
+            if cfg(config, "api_key").is_empty() { return Err("perplexity lease requires config.api_key".into()); }
+            if name.len() > 256 { return Err("perplexity token name must be at most 256 characters".into()); }
+            lease_base(config, "https://api.perplexity.ai")?;
+        }
+        "xai" => {
+            if cfg(config, "management_key").is_empty() || !key_ref_ok(cfg(config, "team_id")) { return Err("xai lease requires config.management_key and team_id".into()); }
+            if name.is_empty() || name.len() > 256 { return Err("xai key name must be 1 to 256 characters".into()); }
+            if let Some(acls) = config.get("acls").and_then(|v| v.as_array()) { if acls.iter().any(|a| !a.as_str().unwrap_or("").starts_with("api-key:")) { return Err("xai acls must be api-key:model or api-key:endpoint values".into()); } }
+            lease_base(config, "https://management-api.x.ai")?;
+        }
+        "gemini" => {
+            if cfg(config, "access_token").is_empty() || !key_ref_ok(cfg(config, "project")) { return Err("gemini lease requires config.access_token and project".into()); }
+            if display.len() > 256 { return Err("gemini key name must be 1 to 256 characters".into()); }
+            lease_base(config, "https://apikeys.googleapis.com")?;
+        }
+        "cloudflare" => {
+            if cfg(config, "api_token").is_empty() { return Err("cloudflare lease requires config.api_token".into()); }
+            if display.len() > 120 { return Err("cloudflare token name must be 1 to 120 characters".into()); }
+            let policies = config.get("policies").and_then(|v| v.as_array()).ok_or("cloudflare lease requires config.policies")?;
+            if policies.is_empty() { return Err("cloudflare policies must not be empty".into()); }
+            lease_base(config, "https://api.cloudflare.com/client/v4")?;
+        }
+        "deepgram" => {
+            if cfg(config, "api_key").is_empty() || !key_ref_ok(cfg(config, "project_id")) { return Err("deepgram lease requires config.api_key and project_id".into()); }
+            if display.len() > 256 { return Err("deepgram key comment must be at most 256 characters".into()); }
+            if let Some(scopes) = config.get("scopes").and_then(|v| v.as_array()) { if scopes.iter().any(|s| s.as_str().map(|t| t.is_empty()).unwrap_or(true)) { return Err("deepgram scopes must be non-empty strings".into()); } }
+            lease_base(config, "https://api.deepgram.com")?;
+        }
+        "elevenlabs" => {
+            if cfg(config, "api_key").is_empty() || !key_ref_ok(cfg(config, "service_account_id")) { return Err("elevenlabs lease requires config.api_key and service_account_id".into()); }
+            if display.len() > 256 { return Err("elevenlabs key name must be 1 to 256 characters".into()); }
+            let permissions = config.get("permissions").cloned().unwrap_or(json!("all"));
+            match &permissions { Value::String(s) if s == "all" => {}, Value::Array(items) if !items.is_empty() && items.iter().all(|p| ELEVENLABS_PERMISSIONS.contains(&p.as_str().unwrap_or(""))) => {}, _ => return Err("elevenlabs permissions must be \"all\" or a list of known permissions".into()) }
+            lease_base(config, "https://api.elevenlabs.io")?;
+        }
+        "deepinfra" => {
+            if cfg(config, "api_key").is_empty() { return Err("deepinfra lease requires config.api_key".into()); }
+            if display.len() > 256 { return Err("deepinfra token name must be 1 to 256 characters".into()); }
+            if let Some(scopes) = config.get("scopes").and_then(|v| v.as_array()) { if scopes.iter().any(|s| s.as_str().map(|t| t.is_empty()).unwrap_or(true)) { return Err("deepinfra scopes must be non-empty strings".into()); } }
+            lease_base(config, "https://api.deepinfra.com")?;
+        }
+        "baseten" => {
+            if cfg(config, "api_key").is_empty() { return Err("baseten lease requires config.api_key".into()); }
+            if display.len() > 256 { return Err("baseten key name must be 1 to 256 characters".into()); }
+            let key_type = { let t = cfg(config, "key_type"); if t.is_empty() { "PERSONAL" } else { t } };
+            if !matches!(key_type, "PERSONAL" | "ROUTES" | "WORKSPACE_MANAGE_ALL") { return Err("baseten key_type must be PERSONAL, ROUTES or WORKSPACE_MANAGE_ALL".into()); }
+            lease_base(config, "https://api.baseten.co")?;
+            let team_id = cfg(config, "team_id");
+            if !team_id.is_empty() && !key_ref_ok(team_id) { return Err("baseten team_id is not a valid id".into()); }
+        }
+        "fal" => {
+            if cfg(config, "api_key").is_empty() { return Err("fal lease requires config.api_key".into()); }
+            if display.len() > 256 { return Err("fal key alias must be 1 to 256 characters".into()); }
+            lease_base(config, "https://api.fal.ai")?;
+        }
+        "speechmatics" => {
+            if cfg(config, "management_token").is_empty() { return Err("speechmatics lease requires config.management_token".into()); }
+            if display.len() > 120 { return Err("speechmatics key name must be 1 to 120 characters".into()); }
+            let product = { let t = cfg(config, "product"); if t.is_empty() { "batch" } else { t } };
+            if !matches!(product, "batch" | "rt" | "tts") { return Err("speechmatics product must be batch, rt or tts".into()); }
+            lease_base(config, "https://mp.speechmatics.com")?;
+        }
+        "chutes" => {
+            if cfg(config, "api_key").is_empty() { return Err("chutes lease requires config.api_key".into()); }
+            if display.len() > 256 { return Err("chutes key name must be 1 to 256 characters".into()); }
+            lease_base(config, "https://api.chutes.ai")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Issue a Fireworks API key. `POST /v1/accounts/{account}/users/{user}/apiKeys`
 pub async fn fireworks_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
     let api_key = cfg(config, "api_key");
     let account_id = cfg(config, "account_id");
     let user_id = cfg(config, "user_id");
-    if api_key.is_empty() || !key_ref_ok(account_id) || !key_ref_ok(user_id) {
-        return Err("fireworks lease requires config.api_key, account_id and user_id".into());
-    }
+    validate_lease("fireworks", config, name)?;
     let display = if name.is_empty() { "openwarp" } else { name };
-    if display.len() > 256 { return Err("fireworks key name must be 1 to 256 characters".into()); }
     let api_key_body = json!({"displayName": display, "expireTime": expires_at(ttl_secs)});
     let base = lease_base(config, "https://api.fireworks.ai")?;
     let url = format!("{}/v1/accounts/{}/users/{}/apiKeys", base, account_id, user_id);
@@ -75,8 +158,7 @@ pub async fn fireworks_revoke_key(base_url: &str, api_key: &str, account_id: &st
 pub async fn mistral_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
     let admin_key = cfg(config, "admin_key");
     let workspace_id = cfg(config, "workspace_id");
-    if admin_key.is_empty() || !key_ref_ok(workspace_id) { return Err("mistral lease requires config.admin_key and workspace_id".into()); }
-    if name.len() > 256 { return Err("mistral key name must be at most 256 characters".into()); }
+    validate_lease("mistral", config, name)?;
     let mut body = serde_json::Map::new();
     body.insert("workspace_uuid".into(), json!(workspace_id));
     if !name.is_empty() { body.insert("name".into(), json!(name)); }
@@ -102,8 +184,7 @@ pub async fn mistral_revoke_key(base_url: &str, admin_key: &str, key_id: &str) -
 /// Issue a Perplexity token. `POST /generate_auth_token`; revoke sends the token back.
 pub async fn perplexity_create_key(config: &Value, name: &str) -> Result<Value, String> {
     let api_key = cfg(config, "api_key");
-    if api_key.is_empty() { return Err("perplexity lease requires config.api_key".into()); }
-    if name.len() > 256 { return Err("perplexity token name must be at most 256 characters".into()); }
+    validate_lease("perplexity", config, name)?;
     let mut body = serde_json::Map::new();
     if !name.is_empty() { body.insert("token_name".into(), json!(name)); }
     let base = lease_base(config, "https://api.perplexity.ai")?;
@@ -125,12 +206,10 @@ pub async fn perplexity_revoke_key(base_url: &str, api_key: &str, auth_token: &s
 pub async fn xai_create_key(config: &Value, name: &str) -> Result<Value, String> {
     let management_key = cfg(config, "management_key");
     let team_id = cfg(config, "team_id");
-    if management_key.is_empty() || !key_ref_ok(team_id) { return Err("xai lease requires config.management_key and team_id".into()); }
-    if name.is_empty() || name.len() > 256 { return Err("xai key name must be 1 to 256 characters".into()); }
+    validate_lease("xai", config, name)?;
     let mut body = serde_json::Map::new();
     body.insert("name".into(), json!(name));
     let acls = config.get("acls").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| vec![json!("api-key:model:*"), json!("api-key:endpoint:*")]);
-    if acls.iter().any(|a| !a.as_str().unwrap_or("").starts_with("api-key:")) { return Err("xai acls must be api-key:model or api-key:endpoint values".into()); }
     body.insert("acls".into(), json!(acls));
     for field in ["qps", "qpm", "tpm"] { if let Some(v) = config.get(field).filter(|v| v.is_number()) { body.insert(field.into(), v.clone()); } }
     let base = lease_base(config, "https://management-api.x.ai")?;
@@ -154,9 +233,8 @@ pub async fn xai_revoke_key(base_url: &str, management_key: &str, key_id: &str) 
 pub async fn gemini_create_key(config: &Value, name: &str) -> Result<Value, String> {
     let token = cfg(config, "access_token");
     let project = cfg(config, "project");
-    if token.is_empty() || !key_ref_ok(project) { return Err("gemini lease requires config.access_token and project".into()); }
+    validate_lease("gemini", config, name)?;
     let display = if name.is_empty() { "openwarp" } else { name };
-    if display.len() > 256 { return Err("gemini key name must be 1 to 256 characters".into()); }
     let services = config.get("api_targets").and_then(|v| v.as_array()).cloned()
         .unwrap_or_else(|| vec![json!({"service": "generativelanguage.googleapis.com"})]);
     let body = json!({"displayName": display, "restrictions": {"apiTargets": services}});
@@ -184,11 +262,9 @@ pub async fn gemini_revoke_key(base_url: &str, token: &str, name: &str) -> Resul
 /// Issue a Cloudflare API token. `POST /client/v4/user/tokens`
 pub async fn cloudflare_create_token(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
     let api_token = cfg(config, "api_token");
-    if api_token.is_empty() { return Err("cloudflare lease requires config.api_token".into()); }
+    validate_lease("cloudflare", config, name)?;
     let display = if name.is_empty() { "openwarp" } else { name };
-    if display.len() > 120 { return Err("cloudflare token name must be 1 to 120 characters".into()); }
-    let policies = config.get("policies").and_then(|v| v.as_array()).cloned().ok_or("cloudflare lease requires config.policies")?;
-    if policies.is_empty() { return Err("cloudflare policies must not be empty".into()); }
+    let policies = &config["policies"];
     let mut body = serde_json::Map::new();
     body.insert("name".into(), json!(display));
     body.insert("policies".into(), json!(policies));
@@ -214,11 +290,9 @@ pub async fn cloudflare_revoke_token(base_url: &str, api_token: &str, token_id: 
 pub async fn deepgram_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
     let api_key = cfg(config, "api_key");
     let project_id = cfg(config, "project_id");
-    if api_key.is_empty() || !key_ref_ok(project_id) { return Err("deepgram lease requires config.api_key and project_id".into()); }
+    validate_lease("deepgram", config, name)?;
     let comment = if name.is_empty() { "openwarp" } else { name };
-    if comment.len() > 256 { return Err("deepgram key comment must be at most 256 characters".into()); }
     let scopes = config.get("scopes").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| vec![json!("member")]);
-    if scopes.iter().any(|s| s.as_str().map(|t| t.is_empty()).unwrap_or(true)) { return Err("deepgram scopes must be non-empty strings".into()); }
     let body = json!({"comment": comment, "scopes": scopes, "expiration_date": expires_at(ttl_secs)});
     let base = lease_base(config, "https://api.deepgram.com")?;
     let text = req(http_client().post(format!("{}/v1/projects/{}/keys", base, project_id)).header("Authorization", format!("Token {}", api_key)).json(&body)).await
@@ -241,15 +315,9 @@ const ELEVENLABS_PERMISSIONS: &[&str] = &["text_to_speech","speech_to_speech","s
 pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, String> {
     let api_key = cfg(config, "api_key");
     let service_account_id = cfg(config, "service_account_id");
-    if api_key.is_empty() || !key_ref_ok(service_account_id) { return Err("elevenlabs lease requires config.api_key and service_account_id".into()); }
+    validate_lease("elevenlabs", config, name)?;
     let display = if name.is_empty() { "openwarp" } else { name };
-    if display.len() > 256 { return Err("elevenlabs key name must be 1 to 256 characters".into()); }
     let permissions = config.get("permissions").cloned().unwrap_or(json!("all"));
-    match &permissions {
-        Value::String(s) if s == "all" => {}
-        Value::Array(items) if !items.is_empty() && items.iter().all(|p| ELEVENLABS_PERMISSIONS.contains(&p.as_str().unwrap_or(""))) => {}
-        _ => return Err("elevenlabs permissions must be \"all\" or a list of known permissions".into()),
-    }
     let mut body = serde_json::Map::new();
     body.insert("name".into(), json!(display));
     body.insert("permissions".into(), permissions);
@@ -273,13 +341,11 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	/// Issue a DeepInfra token. `POST /v1/api-tokens`; the reply carries the secret once.
 	pub async fn deepinfra_create_key(config: &Value, name: &str) -> Result<Value, String> {
 	    let api_key = cfg(config, "api_key");
-	    if api_key.is_empty() { return Err("deepinfra lease requires config.api_key".into()); }
+	    validate_lease("deepinfra", config, name)?;
 	    let display = if name.is_empty() { "openwarp" } else { name };
-	    if display.len() > 256 { return Err("deepinfra token name must be 1 to 256 characters".into()); }
 	    let mut body = serde_json::Map::new();
 	    body.insert("name".into(), json!(display));
 	    if let Some(scopes) = config.get("scopes").and_then(|v| v.as_array()) {
-	        if scopes.iter().any(|s| s.as_str().map(|t| t.is_empty()).unwrap_or(true)) { return Err("deepinfra scopes must be non-empty strings".into()); }
 	        body.insert("scopes".into(), json!(scopes));
 	    }
 	    let base = lease_base(config, "https://api.deepinfra.com")?;
@@ -301,11 +367,9 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	/// Issue a Baseten key. Personal keys must expire within 90 days, so the TTL is capped.
 	pub async fn baseten_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
 	    let api_key = cfg(config, "api_key");
-	    if api_key.is_empty() { return Err("baseten lease requires config.api_key".into()); }
+	    validate_lease("baseten", config, name)?;
 	    let display = if name.is_empty() { "openwarp" } else { name };
-	    if display.len() > 256 { return Err("baseten key name must be 1 to 256 characters".into()); }
 	    let key_type = { let t = cfg(config, "key_type"); if t.is_empty() { "PERSONAL" } else { t } };
-	    if !matches!(key_type, "PERSONAL" | "ROUTES" | "WORKSPACE_MANAGE_ALL") { return Err("baseten key_type must be PERSONAL, ROUTES or WORKSPACE_MANAGE_ALL".into()); }
 	    let mut body = serde_json::Map::new();
 	    body.insert("type".into(), json!(key_type));
 	    body.insert("name".into(), json!(display));
@@ -313,7 +377,6 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	    let team_id = cfg(config, "team_id");
 	    let base = lease_base(config, "https://api.baseten.co")?;
 	    let url = if team_id.is_empty() { format!("{}/v1/api_keys", base) } else {
-	        if !key_ref_ok(team_id) { return Err("baseten team_id is not a valid id".into()); }
 	        format!("{}/v1/teams/{}/api_keys", base, team_id)
 	    };
 	    let text = req(http_client().post(url).bearer_auth(api_key).json(&Value::Object(body))).await
@@ -336,9 +399,8 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	/// Issue a fal API key. `POST /v1/keys`; the secret is returned once.
 	pub async fn fal_create_key(config: &Value, name: &str) -> Result<Value, String> {
 	    let api_key = cfg(config, "api_key");
-	    if api_key.is_empty() { return Err("fal lease requires config.api_key".into()); }
+	    validate_lease("fal", config, name)?;
 	    let display = if name.is_empty() { "openwarp" } else { name };
-	    if display.len() > 256 { return Err("fal key alias must be 1 to 256 characters".into()); }
 	    let mut body = serde_json::Map::new();
 	    body.insert("alias".into(), json!(display));
 	    if let Some(preset) = config.get("preset").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) { body.insert("preset".into(), json!(preset)); }
@@ -362,11 +424,9 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	/// Issue a Speechmatics key. A management token can mint a permanent key; an API key only a temporary one.
 	pub async fn speechmatics_create_key(config: &Value, name: &str, ttl_secs: i64) -> Result<Value, String> {
 	    let token = cfg(config, "management_token");
-	    if token.is_empty() { return Err("speechmatics lease requires config.management_token".into()); }
+	    validate_lease("speechmatics", config, name)?;
 	    let display = if name.is_empty() { "openwarp" } else { name };
-	    if display.len() > 120 { return Err("speechmatics key name must be 1 to 120 characters".into()); }
 	    let product = { let t = cfg(config, "product"); if t.is_empty() { "batch" } else { t } };
-	    if !matches!(product, "batch" | "rt" | "tts") { return Err("speechmatics product must be batch, rt or tts".into()); }
 	    let mut body = serde_json::Map::new();
 	    body.insert("name".into(), json!(display));
 	    let project_id = config.get("project_id").and_then(|v| v.as_i64());
@@ -393,9 +453,8 @@ pub async fn elevenlabs_create_key(config: &Value, name: &str) -> Result<Value, 
 	/// Issue a Chutes key from an existing one. `POST /api_keys/`, `Authorization: Basic`.
 	pub async fn chutes_create_key(config: &Value, name: &str) -> Result<Value, String> {
 	    let api_key = cfg(config, "api_key");
-	    if api_key.is_empty() { return Err("chutes lease requires config.api_key".into()); }
+	    validate_lease("chutes", config, name)?;
 	    let display = if name.is_empty() { "openwarp" } else { name };
-	    if display.len() > 256 { return Err("chutes key name must be 1 to 256 characters".into()); }
 	    let mut body = serde_json::Map::new();
 	    body.insert("name".into(), json!(display));
 	    body.insert("admin".into(), json!(config.get("admin").and_then(|v| v.as_bool()).unwrap_or(false)));

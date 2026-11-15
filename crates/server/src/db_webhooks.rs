@@ -15,7 +15,7 @@ impl WebhookTx<'_> {
             rt.block_on(c.execute(pg_sql(sql).as_str(), &refs)).map_err(pg_err)
         }
         #[cfg(target_arch = "wasm32")] {
-            let cursor=self.storage.exec(sql, do_binds(params)).map_err(|e| e.to_string())?;
+            let cursor=self.storage.exec(&sqlite_sql(sql), do_binds(params)).map_err(|e| e.to_string())?;
             for row in cursor.raw() { row.map_err(|e|e.to_string())?; }
             let changed: Value=self.storage.exec("SELECT changes() AS affected",None).map_err(|e|e.to_string())?.one().map_err(|e|e.to_string())?;
             changed["affected"].as_u64().ok_or_else(||"missing affected row count".into())
@@ -33,7 +33,7 @@ impl WebhookTx<'_> {
             } m }).collect())
         }
         #[cfg(target_arch = "wasm32")] {
-            let cursor=self.storage.exec(sql,do_binds(params)).map_err(|e|e.to_string())?; let cols=cursor.column_names(); let mut out=Vec::new();
+            let cursor=self.storage.exec(&sqlite_sql(sql),do_binds(params)).map_err(|e|e.to_string())?; let cols=cursor.column_names(); let mut out=Vec::new();
             for row in cursor.raw() { let values=row.map_err(|e|e.to_string())?; let mut m=Row::new(); for (i,v) in values.into_iter().enumerate() { if let Some(k)=cols.get(i) {m.insert(k.clone(),do_value(v));} } out.push(m); } Ok(out)
         }
     }

@@ -233,6 +233,27 @@ const NEW_A: [u8; 32] = [42; 32];
 const NEW_B: [u8; 32] = [43; 32];
 const NEW_C: [u8; 32] = [44; 32];
 const NEW_D: [u8; 32] = [45; 32];
+const MAIL_CHILD: &str = "OPENWARP_AI_ENGINE_MAIL_CHILD";
+
+struct Mailbox { url: String, task: tokio::task::JoinHandle<()> }
+impl Drop for Mailbox { fn drop(&mut self) { self.task.abort(); } }
+impl Mailbox {
+    async fn start() -> Self {
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let incoming = messages.clone();
+        let app = axum::Router::new().route("/mail", axum::routing::post(move |axum::Json(message): axum::Json<Value>| {
+            let messages = incoming.clone();
+            async move { messages.lock().unwrap().push(message); axum::Json(json!({"ok":true})) }
+        }).get(move || {
+            let messages = messages.clone();
+            async move { axum::Json(messages.lock().unwrap().clone()) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind private mail provider");
+        let url = format!("http://{}/mail", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve private mail provider"); });
+        Self { url, task }
+    }
+}
 
 struct Fixture { state: S, app: axum::Router }
 impl Fixture {
@@ -251,9 +272,13 @@ impl Fixture {
         json!(self.state.db().query(sql, &[]).await.expect("inspect private fixture").iter().map(openwarp_server::db::obj).collect::<Vec<_>>()).to_string()
     }
     async fn expect(&self, method: Method, path: &str, body: Option<Value>, status: u16) -> Value {
+        self.expect_with_proof(method, path, body, status, None).await
+    }
+    async fn expect_with_proof(&self, method: Method, path: &str, body: Option<Value>, status: u16, grant: Option<&str>) -> Value {
         let request_line = format!("{} {}", method, path);
         let mut builder = Request::builder().method(method).uri(path).header("host", "openwarp.test.invalid")
             .header("authorization", format!("Bearer {}", OWNER));
+        if let Some(grant) = grant { builder = builder.header("x-openwarp-step-up", grant); }
         let body = if let Some(v) = body { builder = builder.header("content-type", "application/json"); Body::from(v.to_string()) } else { Body::empty() };
         let mut request = builder.body(body).unwrap();
         request.extensions_mut().insert(PeerAddr("192.0.2.40".parse().unwrap()));
@@ -266,6 +291,24 @@ impl Fixture {
     }
     async fn rotate(&self, key: &[u8; 32], status: u16) {
         self.expect(Method::POST, "/api/instance/rotate-master", Some(json!({"new_key": oc::b64(key)})), status).await;
+    }
+    async fn rotate_with_email_proof(&self, key: &[u8; 32], status: u16) {
+        let url = std::env::var("OPENWARP_EMAIL_WEBHOOK").expect("child-only mail provider");
+        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+        let messages: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let before = messages.len();
+        let start = self.expect(Method::POST, "/api/auth/step-up/start", Some(json!({"risk":"very_risky"})), 200).await;
+        assert_eq!(start["email_sent"], true);
+        let challenge = start["challenge"].as_str().expect("rotation proof challenge");
+        let messages: Vec<Value> = client.get(&url).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let code = messages.iter().skip(before).rev()
+            .filter(|message| message["to"] == "ai-engine@test.invalid" && message["subject"] == "Your OpenWarp verification code")
+            .filter_map(|message| message["text"].as_str())
+            .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|part| part.len() == 6))
+            .expect("fresh rotation verification email");
+        let verified = self.expect(Method::POST, "/api/auth/step-up/verify", Some(json!({"challenge":challenge,"email_code":code})), 200).await;
+        let grant = verified["token"].as_str().expect("rotation proof grant");
+        self.expect_with_proof(Method::POST, "/api/instance/rotate-master", Some(json!({"new_key":oc::b64(key)})), status, Some(grant)).await;
     }
     async fn ai_key_enc(&self, org: &str) -> String {
         s(&self.state.db().query("SELECT key_enc FROM ai_settings WHERE org_id=?", &[json!(org)]).await.expect("read ai_settings")[0], "key_enc")
@@ -285,17 +328,31 @@ async fn seed_instance(f: &Fixture) {
 
 #[tokio::test]
 async fn rotate_master_rewraps_ai_settings_after_engine_merge() {
+    // Mail configuration is process-wide; isolate it from the other engine tests.
+    if std::env::var_os(MAIL_CHILD).is_none() {
+        let mailbox = Mailbox::start().await;
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("current test binary"));
+        child.args(["--exact", "rotate_master_rewraps_ai_settings_after_engine_merge", "--nocapture", "--test-threads=1"])
+            .env_clear().env(MAIL_CHILD, "1").env("OPENWARP_EMAIL_PROVIDER", "webhook")
+            .env("OPENWARP_EMAIL_WEBHOOK", &mailbox.url).env("NO_PROXY", "127.0.0.1,localhost")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output()).await
+            .expect("bounded rotation fixture child").expect("run rotation fixture child");
+        assert!(output.status.success(), "rotation fixture child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
     let database = Database::new();
     let f = Fixture::open(&database, OLD).await;
     seed_instance(&f).await;
     f.expect(Method::GET, "/api/me", None, 200).await;
-    f.rotate(&NEW_A, 200).await;
+    f.rotate_with_email_proof(&NEW_A, 200).await;
 
     f.sql("INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES('org','{}',?,?)", &[json!(oc::encrypt_symmetric_aad(&NEW_A, &aad("org"), CREDENTIAL)), json!(clock::now())]).await;
     f.sql("INSERT INTO ai_settings(org_id,settings,key_enc,updated_at) VALUES('empty-org','{}','',?)", &[json!(clock::now())]).await;
     let wrapped_a = f.ai_key_enc("org").await;
 
-    f.rotate(&NEW_B, 200).await;
+    f.rotate_with_email_proof(&NEW_B, 200).await;
     let wrapped_b = f.ai_key_enc("org").await;
     assert_ne!(wrapped_b, wrapped_a, "rotation must rewrite the AI credential wrapping");
     assert_eq!(oc::decrypt_symmetric_aad(&NEW_B, &aad("org"), &wrapped_b).unwrap(), CREDENTIAL, "the rewrapped credential must decrypt under the new master");
@@ -320,9 +377,10 @@ async fn rotate_master_rewraps_ai_settings_after_engine_merge() {
     // A silently missed ai_settings update (SQLite RAISE(IGNORE)) is a
     // conflict, never a reported success with a stale credential.
     f.sql("CREATE TRIGGER ignore_ai_rotation BEFORE UPDATE ON ai_settings BEGIN SELECT RAISE(IGNORE); END", &[]).await;
-    f.rotate(&NEW_D, 409).await;
+    // The CAS conflict is reached after step-up consumes a fresh grant.
+    f.rotate_with_email_proof(&NEW_D, 409).await;
     f.sql("DROP TRIGGER ignore_ai_rotation", &[]).await;
     assert_eq!(f.text("SELECT org_id,settings,key_enc FROM ai_settings ORDER BY org_id").await, restored, "a conflicted rotation must leave the restored wrapping in place");
-    f.rotate(&NEW_D, 200).await;
+    f.rotate_with_email_proof(&NEW_D, 200).await;
     assert_eq!(oc::decrypt_symmetric_aad(&NEW_D, &aad("org"), &f.ai_key_enc("org").await).unwrap(), CREDENTIAL);
 }

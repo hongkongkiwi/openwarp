@@ -1,0 +1,13 @@
+{
+  "name": "openwarp-browser-acceptance",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "test": "playwright test",
+    "test:chromium": "playwright test --project=chromium",
+    "test:critical": "playwright test --project=firefox --project=webkit --grep @critical",
+    "browsers": "playwright install chromium firefox webkit"
+  },
+  "devDependencies": {"playwright": "1.65.0"}
+}

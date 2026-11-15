@@ -214,7 +214,7 @@ Use `extract`. The webhook provider implements whole-object reads (`dataFrom.ext
 
 Behaviour worth knowing:
 
-- A 404 from the bridge means the environment no longer resolves. ESO then applies the target's `deletionPolicy`, which is `Retain` unless you set `Delete`. A scoped token produces that 404 for its own environment, which is the reference the examples use. A different id returns 403 instead, and ESO retries rather than deletes, so alert on failing `ExternalSecret` objects if removal matters.
+- A 404 from the bridge means the environment no longer resolves. ESO then applies the target's `deletionPolicy`, which is `Retain` unless you set `Delete`. Deleting an environment removes its ordinary tokens, but eligible live static human-owned read tokens retain a separate deletion receipt for at most 30 days, capped by their original expiry. During that window, an admitted receipt produces 404 for its own ID or matching deletion-time name reference, never a replacement environment. A different ID or name returns 403. Expired, revoked, machine, workload and trust-linked credentials do not gain this behavior. Current creator, membership, read, IP and emergency policies still apply. Reconcile deletion before the receipt expires; afterwards ESO reports an authentication failure and retries rather than deleting. Ordinary token administration lists receipts as `deleted_env_receipt` and can revoke them by original token ID.
 - 401 and 403 pass through, so a revoked token shows up as a failing `ExternalSecret` rather than an empty `Secret`.
 - A 5xx from OpenWarp becomes a 502, which ESO treats as a retryable error.
 - The bridge is stateless. Raise `eso.replicas` freely; each replica resolves names through the API per request.

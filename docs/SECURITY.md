@@ -20,6 +20,25 @@ For true E2E creation, the client must supply `wrapped_key` to the E2E creation 
 
 Browser E2E decryption uses the JavaScript implementation in [`e2e.js`](../crates/server/src/e2e.js). The recovery kit stays in the page during this workflow. The browser still downloads code from the server, so a compromised server that serves altered JavaScript is a separate threat. Local decryption does not eliminate the need to trust the delivered client.
 
+## Wallet storage boundary
+
+SSE wallet types `wallet_private_key` and `wallet_recovery_phrase` use the existing
+environment encryption and version-bound value ciphertext. They are storage,
+not signing identities. Their values remain opaque, without normalization or
+reference expansion. Ordinary lists and history mask them; export, clone,
+wrapping, provider sync, runner jobs and AI value matching exclude their values.
+Promotion masks all earlier history. Wallet kinds cannot change in place, and
+restore or point-in-time recovery cannot cross a wallet type boundary. Personal
+overrides are refused and pre-promotion overrides are ignored.
+
+Only the explicit current-value reveal route accepts wallet plaintext retrieval.
+It requires an actual account session, tenant/environment/path permission checks
+before consuming VeryRisky proof, emailed verification and configured TOTP.
+Automation credentials cannot use a human's proof. A successful reveal requires
+a persisted `wallet.reveal` audit event containing the record ID, not the value,
+credential or verification codes. This is an API access boundary, not protection
+from the SSE instance operator. E2E environments gain no server plaintext path.
+
 ## Key custody and recovery
 
 | Material | What it protects | Where to keep a recovery copy |
@@ -41,7 +60,7 @@ Main's shipped migrations 19 (change requests), 20 (inline-JWKS workload trusts)
 
 Migration 31 adds workspace feature grants. Migration 32 adds stable account session IDs.
 
-The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Online root rotation preflights and atomically updates both stores, v2 authentication keys, LDAP passwords and TOTP state, while retaining the main Transit root-generation fence. It is available only on native single-process SQLite without configured or persisted KMS root state.
+The established `/transit/keys` routes retain `owt1:` ciphertext, required context and independent rewrap authority. `/transit-compat/keys` uses separate keys and tables, `owtransit:v1:` ciphertext, optional context and both encrypt and decrypt authority for rewrap. Neither engine accepts the other's ciphertext. Startup verification and root rotation share the root-encrypted inventory, including persisted rows whose feature is compiled out. Rotation rewraps main Transit version keys and compatibility Transit per-key wrappers, not the compatibility version ciphertext. Native rotation retains its single-process SQLite transaction and refuses configured or persisted KMS root state. Workers rotation uses a checked Durable Object transaction, advances the webhook epoch and any persisted main Transit root generation, and publishes the replacement root only after commit. Its existing request key gate also covers maintenance and prevents in-flight old-root saves across awaited KMS preparation. Store counts, record identities, old ciphertext and root-custody rows are checked before commit; a conflict rolls back the batch.
 
 ## Cryptographic building blocks
 
@@ -150,9 +169,13 @@ unverified; see [the protocol evidence limits](API.md).
 - Microsoft accepts the tenant-specific issuer from the token's `tid` claim and treats `preferred_username` or `upn` as the address when Entra omits `email`. X requires the `users.email` scope and uses only the `confirmed_email` field, failing closed when it is absent.
 - Custom OIDC identities bind by issuer and subject, so changing `OPENWARP_OIDC_ISSUER` does not inherit bindings made under the previous issuer. The issuer and every discovered or configured endpoint pass the egress policy before a request is made.
 - Workspace OIDC binds identities by issuer and subject. A matching email address alone does not authorise silent linking to an existing password account.
+- SAML requires the `saml` build feature, an applicable license and a workspace feature grant on both native and Workers targets. Workers uses the shared RustCrypto signature verification and signing helper, with replay records inserted synchronously into Durable Object SQLite. OCSP responses and CRL generation remain native-only; enabling SAML or PKI does not enable those operations on Workers.
+- SAML metadata URL fetches reject URL credentials and redirects, require 2xx, and bound the response to 2,000,000 bytes and ten seconds. Native production uses a checked DNS connector without ambient proxies. Workers cannot enforce connector DNS and refuses production metadata URL fetches unless the operator sets `OPENWARP_ALLOW_PRIVATE_EGRESS=1`; supply `metadata_xml` to avoid relaxing that boundary.
 - Social sign-in binds each expiring, single-use state to an independent random HttpOnly browser cookie. The cookie secret never enters the authorization URL; the database stores an HMAC of the public state keyed by that secret. Callbacks must present the initiating flow's cookie before consuming state or contacting the provider. Separate cookie names allow concurrent flows. HTTPS Apple callbacks use `SameSite=None; Secure` for cross-site form POSTs; other flows use `SameSite=Lax`. Local HTTP fixtures use Lax cookies and do not model Apple's cross-site browser POST behavior.
 - CLI browser login uses OAuth with PKCE. OAuth scopes narrow what a client can do; workspace and environment policy still applies.
 - Service tokens can be scoped and revoked. Machine identities use Universal Auth and issue short-lived tokens. Prefer these over human credentials for automation.
+
+Environment deletion removes ordinary token rows unchanged. A separate hash-only deletion receipt can retain a live static human-owned environment read token's original ID, creator and parent IDs, scope, expiry, naming snapshot and admission provenance, but no credential plaintext, secrets, keys or account profile. Its lifetime ends at the earlier of the original expiry and 30 days after deletion. Machine, workload, identity-owned and trust-linked credentials are excluded. Receipt middleware terminates only exact Bearer GET requests for minimal own scope, own naming metadata and a coded export 404; it never supplies a principal to ordinary authentication. Every response requires an active verified human, current unlocked membership and read permission, surviving app/workspace, allowed peer IP and no applicable emergency lockdown. Revocation deletes both stores by original token ID with current authority and step-up checks; app, workspace and account deletion remove receipts. A downgraded binary cannot authenticate a receipt because its ordinary token row is absent. Mixed-version token management is not supported: older administrators cannot see or revoke receipts. Invalidate all retained receipts before re-enabling receipt support after administration by an older version.
 
 The first verified account is the instance owner. Bootstrap the instance on a restricted network, register that account, open the verification link, then set the signup policy before public exposure.
 
@@ -214,6 +237,37 @@ Lockdown does not rotate credentials or erase remote data. A client may retain p
 Workspace owners can delete a workspace using `DELETE /api/orgs/{id}?confirm=true`. Ownership transfer requires an active, verified member. Instance ownership transfer uses `PUT /api/instance/owner` with `user_id` or `email` and requires the current instance owner and an active, verified recipient. An instance owner with no other active, verified account may delete itself once its workspaces are gone. Local deletion batches roll back on database errors, including on Workers. Provider operations are not part of that transaction. Workspace deletion refuses unresolved dynamic leases; revoke issued credentials before deleting their workspace. Lease issuance reserves a local record before contacting a provider. If issuance or final persistence fails ambiguously, that pending record blocks deletion and requires operator reconciliation rather than claiming the remote credential was removed. Copies already delivered to clients or remote secret stores are not erased by deleting local records.
 
 OAuth secret scopes do not authorise membership, settings, audit, token minting, PKI or SCIM administration; those routes require `org:admin` in addition to the caller's existing permissions. `org:admin` does not imply secret access. Scoped service tokens use the same separation; empty service-token scopes retain legacy access. Authorisation accepts only the API issuer or its `/mcp` endpoint as a named resource, defaults an omitted resource to the API, and preserves the resource when refreshing tokens. API and MCP tokens cannot cross audiences. Password consent requires email verification, including the legacy password path; existing client-derived authentication and MFA checks still apply.
+
+## Dynamic lease operation recovery
+
+Renewal, manual revocation and expiry cleanup share a database-owned per-lease operation claim in `instance_leases`, named `lease-op:<lease id>` with a unique owner. Checked writes require that owner and an unexpired database-clock deadline. PostgreSQL renewal checks the old local expiry and revocation state again after the remote acknowledgement. Generic renewal and its audit commit atomically. This is not a distributed transaction with PostgreSQL or a provider.
+
+Operation claims are not automatically taken over or removed by expiry maintenance, even after their 60-second validity expires: a remote statement from an interrupted task might still finish. Pre-effect validation failures release the claim. PostgreSQL renewal and revocation connection failures before sending SQL also release it, allowing a retry. An uncertain remote result or failed local commit after remote work retains the claim and returns an error; lookup reports the lease as nonrenewable while claimed. Revocation failures after dispatch are conservatively unresolved rather than automatically retried. A crash can also strand a claim before any effect. This favors refusing further operations over extending a credential after a concurrent revocation.
+
+To recover, first quiesce every server replica and any worker handling that lease, and establish that no old operation or queued job can still run. Inspect the claim owner, the local lease's username, expiry and revocation state, and the target role's actual existence and `VALID UNTIL` (or the provider's credential state). Reconcile the remote credential and local lease record to the intended policy; when uncertain, revoke the remote credential rather than assume it expired. Preserve the audit evidence, then have the database operator retire only that reconciled lease's claim before resuming service. There is no automatic reconciliation endpoint or safe blanket claim deletion. PostgreSQL expiry restricts new password-authenticated logins, not sessions that already connected.
+
+## Sensitive-action verification
+
+Cookie and Bearer account sessions need additional proof for the
+[action tiers](DEPLOY.md#step-up-verification). Major actions require TOTP only
+when configured; very risky actions always require email and also TOTP when
+configured. Missing mail configuration refuses very risky actions with `503`.
+Service, OAuth and machine credentials are not interactive sessions and keep
+their ordinary scope, tenant, environment and IP restrictions. The account-only
+step-up start and verify endpoints do not apply workspace IP allowlists: they
+return proof, not workspace data. The action using that proof still enforces
+its own IP policy, so a blocked workspace cannot prevent proof for an allowed
+workspace or be opened by that proof.
+
+Handlers check authorization and validate local inputs before consuming proof.
+The grant update checks user, risk, expiry and unused state together, and also
+requires the presented session to remain live. Challenge consumption and grant
+creation share a checked transaction. Proof is additional authentication, not
+permission to cross a workspace boundary or to revive a revoked session.
+Concurrent resource changes or provider failures after consumption may still
+fail the operation. Emergency activation and restoration keep their existing
+owner-session checks without an extra challenge, so containment does not depend
+on mail delivery.
 
 ## SSH certificate authority
 
@@ -309,6 +363,8 @@ Only enable forwarded-IP trust behind a proxy you control. Set `OPENWARP_TRUSTED
 The PostgreSQL driver connects without TLS, and the MySQL/MariaDB driver uses TLS only when the connection URL sets `require_ssl=true`. Do not assume an external database connection is encrypted because the console uses HTTPS. Use an isolated network or a separately configured encrypted transport, and test the deployment's requirements.
 
 Provider integrations receive plaintext SSE values. Their credentials, destination URLs, permissions, and remote retention policy are part of your trust boundary. Integration sync excludes sealed values and user-specific overrides. Do not treat sealed secrets as a mechanism for delivering values to providers.
+
+Integration-owned HTTP requests, including secondary token exchanges and custom TLS clients, refuse redirects and ambient proxies. In production without `OPENWARP_ALLOW_PRIVATE_EGRESS=1`, the native transport checks literal IPs and every connector DNS result against the same non-public-address policy used by integration probes. A non-public DNS answer rejects the entire set; the connector uses only checked addresses. Workers cannot pin Fetch DNS and fail closed for production integration HTTP without the override. Development and override-enabled Workers requests use manual redirects but have no connector DNS guarantee. These controls do not apply to the native SSH subprocess or replace separate database transport policy. See [integration transport limits](INTEGRATIONS.md#create-and-sync).
 
 Log streams, email relays, OIDC endpoints, and generic webhooks are outbound connections. Apply network egress controls as well as application validation. Allowing private egress intentionally broadens the destinations the server can contact. See [configuration](CONFIGURATION.md).
 

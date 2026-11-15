@@ -339,6 +339,32 @@ impl Server {
         if let Some(b)=body { req=req.json(&b); }
         reply(req.send().await.expect("fixture HTTP request")).await
     }
+    async fn call_stepped_up(&self, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> Reply {
+        let r=self.call(method.clone(),path,token,body.clone()).await;
+        if r.status!=428 || r.body["step_up_required"]!=true { return r; }
+        let Some(token)=token else { return r; };
+        let Some(risk)=r.body["risk"].as_str() else { return r; };
+        let before=self.idp.inbox.lock().unwrap().len();
+        let start=self.call(Method::POST,"/api/auth/step-up/start",Some(token),Some(json!({"risk":risk}))).await;
+        start.expect(200,"start provider configuration proof"); assert_eq!(start.body["email_sent"],true);
+        let challenge=start.body["challenge"].as_str().expect("provider configuration proof challenge");
+        let deadline=Instant::now()+Duration::from_secs(10);
+        let code=loop {
+            let found=self.idp.inbox.lock().unwrap().iter().skip(before).rev()
+                .filter(|m|m["subject"]=="Your OpenWarp verification code")
+                .filter_map(|m|m["text"].as_str()).filter(|text|text.contains("Your verification code is "))
+                .find_map(|text|text.split(|c:char|!c.is_ascii_digit()).find(|part|part.len()==6).map(str::to_string));
+            if let Some(code)=found { break code; }
+            assert!(Instant::now()<deadline,"new provider configuration proof mail missing");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified=self.call(Method::POST,"/api/auth/step-up/verify",Some(token),Some(json!({"challenge":challenge,"email_code":code}))).await;
+        verified.expect(200,"verify provider configuration proof");
+        let grant=verified.body["token"].as_str().expect("provider configuration proof grant");
+        let mut req=self.client.request(method,format!("{}{}",self.base,path)).bearer_auth(token).header("x-openwarp-step-up",grant);
+        if let Some(body)=body { req=req.json(&body); }
+        reply(req.send().await.expect("stepped-up fixture HTTP request")).await
+    }
     fn db(&self) -> rusqlite::Connection { let db=rusqlite::Connection::open(self.dir.join("test.db")).unwrap(); db.busy_timeout(Duration::from_secs(5)).unwrap(); db }
     async fn register(&self, email: &str) -> String {
         let r=self.call(Method::POST,"/api/auth/register",None,Some(json!({"email":email,"password":PASSWORD}))).await;
@@ -390,7 +416,7 @@ impl Provider {
         }
         match kind {
             Kind::Oidc => {
-                s.call(Method::PUT,&format!("/api/orgs/{}/settings",org),Some(owner),Some(json!({
+                s.call_stepped_up(Method::PUT,&format!("/api/orgs/{}/settings",org),Some(owner),Some(json!({
                     "oidc_issuer":s.idp.base,"oidc_client_id":"test-client","oidc_client_secret":"fixture-secret",
                     "oidc_redirect_uri":format!("{}/api/auth/oidc/callback",s.base),"oidc_auto_provision":auto,"oidc_allowed_domains":domains
                 }))).await.expect(200,"configure workspace OIDC"); Self::Oidc
@@ -405,12 +431,12 @@ impl Provider {
                     .sso_endpoint(SsoEndpoint::post("https://idp.test/sso").unwrap()).sso_endpoint(SsoEndpoint::redirect("https://idp.test/sso").unwrap())
                     .credentials(Credentials { signing_key:Some(PrivateKeyPem::new(pem)),signing_certificate:Some(CertificatePem::new(cert.pem())),..Credentials::default() })
                     .validation(IdpValidationPolicy::strict()).build().unwrap()).unwrap();
-                s.call(Method::PUT,&format!("/api/orgs/{}/saml",org),Some(owner),Some(json!({"idp_entity_id":"https://idp.test/metadata","metadata_xml":idp.metadata_xml().to_string(),"allow_unsigned_metadata":true,"auto_provision":auto,"allowed_domains":domains}))).await.expect(200,"configure signed SAML fixture");
+                s.call_stepped_up(Method::PUT,&format!("/api/orgs/{}/saml",org),Some(owner),Some(json!({"idp_entity_id":"https://idp.test/metadata","metadata_xml":idp.metadata_xml().to_string(),"allow_unsigned_metadata":true,"auto_provision":auto,"allowed_domains":domains}))).await.expect(200,"configure signed SAML fixture");
                 Self::Saml(Box::new(idp))
             }
             Kind::Ldap => {
                 let dir=Directory::start();
-                s.call(Method::PUT,&format!("/api/orgs/{}/ldap",org),Some(owner),Some(json!({"url":format!("ldaps://127.0.0.1:{}",dir.port),"bind_dn":SERVICE_DN,"bind_password":"service-secret","base_dn":"dc=test,dc=invalid","user_filter":"(uid={username})","ca_cert_pem":dir.ca_pem,"auto_provision":auto,"allowed_domains":domains}))).await.expect(200,"configure TLS LDAP fixture");
+                s.call_stepped_up(Method::PUT,&format!("/api/orgs/{}/ldap",org),Some(owner),Some(json!({"url":format!("ldaps://127.0.0.1:{}",dir.port),"bind_dn":SERVICE_DN,"bind_password":"service-secret","base_dn":"dc=test,dc=invalid","user_filter":"(uid={username})","ca_cert_pem":dir.ca_pem,"auto_provision":auto,"allowed_domains":domains}))).await.expect(200,"configure TLS LDAP fixture");
                 Self::Ldap(dir)
             }
         }

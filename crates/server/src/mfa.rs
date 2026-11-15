@@ -75,7 +75,9 @@ pub async fn confirm_totp(st: &S, uid: &str, code: &str) -> Result<bool, String>
             // Promote only after proof. A failed or abandoned re-enrolment keeps
             // the previous secret active, so the account never silently loses
             // its only factor.
-            let statements = factor_meta(&[(format!("totp_secret:{}",uid),enc.clone()),(format!("totp_enabled:{}",uid),"1".into()),(format!("totp_pending:{}",uid),String::new()),(format!("totp_last:{}",uid),"0".into())]);
+            let mut statements = factor_meta(&[(format!("totp_secret:{}",uid),enc.clone()),(format!("totp_enabled:{}",uid),"1".into()),(format!("totp_pending:{}",uid),String::new()),(format!("totp_last:{}",uid),"0".into())]);
+            statements.push(("DELETE FROM step_up_challenges WHERE user_id=?".into(),vec![json!(uid)]));
+            statements.push(("DELETE FROM step_up_grants WHERE user_id=?".into(),vec![json!(uid)]));
             st.audited_batch_master(&statements,&[],["","","",uid,"auth.totp_enabled",""],master).await
                 .map_err(|e| if e=="epoch_stale" {"epoch_stale".into()} else {format!("TOTP enrollment could not be persisted: {}", e)})?;
             return Ok(true);
@@ -294,6 +296,8 @@ pub async fn totp_disable(State(st): State<S>, h: HeaderMap, Json(body): Json<Va
     if !totp_enabled(&st, &uid).await { return Err(bad("TOTP is not enabled")); }
     let mut statements=factor_meta(&[(format!("totp_enabled:{}",uid),"0".into()),(format!("totp_secret:{}",uid),String::new()),(format!("totp_pending:{}",uid),String::new()),(format!("totp_last:{}",uid),"0".into())]);
     if !email_enabled(&st,&uid).await && passkey_count(&st,&uid).await==0 {statements.extend(factor_meta(&[(format!("totp_recovery:{}",uid),String::new())]));}
+    statements.push(("DELETE FROM step_up_challenges WHERE user_id=?".into(),vec![json!(&uid)]));
+    statements.push(("DELETE FROM step_up_grants WHERE user_id=?".into(),vec![json!(&uid)]));
     st.audited_batch(&statements,&[],["","","",&uid,"auth.totp_disabled",""]).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,&e))?;
     Ok(j(json!({"totp": false}))) }
 

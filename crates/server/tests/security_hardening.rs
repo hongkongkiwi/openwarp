@@ -1,3 +1,4 @@
+use axum::{extract::State, routing::post, Json, Router};
 use hmac::Mac;
 use openwarp_crypto as oc;
 use reqwest::{Client, Method};
@@ -5,15 +6,15 @@ use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 const AUTH_KEY: [u8; 32] = [3; 32];
 struct Resp { status: u16, body: Value }
-struct Server { child: Child, base: String, dir: PathBuf, client: Client }
+struct Server { child: Child, base: String, dir: PathBuf, client: Client, mail: Arc<Mutex<Vec<Value>>>, mail_task: tokio::task::JoinHandle<()> }
 impl Drop for Server {
-    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); }
+    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); self.mail_task.abort(); let _ = std::fs::remove_dir_all(&self.dir); }
 }
 impl Server {
     async fn start() -> Self {
@@ -22,17 +23,23 @@ impl Server {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{}", port);
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
+        let mail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mail_url = format!("http://{}/mail", mail_listener.local_addr().unwrap());
+        let mail = Arc::new(Mutex::new(Vec::new()));
+        async fn receive(State(inbox): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>) -> Json<Value> { inbox.lock().unwrap().push(body); Json(json!({})) }
+        let mail_app = Router::new().route("/mail", post(receive)).with_state(mail.clone());
+        let mail_task = tokio::spawn(async move { axum::serve(mail_listener, mail_app).await.unwrap(); });
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", format!("127.0.0.1:{}", port)).env("OPENWARP_PUBLIC_URL", &base)
             .env("TOKIO_WORKER_THREADS", "2")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("REDIS_URL").env_remove("OPENWARP_ENV")
-            .env_remove("OPENWARP_KMS_URL").env_remove("OPENWARP_EMAIL_WEBHOOK")
+            .env_remove("OPENWARP_KMS_URL").env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url)
             .env_remove("OPENWARP_AUTH_PROVIDERS").env_remove("OPENWARP_SIGNUPS")
             .env_remove("OPENWARP_TRUST_PROXY").env_remove("OPENWARP_REQUIRE_EMAIL_VERIFICATION")
             .stdout(Stdio::null()).stderr(Stdio::from(log)).spawn().unwrap();
         let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build().unwrap();
-        let s = Self { child, base, dir, client };
+        let s = Self { child, base, dir, client, mail, mail_task };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(r) = s.client.get(format!("{}/health", s.base)).send().await { if r.status().is_success() { return s; } }
@@ -63,9 +70,25 @@ impl Server {
         }))).await
     }
     fn verification_path(&self) -> String {
-        let text = std::fs::read_to_string(self.dir.join("server.log")).unwrap();
-        let start = text.rfind("/api/auth/verify?token=").expect("verification link in log");
-        text[start..].split(|c: char| c.is_whitespace() || c == '"' || c == '<').next().unwrap().to_string()
+        self.mail.lock().unwrap().iter().rev().filter_map(|m| m["text"].as_str()).find_map(|text| text.split_whitespace()
+            .find_map(|word| word.find("/api/auth/verify?token=").map(|i| word[i..].to_string()))).expect("verification link in mail")
+    }
+    async fn ok_stepped_up(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> Value {
+        let before = self.mail.lock().unwrap().len();
+        let start = self.ok(Method::POST, "/api/auth/step-up/start", token, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.mail.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.ok(Method::POST, "/api/auth/step-up/verify", token, Some(json!({"challenge": start["challenge"], "email_code": code}))).await;
+        let mut request = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(token).header("x-openwarp-step-up", verified["token"].as_str().unwrap());
+        if let Some(body) = body { request = request.json(&body); }
+        let response = request.send().await.unwrap(); assert_eq!(response.status(), 200, "fixture request failed: {}", path);
+        response.json().await.unwrap()
     }
     async fn login(&self, email: &str) -> Value {
         let ch = self.ok(Method::POST, "/api/auth/challenge", "", Some(json!({"email": email}))).await;
@@ -353,7 +376,7 @@ async fn runner_allowlist(result: bool) {
         assert_eq!(jobs["jobs"].as_array().unwrap().len(), 1);
         jobs["jobs"][0]["claim"].as_str().unwrap().to_string()
     } else { String::new() };
-    s.ok(Method::PUT, &format!("/api/orgs/{}/settings", org), ot, Some(json!({"ip_allowlist": "192.0.2.0/24"}))).await;
+    s.ok_stepped_up(Method::PUT, &format!("/api/orgs/{}/settings", org), ot, Some(json!({"ip_allowlist": "192.0.2.0/24"}))).await;
     assert_eq!(s.call(Method::GET, &format!("/api/orgs/{}/settings", org), ot, None).await.status, 403, "fixture must exclude loopback");
     let r = if result {
         s.call(Method::POST, "/api/runner/jobs/fixture-job/result", rt, Some(json!({"ok": true, "claim": claim}))).await

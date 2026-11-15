@@ -1,15 +1,38 @@
-use axum::{body::{to_bytes, Body}, http::Request, Router};
+use axum::{body::{to_bytes, Body}, extract::State, http::Request, routing::post, Json, Router};
 use openwarp_crypto as oc;
 use openwarp_server::{db::Db, new_state, process_maintenance, router, S};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const OLD: &str = "openwarp-isolated-old-password";
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
+type Inbox = Arc<Mutex<Vec<Value>>>;
+async fn capture_mail(State(inbox): State<Inbox>, Json(body): Json<Value>) -> Json<Value> {
+    inbox.lock().unwrap().push(body); Json(json!({}))
+}
+async fn read_mail(State(inbox): State<Inbox>) -> Json<Value> { Json(json!(inbox.lock().unwrap().clone())) }
+struct MailRelay(tokio::task::JoinHandle<()>);
+impl Drop for MailRelay { fn drop(&mut self) { self.0.abort(); } }
+async fn isolated_export_case(name: &'static str) {
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mail", socket.local_addr().unwrap());
+    let app = Router::new().route("/mail", post(capture_mail).get(read_mail)).with_state(Inbox::default());
+    let _relay = MailRelay(tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); }));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Mail configuration belongs only to this exact test's child, never the shared test process.
+    for (key, _) in std::env::vars_os() {
+        let key_name = key.to_string_lossy();
+        if (key_name.starts_with("OPENWARP_") && key_name != "OPENWARP_TEST_STATIC_PG") || matches!(key_name.as_ref(), "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY" | "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy") { command.env_remove(key); }
+    }
+    command.args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("OPENWARP_STATIC_ROTATION_LIVE_CHILD", name).env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", url);
+    let output = tokio::task::spawn_blocking(move || command.output().expect("run isolated static rotation fixture")).await.unwrap();
+    assert!(output.status.success(), "isolated static rotation fixture failed ({:?})\n{}\n{}", output.status.code(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
 // These cases run the request against an in-memory SQLite fixture, and a
 // rusqlite connection is not Send, so the panic isolation they rely on has to
 // come from a task local to this thread rather than tokio::spawn.
@@ -70,10 +93,12 @@ impl Fixture {
         assert_eq!(f.call("PUT", "/api/envs/env/secrets", json!({"secrets":[{"key":"DB_PASSWORD","value":OLD,"path":"/"}]})).await.0, 200);
         f
     }
-    async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        let request = Request::builder().method(method).uri(path).header("authorization", "Bearer owner")
-            .header("content-type", "application/json").extension(openwarp_server::PeerAddr(std::net::IpAddr::from([127,0,0,1])))
-            .body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
+    async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) { self.call_with_grant(method, path, body, None).await }
+    async fn call_with_grant(&self, method: &str, path: &str, body: Value, grant: Option<&str>) -> (u16, Value) {
+        let mut request = Request::builder().method(method).uri(path).header("authorization", "Bearer owner")
+            .header("content-type", "application/json").extension(openwarp_server::PeerAddr(std::net::IpAddr::from([127,0,0,1])));
+        if let Some(grant) = grant { request = request.header("x-openwarp-step-up", grant); }
+        let request = request.body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
         let r = self.app.clone().oneshot(request).await.unwrap(); let status = r.status().as_u16();
         let bytes = to_bytes(r.into_body(), 1024*1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
@@ -88,8 +113,26 @@ impl Fixture {
         assert_eq!(body["scheduled"], true);
         process_maintenance(&self.state).await;
     }
+    async fn export_grant(&self) -> String {
+        let relay = std::env::var("OPENWARP_EMAIL_WEBHOOK").expect("isolated mail relay");
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+        let before: Vec<Value> = client.get(&relay).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let (status, started) = self.call("POST", "/api/auth/step-up/start", json!({"risk":"very_risky"})).await;
+        assert_eq!(status, 200, "start positive export email proof");
+        assert_eq!(started["email_sent"], true, "export proof must send email");
+        let inbox: Vec<Value> = client.get(&relay).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let mail = inbox.get(before.len()).expect("fresh verification email");
+        assert_eq!(mail["to"], "owner@test.invalid", "proof belongs to the exporting owner");
+        let text = mail["text"].as_str().unwrap();
+        let code = text.split_once("Your verification code is ").expect("email verification code").1
+            .split(|c: char| !c.is_ascii_digit()).next().filter(|s| s.len() == 6).expect("six-digit email proof");
+        let (status, verified) = self.call("POST", "/api/auth/step-up/verify", json!({"challenge":started["challenge"],"email_code":code})).await;
+        assert_eq!(status, 200, "verify positive export email proof");
+        verified["token"].as_str().filter(|s| !s.is_empty()).expect("fresh export grant").into()
+    }
     async fn value(&self) -> String {
-        let (status, body) = self.call("GET", "/api/envs/env/export?base=1", Value::Null).await;
+        let grant = self.export_grant().await;
+        let (status, body) = self.call_with_grant("GET", "/api/envs/env/export?base=1", Value::Null, Some(&grant)).await;
         assert_eq!(status,200,"{}",body);
         body["secrets"].as_array().unwrap().iter().find(|s| s["key"]=="DB_PASSWORD").unwrap()["value"].as_str().unwrap().into()
     }
@@ -101,6 +144,8 @@ impl Fixture {
 #[tokio::test]
 async fn live_static_rotation_changes_postgres_login_and_matches_sse_secret() {
     let Some(url) = live_url() else { return; };
+    let name = "live_static_rotation_changes_postgres_login_and_matches_sse_secret";
+    if std::env::var("OPENWARP_STATIC_ROTATION_LIVE_CHILD").as_deref() != Ok(name) { isolated_export_case(name).await; return; }
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone();
@@ -122,6 +167,8 @@ async fn live_static_rotation_changes_postgres_login_and_matches_sse_secret() {
 #[tokio::test]
 async fn live_remote_success_local_failure_retains_same_pending_password_until_retry() {
     let Some(url) = live_url() else { return; };
+    let name = "live_remote_success_local_failure_retains_same_pending_password_until_retry";
+    if std::env::var("OPENWARP_STATIC_ROTATION_LIVE_CHILD").as_deref() != Ok(name) { isolated_export_case(name).await; return; }
     let _lock = ENV_LOCK.lock().await; let _allow = allow(&url);
     let role = std::sync::Arc::new(Role::new(&url).await);
     let worker = role.clone(); let connection = url.clone();

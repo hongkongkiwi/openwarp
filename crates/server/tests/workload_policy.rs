@@ -14,7 +14,9 @@ impl Reply {
     fn forbidden(self) { assert_eq!(self.status, 403, "HTTP {}: {}", self.status, self.text); }
     fn rejected(self) { assert!(matches!(self.status, 400 | 401 | 403 | 422), "expected contract rejection, HTTP {}: {}", self.status, self.text); }
 }
-struct Fixture { app: Router, state: S }
+struct Fixture { app: Router, state: S, http: Option<HttpFixture> }
+struct HttpFixture { server: Native, client: reqwest::Client, mail: Arc<Mutex<Vec<Value>>>, mail_task: tokio::task::JoinHandle<()> }
+impl Drop for HttpFixture { fn drop(&mut self) { self.mail_task.abort(); } }
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
 impl Fixture {
     async fn new() -> Self {
@@ -39,11 +41,45 @@ impl Fixture {
         let (live, _) = tokio::sync::broadcast::channel(16);
         let state = new_state(db, "sqlite::memory:".into(), "tests".into(), "https://openwarp.test".into(), [7;32], live, #[cfg(feature = "redis-cache")] None);
         let app = router(state.clone());
-        let f = Self { app, state };
+        let f = Self { app, state, http: None };
         f.call("GET", "/api/envs/env/secrets", "owner", None).await.ok();
         f
     }
-    async fn call(&self, method: &str, path: &str, user: &str, body: Option<Value>) -> Reply {
+    async fn with_email() -> Self {
+        let mut f = Self::new().await;
+        let mut server = Native::new();
+        let db = Db::open(&format!("sqlite://{}", server.dir.join("test.db").display())).await.unwrap();
+        db.exec("INSERT INTO meta(k,v) VALUES('master',?)", &[json!(oc::b64(&[7;32]))]).await.unwrap();
+        for table in ["orgs", "users", "org_members", "sessions", "roles", "identities", "apps", "envs"] {
+            for row in f.state.db().query(&format!("SELECT * FROM {}", table), &[]).await.unwrap() {
+                let columns: Vec<_> = row.keys().cloned().collect();
+                let values: Vec<_> = columns.iter().map(|k| row[k].clone()).collect();
+                db.exec(&format!("INSERT INTO {}({}) VALUES({})", table, columns.join(","), vec!["?"; columns.len()].join(",")), &values).await.unwrap();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mail", listener.local_addr().unwrap());
+        let mail = Arc::new(Mutex::new(Vec::new())); let sink = mail.clone();
+        let app = Router::new().route("/mail", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone(); async move { sink.lock().unwrap().push(body); axum::Json(json!({})) }
+        }));
+        let mail_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        server.mail_url = Some(url); server.start_mode("", false); server.healthy().await;
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(20)).build().unwrap();
+        f.http = Some(HttpFixture { server, client, mail, mail_task }); f
+    }
+    async fn call(&self, method: &str, path: &str, user: &str, body: Option<Value>) -> Reply { self.call_with_grant(method, path, user, body, None).await }
+    async fn call_with_grant(&self, method: &str, path: &str, user: &str, body: Option<Value>, grant: Option<&str>) -> Reply {
+        if let Some(http) = &self.http {
+            let mut request = http.client.request(method.parse().unwrap(), format!("{}{}", http.server.base, path));
+            if let Some(cookie) = user.strip_prefix("cookie:") { request = request.header("cookie", format!("ow_session={}", cookie)); }
+            else if !user.is_empty() { request = request.bearer_auth(user); }
+            if let Some(grant) = grant { request = request.header("x-openwarp-step-up", grant); }
+            if let Some(body) = body { request = request.json(&body); }
+            let response = request.send().await.unwrap(); let status = response.status().as_u16(); let text = response.text().await.unwrap();
+            let body = serde_json::from_str(&text).unwrap_or(Value::Null); return Reply { status, body, text };
+        }
+        assert!(grant.is_none(), "step-up fixture must use its native HTTP server");
         let mut req = Request::builder().method(method).uri(path)
             .extension(openwarp_server::PeerAddr(std::net::IpAddr::from([127, 0, 0, 1])));
         if let Some(cookie) = user.strip_prefix("cookie:") { req = req.header("cookie", format!("ow_session={}", cookie)); }
@@ -54,6 +90,21 @@ impl Fixture {
         let text = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
         let body = serde_json::from_str(&text).unwrap_or(Value::Null);
         Reply { status, body, text }
+    }
+    async fn export(&self, path: &str, user: &str) -> Reply {
+        let http = self.http.as_ref().expect("export fixture has an isolated email relay");
+        let before = http.mail.lock().unwrap().len();
+        let start = self.call("POST", "/api/auth/step-up/start", user, Some(json!({"risk":"very_risky"}))).await.ok();
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = http.mail.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call("POST", "/api/auth/step-up/verify", user, Some(json!({"challenge":start["challenge"],"email_code":code}))).await.ok();
+        self.call_with_grant("GET", path, user, None, Some(verified["token"].as_str().unwrap())).await
     }
     async fn mcp(&self, user: &str, name: &str, arguments: Value) -> Value {
         self.call("POST", "/mcp", user, Some(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}))).await.ok()
@@ -108,12 +159,12 @@ async fn path_policy_administration_is_owner_only_and_rejects_noncanonical_rules
 
 #[tokio::test]
 async fn path_lists_and_base_exports_filter_before_reference_expansion_for_bearer_and_cookie() {
-    let f = Fixture::new().await;
+    let f = Fixture::with_email().await;
     f.seed().await;
     f.restricted().await;
     for user in ["dev", "cookie:dev"] {
         for path in ["/api/envs/env/secrets", "/api/envs/env/export", "/api/envs/env/export?base=1"] {
-            let body = f.call("GET", path, user, None).await.ok();
+            let body = if path.contains("/export") { f.export(path, user).await.ok() } else { f.call("GET", path, user, None).await.ok() };
             let items = body["secrets"].as_array().unwrap();
             assert_eq!(items.len(), 3, "{}: {}", path, body);
             assert!(items.iter().all(|s| s["path"].as_str().unwrap().starts_with("/team/")), "{}", body);
@@ -160,9 +211,9 @@ async fn bulk_preflight_is_atomic_and_restricted_callers_cannot_clone_whole_envi
 
 #[tokio::test]
 async fn absent_policy_retains_existing_secret_access() {
-    let f = Fixture::new().await;
+    let f = Fixture::with_email().await;
     f.seed().await;
-    let body = f.call("GET", "/api/envs/env/export?base=1", "dev", None).await.ok();
+    let body = f.export("/api/envs/env/export?base=1", "dev").await.ok();
     assert_eq!(body["secrets"].as_array().unwrap().len(), 4);
     assert!(body.to_string().contains("foreign-canary-value"));
     let sid = f.sid("PRIVATE").await;
@@ -310,7 +361,7 @@ async fn path_capabilities_never_grant_missing_role_or_token_scope_permissions()
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
-struct Native { child: Option<Child>, dir: PathBuf, base: String }
+struct Native { child: Option<Child>, dir: PathBuf, base: String, mail_url: Option<String> }
 impl Drop for Native {
     fn drop(&mut self) { self.stop(); let _ = std::fs::remove_dir_all(&self.dir); }
 }
@@ -318,7 +369,7 @@ impl Native {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("openwarp-workload-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).unwrap();
-        Self { child: None, dir, base: String::new() }
+        Self { child: None, dir, base: String::new(), mail_url: None }
     }
     fn stop(&mut self) { if let Some(mut c) = self.child.take() { let _ = c.kill(); let _ = c.wait(); } }
     fn start(&mut self, kms: &str) { self.start_mode(kms, true); }
@@ -328,14 +379,15 @@ impl Native {
         let addr = listener.local_addr().unwrap(); drop(listener);
         self.base = format!("http://{}", addr);
         let log = std::fs::File::create(self.dir.join("server.log")).unwrap();
-        self.child = Some(Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
-            .env("DATABASE_URL", format!("sqlite://{}", self.dir.join("test.db").display()))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_openwarp-server"));
+        command.env("DATABASE_URL", format!("sqlite://{}", self.dir.join("test.db").display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_ENV", if production { "production" } else { "test" })
             .env("OPENWARP_ALLOW_PRIVATE_EGRESS", "1")
             .env("OPENWARP_PUBLIC_URL", &self.base).env("OPENWARP_KMS_URL", kms)
             .env("TOKIO_WORKER_THREADS", "2").env_remove("OPENWARP_MASTER_KEY")
-            .env_remove("OPENWARP_KMS_TOKEN").env_remove("REDIS_URL")
-            .stdout(Stdio::null()).stderr(Stdio::from(log)).spawn().unwrap());
+            .env_remove("OPENWARP_KMS_TOKEN").env_remove("REDIS_URL");
+        if let Some(url) = &self.mail_url { command.env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", url); }
+        self.child = Some(command.stdout(Stdio::null()).stderr(Stdio::from(log)).spawn().unwrap());
     }
     async fn healthy(&mut self) {
         let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(1)).build().unwrap();

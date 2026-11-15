@@ -115,6 +115,23 @@ impl Server {
         let body: Value = response.json().await.expect("HTTP JSON response");
         assert_eq!(status, 200, "HTTP fixture request {} failed: {}", path, body); body
     }
+    async fn export(&self, env: &str, token: &str) -> Value {
+        let before = self.mail.calls().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", token, Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.mail.calls().iter().skip(before).filter_map(|c| c.body["text"].as_str()).find_map(|text|
+                text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", token, Some(json!({"challenge": start["challenge"], "email_code": code}))).await;
+        let response = self.client.get(format!("{}/api/envs/{}/export?base=1", self.base, env)).bearer_auth(token)
+            .header("x-openwarp-step-up", field(&verified, "token")).send().await.unwrap();
+        let status = response.status(); let body: Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "base export failed: {}", body); body
+    }
     async fn register(&self) -> (String, String) {
         let registered = self.call(Method::POST, "/api/auth/register", "", Some(json!({"email": "sync-owner@test.invalid", "password": "sync-collision-test-password"}))).await;
         assert_eq!(registered["verification_required"], true);
@@ -151,7 +168,7 @@ async fn http_sync_keeps_winning_record_metadata(kind: &str) {
         {"key": "SEALED_ONLY", "path": "/sealed/", "value": "sealed-only-base", "tags": "owner=sealed", "type": "sealed"}
     ]}))).await;
     assert_eq!(deployed["deployed"], 7); assert_eq!(deployed["sync_errors"], json!([]));
-    let exported = s.call(Method::GET, &format!("/api/envs/{}/export?base=1", env), &token, None).await;
+    let exported = s.export(&env, &token).await;
     assert_eq!(exported["omitted_sealed"], 2);
     let records = exported["secrets"].as_array().expect("base records");
     let selected: Vec<_> = records.iter().filter(|r| r["path"] == "/alpha/" || r["path"] == "/beta/").collect();

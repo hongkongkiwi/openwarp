@@ -58,7 +58,13 @@ Sync can write remote secrets. Obtain the appropriate approval before executing 
 
 Test uses a reachability probe for `github`, `gitlab`, `vercel`, `netlify`, `cloudflare`, `cloudflare_pages`, `supabase`, `nomad`, `coolify`, `gcp_secret_manager`, `digitalocean`, `railway`, `render`, `flyio`, `heroku`, `azure_key_vault`, `kubernetes`, `hashicorp_vault`, and `webhook`. On the native server it sends one unauthenticated GET to the base URL used by sync (`base_url`, `vault`, `api_server`, `addr` or `url`, depending on the kind), without following redirects or sending other provider configuration. The URL's path and query are sent to the endpoint; URLs with a username or password are rejected. Any HTTP response, including 401 or 403, counts as reachable; credentials are not verified. Invalid URLs, egress rejection and unreachable endpoints return HTTP 400. On Workers, generic probes return HTTP 400 with `generic integration connection tests require the native server` without sending a request. Other supported kinds have kind-specific tests; SSH testing requires the native server. In production, generic probes reject localhost and private or loopback IP addresses, including IPv4-mapped IPv6 addresses, unless `OPENWARP_ALLOW_PRIVATE_EGRESS=1`. The native connector checks every resolved address and connects only to that checked set; a private answer rejects the whole set. Probes do not use configured HTTP proxies. A sync is not a harmless substitute for Test.
 
+Integration-owned HTTP requests use guarded transports for sync, import, provider tests and credential rotation, including secondary GCP/Azure token endpoints, AWS STS, pagination URLs and Docker/OVH clients with custom TLS identities. The native server and standalone sync runner share the request facade; the reachability probe uses a separate client with the same checked resolver. In `OPENWARP_ENV=production`, it rejects non-public literal addresses (including IPv4-mapped IPv6) and any DNS answer set containing a non-public address, then connects using only that checked set. It does not use ambient HTTP proxies or follow redirects. Development mode and the explicit operator override `OPENWARP_ALLOW_PRIVATE_EGRESS=1` permit private destinations; neither enables redirects.
+
+Workers cannot verify or pin Fetch's connector DNS results. Without the private-egress override, production integration HTTP requests therefore fail before Fetch, even for a public hostname. Development mode or `OPENWARP_ALLOW_PRIVATE_EGRESS=1` enables integration Fetch with manual redirects, but does not provide DNS enforcement. URL syntax and embedded-credential checks still apply. This restriction is integration-specific; it does not change operator-configured email delivery or other HTTP clients. Native SSH file sync uses the SSH subprocess rather than this HTTP transport, and database connections retain their separate host and TLS controls.
+
 PostgreSQL dynamic leases use TLS by default and now require the server to accept TLS instead of falling back to plaintext. A deployment that intentionally uses plaintext must explicitly configure `sslmode=disable`; use it only on a trusted network. This transport change also affects existing dynamic-lease configurations that relied on the driver's previous `prefer` fallback.
+
+Dynamic lease renewal supports only local generic credentials and directly managed PostgreSQL roles. PostgreSQL renewal uses the stored encrypted connection and existing username, rechecks `OPENWARP_ALLOWED_DB_HOSTS`, and uses the same TLS transport as issuance. It changes only `VALID UNTIL`, without replacing the password or recreating the role. Worker-delivered PostgreSQL roles have no renewal job protocol and are not renewable; revocation keeps its existing queued worker-drop semantics. AWS STS sessions and other provider-issued keys, including OpenRouter, are not renewable in place. An interrupted remote operation can require [operator reconciliation](SECURITY.md#dynamic-lease-operation-recovery); retrying is not proof that the first operation had no effect.
 
 ## Static PostgreSQL password rotation
 
@@ -167,7 +173,17 @@ The `kubernetes` adapter pushes values to the cluster API. For pods that pull va
 
 ## Advanced sync options
 
-These options apply to server-managed syncs. Customer-run delegated syncs use a separate runner and do not yet support source path selection, per-secret metadata tags, or managed Azure Key Vault behavior.
+Server-managed and customer-run delegated syncs use the same managed adapter dispatch, including Azure Key Vault. Delegated runners decrypt source paths and per-secret tags locally, apply path selection before dispatch and apply naming once. Provider-specific capabilities and deletion limits below still apply. Delegated initial imports (`import_local` and `import_remote`) are unsupported and rejected before provider access; use a client-side deploy instead. Existing sealed configs with these modes also fail closed at the runner.
+
+Delegated results report constant diagnostic categories rather than provider
+messages, response bodies or subprocess output, even on success. A failed managed
+sync can have written some selected names: its job-bound, claim-fenced
+`merge_only` report adds conservative candidate ownership while retaining every
+previous name and hash. New candidate hashes describe attempted values; retained
+hashes describe earlier acknowledged values. Neither proves remote state after a
+failure. A later successful sync replaces ownership and hashes normally, allowing
+mirror cleanup of removed candidates without deleting unrelated remote names.
+Dry-runs, connection tests and preparation failures do not add candidates.
 
 ### Source selection
 

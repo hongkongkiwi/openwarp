@@ -114,6 +114,30 @@ async fn call(client: &Client, base: &str, method: Method, path: &str, token: Op
     Resp { status, text, body }
 }
 
+async fn create_root_ca(server: &PgServer, client: &Client, base: &str, token: &str, org: &str, name: &str) -> Resp {
+    let before = server.inbox.lock().unwrap().len();
+    let start = call(client, base, Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": "very_risky"}))).await;
+    assert_eq!(start.status, 200, "start root CA email proof");
+    assert_eq!(start.body["methods"], json!(["email"]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        let text = server.inbox.lock().unwrap().iter().skip(before).find_map(|m| {
+            if m["subject"] == "Your OpenWarp verification code" { m["text"].as_str().map(str::to_string) } else { None }
+        });
+        if let Some(text) = text { break text; }
+        assert!(Instant::now() < deadline, "fresh root CA step-up email missing");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let code = text.split(|c: char| !c.is_ascii_digit()).find(|v| v.len() == 6).expect("emailed verification code");
+    let verified = call(client, base, Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": start.body["challenge"], "email_code": code}))).await;
+    assert_eq!(verified.status, 200, "verify root CA email proof");
+    let grant = verified.body["token"].as_str().expect("root CA step-up grant");
+    let response = client.post(format!("{}/api/orgs/{}/pki/cas", base, org)).bearer_auth(token)
+        .header("x-openwarp-step-up", grant).json(&json!({"name": name})).send().await.expect("create root CA request");
+    let status = response.status().as_u16(); let text = response.text().await.unwrap_or_default();
+    let body = serde_json::from_str(&text).unwrap_or(Value::Null); Resp { status, text, body }
+}
+
 use openwarp_server::db as storage;
 
 async fn pg_server() -> Option<(PgServer, Client, String, String)> {
@@ -288,7 +312,10 @@ async fn postgres_renewal_rechecks_expiry_after_device_lock() {
     let Some((server,client,base,url))=pg_server().await else{return};
     let (token,org)=pg_owner(&server,&client,&base).await;
     grant_pki(&client,&base,&token,&org).await;
-    let r=call(&client,&base,Method::POST,&format!("/api/orgs/{}/pki/cas",org),Some(&token),Some(json!({"name":"expiry-lock"}))).await;
+    let unproved=call(&client,&base,Method::POST,&format!("/api/orgs/{}/pki/cas",org),Some(&token),Some(json!({"name":"expiry-lock"}))).await;
+    assert_eq!(unproved.status,428,"root CA creation requires fresh proof");
+    assert_eq!(unproved.body["risk"],"very_risky");assert_eq!(unproved.body["email_required"],true);assert_eq!(unproved.body["totp_required"],false);
+    let r=create_root_ca(&server,&client,&base,&token,&org,"expiry-lock").await;
     assert_eq!(r.status,200,"CA creation: {}",r.text);let ca=r.body["id"].as_str().unwrap();
     let r=call(&client,&base,Method::POST,&format!("/api/pki/cas/{}/devices",ca),Some(&token),Some(json!({"name":"expiry-sensor"}))).await;
     assert_eq!(r.status,200);let device=r.body["id"].as_str().unwrap().to_string();
@@ -314,12 +341,13 @@ async fn postgres_renewal_rechecks_expiry_after_device_lock() {
 
 #[tokio::test]
 async fn postgres_enrollment_cannot_cross_revocation_or_group_deletion() {
-    let Some((server, client, base, url)) = pg_server().await else { return; };
-    let (token, org) = pg_owner(&server, &client, &base).await;
-    grant_pki(&client, &base, &token, &org).await;
-    let observer = pg_client(&url).await;
     for mutation in ["device-revoke", "group-revoke", "group-delete", "ca-revoke", "root-revoke", "device-policy"] {
-        let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": mutation}))).await;
+        // Each case needs fresh proof without exhausting the account's start limit.
+        let Some((server, client, base, url)) = pg_server().await else { return; };
+        let (token, org) = pg_owner(&server, &client, &base).await;
+        grant_pki(&client, &base, &token, &org).await;
+        let observer = pg_client(&url).await;
+        let r = create_root_ca(&server, &client, &base, &token, &org, mutation).await;
         assert_eq!(r.status,200,"CA creation for {}: {}",mutation,r.text); let root = r.body["id"].as_str().unwrap().to_string();
         let ca = if mutation == "root-revoke" {
             let r = call(&client, &base, Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(&token), Some(json!({"name": "child", "parent_id": root}))).await;

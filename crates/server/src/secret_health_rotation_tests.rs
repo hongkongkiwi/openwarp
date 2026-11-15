@@ -23,9 +23,20 @@ async fn state() -> (S, HeaderMap) {
     (st, h)
 }
 
+async fn rotation_headers(st: &S, mut h: HeaderMap, mail: &mut crate::mailer::test_mail::Relay) -> HeaderMap {
+    let Json(start) = step_up_start(State(st.clone()), h.clone(), Json(StepUpStartReq { risk: "very_risky".into() })).await.unwrap();
+    assert_eq!(start["methods"], json!(["email"]));
+    let code = mail.code("owner@example.test").await;
+    let Json(verified) = step_up_verify(State(st.clone()), h.clone(), Json(StepUpVerifyReq { challenge: start["challenge"].as_str().unwrap().into(), email_code: code, totp: String::new() })).await.unwrap();
+    h.insert("x-openwarp-step-up", verified["token"].as_str().unwrap().parse().unwrap()); h
+}
+
 #[tokio::test]
 async fn rotation_snapshots_after_queued_credential_write() {
+    let mut mail = crate::mailer::test_mail::Relay::start().await;
+    crate::mailer::test_mail::scope(mail.config(), async {
     let (st, h) = state().await;
+    let h = rotation_headers(&st, h, &mut mail).await;
     let gate = st.secret_health_credentials.lock().await;
     let rotation = rotate_master(State(st.clone()), h, Json(json!({"new_key":oc::b64(&[2; 32])})));
     let mut rotation = Box::pin(rotation);
@@ -37,9 +48,11 @@ async fn rotation_snapshots_after_queued_credential_write() {
     let row = st.db.one("SELECT v FROM meta WHERE k='hibp_api_key:owner'", &[]).await.unwrap().unwrap();
     assert_eq!(st.master(), [2; 32]);
     assert_eq!(oc::decrypt_symmetric(&st.master(), &db::s(&row, "v")).unwrap(), b"credential-written-before-rotation");
-    let _ = rotate_master(State(st.clone()), {
+    let h = rotation_headers(&st, {
         let mut h = HeaderMap::new(); h.insert("authorization", "Bearer rotation-session".parse().unwrap()); h
-    }, Json(json!({"new_key":oc::b64(&[3; 32])}))).await.unwrap();
+    }, &mut mail).await;
+    let _ = rotate_master(State(st.clone()), h, Json(json!({"new_key":oc::b64(&[3; 32])}))).await.unwrap();
+    }).await;
 }
 
 #[tokio::test]

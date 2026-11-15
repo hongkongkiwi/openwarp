@@ -132,6 +132,26 @@ impl Server {
         self.finish(req.send().await).await
     }
 
+    async fn very_risky_proof(&self, token: &str) -> String {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(start.status, 200, "start email proof: {}", start.text);
+        assert_eq!(start.body["methods"], json!(["email"]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            let text = self.inbox.lock().unwrap().iter().skip(before).find_map(|m| {
+                if m["subject"] == "Your OpenWarp verification code" { m["text"].as_str().map(str::to_string) } else { None }
+            });
+            if let Some(text) = text { break text; }
+            assert!(Instant::now() < deadline, "fresh step-up email missing");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let code = text.split(|c: char| !c.is_ascii_digit()).find(|v| v.len() == 6).expect("emailed verification code");
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": start.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify email proof: {}", verified.text);
+        verified.body["token"].as_str().expect("step-up grant").to_string()
+    }
+
     async fn call_with_headers(&self, path: &str, token: &str, body: Value, headers: &[(&str, &str)]) -> Resp {
         let mut req = self.client.post(self.url(path)).bearer_auth(token).json(&body);
         for (k, v) in headers {
@@ -322,7 +342,8 @@ async fn org_with_viewer(s: &Server, suffix: &str) -> (String, String, String, S
 // Device certificates: the key stays on the device, enrollment is a one-time
 // code plus a CSR, and the CRL is public because a broker fetches it.
 async fn pki_ca(s: &Server, token: &str, org: &str, name: &str) -> (String, String) {
-    let r = s.call(Method::POST, &format!("/api/orgs/{}/pki/cas", org), Some(token), Some(json!({"name": name}))).await;
+    let proof = s.very_risky_proof(token).await;
+    let r = s.call_with_headers(&format!("/api/orgs/{}/pki/cas", org), token, json!({"name": name}), &[("x-openwarp-step-up", &proof)]).await;
     assert_eq!(r.status, 200, "create CA failed: {}", r.text);
     (r.body["id"].as_str().unwrap().to_string(), r.body["certificate"].as_str().unwrap().to_string())
 }

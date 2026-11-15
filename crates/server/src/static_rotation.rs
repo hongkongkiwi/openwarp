@@ -60,6 +60,7 @@ pub(super) async fn run(State(st): State<S>,h: HeaderMap,Path(rid): Path<String>
     let uid=st.token_user(&h).await?;
     let r=st.db.one("SELECT env_id FROM rotation_schedules WHERE id=?", &[json!(rid)]).await.map_err(|e| bad(&e))?.ok_or_else(|| bad("rotation schedule not found"))?;
     let eid=db::s(&r,"env_id"); st.check_scope(&h,&eid).await?; let (org,_)=st.require_env(&eid,&uid).await?; st.check_perm(&org,&uid,"rotations:write").await?;
+    require_step_up(&st,&h,&uid,StepUpRisk::TwoFactor).await?;
     st.db.exec("UPDATE rotation_schedules SET next_run=?,enabled=1 WHERE id=?", &[json!(now()),json!(rid)]).await.map_err(|e| bad(&e))?;
     // Scheduling acknowledges no remote success; maintenance claims and performs the rotation.
     Ok(j(json!({"scheduled":true,"id":rid})))

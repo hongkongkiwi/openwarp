@@ -58,6 +58,21 @@ class Element {
   set checked(value) { this._checked = Boolean(value); }
   get disabled() { return this.hasAttribute('disabled'); }
   set disabled(value) { value ? this.setAttribute('disabled', '') : this.removeAttribute('disabled'); }
+  get tabIndex() {
+    const explicit = parseInt(this.getAttribute('tabindex'), 10);
+    if (!Number.isNaN(explicit)) return explicit;
+    if (this.tagName === 'A' && this.hasAttribute('href')) return 0;
+    if (this.tagName === 'SUMMARY' && this.parentElement?.tagName === 'DETAILS' &&
+      this.parentElement.children.find(el => el.tagName === 'SUMMARY') === this) return 0;
+    return /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(this.tagName) &&
+      !(this.tagName === 'INPUT' && (this.getAttribute('type') || '').toLowerCase() === 'hidden') ? 0 : -1;
+  }
+  getClientRects() {
+    if (!this.ownerDocument?.contains(this) || (this.tagName === 'INPUT' && (this.getAttribute('type') || '').toLowerCase() === 'hidden')) return [];
+    for (let el = this; el; el = el.parentElement) if (computedStyle(el).display === 'none') return [];
+    // Synthetic geometry distinguishes rendered boxes without pretending to lay out the page.
+    return [{ x: 0, y: 0, top: 0, left: 0, right: 1, bottom: 1, width: 1, height: 1 }];
+  }
   get value() {
     if (this._value !== undefined) return this._value;
     if (this.tagName === 'TEXTAREA') return this.textContent;
@@ -148,7 +163,8 @@ function parse(markup, root) {
 }
 
 function computedStyle(element) {
-  const values = { display: element.hidden ? 'none' : 'block', visibility: 'visible' };
+  const inheritedVisibility = element.parentElement ? computedStyle(element.parentElement).visibility : 'visible';
+  const values = { display: element.hidden ? 'none' : 'block', visibility: inheritedVisibility };
   const priorities = {};
   for (const [, selectors, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     for (const selector of selectors.split(',').map(s => s.trim())) {
@@ -164,13 +180,16 @@ function computedStyle(element) {
       }
     }
   }
-  return { ...values, ...element.style };
+  const style = { ...values, ...element.style };
+  if (style.visibility === 'inherit' || style.visibility === 'unset' || !style.visibility) style.visibility = inheritedVisibility;
+  if (style.visibility === 'initial') style.visibility = 'visible';
+  return style;
 }
 
 function hidden(element) {
+  if (computedStyle(element).visibility !== 'visible') return true;
   for (let el = element; el; el = el.parentElement) {
-    const style = computedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return true;
+    if (computedStyle(el).display === 'none') return true;
   }
   return false;
 }
@@ -308,7 +327,8 @@ async function consoleUI(secrets = [saved], reuse = [], opts = {}) {
     el(id) { const el = document.getElementById(id); assert.ok(el, 'missing rendered element #' + id); return el; },
     run(code) { return vm.runInContext(code, context, { timeout: 1000 }); },
     async settle() {
-      for (let n = 0; n < 30; n++) await Promise.resolve();
+      // Multi-await renderers need more than a fixed short microtask drain.
+      for (let n = 0; n < 300; n++) await Promise.resolve();
       assert.deepEqual(unexpected, [], 'all requests must have fixture responses');
     },
     async invoke(code) { await this.run(code); await this.settle(); },
@@ -1828,4 +1848,127 @@ test('a locked workspace keeps account settings available and hides workspace se
     'a locked workspace must not fetch SSO or directory settings');
   assert.match(ui.el('view').textContent, /locked/i, 'the settings view must explain why workspace settings are unavailable');
   assert.ok(!ui.el('view').textContent.includes('Organisation security'), 'workspace security settings must be hidden');
+});
+
+test('the DOM fixture models tab indices, rendered boxes and inherited visibility', () => {
+  const document = new Element('document', null);
+  document.ownerDocument = document;
+  const root = document.appendChild(new Element('div', document));
+  root.innerHTML = '<input><textarea></textarea><select></select><button></button><input type="hidden"><div></div>';
+  assert.deepEqual(root.children.map(el => el.tabIndex), [0, 0, 0, 0, -1, -1]);
+  const input = root.children[0], hiddenInput = root.children[4], plain = root.children[5];
+  plain.setAttribute('tabindex', '  +2 ');
+  assert.equal(plain.tabIndex, 2, 'an explicit tab index makes a generic element focusable');
+  input.setAttribute('tabindex', '-2');
+  assert.equal(input.tabIndex, -2);
+  input.setAttribute('tabindex', 'invalid');
+  assert.equal(input.tabIndex, 0, 'an invalid tab index falls back to the element default');
+  plain.setAttribute('tabindex', 'invalid');
+  assert.equal(plain.tabIndex, -1);
+  assert.ok(input.getClientRects().some(rect => rect.width > 0 && rect.height > 0));
+  hiddenInput.setAttribute('tabindex', '0');
+  assert.equal(hiddenInput.getClientRects().length, 0, 'a hidden input has no box even with an explicit tab index');
+  input.hidden = true;
+  assert.equal(input.getClientRects().length, 0);
+  input.hidden = false;
+  root.hidden = true;
+  assert.equal(input.getClientRects().length, 0, 'a hidden ancestor suppresses descendant boxes');
+  root.hidden = false;
+  root.style.display = 'none';
+  assert.equal(input.getClientRects().length, 0);
+  root.style.display = 'block';
+  assert.equal(computedStyle(input).visibility, 'visible');
+  root.style.visibility = 'hidden';
+  assert.equal(computedStyle(input).visibility, 'hidden');
+  assert.ok(hidden(input));
+  assert.ok(input.getClientRects().length > 0, 'visibility does not remove the layout box');
+  input.style.visibility = 'visible';
+  assert.equal(computedStyle(input).visibility, 'visible', 'a descendant can override inherited hidden visibility');
+  assert.ok(!hidden(input));
+  input.style.visibility = 'inherit';
+  assert.equal(computedStyle(input).visibility, 'hidden');
+  input.style.visibility = 'initial';
+  assert.equal(computedStyle(input).visibility, 'visible');
+  root.style.visibility = 'visible';
+  const detached = new Element('button', document);
+  assert.equal(detached.getClientRects().length, 0);
+  root.appendChild(detached);
+  assert.ok(detached.getClientRects().length > 0);
+  detached.remove();
+  assert.equal(detached.getClientRects().length, 0, 'removing a control removes its rendered box');
+  root.innerHTML = '';
+  assert.equal(input.getClientRects().length, 0, 'replaced descendants are no longer connected to the document');
+});
+
+test('dialogs and the command palette advance intermediate Tab focus and skip noninteractive controls', async () => {
+  const ui = await consoleUI();
+  for (const surface of ['modal', 'palette']) {
+    if (surface === 'modal') await ui.invoke("modal('<h3>Focus navigation</h3>')");
+    else await ui.invoke('closeModal(); openPalette()');
+    const container = ui.el(surface);
+    container.innerHTML = '<input id="focus-first">' +
+      '<button disabled>Disabled</button><button hidden>Hidden</button>' +
+      '<button tabindex="-2">Programmatic focus only</button><input type="hidden" tabindex="0">' +
+      '<div hidden><button>Hidden ancestor</button></div>' +
+      '<div style="display:none"><button>Display-none ancestor</button></div>' +
+      '<div style="visibility:hidden"><button>Inherited hidden visibility</button>' +
+      '<textarea id="focus-middle" style="visibility:visible"></textarea></div>' +
+      '<button id="focus-last">Last</button>';
+    const first = container.querySelector('#focus-first'), middle = container.querySelector('#focus-middle'), last = container.querySelector('#focus-last');
+    first.focus();
+    for (const [shift, expected] of [[false, middle], [false, last], [false, first], [true, last], [true, middle], [true, first]]) {
+      const event = ui.key('Tab', shift);
+      assert.equal(event.defaultPrevented, true, `${surface} must prevent native Tab navigation`);
+      assert.equal(ui.document.activeElement, expected, `${surface} must advance, skip excluded controls and wrap in both directions`);
+    }
+  }
+});
+
+test('the DOM fixture gives native summaries and href links their default tab indices', () => {
+  const document = new Element('document', null);
+  document.ownerDocument = document;
+  const root = document.appendChild(new Element('div', document));
+  root.innerHTML = '<details open><summary id="first-summary">Health</summary><summary id="second-summary">Not the disclosure</summary>' +
+    '<a id="provider-link" href="https://provider.example.invalid/">Provider</a><a id="plain-anchor">No destination</a>' +
+    '<div id="custom-control" tabindex="0">Custom control</div><a id="hidden-link" href="https://provider.example.invalid/" hidden>Hidden</a></details>' +
+    '<summary id="standalone-summary">Not in details</summary>';
+  assert.deepEqual(root.querySelectorAll('summary,a,div').map(el => [el.id, el.tabIndex]), [
+    ['first-summary', 0], ['second-summary', -1], ['provider-link', 0], ['plain-anchor', -1],
+    ['custom-control', 0], ['hidden-link', 0], ['standalone-summary', -1],
+  ]);
+  assert.ok(root.querySelector('#first-summary').getClientRects().length > 0);
+  assert.ok(root.querySelector('#provider-link').getClientRects().length > 0);
+  assert.equal(root.querySelector('#hidden-link').getClientRects().length, 0);
+});
+
+test('the New secret modal keeps its health summary, provider link and custom tab stop reachable', async t => {
+  const ui = await consoleUI();
+  await ui.click(ui.button(ui.el('view'), /New secret/));
+  const details = ui.el('modal').querySelector('details');
+  assert.ok(details, 'New secret must expose its optional health disclosure');
+  details.setAttribute('open', '');
+  const summary = details.querySelector('summary');
+  summary.setAttribute('id', 'health-summary');
+  const output = details.querySelector('[data-health-result]');
+  output.innerHTML = '<button id="provider-before" type="button">Before provider</button>' +
+    '<a href="https://provider.example.invalid/" hidden>Hidden provider</a>' +
+    '<a id="health-provider" href="https://provider.example.invalid/">Provider attribution</a>' +
+    '<a href="https://provider.example.invalid/" tabindex="-1">Programmatic focus only</a>' +
+    '<div id="health-custom" tabindex="0">Custom control</div><button id="provider-after" type="button">After provider</button>';
+  for (const [name, before, expected, after] of [
+    ['summary', ui.el('ns-val'), summary, details.querySelector('[data-health="local"]')],
+    ['provider link', ui.el('provider-before'), ui.el('health-provider'), ui.el('health-custom')],
+    ['generic tabindex control', ui.el('health-provider'), ui.el('health-custom'), ui.el('provider-after')],
+  ]) {
+    await t.test(name, () => {
+      before.focus();
+      let event = ui.key('Tab');
+      assert.equal(event.defaultPrevented, true, 'the modal owns sequential keyboard navigation');
+      assert.equal(ui.document.activeElement.id, expected.id, `forward Tab must reach the ${name}`);
+      after.focus();
+      event = ui.key('Tab', true);
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(ui.document.activeElement.id, expected.id, `reverse Tab must reach the ${name}`);
+    });
+  }
 });

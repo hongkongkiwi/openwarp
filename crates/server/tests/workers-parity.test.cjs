@@ -238,14 +238,53 @@ test('Workers KMS bridge performs asynchronous wrapping and unwrapping with HTTP
   assert.ok(!/reqwest::blocking|std::thread::spawn/.test(mask(source)), 'Workers KMS cannot use native blocking threads');
 });
 
+function masterInventoryContract(source) {
+  const inventory = source.match(/const MASTER_STORES:[^]*?\n\];/);
+  assert.ok(inventory, 'master rotation must declare its encrypted-store inventory');
+  const stores = [...inventory[0].matchAll(/MasterStore \{ table: "([^"]+)", ids: &\[([^\]]+)\], col: "([^"]+)", predicate: "([^"]+)" \}/g)];
+  const store = (table, column) => {
+    const matches = stores.filter(entry => entry[1] === table && entry[3] === column);
+    assert.equal(matches.length, 1, `master rotation must reencrypt ${table}.${column}`);
+    return matches[0];
+  };
+  assert.equal(store('users', 'auth_key_enc')[2], '"id"', 'auth keys must be bound to their user identity');
+  contains(store('meta', 'v')[4], /totp_pending:/, 'master rotation must preserve pending TOTP enrollment');
+  store('ldap_configs', 'bind_password_enc');
+  const implementation = source.match(/impl MasterStore \{([^]*?)\n\}/);
+  assert.ok(implementation, 'inventory entries must have a real selection and update implementation');
+  const methods = functions(implementation[0]);
+  contains(selected(methods, 'select', false), /format!\("SELECT \* FROM \{\} WHERE \{\}",\s*self\.table,\s*self\.predicate\)/,
+    'inventory selection must use the descriptor table and predicate');
+  const updates = selected(methods, 'updates', false);
+  contains(updates, /let value=db::s\(row,self\.col\); let id=db::s\(row,self\.ids\[0\]\)/,
+    'rewrapping must read the descriptor ciphertext and record identity');
+  contains(updates, /\("users",_\)\s*=>\s*Some\(auth_key_aad\(&id\)\)/,
+    'rotated client-auth keys must retain their user-bound AAD');
+  contains(updates, /Some\(aad\)=>oc::decrypt_symmetric_aad\(old,aad,&value\)/,
+    'client-auth ciphertext must decrypt with the old master and user AAD');
+  contains(updates, /Some\(aad\)=>oc::encrypt_symmetric_aad\(new,aad,&plain\)/,
+    'client-auth plaintext must reencrypt with the new master and the same AAD');
+  contains(updates, /None=>oc::decrypt_symmetric\(old,&value\)/,
+    'pending TOTP and LDAP ciphertext must decrypt with the old master');
+  contains(updates, /None=>oc::encrypt_symmetric\(new,&plain\)/,
+    'pending TOTP and LDAP plaintext must reencrypt with the new master');
+  contains(updates, /format!\("UPDATE \{\} SET \{\}=\? WHERE \{\}",self\.table,self\.col,self\.ids/,
+    'rotation updates must write the descriptor column using its record identity');
+  contains(updates, /let mut params=vec!\[json!\(encrypted\)\]/, 'the update must persist the replacement ciphertext');
+  for (const wasm of [false, true]) {
+    const rotation = selected(functions(source, wasm), 'rotate_master', wasm);
+    contains(rotation, /for store in MASTER_STORES\s*\{/, 'both rotation targets must traverse the encrypted-store inventory');
+    contains(rotation, /let rows=(?:tx|st\.db)\.query\(&store\.select\(\),&\[\]\)/,
+      'rotation must snapshot each selected inventory store');
+    contains(rotation, /for \(sql,params\) in store\.updates\(&rows,&old,&new\)/,
+      'rotation must rewrap the snapshotted rows from the old to the new master');
+    contains(rotation, wasm ? /statements\.push\(\(sql,params,Some\(1\)\)\)/ : /tx\.exec\(&sql,&params\)\?!=1/,
+      'rotation must apply the generated updates with affected-row checks');
+  }
+}
+
 test('master rotation preserves client-auth keys, pending TOTP, and LDAP credentials', () => {
-  const rotation = reach(native('rotate_master'), nativeAll);
-  for (const [pattern, message] of [
-    [/auth_key_enc/, 'master rotation must reencrypt users.auth_key_enc'],
-    [/auth_key_aad\s*\(/, 'rotated client-auth keys must retain their user-bound AAD'],
-    [/totp_pending:/, 'master rotation must preserve pending TOTP enrollment'],
-    [/bind_password_enc/, 'master rotation must reencrypt persisted LDAP bind credentials even without LDAP runtime support'],
-  ]) contains(rotation, pattern, message);
+  masterInventoryContract(read('app.rs'));
 });
 
 test('master rotation commits encrypted records atomically before publishing the new key', () => {

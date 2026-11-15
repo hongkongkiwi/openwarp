@@ -76,6 +76,72 @@ async fn sqlite_fresh_apply_status_and_rerun() {
 }
 
 #[tokio::test]
+async fn sqlite_fresh_deleted_env_receipts_preserve_identity_and_unique_hashes() {
+    let (path, _scratch) = scratch_path();
+    let db = sqlite(&path).await;
+    fresh(&db).await;
+    let empty = db.one("SELECT COUNT(*) AS n FROM deleted_env_receipts", &[]).await.unwrap().unwrap();
+    assert_eq!(n(&empty, "n"), 0, "a fresh database has no deleted environment receipts");
+
+    let insert = "INSERT INTO deleted_env_receipts(token_id,token_hash,created_by,org_id,app_id,env_id,env_name,app_name,workspace_name,scopes,original_expires_at,deleted_at,expires_at,kind,trust_id,workload_revision,restricted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    let env_name = "environment-name-".repeat(40);
+    let scopes = "secrets:read ".repeat(40);
+    let mut values = vec![json!("original-token-id"), json!("a".repeat(64)), json!("creator"), json!("org"), json!("app"), json!("deleted-env"), json!(env_name), json!("application"), json!("workspace"), json!(scopes), json!(200), json!(100), json!(150), json!("human"), json!(""), json!(""), json!(1)];
+    db.exec(insert, &values).await.unwrap();
+    let before = db.query("SELECT * FROM deleted_env_receipts", &[]).await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(openwarp_server::db::s(&before[0], "token_id"), "original-token-id");
+    assert_eq!(openwarp_server::db::s(&before[0], "token_hash"), "a".repeat(64));
+    assert_eq!(openwarp_server::db::s(&before[0], "env_name"), env_name);
+    assert_eq!(openwarp_server::db::s(&before[0], "scopes"), scopes);
+
+    values[0] = json!("another-token-id");
+    let error = db.exec(insert, &values).await.unwrap_err();
+    assert!(error.contains("UNIQUE constraint failed: deleted_env_receipts.token_hash"), "duplicate credential hashes must fail for the hash constraint: {}", error);
+    values[0] = json!("original-token-id");
+    values[1] = json!("b".repeat(64));
+    let error = db.exec(insert, &values).await.unwrap_err();
+    assert!(error.contains("UNIQUE constraint failed: deleted_env_receipts.token_id"), "original token IDs must not be reused: {}", error);
+
+    let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
+    assert!(report.applied.is_empty());
+    assert_eq!(db.query("SELECT * FROM deleted_env_receipts", &[]).await.unwrap(), before, "rerunning migrations preserves receipt identity and contents");
+}
+
+#[tokio::test]
+async fn sqlite_v38_upgrade_creates_empty_receipts_without_changing_tokens_or_envs() {
+    let (path, _scratch) = scratch_path();
+    let db = sqlite(&path).await;
+    let previous = &MIGRATIONS[..38];
+    assert_eq!(previous.last().unwrap().version, 38);
+    migrate::apply(&db, previous, Options::default()).await.unwrap();
+    assert_eq!(db.version().await.unwrap(), 38);
+    assert!(db.query("SELECT * FROM deleted_env_receipts", &[]).await.is_err(), "version 38 has no receipt table");
+
+    db.exec("INSERT INTO orgs(id,name,created_at) VALUES('org-v38','Existing workspace',1)", &[]).await.unwrap();
+    db.exec("INSERT INTO apps(id,org_id,name,created_at) VALUES('app-v38','org-v38','Existing app',1)", &[]).await.unwrap();
+    db.exec("INSERT INTO envs(id,app_id,name,env_key_wrapped,restricted,created_at) VALUES('env-v38','app-v38','Existing environment','fixture-wrapped-key',1,1)", &[]).await.unwrap();
+    db.exec("INSERT INTO tokens(id,org_id,app_id,env_id,name,token_hash,expires_at,scopes,created_at,created_by) VALUES('scoped-v38','org-v38','app-v38','env-v38','Scoped token','fixture-scoped-hash',200,'secrets:read',1,'creator-v38')", &[]).await.unwrap();
+    db.exec("INSERT INTO tokens(id,org_id,name,token_hash,created_at,created_by) VALUES('ordinary-v38','org-v38','Ordinary token','fixture-ordinary-hash',1,'creator-v38')", &[]).await.unwrap();
+    let tokens = db.query("SELECT * FROM tokens ORDER BY id", &[]).await.unwrap();
+    let envs = db.query("SELECT * FROM envs ORDER BY id", &[]).await.unwrap();
+    let ledger = db.query("SELECT * FROM schema_migrations WHERE version<=38 ORDER BY version", &[]).await.unwrap();
+
+    let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
+    assert_eq!(report.applied, vec![39], "an existing v38 database applies only the receipt migration");
+    assert!(!report.squashed);
+    assert_eq!(db.version().await.unwrap(), 39);
+    assert_eq!(db.query("SELECT * FROM tokens ORDER BY id", &[]).await.unwrap(), tokens, "migration must not revoke or rewrite ordinary tokens");
+    assert_eq!(db.query("SELECT * FROM envs ORDER BY id", &[]).await.unwrap(), envs, "migration must not change existing environments");
+    assert_eq!(db.query("SELECT * FROM schema_migrations WHERE version<=38 ORDER BY version", &[]).await.unwrap(), ledger, "old checksums and ledger metadata remain immutable");
+    let receipts = db.one("SELECT COUNT(*) AS n FROM deleted_env_receipts", &[]).await.unwrap().unwrap();
+    assert_eq!(n(&receipts, "n"), 0, "upgrading must not invent deletion receipts for existing tokens");
+    let status = migrate::status(&db, MIGRATIONS).await.unwrap();
+    assert!(status.problems.is_empty());
+    assert!(status.pending().is_empty());
+}
+
+#[tokio::test]
 async fn sqlite_refuses_checksum_drift_and_accepts_repair() {
     let (path, _scratch) = scratch_path();
     let db = sqlite(&path).await;
@@ -150,10 +216,11 @@ async fn sqlite_upgrades_a_legacy_ledger_without_data() {
     // the binary is behind the current one.
     db.exec("UPDATE schema_migrations SET checksum='', name=''", &[]).await.unwrap();
     db.exec("DELETE FROM schema_migrations WHERE version > 9", &[]).await.unwrap();
-    // Migration 32 creates its index without IF NOT EXISTS, so the rewound
-    // database must look like a real v9 schema: drop what 32 later added.
+    // Remove post-v9 objects created without IF NOT EXISTS by migrations 32
+    // and 39 so strict replay sees the schema represented by the rewound ledger.
     db.exec("DROP INDEX IF EXISTS idx_sessions_id", &[]).await.unwrap();
     db.exec("ALTER TABLE sessions DROP COLUMN id", &[]).await.unwrap();
+    db.exec("DROP TABLE deleted_env_receipts", &[]).await.unwrap();
 
     let report = migrate::apply(&db, MIGRATIONS, Options::default()).await.unwrap();
     assert_eq!(report.applied, (10i64..=MIGRATIONS.last().unwrap().version).collect::<Vec<_>>());

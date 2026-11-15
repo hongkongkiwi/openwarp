@@ -101,6 +101,27 @@ impl Server {
         Self::finish(req.send().await.expect("HTTP request")).await
     }
 
+    async fn verified_call(&self, method: Method, path: &str, session: &str, body: Option<Value>) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let started = self.call(Method::POST, "/api/auth/step-up/start", Some(session), Some(json!({"risk": "very_risky"}))).await;
+        assert_eq!(started.status, 200, "start sensitive-action verification");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .find(|w| w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "sensitive-action email did not arrive");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", Some(session), Some(json!({"challenge": started.body["challenge"], "email_code": code}))).await;
+        assert_eq!(verified.status, 200, "verify emailed sensitive-action code");
+        let mut req = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(session)
+            .header("x-openwarp-step-up", field(&verified.body, "token"));
+        if let Some(body) = body { req = req.json(&body); }
+        Self::finish(req.send().await.expect("verified HTTP request")).await
+    }
+
     async fn cookie(&self, method: Method, path: &str, session: &str, body: Option<Value>) -> Resp {
         let mut req = self.client.request(method, format!("{}{}", self.base, path))
             .header("cookie", format!("ow_session={}", session)).header("origin", &self.base);
@@ -358,7 +379,9 @@ async fn emergency_blocks_owner_and_token_secret_reads_and_workspace_mutations()
         let r = s.mcp(token, "list_secrets", json!({"env_id": env})).await;
         assert_eq!(r.status, 200); assert!(r.body.to_string().contains(SECRET), "MCP credential setup must really read the secret");
     }
-    for token in [&ot, &service, &oauth] {
+    let r = s.verified_call(Method::GET, &format!("/api/envs/{}/export", env), &ot, None).await;
+    assert_eq!(r.status, 200, "export credential setup");
+    for token in [&service, &oauth] {
         let r = s.call(Method::GET, &format!("/api/envs/{}/export", env), Some(token), None).await;
         assert_eq!(r.status, 200, "export credential setup");
     }
@@ -600,7 +623,7 @@ async fn review_settings_redaction(project: bool) {
     let (app, _) = s.app(&ot, &org).await;
     let path = format!("/api/orgs/{}/settings", org);
     let url = "https://review-url-user:review-url-password@example.invalid/audit?token=review-url-query-secret";
-    assert_eq!(s.call(Method::PUT, &path, Some(&ot), Some(json!({"audit_webhook": url, "reuse_check": false}))).await.status, 200, "credential-bearing webhook setup");
+    assert_eq!(s.verified_call(Method::PUT, &path, &ot, Some(json!({"audit_webhook": url, "reuse_check": false}))).await.status, 200, "credential-bearing webhook setup");
     assert_eq!(s.cookie(Method::GET, &path, &ot, None).await.status, 200, "owner settings access setup");
     review_halt(&s, &ot, &org, &app, project, true).await;
     s.project_status(&ot, &app, project, !project).await;
@@ -609,7 +632,7 @@ async fn review_settings_redaction(project: bool) {
     assert_eq!(r.body["reuse_check"], json!(false), "ordinary settings metadata remains usable");
     review_no_credentials(&r.body);
     review_halt(&s, &ot, &org, &app, project, false).await;
-    assert_eq!(s.call(Method::PUT, &path, Some(&ot), Some(json!({"reuse_check": true}))).await.status, 200, "settings mutations resume after restoration");
+    assert_eq!(s.verified_call(Method::PUT, &path, &ot, Some(json!({"reuse_check": true}))).await.status, 200, "settings mutations resume after restoration");
 }
 
 #[tokio::test]

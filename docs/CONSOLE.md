@@ -37,6 +37,22 @@ Enable TOTP MFA from settings and keep the recovery codes somewhere other than y
 
 Settings also manages passkeys and browser sessions. Adding a passkey asks for your password first and then creates the WebAuthn credential in the browser; the recovery codes shown afterwards are the only fallback if the authenticator is lost. Removing a passkey requires the password again. The sessions card lists each signed-in browser session with its sign-in time and marks the current one; revoking another session ends it immediately, and revoking the current session signs this browser out. End all sessions revokes every browser session for the account, including the one you are using; API keys and OAuth tokens are unaffected. My tokens opens the API token list instead of browser sessions.
 
+## Confirm sensitive actions
+
+The console opens a verification dialog when a human-session request returns
+`428`. Major actions require an authenticator or recovery code when TOTP is
+configured. Very risky actions always require an emailed code and also require
+TOTP when configured. Without a mail provider, very risky actions return `503`.
+See the [action tiers](DEPLOY.md#step-up-verification).
+
+Verification retries the submitted request once, using its original payload.
+Codes and the one-use grant stay in memory, not browser storage. Cancel, Escape
+or clicking the backdrop cancels the action. A second action cannot replace an
+outstanding verification. Changing session, workspace or lockdown state cancels
+the old request rather than replaying it in the new context. An editor open
+under the dialog is restored on dismissal; newer secret drafts are not cleared
+by completion of an older deployment.
+
 ## Delete an account or workspace
 
 Settings includes Delete account. Only a signed-in account session can use it, not a service key or OAuth token. Transfer or delete every workspace you own first, even if it has another owner. If issued API keys or live CLI/OAuth sessions remain, the console shows their counts and asks for confirmation before revoking credentials and deleting the account.
@@ -141,6 +157,14 @@ When you stage a `secret` value, the console asks the server whether the same va
 Keys are uppercased on standard secret writes. A path distinguishes identical names in different locations. Use conventional environment-variable names when values will reach a process or integration.
 
 Reveal and copy actions expose plaintext on your device. Comments and tags help describe ownership or usage, but should not contain additional credentials.
+
+Wallet storage is currently API-only; the console has no dedicated wallet
+creation or reveal workflow. The SSE types `wallet_private_key` and
+`wallet_recovery_phrase` remain masked in ordinary reads and history, including
+pre-promotion history. They do not support personal overrides or reference
+expansion, and export, clone and integrations omit them. Explicit current-value
+reveal requires an account session and emailed step-up verification plus TOTP
+when configured. There is no wallet signing feature. See [the API](API.md#wallet-storage-and-reveal).
 
 ## History, overrides, and references
 

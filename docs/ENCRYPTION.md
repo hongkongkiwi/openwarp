@@ -44,6 +44,14 @@ and decrypts secrets to serve the API and to run integrations.
 - **Operator can read.** This mode is for automation, dynamic leases, PKI and
   any feature that needs server-side plaintext.
 
+Wallet storage types `wallet_private_key` and `wallet_recovery_phrase` are SSE
+records encrypted through this same environment-key and version-bound value
+path. Their opaque values are masked in ordinary reads and history and omitted
+from plaintext automation consumers. Only explicit current-value reveal with an
+account session and VeryRisky step-up returns their value. This restriction does
+not exclude the SSE operator or add signing, delegated-wallet support or
+server-side E2E decryption. See [wallet storage](API.md#wallet-storage-and-reveal).
+
 ### `delegated`
 
 The client generates the environment key. It wraps the key to itself and to a
@@ -140,15 +148,24 @@ also fatal.
 Test a restart with the configured bridge before removing any recovery copy.
 The bridge credential is itself a deployment secret and must have access to the
 stored key identifiers. This is not Shamir unseal or a recovery-share protocol.
-The native bridge is unavailable on Workers, which still require an external
-master-key binding.
+Workers uses the asynchronous KMS bridge for root recovery and environment-key
+wrapping. An external master-key binding, when supplied, must match the stored
+KMS root.
 
-Online instance-root rotation is refused when a KMS is configured or a wrapped
-KMS root is persisted. Changing the external KMS key identifier and rewrapping
-keys is a separate operation. The native SQLite root-rotation path also rewraps
-transit wrapping keys and version-2 authentication keys in the same transaction.
-A lifecycle lock prevents HTTP and maintenance work from persisting old-root
-records during that operation. PostgreSQL and MySQL/MariaDB online rotation are
+Native online instance-root rotation is refused when a KMS is configured or a
+wrapped KMS root is persisted. Changing the external KMS key identifier and
+rewrapping keys is a separate operation. Startup and rotation share an inventory
+of root-encrypted environment wrappers, account authentication and TOTP keys,
+OIDC and personal breach-provider credentials, PKI keys and hook secrets, log
+streams, SAML, LDAP, rotation hooks, AI credentials and webhook keys. Persisted
+feature-disabled stores are included. Main Transit version keys are rewrapped;
+compatibility Transit rewraps only its per-key wrapper, retaining version keys
+under that wrapper. Native SQLite updates the inventory and root fences in one
+transaction. Workers uses a checked transaction with store-count and exact
+old-ciphertext guards, including AI settings and root-custody metadata. Its KMS
+wrap and unwrap roundtrip precede the final snapshot. The request key gate also
+covers Worker maintenance, so old-root saves cannot cross root publication.
+Native lifecycle locks protect HTTP and maintenance work during rotation. PostgreSQL and MySQL/MariaDB online rotation are
 refused: OpenWarp does not provide an offline multi-replica root-rotation
 command. Keep the existing
 root until a coordinated migration has been designed and verified. Do not change
@@ -218,13 +235,34 @@ environment for sync.
   claim carries a random fencing token, so a late result from the superseded
   runner is rejected.
 - Sealed secrets are excluded from job payloads, matching the server-side sync
-  path.
+  path. Jobs retain encrypted paths and tags when present. The runner decrypts
+  them locally, rejects invalid ciphertext and applies source selection before
+  dispatch; it never substitutes a root path after a decryption failure.
 - Plaintext exists in the runner's memory while a sync runs. Treat the runner
   host as a secrets-bearing system: dedicated container, no core dumps, no
   debug logging of job payloads.
-- Only `webhook` and the four specialised connectors (`trigger`, `instabox`,
-  `boat`, `daytona`) have runner connection tests. Other kinds sync but report
-  "test not implemented".
+- Stateful kinds use the shared managed adapters and previous ownership names;
+  other kinds retain the legacy sync path. Connection tests use the provider's
+  existing test dispatch and never update ownership.
+- Results contain managed names and value hashes, not secret values. Diagnostics
+  use closed codes and constant messages on success and failure. The server
+  ignores freeform result detail, including from older runners, and selects safe
+  job and audit messages itself. Runner logs omit raw transport and provider errors.
+- Ownership replacement requires a successful sync, an explicit `persist_managed:
+  true` report, the job id and fenced claim. After a managed dispatch fails, a
+  nondry sync reports `managed_mode: "merge_only"` with `persist_managed: false`
+  and previous plus desired candidate ownership. The server adds missing names
+  in the same checked transaction as failed status and audit; it never deletes
+  previous ownership or changes its hashes on failure. Candidate hashes describe
+  attempted values, not proof of remote state. Existing hashes remain advisory
+  until a successful replacement records the current values.
+- Dry-runs, connection tests and preparation failures never change ownership.
+  The server cannot decrypt configs to verify dispatch or dry-run policy, so the
+  authenticated runner is trusted for these reports as well as provider execution.
+  Legacy results without an explicit policy cannot change ownership.
+- Delegated initial imports are unsupported. Configuration creation rejects
+  them before sealing, and the runner rejects existing sealed import configs
+  before contacting a provider. Import through a client-side deploy instead.
 
 ## Features that remain managed-only
 

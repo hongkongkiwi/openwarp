@@ -38,7 +38,7 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_openwarp-server"))
             .env("DATABASE_URL", format!("sqlite://{}/test.db", dir.display()))
             .env("ADDR", addr.to_string()).env("OPENWARP_PUBLIC_URL", &base)
-            .env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
+            .env("OPENWARP_EMAIL_PROVIDER", "webhook").env("OPENWARP_EMAIL_WEBHOOK", mail_url).env("TOKIO_WORKER_THREADS", "1")
             .env_remove("OPENWARP_MASTER_KEY").env_remove("OPENWARP_ENV").env_remove("REDIS_URL")
             .env_remove("OPENWARP_ALLOW_PRIVATE_EGRESS").env_remove("OPENWARP_ALLOWED_DB_HOSTS")
             .env_remove("OPENWARP_TRUST_PROXY")
@@ -60,6 +60,22 @@ impl Server {
         if let Some(t) = token { req = req.bearer_auth(t); }
         if let Some(b) = body { req = req.json(&b); }
         finish(req.send().await).await
+    }
+    async fn call_stepped_up(&self, method: Method, path: &str, token: &str, body: Option<Value>) -> Resp {
+        let before = self.inbox.lock().unwrap().len();
+        let start = self.call(Method::POST, "/api/auth/step-up/start", Some(token), Some(json!({"risk":"very_risky"}))).await; ok(&start);
+        assert_eq!(start.body["email_sent"], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            let code = self.inbox.lock().unwrap().iter().skip(before).filter_map(|m| m["text"].as_str())
+                .find_map(|text| text.split(|c: char| !c.is_ascii_digit()).find(|s| s.len() == 6).map(str::to_string));
+            if let Some(code) = code { break code; }
+            assert!(Instant::now() < deadline, "fresh step-up mail missing"); tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let verified = self.call(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge":start.body["challenge"],"email_code":code}))).await; ok(&verified);
+        let mut request = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(token).header("x-openwarp-step-up", verified.body["token"].as_str().unwrap());
+        if let Some(body) = body { request = request.json(&body); }
+        finish(request.send().await).await
     }
     async fn signed(&self, hook: &str, secret: &str, mid: &str, timestamp: i64, signed_body: &[u8], sent_body: &[u8]) -> Resp {
         let key = secret.strip_prefix("whsec_").expect("whsec prefix");
@@ -352,7 +368,7 @@ async fn incoming_receipts_capture_inspect_replay_and_master_rotation_clears_pay
     // Captured payloads are sealed with the instance master. Rotating that key
     // erases them rather than rewrapping debug data.
     let new_key = Base64::encode_string(&Sha256::digest(b"rotate-incoming-receipts"));
-    ok(&s.call(Method::POST,"/api/instance/rotate-master",Some(t),Some(json!({"new_key":new_key}))).await);
+    ok(&s.call_stepped_up(Method::POST,"/api/instance/rotate-master",t,Some(json!({"new_key":new_key}))).await);
     let r = s.call(Method::GET,&detail,Some(t),None).await; ok(&r);
     assert_eq!(r.body["body_available"],false,"rotation must erase captured payloads: {}",r.text);
     assert!(r.body["body"].is_null());
@@ -446,7 +462,7 @@ async fn outgoing_asymmetric_signing_survives_master_rotation() {
     // Master rotation rewraps the encrypted seed and key rotation regenerates
     // the pair; the next test event must verify under the new keys.
     let new_key = Base64::encode_string(&Sha256::digest(b"asym-rotate-master"));
-    ok(&s.call(Method::POST,"/api/instance/rotate-master",Some(t),Some(json!({"new_key":new_key}))).await);
+    ok(&s.call_stepped_up(Method::POST,"/api/instance/rotate-master",t,Some(json!({"new_key":new_key}))).await);
     let rotated = secret(&s.call(Method::POST,&format!("{}/rotate",path),Some(t),Some(json!({}))).await);
     let r = s.call(Method::GET,&path,Some(t),None).await; ok(&r);
     let pk_b64 = r.body["public_key"].as_str().expect("rotated public key").trim_start_matches("whpk_").to_string();

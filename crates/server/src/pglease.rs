@@ -102,6 +102,21 @@ pub async fn create_role(conn: &str, username: &str, password: &str, expires_at:
     Ok(())
 }
 
+pub enum RenewError { NotSent, Rejected, Uncertain }
+pub async fn renew_role(conn: &str, username: &str, expires_at: i64) -> Result<(), RenewError> {
+    let client = client(conn).await.map_err(|_| RenewError::NotSent)?;
+    let sql = format!("ALTER ROLE {} VALID UNTIL {}", ident(username), literal(&timestamp(expires_at)));
+    client.execute(&sql, &[]).await.map_err(|e| if e.as_db_error().is_some() { RenewError::Rejected } else { RenewError::Uncertain })?;
+    Ok(())
+}
+
+pub async fn drop_role_with_outcome(conn: &str, username: &str) -> Result<(), RenewError> {
+    let client = client(conn).await.map_err(|_| RenewError::NotSent)?;
+    let sql = format!("DROP ROLE IF EXISTS {}", ident(username));
+    client.execute(&sql, &[]).await.map_err(|e| if e.as_db_error().is_some() { RenewError::Rejected } else { RenewError::Uncertain })?;
+    Ok(())
+}
+
 pub async fn drop_role(conn: &str, username: &str) -> Result<(), String> {
     let client = client(conn).await?;
     let sql = format!("DROP ROLE IF EXISTS {}", ident(username));

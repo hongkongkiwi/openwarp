@@ -146,9 +146,10 @@ impl Server {
         if start.status != 200 { return None; }
         let challenge = start.body["challenge"].as_str()?.to_string();
         if !start.body["email_sent"].as_bool().unwrap_or(false) { return None; }
-        let text = wait_for_new_mail(&self.inbox, "sensitive action", before).await;
+        let text = wait_for_new_mail(&self.inbox, "Your verification code is ", before).await;
         let code = six_digit_code_in(&text)?;
         let verified = self.call_raw(Method::POST, "/api/auth/step-up/verify", Some(token), Some(json!({"challenge": challenge, "email_code": code}))).await;
+        if verified.status != 200 { return None; }
         verified.body["token"].as_str().map(str::to_string) }
 
     async fn form(&self, path: &str, form: &[(&str, String)], token: Option<&str>) -> Resp {
@@ -211,7 +212,7 @@ async fn wait_for_new_mail(inbox: &Arc<Mutex<Vec<Value>>>, needle: &str, before:
     for _ in 0..60 {
         { let guard = inbox.lock().unwrap();
           if guard.len() > before {
-              if let Some(m) = guard.iter().rev().find(|m| m["text"].as_str().unwrap_or("").contains(needle)) {
+              if let Some(m) = guard.iter().skip(before).rev().find(|m| m["subject"] == "Your OpenWarp verification code" && m["text"].as_str().unwrap_or("").contains(needle)) {
                   return m["text"].as_str().unwrap_or("").to_string(); } } }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
