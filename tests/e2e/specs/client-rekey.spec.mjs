@@ -53,7 +53,7 @@ async function actorsAndApp(stack, name) {
   return {owner, member, app: await appFixture(stack, owner, name)};
 }
 
-async function createVault(page, stack, owner, app) {
+async function createVault(page, stack, owner, app, testInfo) {
   await enter(page, stack, owner);
   await page.getByRole('button').filter({has: page.getByRole('heading', {name: app.name, exact: true})}).click();
   await page.getByRole('button', {name: '+ E2E environment', exact: true}).click();
@@ -72,7 +72,12 @@ async function createVault(page, stack, owner, app) {
   await editor.getByRole('textbox', {name: 'Value', exact: true}).fill(secret.value);
   await editor.getByRole('textbox', {name: 'Path', exact: true}).fill(secret.path);
   await editor.getByRole('button', {name: 'Stage secret', exact: true}).click();
+  // Live annotation: if the journey stalls, the report shows whether the deploy
+  // request was actually sent and how the server answered. Status codes only.
+  const deployPut = page.waitForResponse(request => new URL(request.url()).pathname.endsWith('/e2e/secrets') && request.request().method() === 'PUT')
+    .then(response => { testInfo.annotations.push({type: 'safe-phase', description: `deploy-put:${response.status()}`}); return response; });
   await page.getByRole('button', {name: 'Deploy changes', exact: true}).click();
+  await deployPut;
   await expect(page.getByText('Deployed 1 secret', {exact: true})).toBeVisible();
   return created.id;
 }
@@ -149,9 +154,10 @@ function snapshotRequest(observation, id, before, membership, remaining, removed
 }
 
 test('UI grant revocation automatically rekeys and rejects the copied old key @critical', async ({page, stack, browser}, testInfo) => {
+  test.slow();
   const {owner, member, app} = await actorsAndApp(stack, 'automatic-client-rekey');
   const observation = watchPlaintext(page, [owner, member]);
-  const id = await createVault(page, stack, owner, app);
+  const id = await createVault(page, stack, owner, app, testInfo);
   await grantMember(page, member);
   const before = await meta(stack, id, owner.token), stored = await ciphertext(stack, id, owner.token);
   assert.equal(before.rekey_required, false, 'adding a grant does not create pending rotation');
@@ -224,10 +230,11 @@ test('UI grant revocation automatically rekeys and rejects the copied old key @c
 
 test.describe('pending rotation after an offline holder returns', () => {
   test.use({anonymousBootstraps: 2});
-  test('signed-out owner reloads and recovery-kit unlock automatically finishes pending rekey @critical', async ({page, stack}) => {
+  test('signed-out owner reloads and recovery-kit unlock automatically finishes pending rekey @critical', async ({page, stack}, testInfo) => {
+    test.slow();
     const {owner, member, app} = await actorsAndApp(stack, 'pending-client-rekey');
     const observation = watchPlaintext(page, [owner, member]);
-    const id = await createVault(page, stack, owner, app);
+    const id = await createVault(page, stack, owner, app, testInfo);
     await grantMember(page, member);
     const before = await meta(stack, id, owner.token), stored = await ciphertext(stack, id, owner.token);
     const offlineSession = good(await stack.call('POST', '/api/auth/login', '', {email: owner.email, password: owner.password}), 'separate authorized API session');
