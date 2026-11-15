@@ -62,7 +62,7 @@ test('secret health is mounted for shared add/edit fields without save-triggered
   for (const verification of [false, true]) {
     h.run("modal('<input id=\"ed-val\">','Secret editor')");
     const generation = h.run('HEALTH_GENERATION');
-    if (verification) h.run('STEP_UP={saved:null,reject:rejectVerification};');
+    if (verification) h.run('STEP_UP={saved:null,shown:true,reject:rejectVerification};');
     h.run('closeModal()');
     assert.ok(h.run('HEALTH_GENERATION') > generation, 'normal close and verification cancellation must invalidate pending health results');
     assert.equal(h.shown.has('show'), false, 'the closed dialog must not remain actionable');
