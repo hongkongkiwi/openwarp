@@ -39,6 +39,8 @@ impl Fixture {
         let st = new_state(db, String::new(), "receipt-expiry-fixture".into(), "https://openwarp.test.invalid".into(), MASTER, live,
             #[cfg(feature = "redis-cache")] None);
         install_kms(&st, None);
+        #[cfg(feature = "pki")]
+        openwarp_server::pki_expiry_alerts(&st).await;
         Self { app: router(st.clone()), st }
     }
     async fn call(&self, method: &str, path: &str, token: &str, body: Option<Value>) -> (u16, Value) {
