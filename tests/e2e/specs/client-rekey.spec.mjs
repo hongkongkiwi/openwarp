@@ -167,13 +167,19 @@ test('UI grant revocation automatically rekeys and rejects the copied old key @c
     await unlockVault(memberPage, member);
     await memberPage.getByRole('button', {name: 'Reveal', exact: true}).click();
     await expect(memberPage.locator('#stable .val')).toHaveText(secret.value);
-    assert.equal(await memberPage.evaluate(async ({id, kit, expected}) => {
+    const copiedKeyStatus = await memberPage.evaluate(async ({id, kit, expected}) => {
       const response = await fetch(`/api/envs/${id}/e2e/secrets`, {credentials: 'same-origin'});
-      if (response.status !== 200) return false;
-      const saved = await response.json(), oldKey = await OW.decryptAsymmetric(kit, saved.wrapped_key);
+      if (response.status !== 200) return `fetch:${response.status}`;
+      const saved = await response.json();
+      if (saved.secrets.length !== 1) return `count:${saved.secrets.length}`;
+      let oldKey;
+      try { oldKey = await OW.decryptAsymmetric(kit, saved.wrapped_key); } catch { return 'unwrap'; }
+      if (oldKey.length !== 32) return 'keylen';
       const decode = bytes => new TextDecoder().decode(bytes), original = saved.secrets[0];
-      if (saved.secrets.length !== 1 || decode(await OW.decryptSymmetric(oldKey, original.value_enc)) !== expected.value) return false;
-      // Retain a copied key only inside this browser realm; report booleans, never key bytes or plaintext.
+      try { if (decode(await OW.decryptSymmetric(oldKey, original.key_enc)) !== expected.key) return 'key'; } catch { return 'key'; }
+      try { if (decode(await OW.decryptSymmetric(oldKey, original.value_enc)) !== expected.value) return 'value'; } catch { return 'value'; }
+      try { if (decode(await OW.decryptSymmetric(oldKey, original.path_enc)) !== expected.path) return 'path'; } catch { return 'path'; }
+      // Retain a copied key only inside this browser realm; report safe status codes, never key bytes or plaintext.
       globalThis.clientRekeyCopiedKeyProbe = async next => {
         let rejected = 0;
         for (const row of next.secrets) for (const field of ['key_enc', 'value_enc', 'path_enc']) {
@@ -182,8 +188,11 @@ test('UI grant revocation automatically rekeys and rejects the copied old key @c
         return {copiedStillReadable: decode(await OW.decryptSymmetric(oldKey, original.value_enc)) === expected.value,
           rejectsEveryNewField: next.secrets.length > 0 && rejected === next.secrets.length * 3};
       };
-      return true;
-    }, {id, kit: member.kit, expected: secret}), true, 'member copies and verifies its authorized old key locally');
+      return 'ok';
+    }, {id, kit: member.kit, expected: secret});
+    const safeCopiedKeyStatus = /^(?:ok|unwrap|keylen|key|value|path|fetch:\d{3}|count:\d+)$/.test(copiedKeyStatus) ? copiedKeyStatus : 'invalid-status';
+    testInfo.annotations.push({type: 'safe-phase', description: `copied-key:${safeCopiedKeyStatus}`});
+    assert.equal(copiedKeyStatus, 'ok', 'member copies and verifies its authorized old key locally');
     await page.getByRole('button', {name: 'Access', exact: true}).click();
     const access = page.getByRole('dialog', {name: 'Environment access', exact: true});
     const confirmed = page.waitForEvent('dialog').then(async dialog => { assert.equal(dialog.type(), 'confirm'); await dialog.accept(); });
